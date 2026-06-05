@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Messaging: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad  { color: var(--color-danger);  font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+        <li><a href="../message-queues.html">Message Queues</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- 1. Hero -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Messaging: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">"Use Kafka" is the wrong answer most of the time. Kafka is a partitioned log; RabbitMQ is a routing broker; SQS is a managed work queue; Pulsar separates broker from storage. They solve different problems and fail differently. This page is the decision tree.</p>
+      <p class="hero-meta">Kafka &bull; Pulsar &bull; RabbitMQ &bull; SQS &bull; Kinesis &bull; Cloud Pub/Sub &bull; NATS / JetStream &bull; Redis Streams</p>
+    </div>
+  </section>
+
+  <!-- 2. Decision flowchart -->
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <p>Walk down this tree out loud. Each leaf is a defensible answer.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 1240 700" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs>
+            <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+            </marker>
+          </defs>
+
+          <rect x="450" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="600" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">Need messaging</text>
+          <text x="600" y="62" text-anchor="middle" fill="white" font-size="12" opacity="0.9">Start here</text>
+
+          <!-- Q1: Need replay / event sourcing? -->
+          <rect x="450" y="120" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="600" y="146" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Need replay / event sourcing /</text>
+          <text x="600" y="164" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">long retention?</text>
+          <line x1="600" y1="76" x2="600" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+          <!-- YES: Log family -->
+          <rect x="60" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="200" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Self-host or managed?</text>
+          <text x="200" y="284" text-anchor="middle" fill="#64748b" font-size="11">log family chosen</text>
+          <line x1="450" y1="170" x2="320" y2="258" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="350" y="220" fill="#16a34a" font-size="12" font-weight="700">YES &mdash; log</text>
+
+          <rect x="20" y="340" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="80" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Kafka</text>
+          <line x1="120" y1="300" x2="100" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="40" y="320" fill="#16a34a" font-size="11" font-weight="700">Self</text>
+
+          <rect x="160" y="340" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="220" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Pulsar</text>
+          <line x1="200" y1="300" x2="200" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="225" y="320" fill="#0891b2" font-size="11" font-weight="700">Self/multi-tenant</text>
+
+          <rect x="20" y="410" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="80" y="440" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Kinesis</text>
+          <line x1="80" y1="390" x2="80" y2="408" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+          <rect x="160" y="410" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="220" y="440" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">MSK / Confluent</text>
+          <line x1="220" y1="390" x2="220" y2="408" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+          <!-- Q2: NO retention; pub/sub or work queue? -->
+          <rect x="780" y="240" width="320" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="940" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Many consumers per message</text>
+          <text x="940" y="284" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">(pub/sub) or one (work queue)?</text>
+          <line x1="750" y1="170" x2="850" y2="258" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="800" y="220" fill="#dc2626" font-size="12" font-weight="700">NO</text>
+
+          <!-- Pub/Sub branch -->
+          <rect x="700" y="340" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="820" y="366" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Cross-region / global?</text>
+          <text x="820" y="384" text-anchor="middle" fill="#64748b" font-size="11">pub/sub branch</text>
+          <line x1="850" y1="300" x2="820" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="780" y="320" fill="#16a34a" font-size="11" font-weight="700">PUB/SUB</text>
+
+          <rect x="700" y="430" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="760" y="460" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Cloud Pub/Sub</text>
+
+          <rect x="830" y="430" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="890" y="460" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">NATS</text>
+          <line x1="780" y1="400" x2="760" y2="428" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <line x1="860" y1="400" x2="890" y2="428" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="730" y="420" fill="#16a34a" font-size="11" font-weight="700">YES</text>
+          <text x="900" y="420" fill="#dc2626" font-size="11" font-weight="700">NO</text>
+
+          <!-- Work queue branch -->
+          <rect x="970" y="340" width="220" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="1080" y="366" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Need complex routing</text>
+          <text x="1080" y="384" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">(topics+exchanges)?</text>
+          <line x1="1020" y1="300" x2="1060" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="1100" y="320" fill="#16a34a" font-size="11" font-weight="700">WORK QUEUE</text>
+
+          <rect x="950" y="430" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1010" y="460" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">RabbitMQ</text>
+          <line x1="1030" y1="400" x2="1010" y2="428" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="980" y="420" fill="#16a34a" font-size="11" font-weight="700">YES</text>
+
+          <rect x="1080" y="430" width="120" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1140" y="460" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">SQS</text>
+          <line x1="1110" y1="400" x2="1140" y2="428" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+          <text x="1140" y="420" fill="#dc2626" font-size="11" font-weight="700">NO &mdash; AWS</text>
+
+          <!-- Tiny inside-stack option -->
+          <rect x="450" y="560" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="600" y="586" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Already running Redis &amp; volume</text>
+          <text x="600" y="604" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">&lt; 1M msg/day?</text>
+
+          <rect x="450" y="640" width="300" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="600" y="670" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Redis Streams (XADD / XREADGROUP)</text>
+          <line x1="600" y1="620" x2="600" y2="638" stroke="#334155" stroke-width="1.5" marker-end="url(#arr2)"/>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Feature matrix -->
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <p>The 14 dimensions that decide a messaging system. Same column ordering and scoring scale as other comparison pages.</p>
+
+      <div class="table-responsive comp-table">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>Kafka</th><th>Pulsar</th><th>RabbitMQ</th><th>SQS</th><th>Kinesis</th><th>Pub/Sub</th><th>NATS JetStream</th><th>Redis Streams</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Model</td><td>Partitioned log (pull)</td><td>Log + queue, broker/storage split</td><td>Queue + exchange (push)</td><td>Pull queue (managed)</td><td>Sharded log (managed)</td><td>Pub/sub (push or pull)</td><td>Subject pub/sub + log</td><td>Log inside Redis</td></tr>
+            <tr><td>Storage engine</td><td>Append-only segments + page cache</td><td>BookKeeper ledgers (separate tier)</td><td>In-memory + Mnesia/Khepri</td><td>Managed (opaque)</td><td>Managed sharded log</td><td>Managed (opaque)</td><td>File store / memory store</td><td>RAM (radix tree)</td></tr>
+            <tr><td>Replication</td><td>ISR per partition</td><td>BookKeeper quorum (E,W,A)</td><td>Quorum queues (Raft)</td><td>3-AZ managed</td><td>Multi-AZ managed</td><td>Managed</td><td>Raft per stream</td><td>Async replica</td></tr>
+            <tr><td>Ordering</td><td>Per partition</td><td>Per partition (key_shared)</td><td>Per queue (single consumer)</td><td>FIFO queue: per group</td><td>Per shard</td><td>Best-effort; ordered keys add'l</td><td>Per subject</td><td>Per stream</td></tr>
+            <tr><td>Delivery semantics</td><td>At-least-once; exactly-once via txn</td><td>At-least-once; exactly-once via txn</td><td>At-least-once</td><td>At-least-once (FIFO: exactly-once dedupe)</td><td>At-least-once</td><td>At-least-once</td><td>At-least-once; exactly-once via dedup</td><td>At-least-once</td></tr>
+            <tr><td>Retention</td><td>Hours&ndash;forever (tiered storage option)</td><td>Forever (tiered storage native)</td><td>Until acked (TTL optional)</td><td>14 days max</td><td>365 days max</td><td>7 days default; 31 max</td><td>Configurable; tiered (file)</td><td>Bounded by trim or memory</td></tr>
+            <tr><td>Throughput / broker</td><td>~600 MB/s sequential write</td><td>~300&ndash;500 MB/s</td><td>~50k msg/sec/queue</td><td>3,000 msg/s/queue (no ordering); 300 msg/s FIFO</td><td>~1 MB/s/shard write</td><td>~1M msg/sec/topic</td><td>~10M msg/sec (NATS core); JetStream lower</td><td>~100k ops/sec/shard</td></tr>
+            <tr><td>Latency P99</td><td>5&ndash;20 ms</td><td>5&ndash;20 ms</td><td>1&ndash;5 ms</td><td>20&ndash;100 ms (long polling)</td><td>~70 ms</td><td>~100 ms (push)</td><td>&lt; 1 ms (NATS core)</td><td>&lt; 1 ms</td></tr>
+            <tr><td>Multi-tenant</td><td>ACLs + quotas; one cluster</td><td>Native (tenants/namespaces)</td><td>vhosts</td><td>Per-queue IAM</td><td>Per-stream IAM</td><td>Per-topic IAM</td><td>Accounts (native)</td><td>None</td></tr>
+            <tr><td>Geo-replication</td><td>MirrorMaker 2; cluster linking</td><td>Native geo-replication</td><td>Federation, shovel</td><td>Cross-region not native</td><td>n/a (regional)</td><td>Native global</td><td>Native (cluster + leaf nodes)</td><td>Async replica only</td></tr>
+            <tr><td>Backpressure</td><td>Consumer pulls; lag is the signal</td><td>Pull or push; permits</td><td>Push; consumer prefetch</td><td>Visibility timeout + retries</td><td>Iterator-driven pull</td><td>Push w/ flow ctrl; pull avail</td><td>Pull, ack-pending limit</td><td>XREAD pull (block)</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>4 self-host, 1 MSK</td><td>5 self-host (BK + ZK + brokers), 1 StreamNative</td><td>3 self-host, 1 CloudAMQP</td><td>1</td><td>1</td><td>1</td><td>2 self-host, 1 Synadia</td><td>2 (already-running Redis)</td></tr>
+            <tr><td>Cost driver</td><td>Brokers + cross-AZ network</td><td>Brokers + bookies + cross-AZ</td><td>Instance hours</td><td>Per-million requests</td><td>Shard-hours + PUTs</td><td>Per-million msgs + storage</td><td>Instance hours</td><td>RAM &times; replicas</td></tr>
+            <tr><td>Cloud equivalents</td><td>MSK, Confluent, GCP Managed Kafka</td><td>StreamNative</td><td>Amazon MQ, CloudAMQP</td><td>AWS only</td><td>AWS only</td><td>GCP only</td><td>Synadia Cloud</td><td>ElastiCache, Memorystore</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Workload patterns -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Event log / event sourcing</td><td>Kafka</td><td>Pulsar</td><td>Kafka if you live on Kafka ecosystem; Pulsar for multi-tenant + tiered storage native</td></tr>
+            <tr><td>Async work queue (background jobs)</td><td>SQS</td><td>RabbitMQ</td><td>SQS if AWS &amp; you accept ~50ms; RabbitMQ for low-latency or complex routing</td></tr>
+            <tr><td>Pub/sub fan-out (notifications)</td><td>Cloud Pub/Sub / SNS</td><td>Kafka</td><td>Native pub/sub if managed; Kafka if you also need replay</td></tr>
+            <tr><td>Inter-service RPC-ish messaging</td><td>NATS</td><td>RabbitMQ</td><td>NATS for sub-ms; Rabbit if you want persistence guarantees</td></tr>
+            <tr><td>Outbox pattern (DB &rarr; bus)</td><td>Kafka via Debezium</td><td>RabbitMQ</td><td>Kafka if you'll grow to many consumers; Rabbit if simple 1:1</td></tr>
+            <tr><td>Buffer between fast producer / slow consumer</td><td>Kafka</td><td>Kinesis</td><td>Kafka with retention; Kinesis if AWS-native</td></tr>
+            <tr><td>Stream-table join feeding a service</td><td>Kafka + Streams</td><td>Pulsar Functions</td><td>Kafka Streams = mature library; Pulsar Functions simpler but smaller community</td></tr>
+            <tr><td>IoT ingest (millions of devices)</td><td>NATS + JetStream / Pulsar</td><td>Kafka</td><td>NATS / Pulsar handle millions of topics; Kafka struggles past ~4k partitions/broker</td></tr>
+            <tr><td>Lightweight in-stack queue (small scale)</td><td>Redis Streams</td><td>RabbitMQ</td><td>Redis if already running; Rabbit if you'll outgrow it</td></tr>
+            <tr><td>Strict-ordering FIFO for finance</td><td>Kafka (per-key partition)</td><td>SQS FIFO</td><td>Kafka for high QPS; SQS FIFO for managed but capped at 300 msg/s/group</td></tr>
+            <tr><td>Schema-evolved event bus</td><td>Kafka + Schema Registry</td><td>Pulsar (built-in schema)</td><td>Pulsar has schema in-broker; Kafka requires Schema Registry sidecar</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape (the staff+ probe matrix)</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Access pattern</th><th>Kafka</th><th>Pulsar</th><th>RabbitMQ</th><th>SQS</th><th>Pub/Sub</th><th>NATS JS</th><th>Redis Streams</th></tr></thead>
+          <tbody>
+            <tr><td>Read-heavy uniform (many consumers)</td><td><span class="pat-good">&#10003;&#10003;</span> consumer groups</td><td><span class="pat-good">&#10003;&#10003;</span> shared subs + Reader API</td><td><span class="pat-warn">&#9888;</span> queue == one consumer</td><td><span class="pat-bad">&#10005;</span> not pub/sub</td><td><span class="pat-good">&#10003;&#10003;</span> native</td><td><span class="pat-good">&#10003;</span> queue group</td><td><span class="pat-good">&#10003;</span> consumer group</td></tr>
+            <tr><td>Write-heavy uniform</td><td><span class="pat-good">&#10003;&#10003;</span> 600 MB/s/broker</td><td><span class="pat-good">&#10003;</span> ~400 MB/s</td><td><span class="pat-warn">&#9888;</span> 50k/s/queue</td><td><span class="pat-warn">&#9888;</span> 3k/s standard</td><td><span class="pat-good">&#10003;</span> elastic</td><td><span class="pat-good">&#10003;&#10003;</span> millions/sec core</td><td><span class="pat-good">&#10003;</span> in-RAM</td></tr>
+            <tr><td>Power-law / hot key (skewed partition)</td><td><span class="pat-bad">&#10005;</span> hot partition pegs one broker</td><td><span class="pat-bad">&#10005;</span> same shape</td><td><span class="pat-warn">&#9888;</span> hot queue</td><td><span class="pat-good">&#10003;</span> no key</td><td><span class="pat-good">&#10003;</span> no key by default</td><td><span class="pat-bad">&#10005;</span> hot subject</td><td><span class="pat-bad">&#10005;</span> single-thread</td></tr>
+            <tr><td>Bursty / spiky</td><td><span class="pat-good">&#10003;</span> log absorbs</td><td><span class="pat-good">&#10003;</span> log absorbs</td><td><span class="pat-warn">&#9888;</span> RAM ceiling</td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td><td><span class="pat-good">&#10003;</span> file store</td><td><span class="pat-warn">&#9888;</span> bounded by RAM</td></tr>
+            <tr><td>Many topics (millions)</td><td><span class="pat-bad">&#10005;</span> ~4k partitions/broker cap</td><td><span class="pat-good">&#10003;</span> namespaces scale</td><td><span class="pat-warn">&#9888;</span> ~10k queues</td><td><span class="pat-good">&#10003;</span> 1M queues</td><td><span class="pat-good">&#10003;</span> millions</td><td><span class="pat-good">&#10003;&#10003;</span> subject hierarchy</td><td><span class="pat-warn">&#9888;</span> RAM</td></tr>
+            <tr><td>Strict ordering across many keys</td><td><span class="pat-good">&#10003;</span> per partition</td><td><span class="pat-good">&#10003;</span> key_shared</td><td><span class="pat-warn">&#9888;</span> single consumer queue</td><td><span class="pat-warn">&#9888;</span> FIFO per group, 300/s</td><td><span class="pat-warn">&#9888;</span> ordering keys, lower throughput</td><td><span class="pat-good">&#10003;</span> per subject</td><td><span class="pat-good">&#10003;</span> per stream</td></tr>
+            <tr><td>Replay / rewind</td><td><span class="pat-good">&#10003;&#10003;</span> seek by offset</td><td><span class="pat-good">&#10003;&#10003;</span> seek by msg id / time</td><td><span class="pat-bad">&#10005;</span> dequeue is destructive</td><td><span class="pat-bad">&#10005;</span> can't replay</td><td><span class="pat-good">&#10003;</span> snapshot + seek</td><td><span class="pat-good">&#10003;</span> seek by seq</td><td><span class="pat-good">&#10003;</span> XRANGE</td></tr>
+            <tr><td>Long retention (days+)</td><td><span class="pat-good">&#10003;</span> incl. tiered S3</td><td><span class="pat-good">&#10003;&#10003;</span> tiered storage native</td><td><span class="pat-bad">&#10005;</span> not designed for</td><td><span class="pat-warn">&#9888;</span> 14 days max</td><td><span class="pat-good">&#10003;</span> up to 31 days</td><td><span class="pat-good">&#10003;</span> file store</td><td><span class="pat-warn">&#9888;</span> RAM-bounded</td></tr>
+            <tr><td>Exactly-once (E2E)</td><td><span class="pat-good">&#10003;</span> txn + idempotent producer</td><td><span class="pat-good">&#10003;</span> txn API</td><td><span class="pat-warn">&#9888;</span> publisher confirms + dedupe app-side</td><td><span class="pat-good">&#10003;</span> FIFO dedupe (5 min)</td><td><span class="pat-warn">&#9888;</span> dedupe app-side</td><td><span class="pat-good">&#10003;</span> message dedup window</td><td><span class="pat-warn">&#9888;</span> app-side dedupe</td></tr>
+            <tr><td>Low-latency RPC-ish (sub-ms)</td><td><span class="pat-bad">&#10005;</span> 5&ndash;20 ms</td><td><span class="pat-bad">&#10005;</span> similar</td><td><span class="pat-good">&#10003;</span> ~1 ms</td><td><span class="pat-bad">&#10005;</span> 50ms+</td><td><span class="pat-bad">&#10005;</span> ~100 ms</td><td><span class="pat-good">&#10003;&#10003;</span> &lt; 1 ms</td><td><span class="pat-good">&#10003;&#10003;</span> &lt; 1 ms</td></tr>
+            <tr><td>Cross-region active-active</td><td><span class="pat-warn">&#9888;</span> MM2 / Cluster Linking</td><td><span class="pat-good">&#10003;&#10003;</span> built-in</td><td><span class="pat-warn">&#9888;</span> federation</td><td><span class="pat-bad">&#10005;</span> regional</td><td><span class="pat-good">&#10003;&#10003;</span> global by design</td><td><span class="pat-good">&#10003;</span> superclusters</td><td><span class="pat-bad">&#10005;</span> async only</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend">
+        <span class="pat-good">&#10003;&#10003;</span> excellent fit
+        <span class="pat-good">&#10003;</span> handles natively
+        <span class="pat-warn">&#9888;</span> works with effort / a technique
+        <span class="pat-bad">&#10005;</span> wrong tool
+      </p>
+    </div>
+  </section>
+
+  <!-- 5. Scaling cliffs -->
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Kafka</td><td>~4k partitions per broker</td><td>Controller pressure; rebalance time grows linearly; metadata ZK/KRaft overload</td><td>Move to Pulsar; or rearchitect to fewer + larger partitions</td></tr>
+            <tr><td>Kafka (hot partition)</td><td>One key &gt; per-partition throughput</td><td>One broker pegged regardless of cluster size</td><td>Repartition by composite key (user_id + time bucket)</td></tr>
+            <tr><td>Pulsar</td><td>BookKeeper bookie loss / fencing</td><td>Ledger fencing during failure adds latency spikes</td><td>Larger ensembles; tune ack quorum</td></tr>
+            <tr><td>RabbitMQ</td><td>Mirrored queues at &gt; ~100k msgs in flight</td><td>Mirror sync stalls; head-of-line blocking</td><td>Quorum queues (Raft); shard logically by user/region</td></tr>
+            <tr><td>SQS standard</td><td>None (effectively unlimited)</td><td>Per-queue 3k msg/s if no batching</td><td>Use SendMessageBatch (10x)</td></tr>
+            <tr><td>SQS FIFO</td><td>300 msg/s per group, 3k/s/queue</td><td>Ordering guarantee comes with hard cap</td><td>Spread across MessageGroupIds</td></tr>
+            <tr><td>Kinesis</td><td>1 MB/s in, 2 MB/s out per shard</td><td>Re-sharding has cooldown; consumer rebalance pain</td><td>Enhanced fan-out for read; resize shards via UpdateShardCount</td></tr>
+            <tr><td>Pub/Sub</td><td>Push subscriber backlog</td><td>Push delivery slows when subscriber 5xx; backlog grows</td><td>Switch to pull; tune ack deadline</td></tr>
+            <tr><td>NATS core</td><td>No persistence</td><td>Subscriber death = lost messages</td><td>Use JetStream for at-least-once</td></tr>
+            <tr><td>Redis Streams</td><td>Memory ceiling per shard</td><td>One shard's RAM caps total stream length</td><td>Trim aggressively (MAXLEN); migrate to Kafka past ~1M msg/day</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Migration paths -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <p>Pattern: <strong>dual-publish &rarr; consumers shadow new &rarr; cutover reads &rarr; stop publishing to old</strong>. Schema registry is critical for non-trivial migrations.</p>
+
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>From &darr; / To &rarr;</th><th>Kafka</th><th>Pulsar</th><th>RabbitMQ</th><th>SQS</th><th>Pub/Sub</th></tr></thead>
+          <tbody>
+            <tr><td>Kafka</td><td>&mdash; (MM2 between clusters)</td><td>KoP (Kafka-on-Pulsar) or dual-publish</td><td>Kafka Connect Sink</td><td>Lambda consumer &rarr; SQS</td><td>Pub/Sub Kafka Connector</td></tr>
+            <tr><td>Pulsar</td><td>Pulsar IO sink to Kafka</td><td>&mdash; (geo-replicate)</td><td>Pulsar IO sink</td><td>Function &rarr; SQS</td><td>Pulsar IO sink</td></tr>
+            <tr><td>RabbitMQ</td><td>Shovel &rarr; Kafka Connect Source</td><td>Pulsar IO source</td><td>&mdash; (federation)</td><td>Lambda</td><td>Connector</td></tr>
+            <tr><td>SQS</td><td>EventBridge &rarr; Kafka via Lambda</td><td>Lambda &rarr; Pulsar</td><td>Lambda &rarr; AMQP</td><td>&mdash;</td><td>EventBridge</td></tr>
+            <tr><td>Pub/Sub</td><td>Pub/Sub &rarr; BQ &rarr; nope; use Dataflow &rarr; Kafka</td><td>Dataflow &rarr; Pulsar</td><td>Dataflow &rarr; AMQP</td><td>Dataflow &rarr; SQS</td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. Cost shape -->
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Kafka self-host</td><td>Brokers (CPU + disk) + cross-AZ replication network</td><td>Cross-AZ traffic for RF=3 across 3 AZs &mdash; often the #1 line item</td></tr>
+            <tr><td>MSK / Confluent Cloud</td><td>Broker-hours + storage + ingress/egress</td><td>Confluent prices Kafka by ingress GB &mdash; cross-AZ doesn't show as a line but it's baked in</td></tr>
+            <tr><td>Pulsar self-host</td><td>Brokers + bookies + ZK/Metadata</td><td>3 tiers to scale; tiered storage to S3 saves $$ but adds complexity</td></tr>
+            <tr><td>RabbitMQ</td><td>Instance hours</td><td>Quorum queues need 3 nodes minimum; classic mirrored queues are deprecated</td></tr>
+            <tr><td>SQS</td><td>$0.40/M req standard, $0.50/M FIFO</td><td>Long-poll savings; batch operations 10&times;; FIFO is expensive at scale</td></tr>
+            <tr><td>Kinesis</td><td>Shard-hours + per-PUT</td><td>1 shard &asymp; $11/mo + ingest; over-provision for headroom = idle $$</td></tr>
+            <tr><td>Pub/Sub</td><td>Per-million messages + storage GB-mo</td><td>Storage charge for retained but unacked messages can dominate</td></tr>
+            <tr><td>NATS JS self-host</td><td>Instance hours</td><td>Cheap; storage on local SSD; no cross-AZ replication unless cluster spans</td></tr>
+            <tr><td>Redis Streams</td><td>RAM &times; replicas</td><td>Memory bill for retained messages; trim aggressively</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. Hybrid -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns ("use them together")</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>Kafka + RabbitMQ (log + work queue)</h3>
+          <p>Kafka holds the immutable event log; a sidecar consumer reads from Kafka and dispatches work into RabbitMQ for low-latency RPC-style processing. Pattern shows up at orgs that started on Rabbit, added Kafka for analytics, and ended up with both.</p>
+        </div>
+        <div>
+          <h3>Outbox pattern (DB &rarr; Kafka via Debezium)</h3>
+          <p>App writes business row + outbox row in one DB transaction. Debezium tails the WAL/binlog and publishes outbox rows to Kafka. Solves dual-write atomicity (DB and Kafka) without 2PC.</p>
+        </div>
+        <div>
+          <h3>SQS in front of Lambda + Kafka behind</h3>
+          <p>SQS as the buffer + retry layer; Lambda as the worker; final result published to Kafka for downstream consumers. SQS isolates retry/DLQ from the event log.</p>
+        </div>
+        <div>
+          <h3>Pub/Sub fan-out + Cloud Run subscribers</h3>
+          <p>One topic, N push subscriptions, each to a Cloud Run service. Pub/Sub scales each subscriber independently; backlog is the natural backpressure signal.</p>
+        </div>
+        <div>
+          <h3>Redis Streams as fast-path + Kafka as cold path</h3>
+          <p>Redis Streams for sub-ms intra-region delivery; Kafka downstream for analytics + replay. Useful when latency budget &lt; 5 ms.</p>
+        </div>
+        <div>
+          <h3>NATS for control plane + Kafka for data plane</h3>
+          <p>NATS pub/sub for low-latency commands &amp; service discovery; Kafka for high-volume event log. NATS does not try to be Kafka and vice versa.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9. Anti-patterns -->
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"We used Kafka as a database"</h3>
+          <p>Random reads by key are slow. Kafka is a log, not a KV. Use Kafka Streams + RocksDB to materialize a view, or pair Kafka with an actual DB.</p>
+        </div>
+        <div>
+          <h3>"We used Kafka for low-latency RPC"</h3>
+          <p>5&ndash;20 ms typical, even more with batching. For sub-ms, use NATS or gRPC.</p>
+        </div>
+        <div>
+          <h3>"We used RabbitMQ for high-throughput event log"</h3>
+          <p>Mirrored queues stall above ~100k in-flight; classic queues lose messages on crash. Switch to Kafka or quorum queues.</p>
+        </div>
+        <div>
+          <h3>"We used SQS for ordered processing without FIFO"</h3>
+          <p>Standard SQS is at-least-once and unordered. If you assumed order, you have a bug. Switch to FIFO (300 msg/s/group cap) or Kafka.</p>
+        </div>
+        <div>
+          <h3>"We used Pub/Sub push and consumers can't keep up"</h3>
+          <p>Push delivery slows when subscriber returns 5xx, growing backlog. Switch subscription type to pull, or fix the consumer.</p>
+        </div>
+        <div>
+          <h3>"We used NATS core for durable workflows"</h3>
+          <p>NATS core is fire-and-forget. If consumer is down, messages are dropped. Use JetStream.</p>
+        </div>
+        <div>
+          <h3>"We made one Kafka topic per user"</h3>
+          <p>Past ~4k partitions/broker, controller pressure tanks the cluster. Use a key-partitioned shared topic instead.</p>
+        </div>
+        <div>
+          <h3>"We expected exactly-once and it wasn't"</h3>
+          <p>Kafka EOS only inside Kafka (read-process-write). If the side effect is a payment or external API, you still need an idempotency key.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. Decision rules -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>"Need replay or many consumers?" &rarr; log family (Kafka / Pulsar / Kinesis / Pub/Sub).</strong></li>
+          <li><strong>"Need low-latency work queue?" &rarr; RabbitMQ.</strong></li>
+          <li><strong>"On AWS, simple async background jobs?" &rarr; SQS.</strong></li>
+          <li><strong>"On GCP, global pub/sub?" &rarr; Cloud Pub/Sub.</strong></li>
+          <li><strong>"On AWS but want a log?" &rarr; Kinesis or MSK.</strong></li>
+          <li><strong>"Multi-tenant SaaS with millions of topics?" &rarr; Pulsar or NATS, not Kafka.</strong></li>
+          <li><strong>"Sub-ms RPC?" &rarr; NATS.</strong></li>
+          <li><strong>"Already running Redis, &lt; 1M msg/day?" &rarr; Redis Streams.</strong></li>
+          <li><strong>Always ask "do you need replay?" before naming Kafka vs RabbitMQ.</strong></li>
+          <li><strong>Exactly-once is "exactly-once inside Kafka" &mdash; external side effects still need idempotency keys.</strong></li>
+          <li><strong>Hot partition is the most-asked failure mode &mdash; the answer is composite keys (user_id + time bucket).</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../message-queues.html">Message Queues (concept)</a></li>
+        <li><a href="../scenarios/12-pubsub-ordering.html">Scenario: Pub/Sub ordering</a></li>
+        <li><a href="../scenarios/14-exactly-once.html">Scenario: Exactly-once</a></li>
+        <li><a href="../scenarios/13-backpressure.html">Scenario: Backpressure</a></li>
+        <li><a href="../technologies.html">All Technologies</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

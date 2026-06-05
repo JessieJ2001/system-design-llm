@@ -1,0 +1,2651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Inference Serving — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Serving Llama-3 70B to 2 Million Users</h1>
+      <p class="hero-subtitle">Design a real-time inference system that serves a 70-billion-parameter LLM with streaming output, multi-turn conversations, and sub-second time-to-first-token &mdash; at scale.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~20 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>Your company is launching a ChatGPT-style product powered by Llama-3 70B. Users send text messages and receive streaming responses. Conversations are multi-turn &mdash; the model must see the full conversation history for every message. The interview question: <strong>design the GPU inference serving layer</strong> &mdash; from the moment a tokenized prompt arrives to the moment the last token streams back.</p>
+
+      <div>
+        <h3>The Problem</h3>
+        <p>LLM inference is unlike any traditional web service. A single request can occupy a GPU for 5&ndash;30 seconds, consume gigabytes of memory, and produce output one token at a time. The model itself is too large to fit on a single GPU. You need to split it across multiple GPUs, batch requests efficiently, and manage a massive, dynamically-growing cache of intermediate computations &mdash; all while maintaining sub-second responsiveness for streaming output.</p>
+        <p>The core tension: <strong>GPU memory is the bottleneck, not compute.</strong> A single H100 has 989 TFLOP/s of FP16 compute but only 80 GB of memory. The model weights alone eat 140 GB. The intermediate state (KV cache) for each active conversation eats hundreds of megabytes to gigabytes. Every design decision revolves around fitting more useful work into limited GPU memory.</p>
+      </div>
+
+      <div>
+        <h3>Constraints</h3>
+        <ul>
+          <li><strong>Model:</strong> Llama-3 70B &mdash; 80 transformer layers, 64 query heads, 8 KV heads (Grouped Query Attention), d_model = 8192, head_dim = 128</li>
+          <li><strong>Precision:</strong> FP16 (2 bytes per parameter)</li>
+          <li><strong>GPU:</strong> NVIDIA H100 80 GB HBM3 &mdash; 3.35 TB/s memory bandwidth, 989 TFLOP/s FP16</li>
+          <li><strong>DAU:</strong> 2 million</li>
+          <li><strong>Avg messages/user/day:</strong> 40 (mix of short and long conversations)</li>
+          <li><strong>Avg input:</strong> 1,000 tokens; avg output: 500 tokens</li>
+          <li><strong>SLO:</strong> p99 time-to-first-token (TTFT) &lt; 1 second, p99 inter-token latency &lt; 50 ms</li>
+          <li><strong>Context window:</strong> up to 32K tokens</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Quantified Requirements</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th><th>Derivation</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Daily messages</td><td>80M</td><td>2M DAU &times; 40 msg/user</td></tr>
+              <tr><td>Avg QPS</td><td>926 msg/sec</td><td>80M / 86,400</td></tr>
+              <tr><td>Peak QPS (3&times;)</td><td>2,778 msg/sec</td><td>926 &times; 3</td></tr>
+              <tr><td>Avg input tokens/request</td><td>1,000</td><td>Given (prompt + conversation history)</td></tr>
+              <tr><td>Avg output tokens/request</td><td>500</td><td>Given (model response)</td></tr>
+              <tr><td>Total tokens/request</td><td>1,500</td><td>1,000 + 500</td></tr>
+              <tr><td>Peak token throughput</td><td>4.2M tok/sec</td><td>2,778 &times; 1,500</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Essential Formulas                                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="formulas">
+    <div class="container">
+      <h2>Essential Formulas</h2>
+      <p class="full-width">Every calculation in this page derives from these formulas. Refer back here when you see a number you can&rsquo;t trace.</p>
+
+      <div>
+        <h3>Hardware Constants (H100 80GB)</h3>
+<pre class="line-numbers"><code class="language-text">HBM capacity:     80 GB per GPU
+HBM bandwidth:    3,350 GB/s (= 3.35 TB/s) per GPU
+Peak FP16 compute: 989 TFLOP/s per GPU
+MFU (utilization): 0.4 (40%, conservative estimate)
+Effective compute: 989 &times; 0.4 = 395.6 TFLOP/s per GPU</code></pre>
+      </div>
+
+      <div>
+        <h3>Model Constants (Llama-3 70B)</h3>
+<pre class="line-numbers"><code class="language-text">Parameters:      70B
+Model size (FP16): 70B &times; 2 bytes = 140 GB
+Model size (INT8): 70B &times; 1 byte  = 70 GB
+Layers:          80
+d_model:         8,192
+d_head:          128 (numbers per head per token)
+num_q_heads:     64 (= d_model / d_head)
+num_kv_heads:    8 (GQA: 64/8 = 8 Q heads per KV head)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Core Formulas</h3>
+<pre class="line-numbers"><code class="language-text">=== Per-GPU Memory Budget ===
+  weights_per_GPU   = model_size / TP
+  available_for_KV  = 80 GB - weights_per_GPU - overhead (~10 GB)
+
+=== KV Cache ===
+  KV_per_token      = 2 &times; layers &times; num_kv_heads &times; d_head &times; 2 bytes
+                    = 2 &times; 80 &times; 8 &times; 128 &times; 2 = 320 KB (total across GPUs)
+  KV_per_token/GPU  = 320 KB / TP
+  KV_per_req/GPU    = KV_per_token/GPU &times; avg_tokens
+
+=== Max Batch Size ===
+  max_batch = available_for_KV / KV_per_req/GPU
+
+=== Decode Step Time (per decode step, per GPU) ===
+  Load time    = (weights_per_GPU + batch &times; KV_per_req/GPU) / 3,350 GB/s
+                 [weights: constant. KV reads: scales with batch]
+  Compute time = (2 &times; params &times; batch + attn_FLOPs) / TP / 395.6 TFLOP/s
+                 [weight matmuls + attention compute, per GPU]
+  Decode step time = max(Load, Compute)   [double buffering]
+
+=== Attention FLOPs (per layer, per sequence, c cached tokens) ===
+  scores (q&times;K^T):   2 &times; d_head &times; c &times; num_q_heads
+  weighted sum (w&times;V): 2 &times; d_head &times; c &times; num_q_heads
+  Total per layer:    4 &times; d_head &times; c &times; num_q_heads
+  Total all layers:   4 &times; 128 &times; c &times; 64 &times; 80 &times; batch = 3.93G &times; c_avg &times; batch
+
+=== Attention HBM Reads (per layer, per sequence) ===
+  K_all + V_all:      2 &times; num_kv_heads &times; d_head &times; c &times; 2 bytes
+  (scales with num_kv_heads=8, NOT num_q_heads=64 &mdash; GQA saves 8&times;)
+
+=== Prefill Time ===
+  FLOPs  = 2 &times; params &times; input_tokens
+  Load   = model_size / TP / 3,350 GB/s
+  Compute = FLOPs / TP / 395.6 TFLOP/s
+  Prefill = max(Load, Compute)   [compute-bound for &gt;~189 tokens]
+
+=== Request Latency &amp; Throughput ===
+  Latency    = prefill_time + output_tokens &times; decode_step_time
+  Throughput = batch / latency  (per node)
+  Nodes      = peak_QPS / throughput_per_node
+
+=== Crossover Points ===
+  Load-bound &harr; Compute-bound crossover:
+    Set Load time = Compute time, solve for batch (or tokens).
+    At TP=4 with avg 1,500 cached tokens: crossover &asymp; batch 189.
+    Below: load-bound (good for batching).
+    Above: compute-bound (throughput plateaus).
+
+=== Chunked Prefill ===
+  chunk_size: chosen so mixed step time &lt; inter-token SLO (50ms)
+    Mixed step time = max(10.4ms, 2&times;70B&times;(chunk_size + decode_reqs) / 1,582T)
+    (mixed = prefill chunk + decode tokens in same forward pass)
+  chunk_count = ceil(total_input_tokens / chunk_size)
+  Total prefill = chunk_count &times; mixed_step_time
+
+=== Speculative Decoding ===
+  E[tokens per iteration] = 1 / (1 - &alpha;)   [&alpha; = acceptance rate]
+  Iteration cost = K &times; draft_step_time + 1 &times; target_step_time
+  Effective ms/token = iteration_cost / E[tokens]
+  Speedup = target_step_time / effective_ms_per_token</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>Before designing anything, we need to understand the fundamental resource constraints. The model&rsquo;s 70 billion parameters dominate GPU memory, and the forward pass computation determines how fast we can generate tokens. Let&rsquo;s quantify the basics.</p>
+
+      <div>
+        <h3>Model Memory</h3>
+<pre class="line-numbers"><code class="language-text">Model weights:
+  70B params &times; 2 bytes (FP16) = 140 GB
+
+Single H100 = 80 GB HBM
+  140 GB &gt; 80 GB &rarr; doesn't fit on 1 GPU
+
+Tensor Parallelism with TP=2 (2 H100s):
+  140 / 2 = 70 GB per GPU
+  Remaining per GPU: 80 - 70 = 10 GB for activations
+
+  Without KV cache (our starting point in the Naive Design),
+  10 GB is plenty for activations &mdash; the model processes one
+  layer at a time, holding only that layer's intermediates:
+    Peak activation memory &asymp; batch &times; seq_len &times; d_model &times; 2B &times; ~4
+    = 1 &times; 1,500 &times; 8,192 &times; 2 &times; 4 &asymp; 98 MB  (well within 10 GB)
+
+    (2B = 2 bytes per value &mdash; FP16 is 16 bits = 2 bytes.
+     The &times;4 is a rough empirical multiplier &mdash; NOT related to TP.
+     It means: peak activation memory during one layer &asymp; 4&times; the
+     base activation footprint [batch, seq_len, d_model, 2B].
+
+     This is NOT literally "4 tensors of the same size." During a
+     layer's forward pass, several intermediate tensors exist at
+     different times &mdash; the residual stream (kept for the skip
+     connection), attention outputs, and the MLP intermediate.
+     The MLP intermediate is the largest: the FFN expands the
+     hidden state from d_model (8,192) to 28,672 (&asymp;3.5&times; d_model)
+     via a linear layer, applies SiLU, then projects back down.
+     These tensors vary in size and don't all coexist, but their
+     combined peak footprint works out to roughly 4&times; the base.
+
+     TP=2 splits these across 2 GPUs (~49 MB each), but the
+     total is still ~98 MB.)
+
+  TP=2 works when we DON'T store KV cache. Once we introduce
+  KV cache (Iteration 0), we'll need TP=4 for the extra memory.
+
+"Node" = one physical server with 2 H100 GPUs,
+connected via NVLink (900 GB/s inter-GPU bandwidth).
+The 2 GPUs work together (tensor parallelism) to serve ONE
+model replica. Node &ne; GPU. Node = 2 GPUs = 1 model copy.</code></pre>
+      </div>
+
+      <div>
+        <h3>Forward Pass Basics</h3>
+<pre class="line-numbers"><code class="language-text">=== What Happens Each Step ===
+
+A forward pass through Llama-3 70B:
+1. Loads ALL 140 GB of weights from GPU HBM (layer by layer)
+2. Processes the input tokens through 80 transformer layers
+3. Produces output logits for the next token
+
+Why ALL weights every step? GPU compute units (registers, SRAM)
+are tiny (~20-40 MB). They can't hold 140 GB. So each step
+streams weights layer by layer:
+  Load layer 0 attention weights &rarr; compute &rarr; discard
+  Load layer 0 FFN weights &rarr; compute &rarr; discard
+  Load layer 1 attention weights &rarr; compute &rarr; discard
+  ... repeat through all 80 layers ...
+  Done: 140 GB streamed, one forward pass complete.
+
+Each layer is ~1.75 GB (140 GB / 80 layers), far too large
+for SRAM (~20-40 MB). So the GPU streams each layer's weights
+from HBM through SRAM in small tiles (a few MB at a time),
+computes on each tile, then discards it. The conceptual unit
+of work is "one layer at a time," but SRAM never holds a full
+layer &mdash; just small pieces of it in flight.
+
+=== Two Bottlenecks ===
+
+  Memory bandwidth: loading 140 GB of weights from HBM
+    At TP=2: 140 GB / (2 &times; 3.35 TB/s) = 140 / 6.7 = 20.9 ms
+
+  Compute: matrix multiplications across all layers
+    FLOPs = 2 &times; num_params &times; num_tokens_processed
+    (See &ldquo;Deriving 2 &times; params &times; tokens&rdquo; below.)
+    At TP=2: capacity = 2 &times; 989 &times; 0.4 MFU = 791 TFLOP/s
+    (MFU = Model FLOPs Utilization &mdash; fraction of peak FLOP/s
+     achieved in practice. 40% is conservative; range 30-60%.)
+
+Which bottleneck dominates depends on num_tokens_processed:
+
+  Small (1 token):
+    Load:    20.9 ms
+    Compute: 2 &times; 70B &times; 1 / 791T = 0.18 ms
+    &rarr; Memory-bandwidth-bound (load is 116&times; slower)
+
+  Large (1,000 tokens):
+    Load:    20.9 ms
+    Compute: 2 &times; 70B &times; 1,000 / 791T = 177 ms
+    &rarr; Compute-bound (compute is 8.5&times; slower)
+
+This distinction is critical: without KV cache, every
+generation step processes ALL tokens (compute-bound).
+With KV cache (Iteration 0), each step processes just 1
+new token (memory-bandwidth-bound). This fundamentally
+changes how batching works.</code></pre>
+      </div>
+
+      <div>
+        <h3>FLOPs = "2 &times; params &times; tokens"</h3>
+        <p>X = one token's activation vector [1 &times; 8192] &mdash; the token's representation flowing through the model. (Layer 1: X comes from embedding. Later layers: X is the previous layer's output.)</p>
+        <p>Consider one matmul, e.g. <code>Q = X &times; W_Q</code>:</p>
+<pre class="line-numbers"><code class="language-text">X is [1 &times; 8192], W_Q is [8192 &times; 8192] (67M parameters).
+
+Each output element:
+  Q[j] = X[0]&times;W[0][j] + X[1]&times;W[1][j] + ... + X[8191]&times;W[8191][j]
+  = 8192 multiplies + 8192 adds = 16,384 FLOPs
+
+Q has 8192 elements &rarr; total = 2 &times; 8192 &times; 8192 = 134M FLOPs.
+W_Q has 8192 &times; 8192 = 67M parameters &rarr; 2 FLOPs per parameter.</code></pre>
+        <p>Each of W_Q's 67M params is used exactly <strong>once</strong>. W_K is a <em>separate</em> matrix with its own 8M params, each used once too. Across the full model:</p>
+<pre class="line-numbers"><code class="language-text">Per layer &mdash; 7 separate matmuls, each with its own weights:
+  Q = X &times; W_Q       (67M params, used once per token)
+  K = X &times; W_K       ( 8M params, used once)
+  V = X &times; W_V       ( 8M params, used once)
+  out = attn &times; W_O   (67M params, used once)
+  up = X &times; W_up     (235M params, used once)
+  gate = X &times; W_gate (235M params, used once)
+  down = h &times; W_down (235M params, used once)
+  ──────────────────────
+  Per layer total: ~855M params
+
+80 layers &times; 855M = ~68B + ~2B embeddings = ~70B params
+Every param used once &rarr; 2 &times; 70B = 140 GFLOP per token
+For 1,000 tokens: 140 GFLOP &times; 1,000 = 140 TFLOP
+
+(Q&times;K^T and scores&times;V use activations, not weight params,
+so they're not counted. Softmax/layernorm &lt;5% &mdash; ignored.)</code></pre>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: No KV Cache</h2>
+      <p>Let&rsquo;s start with the simplest possible approach: load the model onto 2 GPUs and generate tokens by running a full forward pass over the entire sequence at each step. No caching, no batching.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 700 160" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:700px;margin:0 auto;display:block;">
+          <!-- Request Queue -->
+          <rect x="20" y="50" width="140" height="60" rx="8" fill="#f0f4ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="90" y="75" text-anchor="middle" font-size="13" fill="#2563eb" font-weight="bold">Request Queue</text>
+          <text x="90" y="95" text-anchor="middle" font-size="11" fill="#64748b">FIFO</text>
+          <!-- Arrow -->
+          <line x1="160" y1="80" x2="250" y2="80" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowNaive)"/>
+          <text x="205" y="70" text-anchor="middle" font-size="10" fill="#94a3b8">1 at a time</text>
+          <!-- GPU Node -->
+          <rect x="250" y="40" width="200" height="80" rx="8" fill="#f0fdfa" stroke="#0891b2" stroke-width="2"/>
+          <text x="350" y="62" text-anchor="middle" font-size="13" fill="#0891b2" font-weight="bold">GPU Node (2&times;H100)</text>
+          <text x="350" y="82" text-anchor="middle" font-size="11" fill="#64748b">TP=2, 140 GB model</text>
+          <text x="350" y="100" text-anchor="middle" font-size="10" fill="#dc2626">No KV cache</text>
+          <!-- Arrow -->
+          <line x1="450" y1="80" x2="540" y2="80" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowNaive)"/>
+          <!-- Output -->
+          <rect x="540" y="50" width="120" height="60" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+          <text x="600" y="75" text-anchor="middle" font-size="13" fill="#22c55e" font-weight="bold">Output</text>
+          <text x="600" y="93" text-anchor="middle" font-size="11" fill="#64748b">All at once</text>
+          <defs>
+            <marker id="arrowNaive" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+              <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8"/>
+            </marker>
+          </defs>
+        </svg>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Why a Request Queue in Front of the GPU?</h4>
+        <p>GPU compute and memory are <strong>fixed</strong>, but request arrival is <strong>bursty and unpredictable</strong>. The queue solves four problems:</p>
+        <ol>
+          <li><strong>Admission control</strong> &mdash; each in-flight request consumes GPU memory (activations, KV cache). Letting unlimited requests hit the GPU simultaneously causes OOM or thrashing. The queue only admits what the GPU can handle right now. (Note: admission control is <em>not</em> the same as rate limiting. Rate limiting caps requests per unit of time per client, regardless of GPU state &mdash; it&rsquo;s about fairness across callers. Admission control is <em>capacity-aware</em>: it checks current resource state, e.g., &ldquo;the GPU has 12 GB free, this request needs 8 GB, admit it.&rdquo; Both typically coexist &mdash; rate limiting at the API gateway, admission control at the GPU queue.)</li>
+          <li><strong>Decoupling arrival from processing</strong> &mdash; the GPU processes at a roughly fixed rate, but requests arrive in bursts. The queue absorbs spikes so excess requests wait instead of being dropped.</li>
+          <li><strong>Backpressure signal</strong> &mdash; a growing queue tells the load balancer or autoscaler &ldquo;we&rsquo;re saturated&rdquo; so it can reject, reroute, or scale up. Without a queue, overload is only discovered when the GPU fails.</li>
+          <li><strong>Fairness</strong> &mdash; FIFO ordering ensures requests are served in arrival order so no request starves while later ones jump ahead.</li>
+        </ol>
+        <p>In this naive design, the GPU processes <strong>1 request at a time</strong>, so every other request <em>must</em> wait somewhere &mdash; the queue is that &ldquo;somewhere.&rdquo; Later iterations add batching, but even then the batch size is bounded by GPU memory, so a queue remains necessary.</p>
+      </div>
+
+      <div>
+        <h3>How It Works</h3>
+        <ol>
+          <li>Requests queue up in a FIFO queue.</li>
+          <li>The model runs on 2 H100 GPUs (TP=2). 140 GB / 2 = 70 GB per GPU, leaving 10 GB for activations.</li>
+          <li>To generate each output token, the model runs a <strong>full forward pass</strong> over the entire sequence so far (all input tokens + all previously generated tokens). There is no cache &mdash; the model recomputes K,V for every previous token at every step.</li>
+          <li>Response is returned only after all tokens are generated. No streaming.</li>
+        </ol>
+      </div>
+
+      <div>
+        <h3>Why This Is Catastrophically Slow</h3>
+<pre class="line-numbers"><code class="language-text">Without KV cache, the model has no memory of previous tokens.
+To generate each new output token, it must re-process the ENTIRE
+sequence from scratch &mdash; like re-reading an entire book every
+time you want to write the next word of a summary.
+
+Key regime: no KV cache = many tokens per step = COMPUTE-BOUND.
+(With KV cache, each step processes just 1 token, flipping to
+memory-bandwidth-bound. That regime change is why KV cache matters.)
+
+For Llama-3 70B at TP=2 (791 TFLOP/s compute capacity):
+
+  Token 1 (prefill 1,000 input tokens):
+    FLOPs: 2 &times; 70B &times; 1,000 = 140 TFLOP
+    Time: 140 / 791 = 177 ms (compute-bound)
+
+  Token 2 (re-process 1,001 tokens): 177.2 ms
+  Token 3 (re-process 1,002 tokens): 177.4 ms
+  ...
+  Token 500 (re-process 1,499 tokens):
+    FLOPs: 2 &times; 70B &times; 1,499 = 210 TFLOP
+    Time: 265 ms
+
+  Total: sum of 177 ms .. 265 ms &asymp; 500 &times; 221 ms = ~110 seconds
+
+Compare: weight loading takes only 20.9 ms per step, but
+the COMPUTATION takes 177-265 ms. Every step is compute-bound.</code></pre>
+      </div>
+
+      <div>
+        <h3>Batching Doesn&rsquo;t Help</h3>
+<pre class="line-numbers"><code class="language-text">In a compute-bound regime, adding more sequences to the batch
+proportionally increases compute per step:
+
+  batch=1:  load = 21 ms, compute = 177 ms  &rarr; 1 token out
+  batch=16: load = 21 ms, compute = 2,832 ms (177 ms x 16) &rarr; 16 tokens out
+
+  Per-token: 177 ms either way!
+
+The weight loading IS amortized (21 ms shared across 16
+sequences), but since compute (177 ms) &gt;&gt; load (21 ms),
+the saving is negligible (&lt;1%).
+
+This changes dramatically with KV cache (Iteration 0):
+each step processes just 1 token per sequence, making it
+memory-bandwidth-bound &mdash; and batching becomes powerful.</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The cost of no caching.</strong> At ~0.009 req/sec per node (1 request / 110 sec), we need 2,778 / 0.009 &asymp; 309,000 nodes (618,000 GPUs). At ~$2/GPU/hr, that&rsquo;s <strong>~$890M/month</strong>. KV cache (next) is not an optional optimization &mdash; it&rsquo;s a necessity.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 0: KV Cache + Static Batching                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration0">
+    <div class="container">
+      <h2>Iteration 0: KV Cache + Static Batching</h2>
+      <p class="full-width">The naive design recomputes attention from scratch at every step &mdash; 375,000 redundant K,V projections for 500 output tokens. The fix: <strong>cache</strong> the Key and Value vectors so each decode step processes only 1 new token.</p>
+
+      <div>
+        <h3>KV Cache: Why It Exists</h3>
+        <p>During <strong>prefill</strong>, the model computes Q (query), K (key), and V (value) for all input tokens in parallel. The attention output for token <em>i</em> uses Q[i] against ALL keys K[0..i] and values V[0..i]. The full Q matrix is computed, used immediately for attention, and then <strong>discarded</strong> within this same step &mdash; Q₀, Q₁, Q₂ are never needed again. After prefill, only K and V are kept in GPU memory.</p>
+        <p>During <strong>generation</strong> (decode), we produce one new token at a time. We no longer compute a full Q matrix &mdash; we compute <strong>a single Q vector</strong> [1 &times; d_model] for just the new token (from its own hidden state; it cannot reuse any previous token&rsquo;s Q). That single Q vector is then multiplied against the <strong>full cached K</strong> from all previous tokens to get attention scores, and the scores are applied to the <strong>full cached V</strong> to get the attention output. K and V have not changed (the model&rsquo;s weights are frozen, and the inputs that produced them are unchanged).</p>
+        <p><strong>Why not cache Q too?</strong> Q is only used by the token that created it &mdash; Q₀ was used by &ldquo;The&rdquo; to compute its attention, and no future token ever references Q₀ again. K and V are the opposite: every future token attends <em>to</em> them. Think of it as: <strong>Q</strong> = &ldquo;what am I looking for?&rdquo; (used once, by its own token), <strong>K</strong> = &ldquo;what do I contain?&rdquo; (queried by every future token), <strong>V</strong> = &ldquo;what do I provide?&rdquo; (read by every future token). Caching Q would waste memory on values that are never reused.</p>
+
+<pre class="line-numbers"><code class="language-text">=== Prefill vs Decode: Same Operations, Different Sizes ===
+
+Both phases perform the SAME operations. The difference is input size.
+
+PREFILL (all input tokens at once, e.g. n=1000):
+  1. Q = X &times; W_Q        [n &times; d] &times; [d &times; d]     &rarr; [n &times; d]
+  2. K = X &times; W_K        [n &times; d] &times; [d &times; d_kv]  &rarr; [n &times; d_kv]
+  3. V = X &times; W_V        [n &times; d] &times; [d &times; d_kv]  &rarr; [n &times; d_kv]
+  4. scores = Q &times; K^T   [n &times; d] &times; [d &times; n]     &rarr; [n &times; n]
+  5. weights = softmax(scores / &radic;d_k)
+  6. attn = weights &times; V [n &times; n] &times; [n &times; d_kv]  &rarr; [n &times; d_kv]
+  7. out = attn &times; W_O   (project back)
+  8. FFN: W_up, W_gate, W_down
+  &rarr; Store K, V into cache. Discard Q.
+
+DECODE (1 new token, cache has c previous tokens):
+  1. q = x &times; W_Q        [1 &times; d] &times; [d &times; d]     &rarr; [1 &times; d]
+  2. k = x &times; W_K        [1 &times; d] &times; [d &times; d_kv]  &rarr; [1 &times; d_kv]
+  3. v = x &times; W_V        [1 &times; d] &times; [d &times; d_kv]  &rarr; [1 &times; d_kv]
+  4. Append k,v to cache &rarr; K_all=[K_cached; k], V_all=[V_cached; v]
+  5. scores = q &times; K_all^T  [1 &times; d] &times; [d &times; (c+1)] &rarr; [1 &times; (c+1)]
+  6. weights = softmax(scores / &radic;d_k)
+  7. attn = weights &times; V_all  [1 &times; (c+1)] &times; [(c+1) &times; d_kv] &rarr; [1 &times; d_kv]
+  8. out = attn &times; W_O
+  9. FFN: W_up, W_gate, W_down
+
+Steps 1-3 shrink from n tokens to 1 token &mdash; that's why decode
+is so much cheaper and flips from compute-bound to
+memory-bandwidth-bound.
+
+Where the KV CACHE is actually used during decode:
+  Step 4: append new k,v to the cache
+  Step 5: q &times; K_all^T  &larr; reads ALL cached K vectors
+  Step 7: weights &times; V_all &larr; reads ALL cached V vectors
+  These two reads are why it's called the "KV" cache &mdash;
+  K is read for scoring, V is read for the weighted sum.</code></pre>
+
+
+<pre class="line-numbers"><code class="language-text">Without KV cache (the naive design):
+  To generate token 501, we must recompute K,V for ALL 500
+  previous tokens &rarr; 500 &times; (W_K + W_V) matrix projections.
+  At token 1000: 1000 projections.
+  Total for 500 output tokens:
+    501 + 502 + 503 + ... + 1000 &asymp; 375,000 projections
+
+With KV cache:
+  At each step, compute K,V for ONLY the 1 new token,
+  append to cache, then attend over the full cached K,V.
+  Total for 500 output tokens: 500 projections
+
+  Speedup: 375,000 / 500 = 750&times; fewer K,V projections</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>KV Cache: Step-by-Step</h3>
+        <p>Click <strong>Next</strong> to walk through how a 3-token input (<code>The cat sat</code>) generates 2 output tokens, comparing no-cache vs. cached behavior.</p>
+        <div id="kv-anim" style="background:#f8fafc;border:2px solid #e2e8f0;border-radius:12px;padding:24px;max-width:820px;margin:0 auto;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <button id="kv-prev" style="padding:8px 20px;border:2px solid #2563eb;background:#fff;color:#2563eb;border-radius:6px;font-weight:bold;cursor:pointer;font-size:14px;" disabled>&larr; Prev</button>
+            <span id="kv-step-label" style="font-weight:bold;font-size:15px;color:#334155;">Step 1 / 7</span>
+            <button id="kv-next" style="padding:8px 20px;border:2px solid #2563eb;background:#2563eb;color:#fff;border-radius:6px;font-weight:bold;cursor:pointer;font-size:14px;">Next &rarr;</button>
+          </div>
+          <div id="kv-title" style="font-size:16px;font-weight:bold;color:#1e293b;margin-bottom:8px;"></div>
+          <div id="kv-desc" style="font-size:14px;color:#475569;margin-bottom:16px;line-height:1.6;"></div>
+          <svg id="kv-svg" viewBox="0 0 780 260" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:780px;display:block;margin:0 auto;"></svg>
+          <div id="kv-detail" style="margin-top:12px;font-size:13px;color:#64748b;font-style:italic;"></div>
+        </div>
+
+<script>
+(function() {
+  const steps = [
+    {
+      title: "Step 1: Input arrives",
+      desc: "We receive 3 input tokens: <b>The</b>, <b>cat</b>, <b>sat</b>. The KV cache is empty. We need to process these before we can generate any output.",
+      detail: "This is the start of the prefill phase.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#2563eb">Input Tokens</text>
+          <rect x="120" y="35" width="80" height="36" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="160" y="58" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">The</text>
+          <rect x="220" y="35" width="80" height="36" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="260" y="58" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">cat</text>
+          <rect x="320" y="35" width="80" height="36" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="360" y="58" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">sat</text>
+          <text x="390" y="110" text-anchor="middle" font-size="13" font-weight="bold" fill="#64748b">KV Cache (GPU Memory)</text>
+          <rect x="80" y="120" width="620" height="50" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="6,4"/>
+          <text x="390" y="150" text-anchor="middle" font-size="13" fill="#94a3b8">(empty)</text>
+          <text x="390" y="230" text-anchor="middle" font-size="13" fill="#94a3b8">Output: (none yet)</text>`;
+      }
+    },
+    {
+      title: "Step 2: Prefill — compute Q, K, V for ALL input tokens at once",
+      desc: "The model runs a forward pass over all 3 tokens <b>in parallel</b>. For each token, it computes a Query (Q), Key (K), and Value (V) vector. This is the <b>prefill</b> phase &mdash; it's compute-bound because we process many tokens.",
+      detail: "Q is used for attention now. K and V will be cached for future steps.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#2563eb">Prefill: All 3 tokens processed in parallel</text>
+          ${['The','cat','sat'].map((t,i) => {
+            const x = 120 + i*220;
+            return `
+              <rect x="${x}" y="35" width="180" height="80" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+              <text x="${x+90}" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">"${t}"</text>
+              <text x="${x+90}" y="75" text-anchor="middle" font-size="12" fill="#2563eb">Q<tspan font-size="10" dy="3">${i}</tspan><tspan dy="-3">, </tspan>K<tspan font-size="10" dy="3">${i}</tspan><tspan dy="-3">, </tspan>V<tspan font-size="10" dy="3">${i}</tspan></text>
+              <text x="${x+90}" y="100" text-anchor="middle" font-size="11" fill="#64748b">↓ computed by W_Q, W_K, W_V</text>`;
+          }).join('')}
+          <text x="390" y="145" text-anchor="middle" font-size="13" font-weight="bold" fill="#059669">Attention: Q[i] attends to K[0..i], V[0..i]</text>
+          <text x="390" y="165" text-anchor="middle" font-size="12" fill="#64748b">"The" sees only itself. "cat" sees "The"+"cat". "sat" sees all three.</text>
+          <text x="390" y="200" text-anchor="middle" font-size="13" font-weight="bold" fill="#7c3aed">→ First output token predicted from "sat" position</text>
+          <text x="390" y="240" text-anchor="middle" font-size="12" fill="#94a3b8">All Q, K, V computed from scratch (no cache yet)</text>`;
+      }
+    },
+    {
+      title: "Step 3: Cache K and V vectors",
+      desc: "After prefill, we <b>store K and V</b> (but not Q) for all 3 tokens into GPU memory. This is the KV cache. We don't need Q anymore &mdash; Q was only used during attention in this step.",
+      detail: "K and V are cached because future tokens will need to attend to them. Q is discarded — each new token computes its own Q.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#059669">Store K, V into cache (discard Q)</text>
+          ${['The','cat','sat'].map((t,i) => {
+            const x = 120 + i*220;
+            return `
+              <rect x="${x}" y="35" width="180" height="45" rx="6" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+              <text x="${x+90}" y="63" text-anchor="middle" font-size="13" fill="#15803d"><tspan font-weight="bold">K<tspan font-size="10" dy="3">${i}</tspan><tspan dy="-3">, V<tspan font-size="10" dy="3">${i}</tspan></tspan></tspan></text>`;
+          }).join('')}
+          <line x1="210" y1="80" x2="210" y2="110" stroke="#22c55e" stroke-width="2" marker-end="url(#kvArrow)"/>
+          <line x1="430" y1="80" x2="430" y2="110" stroke="#22c55e" stroke-width="2" marker-end="url(#kvArrow)"/>
+          <line x1="650" y1="80" x2="650" y2="110" stroke="#22c55e" stroke-width="2" marker-end="url(#kvArrow)"/>
+          <text x="390" y="130" text-anchor="middle" font-size="13" font-weight="bold" fill="#64748b">KV Cache (GPU Memory)</text>
+          <rect x="80" y="138" width="620" height="50" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+          <text x="170" y="168" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₀,V₀</text>
+          <text x="390" y="168" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₁,V₁</text>
+          <text x="610" y="168" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₂,V₂</text>
+          <text x="390" y="215" text-anchor="middle" font-size="13" fill="#7c3aed" font-weight="bold">Output so far: "on" (predicted from prefill)</text>
+          <text x="390" y="245" text-anchor="middle" font-size="12" fill="#dc2626">Q vectors discarded — only needed during their own attention step</text>
+          <defs><marker id="kvArrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#22c55e"/></marker></defs>`;
+      }
+    },
+    {
+      title: "Step 4: Decode token 1 — WITHOUT KV cache (the slow way)",
+      desc: "To show why the cache matters, imagine we <b>don't</b> have it. To generate the next token after \"on\", we must re-feed <b>all 4 tokens</b> (The, cat, sat, on) through the model and recompute K, V for every single one.",
+      detail: "4 tokens × K,V projections = 8 matrix multiplies wasted on tokens we already processed. This is why the naive design takes 110 seconds.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#dc2626">❌ WITHOUT cache: recompute EVERYTHING</text>
+          ${['The','cat','sat','on'].map((t,i) => {
+            const x = 60 + i*175;
+            return `
+              <rect x="${x}" y="38" width="155" height="55" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+              <text x="${x+78}" y="58" text-anchor="middle" font-size="13" font-weight="bold" fill="#991b1b">"${t}"</text>
+              <text x="${x+78}" y="78" text-anchor="middle" font-size="11" fill="#dc2626">recompute Q,K,V</text>`;
+          }).join('')}
+          <text x="390" y="118" text-anchor="middle" font-size="12" fill="#dc2626">All 4 tokens processed → 4× the compute of 1 token</text>
+          <rect x="80" y="135" width="620" height="45" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="6,4"/>
+          <text x="390" y="163" text-anchor="middle" font-size="13" fill="#94a3b8">No cache — nothing saved, nothing reused</text>
+          <text x="390" y="210" text-anchor="middle" font-size="13" fill="#991b1b" font-weight="bold">Wasted work: K₀,V₀, K₁,V₁, K₂,V₂ recomputed for no reason</text>
+          <text x="390" y="240" text-anchor="middle" font-size="12" fill="#64748b">And it gets WORSE: token 2 re-does 5 tokens, token 3 re-does 6, ...</text>`;
+      }
+    },
+    {
+      title: "Step 5: Decode token 1 — WITH KV cache (the fast way)",
+      desc: "With the cache, we only feed the <b>1 new token</b> (\"on\") through the model. We compute Q, K, V for just that token. Then we <b>look up</b> the cached K,V for all previous tokens and attend over them.",
+      detail: "1 token processed instead of 4. The K,V for 'The', 'cat', 'sat' are read from cache — no recomputation.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#059669">✓ WITH cache: process ONLY the new token</text>
+          <rect x="310" y="35" width="160" height="55" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="390" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">"on" (new token)</text>
+          <text x="390" y="75" text-anchor="middle" font-size="11" fill="#2563eb">compute Q₃, K₃, V₃</text>
+          <line x1="390" y1="90" x2="390" y2="120" stroke="#2563eb" stroke-width="2" marker-end="url(#kvArrow2)"/>
+          <text x="390" y="138" text-anchor="middle" font-size="13" font-weight="bold" fill="#64748b">KV Cache</text>
+          <rect x="80" y="146" width="620" height="50" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+          <text x="140" y="175" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₀,V₀</text>
+          <text x="280" y="175" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₁,V₁</text>
+          <text x="420" y="175" text-anchor="middle" font-size="12" fill="#15803d" font-weight="bold">K₂,V₂</text>
+          <rect x="490" y="152" width="120" height="38" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="550" y="176" text-anchor="middle" font-size="12" fill="#1e40af" font-weight="bold">K₃,V₃ ✨</text>
+          <text x="550" y="148" text-anchor="middle" font-size="10" fill="#2563eb">appended!</text>
+          <text x="390" y="222" text-anchor="middle" font-size="13" fill="#059669" font-weight="bold">Attention: Q₃ attends to cached [K₀,K₁,K₂,K₃] and [V₀,V₁,V₂,V₃]</text>
+          <text x="390" y="248" text-anchor="middle" font-size="12" fill="#7c3aed" font-weight="bold">→ Predicts next token: "the"</text>
+          <defs><marker id="kvArrow2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2563eb"/></marker></defs>`;
+      }
+    },
+    {
+      title: "Step 6: Decode token 2 — cache keeps growing",
+      desc: "Now we feed <b>only</b> \"the\" (1 token) through the model. Compute Q₄, K₄, V₄. Append K₄, V₄ to cache. Attend Q₄ over all 5 cached K,V vectors.",
+      detail: "Cache now holds 5 entries. Each step: 1 new token processed, 1 new K,V pair appended. Cost stays constant per step.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="390" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#059669">Decode step 2: only "the" is new</text>
+          <rect x="310" y="35" width="160" height="50" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="390" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">"the" (new token)</text>
+          <text x="390" y="72" text-anchor="middle" font-size="11" fill="#2563eb">compute Q₄, K₄, V₄</text>
+          <line x1="390" y1="85" x2="390" y2="110" stroke="#2563eb" stroke-width="2" marker-end="url(#kvArrow3)"/>
+          <text x="390" y="128" text-anchor="middle" font-size="13" font-weight="bold" fill="#64748b">KV Cache</text>
+          <rect x="50" y="136" width="680" height="50" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+          <text x="105" y="165" text-anchor="middle" font-size="11" fill="#15803d" font-weight="bold">K₀,V₀</text>
+          <text x="215" y="165" text-anchor="middle" font-size="11" fill="#15803d" font-weight="bold">K₁,V₁</text>
+          <text x="325" y="165" text-anchor="middle" font-size="11" fill="#15803d" font-weight="bold">K₂,V₂</text>
+          <text x="445" y="165" text-anchor="middle" font-size="11" fill="#15803d" font-weight="bold">K₃,V₃</text>
+          <rect x="520" y="142" width="120" height="38" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="580" y="166" text-anchor="middle" font-size="11" fill="#1e40af" font-weight="bold">K₄,V₄ ✨</text>
+          <text x="390" y="212" text-anchor="middle" font-size="13" fill="#059669" font-weight="bold">Q₄ attends to all 5 cached K,V pairs</text>
+          <text x="390" y="240" text-anchor="middle" font-size="12" fill="#7c3aed" font-weight="bold">→ Predicts next token: "mat"</text>
+          <text x="390" y="255" text-anchor="middle" font-size="11" fill="#64748b">Full output so far: "The cat sat on the mat"</text>
+          <defs><marker id="kvArrow3" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2563eb"/></marker></defs>`;
+      }
+    },
+    {
+      title: "Step 7: Summary — why KV cache changes everything",
+      desc: "Without cache: every step reprocesses <b>all</b> tokens → compute-bound, gets slower as sequence grows.<br>With cache: every step processes <b>1 token</b> → memory-bandwidth-bound (loading weights dominates), stays constant per step.",
+      detail: "The tradeoff: KV cache uses GPU memory (320 KB per token for Llama-3 70B), but saves enormous compute.",
+      draw(svg) {
+        svg.innerHTML = `
+          <text x="200" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#dc2626">Without KV Cache</text>
+          <text x="580" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#059669">With KV Cache</text>
+          <line x1="390" y1="10" x2="390" y2="250" stroke="#cbd5e1" stroke-width="2"/>
+          <text x="200" y="55" text-anchor="middle" font-size="12" fill="#64748b">Step 1: process 4 tokens</text>
+          <text x="200" y="80" text-anchor="middle" font-size="12" fill="#64748b">Step 2: process 5 tokens</text>
+          <text x="200" y="105" text-anchor="middle" font-size="12" fill="#64748b">Step 3: process 6 tokens</text>
+          <text x="200" y="130" text-anchor="middle" font-size="12" fill="#64748b">...</text>
+          <text x="200" y="155" text-anchor="middle" font-size="12" fill="#64748b">Step 500: process 1,500 tokens</text>
+          <text x="200" y="185" text-anchor="middle" font-size="12" fill="#dc2626" font-weight="bold">Total: ~375,000 token-processes</text>
+          <text x="200" y="205" text-anchor="middle" font-size="11" fill="#dc2626">~110 seconds per request</text>
+          <text x="580" y="55" text-anchor="middle" font-size="12" fill="#64748b">Step 1: process 1 token</text>
+          <text x="580" y="80" text-anchor="middle" font-size="12" fill="#64748b">Step 2: process 1 token</text>
+          <text x="580" y="105" text-anchor="middle" font-size="12" fill="#64748b">Step 3: process 1 token</text>
+          <text x="580" y="130" text-anchor="middle" font-size="12" fill="#64748b">...</text>
+          <text x="580" y="155" text-anchor="middle" font-size="12" fill="#64748b">Step 500: process 1 token</text>
+          <text x="580" y="185" text-anchor="middle" font-size="12" fill="#059669" font-weight="bold">Total: 500 token-processes</text>
+          <text x="580" y="205" text-anchor="middle" font-size="11" fill="#059669">~5.2 seconds per request</text>
+          <text x="390" y="240" text-anchor="middle" font-size="14" font-weight="bold" fill="#7c3aed">750× fewer K,V computations</text>`;
+      }
+    }
+  ];
+
+  let cur = 0;
+  const svg = document.getElementById('kv-svg');
+  const titleEl = document.getElementById('kv-title');
+  const descEl = document.getElementById('kv-desc');
+  const detailEl = document.getElementById('kv-detail');
+  const labelEl = document.getElementById('kv-step-label');
+  const prevBtn = document.getElementById('kv-prev');
+  const nextBtn = document.getElementById('kv-next');
+
+  function render() {
+    const s = steps[cur];
+    titleEl.textContent = s.title;
+    descEl.innerHTML = s.desc;
+    detailEl.textContent = s.detail;
+    labelEl.textContent = `Step ${cur + 1} / ${steps.length}`;
+    prevBtn.disabled = cur === 0;
+    nextBtn.disabled = cur === steps.length - 1;
+    s.draw(svg);
+  }
+
+  prevBtn.addEventListener('click', () => { if (cur > 0) { cur--; render(); } });
+  nextBtn.addEventListener('click', () => { if (cur < steps.length - 1) { cur++; render(); } });
+  render();
+})();
+</script>
+      </div>
+
+      <div>
+        <h3>KV Cache Per Request</h3>
+<pre class="line-numbers"><code class="language-text">KV cache stores the Key and Value vectors for every token
+the model has processed, at every layer.
+
+Formula:
+  2 &times; num_layers &times; seq_len &times; num_kv_heads &times; head_dim &times; 2 bytes
+  |                    |                                      |
+  K and V              total tokens so far                    FP16
+                       (input + generated;
+                       grows by 1 each decode step)
+                                    |
+                                    GQA: only 8 KV heads (not 64)
+
+For Llama-3 70B (GQA: 8 KV heads, head_dim=128, 80 layers):
+  Per token: 2 &times; 80 &times; 1 &times; 8 &times; 128 &times; 2 = 327,680 bytes &asymp; 320 KB
+
+At 1,500 tokens (1K input + 500 output):
+  320 KB &times; 1,500 = 480 MB per request
+
+At 32K tokens (max context):
+  320 KB &times; 32,768 = 10.24 GB per request &larr; a single long
+  conversation eats 10 GB!</code></pre>
+      </div>
+
+      <div>
+        <h3>The Memory vs Compute Tradeoff</h3>
+        <p>The KV cache trades memory for compute. We store intermediate results in GPU HBM so we don&rsquo;t have to recompute them.</p>
+
+<pre class="line-numbers"><code class="language-text">=== Latency Formula (applies to BOTH prefill and decode) ===
+
+A "step" = one full forward pass through ALL 80 layers.
+Each request requires two SEPARATE phases, done sequentially:
+
+  1. PREFILL (1 step): process all input tokens in parallel.
+     Input shape: [1,000 &times; d]. Produces first output token + fills KV cache.
+     Compute-bound (many tokens &rarr; compute &gt;&gt; load).
+
+  2. DECODE (499 steps): produce 1 new token per step, reading KV cache.
+     Input shape: [1 &times; d]. Each step appends to KV cache.
+     Memory-bandwidth-bound (1 token &rarr; load &gt;&gt; compute).
+
+  Total: 1 prefill + 499 decode = 500 forward passes.
+
+The SAME formula applies to both phases (only "tokens" changes).
+Each step is composed of:
+
+  For each of 80 layers:
+    1. Load layer's attention weights (~0.9 GB) from HBM
+    2. Attention matmuls: Q, K, V, O projections
+    3. All-reduce (sync partial results across TP GPUs)
+    4. Load layer's FFN weights (~0.9 GB) from HBM
+    5. FFN matmuls: W_up, W_gate, W_down
+    6. All-reduce
+  = 80 layers &times; 7 matmuls &times; 2 all-reduces = one step done
+
+The formulas below roll all 80 layers into aggregate numbers:
+  "Load 140 GB" = sum of all layers' weights (80 &times; ~1.75 GB)
+  "Compute 2 &times; 70B &times; tokens" = sum of all matmuls across all layers
+
+BOTH prefill and decode load ALL 140 GB of weights every step.
+The weights don't change between phases &mdash; same load, same time.
+The only difference is how much compute happens per byte loaded:
+  Prefill (1,000 tokens): compute &gt;&gt; load &rarr; compute-bound
+  Decode (1 token):       load &gt;&gt; compute &rarr; memory-bandwidth-bound
+
+Every step has two costs:
+
+  Load    = model_size / (bandwidth_per_GPU &times; TP)
+          = 140 GB / (3.35 TB/s &times; TP)
+          CONSTANT &mdash; always load ALL weights, regardless of token count.
+
+  Compute = 2 &times; params &times; tokens_processed / (peak_TFLOP/s &times; TP &times; MFU)
+          = 2 &times; 70B &times; tokens / (989 TFLOP/s &times; TP &times; 0.4)
+          SCALES with how many tokens are processed in this step.
+
+  Decode step time &asymp; max(Load, Compute)
+
+  Why max() and not sum()? The GPU overlaps load and compute
+  using DOUBLE BUFFERING.
+
+  All 140 GB of weights are ALREADY in HBM. "Load" means streaming
+  weight tiles from HBM &rarr; SRAM (the tiny on-chip memory where
+  compute happens). SRAM is split into two buffers (A and B).
+  While compute units work on a tile in buffer A, the memory
+  controller loads the next tile into buffer B. Then they swap:
+
+    Buffer A: [compute tile 1] [ load tile 3  ] [compute tile 3] ...
+    Buffer B: [ load tile 2  ] [compute tile 2] [ load tile 4  ] ...
+
+  This works because:
+    &bull; SRAM is partitioned &mdash; two buffers, not one shared block
+    &bull; Load units and compute units are SEPARATE hardware &mdash;
+      they physically operate in parallel
+    &bull; Each buffer only holds one small tile, not a whole layer
+
+  Prefill (many tokens): compute per tile is slow, so the next
+    tile arrives before compute finishes &rarr; load hidden behind compute.
+  Decode (1 token): compute per tile is instant, so you just wait
+    for tiles to arrive from HBM &rarr; compute hidden behind load.
+
+  max() is an approximation &mdash; double buffering doesn't perfectly
+  overlap (switching overhead, first tile has no overlap). This
+  imperfect overlap is part of why MFU is ~40%, not 100%.
+
+At TP=4:
+  Load    = 140 / 13.4 (= 3.35 * 4) = 10.4 ms  (same for both phases)
+  Compute = 140 GFLOP &times; tokens / 1,582 TFLOP/s
+
+  Prefill (1,000 tokens):
+    Compute = 140G &times; 1,000 / 1,582T = 88 ms
+    max(10.4, 88) &rarr; 88 ms  &larr; COMPUTE-BOUND (many tokens)
+
+  Decode (1 token):
+    Compute = 140G &times; 1 / 1,582T = 0.09 ms
+    max(10.4, 0.09) &rarr; 10.4 ms  &larr; MEMORY-BANDWIDTH-BOUND (1 token)
+
+The crossover point (where load = compute) is at ~118 tokens:
+  10.4 ms = 140G &times; N / 1,582T &rarr; N &asymp; 118 tokens
+  &lt;118 tokens: memory-bandwidth-bound (decode regime)
+  &gt;118 tokens: compute-bound (prefill regime)</code></pre>
+
+<pre class="line-numbers"><code class="language-text">Without KV cache (500 output tokens, TP=2):
+  Re-prefill every step: ~110 sec per request
+  Compute-bound throughout. Batching doesn't help.
+
+With KV cache:
+  Prefill once (88 ms at TP=4) + 499 decode steps
+  Total: 88 ms + 499 &times; 10.4 ms &asymp; 5.3 sec per request
+
+  Per-request speedup: 110 sec &rarr; 5.3 sec = ~20&times; faster
+  KV cache is a LATENCY optimization, not just throughput.
+
+But we PAY memory: 480 MB per request at 1,500 tokens
+(or up to 10.24 GB pre-allocated for 32K max context).
+
+Why TP=2 is now IMPOSSIBLE (purely a memory problem):
+  TP=2: each GPU holds 70 GB weights, leaving only 10 GB free.
+  KV per request per GPU: 10.24 GB / 2 = 5.12 GB
+  Max batch = 10 / 5.12 &asymp; 1 request. Unusable!
+
+  It's NOT a latency or throughput issue &mdash; a single request
+  would still be fast. The problem is we can only fit ONE
+  request's KV cache in memory. No batching = no throughput.
+
+Why TP=4 WORKS (more GPUs = more total memory):
+  TP=4: each GPU holds 35 GB weights, leaving 45 GB free.
+  KV per request per GPU: 10.24 GB / 4 = 2.56 GB
+  Max batch = ~35 GB / 2.56 GB &asymp; 13-16 concurrent requests.
+  Now we can batch, and throughput follows.
+
+How concurrency drives throughput (Little's Law):
+  Global concurrency needed:
+    2,778 req/sec &times; 5.3 sec = ~14,723 in-flight requests
+
+  Per node (TP=4, batch=16):
+    node_throughput = batch / latency = 16 / 5.3 = ~3 req/sec
+    nodes_needed = 2,778 / 3 = 926 nodes
+
+Solution: increase to TP=4 (4 GPUs per node).</code></pre>
+      </div>
+
+      <div>
+        <h3>Now We Need TP=4</h3>
+<pre class="line-numbers"><code class="language-text">With KV cache, memory per request is significant.
+We need more GPU memory headroom &rarr; increase TP.
+
+TP=4 (4 H100s):
+  140 / 4 = 35 GB weights per GPU
+  Remaining: 80 - 35 = 45 GB per GPU for KV cache + activations
+
+Without PagedAttention, each request must PRE-ALLOCATE KV
+for max context (32K tokens):
+  KV per req = 32K &times; 320 KB = 10.24 GB total
+  Per GPU (TP=4): 10.24 / 4 = 2.56 GB per request
+  Usable memory: ~35 GB per GPU (after overhead)
+  Max batch = 35 / 2.56 = ~13 concurrent requests
+
+Compare TP choices (pre-allocating for 32K):
+
+  TP=2: 10 GB free/GPU, KV/GPU=5.12 GB &rarr; batch&asymp;1. Unusable!
+        (70 GB weights + 10 GB overhead = 80 GB, no room for KV)
+  TP=4: 45 GB free/GPU, KV/GPU=2.56 GB &rarr; batch=13-16
+        Decode: 140 GB / 13.4 TB/s = 10.4 ms/tok
+  TP=8: 62.5 GB free/GPU, KV/GPU=1.28 GB &rarr; batch=41
+        Decode: 140 GB / 26.8 TB/s = 5.2 ms/tok
+
+Why not TP=8? It uses fewer TOTAL GPUs:
+  TP=4: latency = 88 ms + 499 &times; 10.4 ms &asymp; 5.3s
+        16/5.3s = 3 req/s/node &rarr; 926 nodes &times; 4 = 3,704 GPUs
+  TP=8: latency = 44 ms + 499 &times; 5.2 ms &asymp; 2.6s
+        (prefill halves: 2&times;70B&times;1000 / 3,164 TFLOP/s = 44 ms)
+        (decode halves: 140 GB / 26.8 TB/s = 5.2 ms/step)
+        41/2.6s = 15.8 req/s/node &rarr; 176 nodes &times; 8 = 1,408 GPUs
+
+But TP=4 is preferred in practice for:
+  1. Scaling granularity &mdash; scale by 4 GPUs, not 8. Easier to
+     match fluctuating demand with smaller replicas.
+  2. Fault blast radius &mdash; one node failure loses 1/926 capacity
+     (TP=4) vs 1/176 (TP=8). Smaller blast radius.
+  3. Hardware availability &mdash; 4-GPU NVLink configs are more
+     common and cheaper than 8-GPU DGX nodes.
+  4. Latency is already fine &mdash; 5.3 sec meets the SLO. Halving
+     it to 2.6 sec doesn't justify 2&times; GPUs per replica.
+
+We use TP=4 for this walkthrough (the optimization
+techniques apply regardless of TP choice).
+
+  "Node" = one physical server with 4 H100 GPUs,
+  connected via NVLink (900 GB/s inter-GPU bandwidth).
+  The 4 GPUs work together (tensor parallelism) to serve ONE
+  model replica. Node &ne; GPU. Node = 4 GPUs = 1 model copy.
+  Throughout this page: "600 nodes" = 600 &times; 4 = 2,400 GPUs.</code></pre>
+      </div>
+
+      <div>
+        <h3>What Is All-Reduce?</h3>
+        <p>With tensor parallelism, each GPU computes a <strong>partial result</strong> (e.g., GPU 0 computes heads 0-7, GPU 1 computes heads 8-15). After each layer, the partial results must be <strong>combined</strong> so every GPU has the full output to feed into the next layer. This combining step is called <strong>all-reduce</strong>.</p>
+<pre class="line-numbers"><code class="language-text">Example: TP=4, output vector = [a, b, c, d] split across 4 GPUs
+
+  GPU 0 has [a, 0, 0, 0]  (computed its 1/4)
+  GPU 1 has [0, b, 0, 0]
+  GPU 2 has [0, 0, c, 0]
+  GPU 3 has [0, 0, 0, d]
+
+  All-reduce: every GPU sends its piece to all others.
+  After: all 4 GPUs have [a, b, c, d].
+
+  Cost per all-reduce:
+    Data moved: d_model &times; batch &times; 2 bytes
+    = 8192 &times; 16 &times; 2 = 256 KB (tiny)
+    (batch=16 = max concurrent requests, derived from
+     the GPU memory budget above: ~35 GB / 2.56 GB per req.)
+    At 900 GB/s NVLink: &lt;0.001 ms per sync
+
+  But it happens TWICE per layer (after attention + after FFN):
+    80 layers &times; 2 = 160 syncs per forward pass
+    Total: 160 &times; 0.001 ms = 0.16 ms (negligible at TP=4)
+
+  At TP=8: more GPUs in the ring &rarr; more hops per sync.
+    Each sync takes ~2&times; longer: 160 &times; 0.002 = 0.32 ms.
+    Still small vs 5.2 ms decode. But at TP=16 over
+    InfiniBand (50 GB/s): 160 &times; 0.04 ms = 6.4 ms
+    &mdash; that DOUBLES the decode step time. Unacceptable.</code></pre>
+      </div>
+
+      <div>
+        <h3>Decode Is Now Memory-Bandwidth-Bound</h3>
+<pre class="line-numbers"><code class="language-text">With KV cache, each decode step processes just 1 new token:
+  Weight load: 140 GB / (3.35 TB/s &times; 4) = 10.4 ms
+  Compute:     2 &times; 70B &times; 1 / 1,582 TFLOP/s = 0.09 ms
+  Load is 116&times; slower &rarr; memory-bandwidth-bound!
+
+Now batching HELPS &mdash; load weights once, multiply against
+all requests' single new tokens:
+
+  batch=1:  10.4 ms/step &rarr;   96 tokens/sec
+  batch=8:  10.4 ms/step &rarr;  769 tokens/sec
+  batch=16: 10.4 ms/step &rarr; 1,538 tokens/sec
+  (Same load time per step, but more tokens produced!)
+
+When does batching stop helping? When compute &ge; load:
+  2 &times; 70B &times; B / 1,582 TFLOP/s = 10.4 ms &rarr; B &asymp; 117
+  Up to batch&asymp;117, decode is memory-bound (linear scaling).
+
+Per request (1K input + 500 output):
+  Prefill: 2 &times; 70B &times; 1,000 / 1,582 = 88 ms (compute-bound)
+  Decode: 499 steps &times; 10.4 ms = 5,190 ms
+  Total: 88 + 5,190 = 5,278 ms &asymp; 5.3 sec per request
+
+  (vs 110 sec without KV cache &mdash; 21&times; faster!)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Static Batching Throughput</h3>
+<pre class="line-numbers"><code class="language-text">We still use static batching here (continuous batching comes
+in Iteration 1). Batch of 16 requests &mdash; the batch waits for
+the LONGEST request before any slot can be reused:
+
+  Worst case: longest output = 2,000 tokens
+    Batch time = 88 ms + 2,000 &times; 10.4 ms = 20.9 sec
+    Throughput = 16 / 20.9 = 0.77 req/sec
+
+  Average case: longest output &asymp; 1,000 tokens (realistic mix)
+    Batch time = 88 ms + 1,000 &times; 10.4 ms = 10.5 sec
+    Throughput = 16 / 10.5 = 1.5 req/sec
+
+  Short requests (50-token output) finish in 600 ms but wait
+  10+ seconds for the longest request in the batch.
+  No streaming &mdash; users see nothing until the batch completes.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Visualizing Padding Waste &amp; Stalling</h3>
+        <svg viewBox="0 0 780 310" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:780px;margin:0 auto;display:block;" font-family="system-ui,-apple-system,sans-serif" font-size="12">
+          <!-- Title -->
+          <text x="390" y="18" text-anchor="middle" font-size="13" font-weight="bold" fill="#334155">Static Batch of 4 Requests (padded to longest = 2,000 tokens)</text>
+
+          <!-- Axis labels -->
+          <text x="28" y="50" text-anchor="end" font-size="11" fill="#64748b">Req A</text>
+          <text x="28" y="90" text-anchor="end" font-size="11" fill="#64748b">Req B</text>
+          <text x="28" y="130" text-anchor="end" font-size="11" fill="#64748b">Req C</text>
+          <text x="28" y="170" text-anchor="end" font-size="11" fill="#64748b">Req D</text>
+
+          <!-- Scale: 2000 tokens = 700 px -->
+          <!-- Req A: 200 real tokens, 1800 padding -->
+          <rect x="35" y="36" width="70" height="26" rx="3" fill="#2563eb"/>
+          <rect x="105" y="36" width="630" height="26" rx="3" fill="#fecaca" stroke="#fca5a5" stroke-width="0.5" stroke-dasharray="3 2"/>
+          <text x="70" y="54" text-anchor="middle" font-size="10" fill="white" font-weight="bold">200</text>
+          <text x="420" y="54" text-anchor="middle" font-size="10" fill="#dc2626">1,800 padding (wasted compute &amp; memory)</text>
+
+          <!-- Req B: 500 real, 1500 padding -->
+          <rect x="35" y="76" width="175" height="26" rx="3" fill="#2563eb"/>
+          <rect x="210" y="76" width="525" height="26" rx="3" fill="#fecaca" stroke="#fca5a5" stroke-width="0.5" stroke-dasharray="3 2"/>
+          <text x="122" y="94" text-anchor="middle" font-size="10" fill="white" font-weight="bold">500</text>
+          <text x="472" y="94" text-anchor="middle" font-size="10" fill="#dc2626">1,500 padding</text>
+
+          <!-- Req C: 1000 real, 1000 padding -->
+          <rect x="35" y="116" width="350" height="26" rx="3" fill="#2563eb"/>
+          <rect x="385" y="116" width="350" height="26" rx="3" fill="#fecaca" stroke="#fca5a5" stroke-width="0.5" stroke-dasharray="3 2"/>
+          <text x="210" y="134" text-anchor="middle" font-size="10" fill="white" font-weight="bold">1,000</text>
+          <text x="560" y="134" text-anchor="middle" font-size="10" fill="#dc2626">1,000 padding</text>
+
+          <!-- Req D: 2000 real, 0 padding -->
+          <rect x="35" y="156" width="700" height="26" rx="3" fill="#2563eb"/>
+          <text x="385" y="174" text-anchor="middle" font-size="10" fill="white" font-weight="bold">2,000 (longest &mdash; sets the padding width for everyone)</text>
+
+          <!-- Totals -->
+          <line x1="735" y1="36" x2="735" y2="182" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4 2"/>
+          <text x="755" y="115" text-anchor="start" font-size="10" fill="#dc2626" font-weight="bold" transform="rotate(90,755,115)">all must be this wide</text>
+
+          <!-- Waste calculation -->
+          <rect x="35" y="200" width="700" height="44" rx="6" fill="#fef2f2" stroke="#fca5a5" stroke-width="1"/>
+          <text x="390" y="218" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="bold">Total tokens in GPU matrix: 4 &times; 2,000 = 8,000</text>
+          <text x="390" y="234" text-anchor="middle" font-size="11" fill="#dc2626">Real tokens: 200+500+1,000+2,000 = 3,700.  Padding: 4,300 (54% wasted!)</text>
+
+          <!-- Stalling -->
+          <rect x="35" y="258" width="700" height="44" rx="6" fill="#fef2f2" stroke="#fca5a5" stroke-width="1"/>
+          <text x="390" y="276" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="bold">Stalling: Req A finishes at token 200, but waits for Req D to reach 2,000</text>
+          <text x="390" y="292" text-anchor="middle" font-size="11" fill="#dc2626">A's slot sits idle for 1,800 decode steps (~18.7 sec at 10.4 ms/step)</text>
+
+          <!-- Legend -->
+          <rect x="35" y="36" width="12" height="12" rx="2" fill="#2563eb"/>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Impact:</strong> KV cache reduces per-request time from ~110 sec to ~5.3 sec (21&times; faster). But it requires TP=4 instead of TP=2 (2&times; more GPUs per node). At ~1.5 req/sec per node (static batching average), we need 2,778 / 1.5 = 1,852 nodes &mdash; <strong>7,408 GPUs, $10.7M/month</strong>. Down from 618,000 GPUs &mdash; an 83&times; reduction. Next: eliminate static batching waste.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Continuous Batching                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration1">
+    <div class="container">
+      <h2>Iteration 1: Continuous Batching</h2>
+      <p class="full-width">KV cache (Iteration 0) made each request 21&times; faster, but static batching still wastes GPU slots &mdash; finished requests wait for the slowest one before their slot can be reused. Continuous batching fixes this.</p>
+
+      <div>
+        <h3>Continuous Batching (Orca)</h3>
+        <p>Static batching waits for the entire batch to finish before releasing any slot. Continuous batching (introduced in the <em>Orca</em> paper, 2022) fixes this by checking after <strong>every decode step</strong> which sequences have finished, immediately evicting them and admitting new requests from the queue.</p>
+        <p>Each sequence maintains its own KV cache at its own length &mdash; no padding needed. A sequence at 200 tokens uses 200 tokens of cache; a sequence at 2,000 tokens uses 2,000. They share the same batch dimension for the matrix multiply but have independent lifetimes.</p>
+<pre class="line-numbers"><code class="language-python">def serve_loop(model, queue, max_batch=16):
+    active = []
+
+    while True:
+        # Decode one step for all active sequences
+        for seq in active:
+            token = model.decode_one(seq.kv_cache)
+            seq.output.append(token)
+            seq.stream_to_client(token)  # SSE push
+
+        # Evict finished sequences, admit new ones
+        active = [s for s in active if not s.done()]
+
+        while len(active) < max_batch and not queue.empty():
+            new_seq = queue.get()
+            new_seq.kv_cache = model.prefill(new_seq.prompt)
+            active.append(new_seq)
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Timeline: 4 Requests</h3>
+        <p>Watch how continuous batching keeps the GPU full. The moment a sequence finishes, a new one takes its slot &mdash; no idle cycles.</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Step</th><th>Slot 1</th><th>Slot 2</th><th>Slot 3</th><th>Slot 4</th><th>Event</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>0</td><td>A (prefill)</td><td>B (prefill)</td><td>C (prefill)</td><td>D (prefill)</td><td>Batch starts</td></tr>
+              <tr><td>1</td><td>A (dec 1)</td><td>B (dec 1)</td><td>C (dec 1)</td><td>D (dec 1)</td><td>All decoding</td></tr>
+              <tr><td>2</td><td>A (dec 2)</td><td>B (dec 2)</td><td>C (dec 2)</td><td>D (dec 2)</td><td></td></tr>
+              <tr><td>3</td><td>A (dec 3)</td><td><strong>B done &rarr; E</strong></td><td>C (dec 3)</td><td>D (dec 3)</td><td>B finishes, E joins</td></tr>
+              <tr><td>4</td><td>A (dec 4)</td><td>E (prefill)</td><td>C (dec 4)</td><td><strong>D done &rarr; F</strong></td><td>D finishes, F joins</td></tr>
+              <tr><td>5</td><td><strong>A done &rarr; G</strong></td><td>E (dec 1)</td><td>C (dec 5)</td><td>F (prefill)</td><td>A finishes, G joins</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>GPU never has empty slots. No padding. No waiting. Each slot operates independently at its own sequence length.</p>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Impact:</strong> Each request uses its ACTUAL output length (avg 500 tokens, 5.3 sec) instead of waiting for the longest. Throughput: 16 / 5.3 = <strong>3 req/sec per node</strong> &mdash; a <strong>2&times; improvement</strong> over static batching, with zero hardware changes. The key insight: treat the batch as a dynamically-managed pool of slots, not a fixed group that must start and finish together.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Revised Fleet Sizing</h3>
+<pre class="line-numbers"><code class="language-text">Throughput per node: 3 req/sec (up from ~1.5 with static batching)
+Peak demand: 2,778 req/sec
+Nodes needed: 2,778 / 3 = 926 nodes
++30% headroom: 1,204 nodes &times; 4 GPUs = 4,816 H100s
+
+Monthly cost at $2/GPU/hr:
+  4,816 &times; $2 &times; 24 &times; 30 = $6.9M/month
+  (down from $10.7M with Iteration 0's static batching)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: PagedAttention                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration2">
+    <div class="container">
+      <h2>Iteration 2: PagedAttention &mdash; Virtual Memory for KV Cache</h2>
+      <p class="full-width">Continuous batching solved scheduling waste. But KV cache memory management is still naive: each sequence pre-allocates a contiguous block for its <em>maximum possible length</em>. This wastes 60&ndash;90% of GPU memory.</p>
+
+      <div>
+        <h3>Contiguous Allocation Waste</h3>
+        <p>Without PagedAttention, the serving engine must reserve a contiguous memory region for each sequence&rsquo;s KV cache. Since it doesn&rsquo;t know how long the output will be, it pre-allocates for the worst case &mdash; the full context window.</p>
+<pre class="line-numbers"><code class="language-text">Scenario: max context = 32K tokens
+KV cache per token: 320 KB
+
+Without PagedAttention:
+  Each sequence pre-allocates: 32K &times; 320 KB = 10.24 GB
+  With 45 GB per GPU: only 4 sequences fit
+  But most sequences use ~1,500 tokens = 480 MB
+  Waste: (10.24 GB - 0.48 GB) / 10.24 GB = 95.3% wasted!
+
+  batch=4 &rarr; only 4 requests in flight &rarr; 4/5.3s = 0.75 req/sec
+  Way below our target of 3 req/sec.
+
+Even "right-sizing" to avg 1,500 tokens doesn't help much:
+  Some sequences are 200 tokens, some 8,000.
+  When a 200-token sequence finishes, it leaves a 480 MB
+  "hole" that an 8,000-token sequence (2.56 GB) can't use.
+  This is external fragmentation &mdash; just like OS memory
+  before paging was invented.</code></pre>
+      </div>
+
+      <div>
+        <h3>Paging: Allocate on Demand</h3>
+        <p>PagedAttention (introduced in the <em>vLLM</em> paper, 2023) borrows the page table idea from operating system virtual memory. Instead of allocating one contiguous region per sequence, it divides KV cache into fixed-size <strong>blocks</strong> (pages) and allocates them on demand as the sequence grows.</p>
+<pre class="line-numbers"><code class="language-text">Each GPU manages its own block pool independently.
+With TP=4, each GPU stores its share of the KV heads (2 out of 8).
+
+Block size: 16 tokens per block, per GPU:
+  16 tokens &times; 80 KB/token = 1.28 MB per block
+  (80 KB/token/GPU = 320 KB total per token &divide; 4 GPUs)
+
+How it works:
+  1. Each GPU maintains its own free pool of 1.28 MB blocks
+  2. Each sequence has a block table (like an OS page table)
+     mapping logical block index &rarr; physical block address
+  3. When a sequence needs a new token's KV cache:
+     - If current block has room (&lt;16 tokens), append there
+     - If full, allocate a new block from the free pool
+  4. When a sequence finishes, return all its blocks to the pool
+  (All 4 GPUs allocate/free blocks in lockstep for the same sequence.)
+
+Sequence of 1,500 tokens:
+  Blocks needed per GPU: ceil(1500/16) = 94 blocks
+  Memory per GPU: 94 &times; 1.28 MB = 120 MB  (exact fit, no waste!)
+
+Sequence of 200 tokens:
+  Blocks per GPU: ceil(200/16) = 13 &rarr; 16.6 MB per GPU
+
+45 GB per GPU &divide; 1.28 MB/block = 35,156 blocks per GPU
+  (block per GPU = 16 tokens &times; 80 KB = 1.28 MB; 80 KB = 320 KB / TP=4)
+  Per request: ceil(1500/16) = 94 blocks &times; 1.28 MB = 120 MB per GPU
+
+  Max batch = available_mem / KV_per_req_per_GPU
+    KV_per_req_per_GPU = 120 MB = 0.12 GB (from line above)
+    Without overhead: 45 GB / 0.12 GB = 375
+    With ~10 GB overhead: 35 GB / 0.12 GB &asymp; 291
+
+  &rarr; Or ~4 sequences at 32K + many short sequences
+  &rarr; Memory adapts to actual workload mix</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Impact on Throughput</h3>
+<pre class="line-numbers"><code class="language-text">Before PagedAttention (pre-allocate for max 32K):
+  Max concurrent per GPU: 4 sequences
+  Across 4 GPUs (TP=4): batch = 16
+  Throughput: 16 / 5.3 sec = ~3 req/sec/node
+
+After PagedAttention (allocate actual ~1,500 tokens):
+  Max batch = (GPU_mem - weights/TP - overhead) / KV_per_req_per_GPU
+            = (80 - 35 - 10) / 0.12 = 291 (theoretical max)
+  Practical batch &asymp; 64 (conservative, see below)
+  Throughput: 64 / 6.3 sec = ~10 req/sec/node
+
+  Max batch from a single formula:
+
+    max_batch = (GPU_mem - weights/TP - overhead) / (KV_per_token &times; avg_tokens / TP)
+
+    Where:
+      GPU_mem          = 80 GB
+      weights/TP       = 140 / 4 = 35 GB
+      overhead         &asymp; 10 GB (CUDA context, PagedAttention structs,
+                         activations, headroom)
+      KV_per_token     = 320 KB  (from "KV Cache Per Request" above:
+                         2 &times; 80 layers &times; 8 heads &times; 128 dim &times; 2B)
+      avg_tokens       = 1,500
+      KV_per_req/GPU   = 320 KB &times; 1,500 / 4 = 120 MB = 0.12 GB
+
+    max_batch = (80 - 35 - 10) / 0.12 = 35 / 0.12 &asymp; 291
+
+  In practice, batch is much lower than 291 because:
+    &bull; Sequences vary in length (some &gt;1,500 tokens, eating more memory)
+    &bull; PagedAttention block tables and pool management add overhead
+    &bull; Safety headroom to avoid OOM during bursty allocation
+    &bull; Higher batch = higher per-request latency (see table below)
+
+  A conservative operating point of ~64 leaves generous headroom.
+  The exact number depends on your workload's token distribution.
+
+  Throughput at different batch sizes (all derived, no trial-and-error):
+
+  Per GPU per decode step, two costs:
+
+  1. Load time = HBM_reads_per_GPU / HBM_bandwidth_per_GPU
+     (same as "Load" in the Latency Formula section above,
+      but now includes KV cache reads, not just weight reads)
+
+     HBM_reads_per_GPU = weight_reads + KV_reads
+       weight_reads = model_size / TP = 140 / 4 = 35 GB
+       KV_reads     = batch &times; KV_per_req_per_GPU
+                    = batch &times; (KV_per_token / TP) &times; avg_tokens
+                    = batch &times; (320 KB / 4) &times; 1,500
+                    = batch &times; 0.12 GB
+     HBM_bandwidth_per_GPU = 3,350 GB/s
+
+     Load time = (35 + batch &times; 0.12) / 3,350
+
+  2. Compute time = total_FLOPs_per_GPU / TFLOP/s_per_GPU
+
+     total_FLOPs_per_GPU = (weight_matmul_FLOPs + attn_FLOPs) / TP
+       weight_matmul_FLOPs = 2 &times; params &times; batch
+                           = 2 &times; 70B &times; batch
+       attn_FLOPs          = 4 &times; d_head &times; c &times; num_q_heads &times; layers &times; batch
+                           = 4 &times; 128 &times; 1,500 &times; 64 &times; 80 &times; batch
+                           = 3.93G &times; batch
+       total_FLOPs         = (140G + 3.93G) &times; batch = 143.93G &times; batch
+       per GPU             = 143.93G &times; batch / 4
+     TFLOP/s_per_GPU = 989 &times; 0.4 (MFU) = 395.6 TFLOP/s
+
+     Compute time = 143.93G &times; batch / 4 / 395.6T
+                  = batch &times; 0.091 ms
+
+  3. Decode step time = max(Load time, Compute time)
+     Latency  = 499 decode steps &times; decode_step_time
+     Throughput = batch / latency
+
+  Crossover batch (where Load time = Compute time):
+    Set them equal and solve:
+      (35 + B &times; 0.12) / 3.35 = B &times; 0.091
+      10.45 + B &times; 0.0358  = B &times; 0.091
+      10.45 = B &times; (0.091 - 0.0358)
+      B = 10.45 / 0.0552 &asymp; 189
+
+  Below batch ~189: load-bound (Load time &gt; Compute time)
+    The fixed weight load (35 GB) dominates step time. Adding
+    requests barely increases step time, but you get more tokens
+    out per step. Great throughput-per-latency tradeoff.
+
+  Above batch ~189: compute-bound (Compute time &gt; Load time)
+    Per-request compute dominates. Throughput becomes CONSTANT:
+      step_time   = batch &times; 0.091 ms  (proportional to batch)
+      latency     = 499 &times; batch &times; 0.091 ms
+      throughput  = batch / latency = 1 / (499 &times; 0.091 ms) &asymp; 22 req/s
+    The "batch" cancels out! Adding more requests adds exactly
+    proportional compute, so throughput is flat at ~22 req/s
+    whether batch is 200 or 1,000 &mdash; but latency keeps worsening.
+
+  At batch=64, we're safely in the load-bound regime
+  (Load=12.7 ms, Compute=5.9 ms).
+
+  The diagram below shows the attention cost calculation:
+
+  === Attention Cost Per Decode Step (1 layer, 1 sequence, c cached tokens) ===</code></pre>
+
+      <div class="full-width" style="overflow-x:auto;">
+        <h3>GQA Decode Step: How Attention Cost Is Calculated</h3>
+        <p>Applied with <strong>batch=64</strong> (theoretical max ~291, but ~64 is a conservative operating point leaving headroom), <strong>c=1,500</strong> cached tokens per request, <strong>TP=4</strong>.</p>
+        <svg viewBox="0 0 1060 880" xmlns="http://www.w3.org/2000/svg" style="max-width:1060px;width:100%;height:auto;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;">
+          <defs>
+            <marker id="gqA" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+            <marker id="gqAb" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="gqAg" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#059669"/></marker>
+            <marker id="gqAr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#dc2626"/></marker>
+          </defs>
+
+          <!-- ═══ LEVEL 0: Input token ═══ -->
+          <rect x="280" y="8" width="500" height="44" rx="8" fill="#1e293b"/>
+          <text x="530" y="28" text-anchor="middle" fill="white" font-size="13" font-weight="700">New token enters as x = [1 &times; 8,192]  (d_model)</text>
+          <text x="530" y="44" text-anchor="middle" fill="#94a3b8" font-size="10">d_model = num_q_heads (64) &times; d_head (128) = 8,192</text>
+
+          <!-- Arrows down to 3 projections -->
+          <line x1="380" y1="52" x2="180" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#gqAb)"/>
+          <line x1="530" y1="52" x2="530" y2="78" stroke="#059669" stroke-width="1.5" marker-end="url(#gqAg)"/>
+          <line x1="680" y1="52" x2="880" y2="78" stroke="#dc2626" stroke-width="1.5" marker-end="url(#gqAr)"/>
+
+          <!-- ═══ LEVEL 1: Three projections ═══ -->
+          <!-- Q projection -->
+          <rect x="40" y="80" width="280" height="55" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="180" y="100" text-anchor="middle" fill="#1e40af" font-size="12" font-weight="700">Q = x &times; W_Q</text>
+          <text x="180" y="118" text-anchor="middle" fill="#475569" font-size="10">[1&times;8192] &times; [8192&times;8192] &rarr; [1&times;8192]</text>
+          <text x="180" y="130" text-anchor="middle" fill="#2563eb" font-size="9">reshaped to 64 heads &times; 128 dims</text>
+
+          <!-- K projection -->
+          <rect x="390" y="80" width="280" height="55" rx="8" fill="#dcfce7" stroke="#059669" stroke-width="2"/>
+          <text x="530" y="100" text-anchor="middle" fill="#166534" font-size="12" font-weight="700">k = x &times; W_K</text>
+          <text x="530" y="118" text-anchor="middle" fill="#475569" font-size="10">[1&times;8192] &times; [8192&times;1024] &rarr; [1&times;1024]</text>
+          <text x="530" y="130" text-anchor="middle" fill="#059669" font-size="9">reshaped to 8 heads &times; 128 dims</text>
+
+          <!-- V projection -->
+          <rect x="740" y="80" width="280" height="55" rx="8" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+          <text x="880" y="100" text-anchor="middle" fill="#991b1b" font-size="12" font-weight="700">v = x &times; W_V</text>
+          <text x="880" y="118" text-anchor="middle" fill="#475569" font-size="10">[1&times;8192] &times; [8192&times;1024] &rarr; [1&times;1024]</text>
+          <text x="880" y="130" text-anchor="middle" fill="#dc2626" font-size="9">reshaped to 8 heads &times; 128 dims</text>
+
+          <!-- ═══ LEVEL 2: GQA grouping ═══ -->
+          <line x1="530" y1="135" x2="530" y2="158" stroke="#059669" stroke-width="1.5" marker-end="url(#gqAg)"/>
+          <line x1="880" y1="135" x2="880" y2="158" stroke="#dc2626" stroke-width="1.5" marker-end="url(#gqAr)"/>
+
+          <!-- KV Cache -->
+          <rect x="390" y="160" width="630" height="70" rx="8" fill="#f0fdf4" stroke="#059669" stroke-width="2"/>
+          <text x="705" y="180" text-anchor="middle" fill="#166534" font-size="12" font-weight="700">KV Cache (append k,v then read all)</text>
+          <text x="540" y="200" text-anchor="middle" fill="#059669" font-size="10">K_all: [8 heads &times; (c+1) &times; 128]</text>
+          <text x="540" y="215" text-anchor="middle" fill="#059669" font-size="9">8 KV heads, c+1 cached tokens, 128 dims each</text>
+          <text x="870" y="200" text-anchor="middle" fill="#dc2626" font-size="10">V_all: [8 heads &times; (c+1) &times; 128]</text>
+          <text x="870" y="215" text-anchor="middle" fill="#dc2626" font-size="9">HBM read: 2&times;8&times;128&times;(c+1)&times;2B per layer</text>
+
+          <!-- ═══ LEVEL 3: GQA Grouping diagram ═══ -->
+          <line x1="180" y1="135" x2="180" y2="248" stroke="#2563eb" stroke-width="1.5" marker-end="url(#gqAb)"/>
+          <line x1="530" y1="230" x2="530" y2="248" stroke="#059669" stroke-width="1.5" marker-end="url(#gqAg)"/>
+
+          <rect x="30" y="250" width="1000" height="110" rx="10" fill="#fefce8" stroke="#ca8a04" stroke-width="2"/>
+          <text x="530" y="272" text-anchor="middle" fill="#a16207" font-size="13" font-weight="700">GQA Grouping: 64 Query Heads &rarr; 8 Groups &rarr; 8 KV Heads</text>
+
+          <!-- 8 groups -->
+          <rect x="50"  y="282" width="110" height="55" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="105" y="298" text-anchor="middle" fill="#1e40af" font-size="9" font-weight="700">Group 0: q0-q7</text>
+          <text x="105" y="312" text-anchor="middle" fill="#059669" font-size="9">&#9660; KV head 0</text>
+          <text x="105" y="326" text-anchor="middle" fill="#64748b" font-size="8">8 Q &times; 1 KV</text>
+
+          <rect x="170" y="282" width="110" height="55" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="225" y="298" text-anchor="middle" fill="#1e40af" font-size="9" font-weight="700">Group 1: q8-q15</text>
+          <text x="225" y="312" text-anchor="middle" fill="#059669" font-size="9">&#9660; KV head 1</text>
+          <text x="225" y="326" text-anchor="middle" fill="#64748b" font-size="8">8 Q &times; 1 KV</text>
+
+          <rect x="290" y="282" width="110" height="55" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="345" y="298" text-anchor="middle" fill="#1e40af" font-size="9" font-weight="700">Group 2: q16-q23</text>
+          <text x="345" y="312" text-anchor="middle" fill="#059669" font-size="9">&#9660; KV head 2</text>
+          <text x="345" y="326" text-anchor="middle" fill="#64748b" font-size="8">8 Q &times; 1 KV</text>
+
+          <text x="440" y="312" text-anchor="middle" fill="#64748b" font-size="14">...</text>
+
+          <rect x="475" y="282" width="110" height="55" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="530" y="298" text-anchor="middle" fill="#1e40af" font-size="9" font-weight="700">Group 5: q40-q47</text>
+          <text x="530" y="312" text-anchor="middle" fill="#059669" font-size="9">&#9660; KV head 5</text>
+          <text x="530" y="326" text-anchor="middle" fill="#64748b" font-size="8">8 Q &times; 1 KV</text>
+
+          <text x="620" y="312" text-anchor="middle" fill="#64748b" font-size="14">...</text>
+
+          <rect x="655" y="282" width="110" height="55" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="710" y="298" text-anchor="middle" fill="#1e40af" font-size="9" font-weight="700">Group 7: q56-q63</text>
+          <text x="710" y="312" text-anchor="middle" fill="#059669" font-size="9">&#9660; KV head 7</text>
+          <text x="710" y="326" text-anchor="middle" fill="#64748b" font-size="8">8 Q &times; 1 KV</text>
+
+          <text x="890" y="298" text-anchor="middle" fill="#a16207" font-size="10" font-weight="700">Compute: all 64 Q heads</text>
+          <text x="890" y="314" text-anchor="middle" fill="#a16207" font-size="10" font-weight="700">HBM read: only 8 KV heads</text>
+          <text x="890" y="330" text-anchor="middle" fill="#a16207" font-size="10">GQA saves 8&times; bandwidth</text>
+
+          <!-- ═══ LEVEL 4: Two attention operations ═══ -->
+          <line x1="350" y1="360" x2="250" y2="388" stroke="#64748b" stroke-width="1.5" marker-end="url(#gqA)"/>
+          <line x1="710" y1="360" x2="810" y2="388" stroke="#64748b" stroke-width="1.5" marker-end="url(#gqA)"/>
+
+          <!-- scores = q × K^T -->
+          <rect x="40" y="390" width="440" height="120" rx="8" fill="#f0f4ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="260" y="412" text-anchor="middle" fill="#1e40af" font-size="13" font-weight="700">scores = q &times; K_all^T</text>
+          <text x="260" y="432" text-anchor="middle" fill="#475569" font-size="11">Per head: q=[1&times;128] &times; K^T=[128&times;(c+1)] &rarr; [1&times;(c+1)]</text>
+          <text x="260" y="450" text-anchor="middle" fill="#475569" font-size="10">Each of (c+1) scores: 128 muls + 128 adds = 256 FLOPs</text>
+          <text x="260" y="468" text-anchor="middle" fill="#475569" font-size="10">Per head: 2 &times; 128 &times; (c+1)  |  &times;64 heads</text>
+          <rect x="60" y="476" width="400" height="24" rx="4" fill="#dbeafe"/>
+          <text x="260" y="493" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="700">Per layer: 2 &times; d_head &times; c &times; num_q_heads</text>
+
+          <!-- attn = weights × V -->
+          <rect x="580" y="390" width="440" height="120" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+          <text x="800" y="412" text-anchor="middle" fill="#991b1b" font-size="13" font-weight="700">attn = softmax(scores) &times; V_all</text>
+          <text x="800" y="432" text-anchor="middle" fill="#475569" font-size="11">Per head: wts=[1&times;(c+1)] &times; V=[(c+1)&times;128] &rarr; [1&times;128]</text>
+          <text x="800" y="450" text-anchor="middle" fill="#475569" font-size="10">Each of 128 outputs: (c+1) muls + (c+1) adds = 2(c+1) FLOPs</text>
+          <text x="800" y="468" text-anchor="middle" fill="#475569" font-size="10">Per head: 2 &times; 128 &times; (c+1)  |  &times;64 heads</text>
+          <rect x="600" y="476" width="400" height="24" rx="4" fill="#fee2e2"/>
+          <text x="800" y="493" text-anchor="middle" fill="#991b1b" font-size="11" font-weight="700">Per layer: 2 &times; d_head &times; c &times; num_q_heads</text>
+
+          <!-- ═══ LEVEL 5: Two separate totals ═══ -->
+          <!-- Compute total (from both matmul boxes) -->
+          <line x1="260" y1="510" x2="270" y2="538" stroke="#2563eb" stroke-width="1.5" marker-end="url(#gqAb)"/>
+          <line x1="800" y1="510" x2="500" y2="538" stroke="#2563eb" stroke-width="1.5" marker-end="url(#gqAb)"/>
+
+          <rect x="40" y="540" width="500" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="290" y="560" text-anchor="middle" fill="#1e40af" font-size="12" font-weight="700">Compute total per layer: (2+2) &times; d_head &times; c &times; num_q_heads</text>
+          <text x="290" y="580" text-anchor="middle" fill="#1e40af" font-size="11">= 4 &times; 128 &times; c &times; 64 &nbsp; (the "4" = sum of two matmuls, NOT related to TP)</text>
+
+          <!-- HBM reads total (separate formula from KV cache) -->
+          <!-- Arrow from KV cache box down to HBM reads total -->
+          <line x1="705" y1="230" x2="790" y2="538" stroke="#059669" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#gqAg)"/>
+
+          <rect x="560" y="540" width="460" height="52" rx="8" fill="#f0fdf4" stroke="#059669" stroke-width="2"/>
+          <text x="790" y="560" text-anchor="middle" fill="#166534" font-size="12" font-weight="700">HBM reads total per layer: 2 &times; num_kv_heads &times; d_head &times; c &times; 2B</text>
+          <text x="790" y="580" text-anchor="middle" fill="#166534" font-size="11">= 2 &times; 8 &times; 128 &times; c &times; 2B &nbsp; (separate formula &mdash; reads K_all + V_all from HBM)</text>
+
+          <!-- ═══ LEVEL 6: Applied numbers side-by-side ═══ -->
+          <line x1="290" y1="592" x2="270" y2="618" stroke="#2563eb" stroke-width="1.5" marker-end="url(#gqAb)"/>
+          <line x1="790" y1="592" x2="790" y2="618" stroke="#059669" stroke-width="1.5" marker-end="url(#gqAg)"/>
+
+          <!-- Compute applied (per GPU) -->
+          <rect x="40" y="620" width="460" height="130" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="270" y="642" text-anchor="middle" fill="#1e40af" font-size="13" font-weight="700">COMPUTE per GPU (scales with num_q_heads = 64)</text>
+          <text x="270" y="665" text-anchor="middle" fill="#475569" font-size="11">4 &times; 128 &times; 1,500(c) &times; 64(heads) = 49.2M FLOPs / layer / request</text>
+          <text x="270" y="685" text-anchor="middle" fill="#475569" font-size="11">&times; 80 layers &times; 64 requests(batch) &divide; 4 GPUs = 63 GFLOP per GPU</text>
+          <text x="270" y="708" text-anchor="middle" fill="#475569" font-size="10">395.6 TFLOP/s = 989 (H100 peak) &times; 0.4 (MFU) per GPU</text>
+          <text x="270" y="728" text-anchor="middle" fill="#2563eb" font-size="12" font-weight="700">63 GFLOP &divide; 395.6 TFLOP/s = 0.16 ms</text>
+
+          <!-- HBM reads applied (per GPU) -->
+          <rect x="560" y="620" width="460" height="130" rx="8" fill="#f0fdf4" stroke="#059669" stroke-width="2"/>
+          <text x="790" y="642" text-anchor="middle" fill="#166534" font-size="13" font-weight="700">HBM READS per GPU (scales with num_kv_heads = 8)</text>
+          <text x="790" y="665" text-anchor="middle" fill="#475569" font-size="11">2 &times; 8 &times; 128 &times; 1,500(c) &times; 2B = 6.1 MB / layer / request</text>
+          <text x="790" y="685" text-anchor="middle" fill="#475569" font-size="11">&times; 80 layers &times; 64 requests(batch) &divide; 4 GPUs = 7.8 GB per GPU</text>
+          <text x="790" y="708" text-anchor="middle" fill="#475569" font-size="10">3,350 GB/s = 3.35 TB/s per H100 (per GPU)</text>
+          <text x="790" y="728" text-anchor="middle" fill="#059669" font-size="12" font-weight="700">7.8 GB &divide; 3,350 GB/s = 2.3 ms</text>
+
+          <!-- ═══ LEVEL 7: Bottom line ═══ -->
+          <line x1="270" y1="750" x2="420" y2="778" stroke="#64748b" stroke-width="1.5" marker-end="url(#gqA)"/>
+          <line x1="790" y1="750" x2="640" y2="778" stroke="#64748b" stroke-width="1.5" marker-end="url(#gqA)"/>
+
+          <rect x="130" y="780" width="800" height="95" rx="10" fill="#1e293b"/>
+          <text x="530" y="803" text-anchor="middle" fill="white" font-size="14" font-weight="700">Total per-GPU decode step: weight load (35 GB) + KV read (7.8 GB) = 42.8 GB</text>
+          <text x="530" y="823" text-anchor="middle" fill="#94a3b8" font-size="11">42.8 GB &divide; 3,350 GB/s (per-GPU bandwidth) = 12.8 ms (vs 10.4 ms weights-only)</text>
+          <text x="530" y="843" text-anchor="middle" fill="#94a3b8" font-size="10">3,350 GB/s = one H100's HBM bandwidth. All numbers here are per-GPU (data &divide; 4, bandwidth &divide; 4 cancel out)</text>
+          <text x="530" y="858" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="700">Bandwidth-bound: HBM reads (12.8 ms) &gt;&gt; total compute (0.16 ms attn + 5.8 ms weights = 5.96 ms)</text>
+          <text x="530" y="873" text-anchor="middle" fill="#94a3b8" font-size="9">5.8 ms = weight matmul compute: 2&times;70B&times;64(batch) &divide; 4 GPUs &divide; 395.6 TFLOP/s per GPU</text>
+        </svg>
+      </div>
+
+<pre class="line-numbers"><code class="language-text">  (See diagram above for the full attention cost derivation.)
+
+  In the diagram, c = number of tokens already in the KV cache
+  before this step (input tokens + previously generated tokens).
+  e.g., at decode step 100 with 1,000 input tokens:
+  c = 1,000 + 99 = 1,099. After appending the new token: c+1 = 1,100.
+
+  Terminology (Llama-3 70B architecture choices, not arbitrary):
+    d_model = 8,192    &mdash; model width (chosen for capacity at 70B params)
+    d_head = 128       &mdash; numbers per head per token. Each head represents
+                         one token as a VECTOR of 128 numbers [1&times;128],
+                         NOT a 128&times;128 matrix. d_model is split into 64
+                         slices of 128: each slice = one head's "view" of
+                         the token. (Power of 2, efficient on tensor cores.)
+    num_q_heads = 64   &mdash; d_model / d_head = 8,192 / 128 = 64
+    num_kv_heads = 8   &mdash; GQA choice: 8 groups of 8 query heads
+
+    Why 8 KV heads and not 64?
+      MHA (original):  64 KV heads (1 per Q head) &mdash; max quality, max memory
+      GQA (Llama-3):    8 KV heads (1 per 8 Q heads) &mdash; 8&times; memory savings
+      MQA (extreme):    1 KV head  (shared by all 64) &mdash; 64&times; savings, quality loss
+      Meta chose 8 as the sweet spot: research showed reducing KV heads
+      hurts quality very little &mdash; the queries are the expressive part,
+      K and V can be shared across groups of query heads.
+      (Different model sizes use different ratios: Llama-3 8B = 32 Q / 8 KV)
+
+  === Applying to batch=64, c=1,500, TP=4 ===
+
+  Two bottlenecks converge:
+
+  1. KV cache READS compete with weight loads for HBM bandwidth.
+     At batch=16, we only counted weight loading (10.4 ms) because
+     KV reads were tiny. At batch=64, they're significant:
+
+     Per GPU per decode step:
+       Weight reads:   140 GB / 4 = 35.0 GB  (same as before)
+       KV cache reads:
+         Per seq per layer: 2 &times; 8 &times; 128 &times; 1,500 &times; 2B = 6.1 MB
+         &times; 80 layers &times; 64 seqs / 4 GPUs = 7.8 GB
+       Total HBM reads: 35.0 + 7.8 = 42.8 GB
+       Time: 42.8 GB / 3,350 GB/s = 12.8 ms (vs 10.4 ms weights-only)
+
+     The KV cache reads add ~23% more bandwidth pressure.
+
+  2. Attention COMPUTE also grows (but is smaller than the BW cost):
+       Per seq per layer: 4 &times; 128 &times; 1,500 &times; 64 = 49.2M FLOPs
+       &times; 80 layers &times; 64 seqs = 252 GFLOP
+       + weight matmuls: 2 &times; 70B &times; 64 = 8,960 GFLOP
+       Total compute: 9,212 GFLOP / 1,582 TFLOP/s = 5.8 ms
+       Still below 12.8 ms &rarr; bandwidth is STILL the bottleneck,
+       but now it's bandwidth for weights + KV cache combined.
+
+  3. Memory capacity: 64 &times; 1,500 tokens &times; 320 KB = 30 GB of
+     KV data per GPU. The remaining ~15 GB is needed for:
+
+     Non-KV memory budget per GPU (TP=4):
+       Total:           80 GB
+       Model weights:  -35 GB
+       Available:       45 GB
+       KV cache:       -30 GB  (batch=64 &times; 1,500 tokens)
+       Remaining:       15 GB, allocated to:
+         CUDA context + framework buffers:     ~2-3 GB
+         Activations (per-layer intermediates): ~4-70 MB
+           (only 1 layer held at a time; from earlier formula:
+            decode: 64 &times; 1 &times; 8192 &times; 2 &times; 4 = 4 MB
+            prefill: 1000 &times; 8192 &times; 2 &times; 4 = 65 MB
+            Why 1 token, not 1,500? The earlier 98 MB calculation
+            was for the NAIVE design (no KV cache), where each step
+            reprocesses ALL 1,500 tokens &rarr; activations scale with
+            seq_len. With KV cache, decode processes only 1 NEW
+            token per step &rarr; activations shrink from O(seq_len)
+            to O(1). Same cause as the compute savings.)
+         PagedAttention overhead (block tables,
+           memory pool, fragmentation padding):  ~2-5 GB
+         Safety headroom (avoid OOM under bursts): ~7-10 GB
+
+     (Earlier, without PagedAttention, we used ~10 GB overhead.
+      PagedAttention adds ~2-5 GB for its own data structures,
+      bringing the total to ~12-15 GB. The exact number varies
+      by framework &mdash; vLLM, TensorRT-LLM, etc. use different
+      allocators with different overheads.)
+
+  The real win: we went from memory-CAPACITY-limited (batch=16,
+  couldn't fit more KV caches) to memory-BANDWIDTH-limited (batch=64,
+  limited by HBM bandwidth for weights + KV cache reads).
+  PagedAttention removed memory capacity as the bottleneck.
+
+Revised fleet (batch=64):
+  step_time  = (35 + 64&times;0.12) / 3,350 = 12.7 ms
+  latency    = 499 &times; 12.7 ms = 6.3 sec
+  throughput = 64 / 6.3 = 10.1 req/sec/node
+  nodes      = 2,778 / 10.1 = 275 nodes &times; 4 = 1,100 H100s
+  Cost: 1,100 &times; $2 &times; 24 &times; 30 = $1.58M/month
+  (down from $3.47M &mdash; PagedAttention reduced our fleet ~3&times;)</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>PagedAttention is the single highest-ROI optimization in LLM serving.</strong> It costs nothing (pure software change, no new hardware) and roughly doubles serving capacity by eliminating memory waste. The insight is simple: don&rsquo;t pre-allocate memory you might not use. Allocate in small fixed-size blocks on demand, just like an OS manages RAM with pages. This is why vLLM became the standard open-source inference engine &mdash; its core contribution is PagedAttention.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ITERATION 3 CONTINUES -->
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Flash Attention + Chunked Prefill               -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration3">
+    <div class="container">
+      <h2>Iteration 3: Flash Attention + Chunked Prefill</h2>
+      <p>Our system handles steady-state load. But what happens when a user with a 32K-token conversation sends a new message? Prefill takes 2.8 seconds, during which all other requests in the batch are blocked from decoding. We need to fix the attention computation itself.</p>
+
+      <div>
+        <h3>Standard Attention Is Memory-Wasteful</h3>
+        <p>During prefill, the attention mechanism computes the full N&times;N score matrix: <code>scores = Q @ K<sup>T</sup></code>. For a 32K-token prefill, this matrix is enormous:</p>
+        <pre class="line-numbers"><code class="language-text">Attention matrix size per head:
+  32,768 &times; 32,768 &times; 2 bytes (FP16) = 2.15 GB
+
+Llama-3 70B has 64 attention heads across 80 layers.
+That's 64 &times; 80 = 5,120 attention computations per forward pass.
+
+Even computing one head at a time:
+  2.15 GB written to HBM + 2.15 GB read back = 4.3 GB of HBM traffic
+  At 3.35 TB/s bandwidth: 4.3 GB / 3.35 TB/s = 1.28 ms per head
+
+  Total HBM traffic for attention alone:
+    1.28 ms &times; 5,120 heads = 6,554 ms &asymp; 6.6 seconds
+
+This is JUST the memory traffic for attention scores &mdash;
+the actual compute on top of this makes 32K prefill take ~2.8s
+even with the optimized GPU kernels.</code></pre>
+        <p>The core problem: the N&times;N matrix is <strong>materialized in HBM</strong> (GPU main memory). HBM is large (80 GB) but relatively slow (3.35 TB/s). The GPU has a much faster memory &mdash; SRAM &mdash; but it is tiny.</p>
+      </div>
+
+      <div>
+        <h3>Flash Attention: Tile in SRAM</h3>
+        <p>Flash Attention (Dao et al., 2022) never writes the N&times;N attention matrix to HBM. Instead, it tiles the computation into blocks that fit entirely in GPU SRAM:</p>
+        <pre class="line-numbers"><code class="language-text">GPU memory hierarchy (H100):
+  HBM:  80 GB capacity,  3.35 TB/s bandwidth
+  SRAM: 50 MB capacity, ~33 TB/s bandwidth (10&times; faster!)
+
+Flash Attention algorithm:
+  1. Split Q into blocks of B_r = 128 rows  (Block-row: query tile size)
+  2. Split K, V into blocks of B_c = 128 rows  (Block-col: key/value tile size)
+     Why 128? All tiles must fit in SRAM simultaneously:
+       Q tile:  128&times;128&times;2B = 32 KB
+       K tile:  128&times;128&times;2B = 32 KB
+       V tile:  128&times;128&times;2B = 32 KB
+       Output:  128&times;128&times;2B = 32 KB
+       Total: ~128 KB per tile operation &lt;&lt; 50 MB SRAM
+     Too large &rarr; won't fit in SRAM. Too small &rarr; poor tensor core utilization.
+     128 is the sweet spot (power of 2, good matmul efficiency).
+
+  3. For each Q block:
+     For each K/V block:
+       a. Load Q tile + K tile + V tile into SRAM  (~96 KB)
+       b. Compute attention for this tile entirely in SRAM
+       c. Accumulate partial result using online softmax
+  4. Write only the final output: N &times; d_head to HBM
+
+Key insight: "online softmax" lets us compute softmax
+incrementally across tiles without ever materializing
+the full row of scores.</code></pre>
+        <pre class="line-numbers"><code class="language-text">Why O(N&sup2;) vs O(N)?
+
+  Standard attention must STORE the full N&times;N matrix in HBM:
+    Q = [N &times; d_head]    K^T = [d_head &times; N]
+    scores = Q &times; K^T &rarr; [N &times; N]  (context_len &times; context_len)
+    One score per (query token, key token) pair &rarr; written to HBM (O(N&sup2;))
+    At 32K tokens: 32,768 &times; 32,768 &times; 2B = 2.15 GB per head!
+    softmax(scores) needs ALL scores in a row to normalize
+    &rarr; must keep entire [N &times; N] matrix in HBM before softmax
+
+  Flash Attention NEVER writes N&times;N to HBM:
+    Yes, there are (N/128)&sup2; tile operations &mdash; same O(N&sup2;) FLOPs.
+    But each tile's [128&times;128] score matrix is:
+      1. Computed in SRAM
+      2. Immediately consumed (accumulated via online softmax)
+      3. Discarded in SRAM &mdash; never written to HBM
+    Only the accumulated output [128 &times; d_head] per Q tile is
+    written to HBM. Total HBM writes: N/128 tiles &times; 128 &times; d_head
+    = N &times; d_head &rarr; O(N).
+
+    Flash Attention doesn't reduce compute (still O(N&sup2;) FLOPs).
+    It reduces HBM I/O by keeping scores in SRAM.
+
+Memory savings:
+  Standard: O(N&sup2;) &mdash; 32K tokens &rarr; 2.15 GB per head
+  Flash:    O(N)  &mdash; 32K tokens &rarr; N(32K) &times; d_head(128) &times; 2B = 8 MB per head
+  Reduction: 268&times; less HBM usage
+
+Speed improvement (fewer HBM round-trips):
+
+  "HBM pass" = one read or write between HBM and SRAM.
+  Standard attention runs separate GPU kernels per step,
+  so intermediates bounce back to HBM between steps:
+
+  Standard attention (each arrow = HBM read or write):
+    1. READ  Q, K from HBM
+    2. WRITE scores = Q&times;K^T to HBM       [N&times;N to HBM!]
+    3. READ  scores back from HBM          [N&times;N from HBM!]
+    4. WRITE softmax(scores) to HBM        [N&times;N to HBM again!]
+    5. READ  softmax weights + V from HBM  [N&times;N + N&times;d from HBM!]
+    6. WRITE output to HBM
+    The N&times;N matrix bounces HBM &harr; SRAM multiple times.
+    Total HBM I/O: ~4 passes over O(N&sup2;) data + 2 over O(N).
+
+  Flash Attention (one fused kernel, tiles stay in SRAM):
+    1. READ  Q, K, V tiles from HBM    [O(N) data]
+    2. WRITE final output to HBM        [O(N) data]
+    Scores computed and consumed entirely in SRAM &mdash; zero
+    HBM round-trips for the N&times;N data.
+    Total HBM I/O: 2 passes over O(N) data only.
+
+  Result: 2-4&times; faster in practice (empirical, from Flash Attention
+  papers &mdash; depends on N, d_head, hardware, implementation).
+
+  Prefill 32K tokens (derived):
+    Weight matmuls: 2 &times; 70B &times; 32,768 / 1,582 TFLOP/s = 2.9s
+    + attention HBM overhead (standard): N&sup2; data bouncing through HBM
+      adds significant time at 32K tokens (N&sup2; = 1 billion entries)
+    + attention compute: 4 &times; 128 &times; 32K &times; 64 &times; 80 layers = 84 TFLOP
+      84 / 1,582 = 53 ms (small vs weight matmuls)
+    Standard attention HBM overhead (the N&times;N matrix bouncing through HBM):
+      N&times;N matrix: 32,768&sup2; &times; 2B = 2.15 GB per head
+      4 HBM passes per head per layer (write scores, read scores,
+        write softmax, read softmax): 4 &times; 2.15 = 8.6 GB
+      Per GPU (TP=4): 16 heads &times; 80 layers &times; 8.6 GB = 11,008 GB
+      Time: 11,008 / 3,350 GB/s = 3.3s
+
+    Standard total &asymp; 2.9s (weights) + 3.3s (attn HBM) = 6.2s
+    Flash Attention total &asymp; 2.9s (weights) + 53 ms (attn compute) = 3.0s
+      (attention HBM overhead eliminated &mdash; tiles stay in SRAM)
+    Speedup: 6.2 / 3.0 &asymp; 2.1&times;
+
+  Flash Attention doesn't speed up the weight matmuls (2.9s).
+  It speeds up the ATTENTION part by eliminating N&sup2; HBM I/O.
+  The win is largest for long sequences where N&sup2; dominates.
+
+  Flash Attention primarily benefits PREFILL, not decode:
+    Prefill: Q=[N &times; d_head], so Q&times;K^T = [N &times; N] &mdash; huge matrix.
+      Flash avoids materializing this in HBM. Big win.
+    Decode:  q=[1 &times; d_head], so q&times;K^T = [1 &times; c] &mdash; just a vector.
+      No N&times;N matrix to avoid. Standard attention is already
+      cheap here (one dot product per cached token).</code></pre>
+      </div>
+
+      <div>
+        <h3>Chunked Prefill: The Problem</h3>
+        <p>Even with Flash Attention, a 32K-token prefill still takes ~3 seconds. With continuous batching, prefill and decode run in the <strong>same forward pass</strong> — the GPU processes the prefill tokens alongside the decode tokens. But the prefill&rsquo;s compute dominates the step:</p>
+<pre class="line-numbers"><code class="language-text">Normal decode step (64 reqs &times; 1 token each): 12.7 ms
+If one request prefills 32K tokens in the same step:
+  Weight matmuls: 2 &times; 70B &times; (32,000 + 63) / 1,582T &asymp; 2.8s
+  The step takes 2.8s instead of 12.7ms.
+  ALL 63 other users wait 2.8s for their next token!
+
+The problem isn't memory &mdash; it's compute interference.
+The prefill doesn't take a separate GPU; it runs in the SAME
+batch, stretching step time for everyone.</code></pre>
+        <p><strong>This creates catastrophic latency spikes.</strong></p>
+        <p><strong>Why not decode during the prefill?</strong> A forward pass is synchronous — all tokens in the batch move through all 80 layers in lockstep. The GPU&rsquo;s tensor cores and HBM bandwidth are shared resources; one forward pass uses all of them. You can&rsquo;t have request A at layer 40 while request B is at layer 10 on the same GPU.</p>
+      </div>
+
+      <div>
+        <h3>Chunked Prefill: The Solution</h3>
+        <p><strong>Solution:</strong> split the prefill into small chunks and process each chunk + decode tokens in one forward pass.</p>
+        <p><strong>Common misconception:</strong> a chunk does <em>not</em> emit a prediction. The model predicts the first output token <em>once</em>, after the <em>whole</em> prompt is in the KV cache &mdash; never mid-prompt. Chunking changes only <em>how the prefill compute is scheduled</em>, never what is computed or what is output.</p>
+<pre class="line-numbers"><code class="language-text">Concrete example &mdash; prompt "I like to go to" &rarr; model predicts "park"
+tokens = [I][like][to][go][to]   (5 tokens),  chunk_size = 2
+
+WITHOUT chunking &mdash; one prefill pass:
+  process [I][like][to][go][to] through all 80 layers
+    &rarr; KV written for positions 0..4
+    &rarr; read logits at LAST position (4) &rarr; predict "park"
+  (every position attends causally to all earlier positions)
+
+WITH chunked prefill &mdash; chunk_count = ceil(5/2) = 3:
+  Chunk 1 = [I][like]  &rarr; KV for pos 0..1.   NO prediction.
+  Chunk 2 = [to][go]   &rarr; KV for pos 2..3.   NO prediction.
+                         (chunk 2 still attends to chunk 1's KV &mdash;
+                          chunks are NOT independent prompts)
+  Chunk 3 = [to]       &rarr; KV for pos 4. Prompt fully cached.
+                         &rarr; read logits at last pos &rarr; predict "park"
+  then decode: "park" &rarr; next token &rarr; ...   (1 token/step)
+
+Why this matters:
+  - Prediction happens ONCE, at the end of the LAST chunk &mdash;
+    not per-chunk, not mid-prompt.
+  - Output is identical with or without chunking. Same prompt
+    &rarr; same KV &rarr; same logits &rarr; same "park".
+  - Chunking does not speed up X &mdash; X's prefill gets slightly
+    SLOWER (more passes, more weight reloads). It exists so the
+    OTHER batched users (A,B,C below) get a decode token between
+    X's chunks instead of stalling for one huge prefill pass.</code></pre>
+        <pre class="line-numbers"><code class="language-text">Choosing chunk size (derive from SLO):
+  Each step processes: chunk_size prefill tokens + decode_reqs decode tokens
+  Step time = max(Load, Compute)
+    Load:    35 GB / 3,350 GB/s = 10.4 ms  (constant)
+    Compute: 2 &times; 70B &times; (chunk + decode_reqs) / 1,582 TFLOP/s
+
+  We need step time &lt; 50ms. Why? From the scenario requirements:
+  "p99 inter-token latency &lt; 50 ms." Each step produces one token
+  per user, so step time = inter-token latency for all decode users.
+  With 63 decode requests in the batch (batch=64 minus 1 prefilling):
+  Total tokens per step = chunk_size + 63 (each decode req = 1 token)
+
+    chunk=512: total=512+63=575  2&times;70B&times;575/1,582T = 51 ms (exceeds SLO!)
+    chunk=256: total=256+63=319  2&times;70B&times;319/1,582T = 28 ms (ok)
+    chunk_size=128: total=128+63=191  2&times;70B&times;191/1,582T = 17 ms (comfortable)
+
+  We use chunk_size=128 (17ms per step, well within 50ms SLO).
+  chunk_count = ceil(total_tokens / chunk_size)
+    1K context:  ceil(1000/128) = 8 chunks
+    32K context: ceil(32768/128) = 256 chunks
+  Tradeoff: smaller chunks = better decode latency, but more
+  steps to finish prefill.
+
+Without chunked prefill (User X sends 32K-token request):
+  t=0ms:    Start prefill for User X (32K tokens in one pass)
+  t=0-3.0s: GPU processes all 32K tokens.
+            Users A, B, C: BLOCKED. No tokens generated.
+  t=3.0s:   X's prefill done. Resume decode for A, B, C, X.
+            &rarr; A, B, C experienced a 3-SECOND gap between tokens!
+
+With chunked prefill (chunk_size=128, chunk_count=ceil(32K/128)=256):
+  Each forward pass processes chunk + decode tokens together:
+
+  t=0ms:   Forward pass 1: X's chunk 1 (128 tok) + A,B,C decode (63 tok)
+           = 191 tokens through all 80 layers                    [~17ms]
+           A, B, C each get their next decode token!
+  t=17ms:  Forward pass 2: X's chunk 2 (128 tok) + A,B,C decode (63 tok)
+           = 191 tokens                                          [~17ms]
+           A, B, C get another decode token!
+  ...
+  (continues for 256 steps = chunk_count)
+
+  X's total prefill: chunk_count(256) &times; 17ms = 4.4s (vs 3.0s unchunked)
+  A, B, C get a decode token every ~17ms (within 50ms SLO)
+  (vs one 3.0s stall without chunking)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Chunked Prefill Timeline</h3>
+        <p>Comparing without vs with chunked prefill. User X sends a 1K-token request while A, B, C are mid-decode (chunk_size=128).</p>
+        <svg viewBox="0 0 1060 520" xmlns="http://www.w3.org/2000/svg" style="width:70%;height:auto;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;">
+          <defs>
+            <marker id="cpArr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+          </defs>
+
+          <!-- ═══ TOP: Without Chunked Prefill ═══ -->
+          <text x="530" y="20" text-anchor="middle" font-size="15" font-weight="700" fill="#dc2626">Without Chunked Prefill</text>
+          <text x="530" y="38" text-anchor="middle" font-size="11" fill="#64748b">User X sends 1K-token request. A, B, C are decoding.</text>
+
+          <!-- Time axis -->
+          <line x1="60" y1="55" x2="1020" y2="55" stroke="#cbd5e1" stroke-width="1"/>
+          <text x="60" y="50" text-anchor="middle" font-size="9" fill="#94a3b8">0ms</text>
+          <text x="360" y="50" text-anchor="middle" font-size="9" fill="#94a3b8">88ms</text>
+          <text x="400" y="50" text-anchor="middle" font-size="9" fill="#94a3b8">101ms</text>
+
+          <!-- Row labels -->
+          <text x="30" y="80" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="700">GPU</text>
+          <text x="30" y="115" text-anchor="middle" font-size="10" fill="#2563eb">User X</text>
+          <text x="30" y="145" text-anchor="middle" font-size="10" fill="#059669">A,B,C</text>
+
+          <!-- GPU row: one huge prefill block, then small decode -->
+          <rect x="60" y="65" width="300" height="24" rx="4" fill="#fecaca" stroke="#dc2626" stroke-width="1.5"/>
+          <text x="210" y="81" text-anchor="middle" font-size="10" fill="#991b1b" font-weight="700">X's full prefill: 1,000 tokens [88ms]</text>
+          <rect x="360" y="65" width="40" height="24" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="380" y="81" text-anchor="middle" font-size="8" fill="#1e40af">decode</text>
+
+          <!-- User X: waiting then gets first token -->
+          <rect x="60" y="100" width="300" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1" stroke-dasharray="4 2"/>
+          <text x="210" y="114" text-anchor="middle" font-size="9" fill="#dc2626">prefilling (building KV cache)</text>
+          <rect x="360" y="100" width="40" height="20" rx="3" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+          <text x="380" y="114" text-anchor="middle" font-size="8" fill="#1e40af">tok 1</text>
+
+          <!-- A,B,C: BLOCKED then get a token -->
+          <rect x="60" y="130" width="300" height="20" rx="3" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/>
+          <text x="210" y="144" text-anchor="middle" font-size="9" fill="#dc2626" font-weight="700">BLOCKED — 88ms gap! No tokens.</text>
+          <rect x="360" y="130" width="40" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="380" y="144" text-anchor="middle" font-size="8" fill="#059669">tok</text>
+
+          <!-- Annotation -->
+          <line x1="60" y1="160" x2="60" y2="175" stroke="#dc2626" stroke-width="1"/>
+          <line x1="360" y1="160" x2="360" y2="175" stroke="#dc2626" stroke-width="1"/>
+          <line x1="60" y1="175" x2="360" y2="175" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4 2"/>
+          <text x="210" y="190" text-anchor="middle" font-size="10" fill="#dc2626" font-weight="700">88ms stall for A, B, C!</text>
+
+          <!-- ═══ Separator ═══ -->
+          <line x1="20" y1="210" x2="1040" y2="210" stroke="#e2e8f0" stroke-width="2"/>
+
+          <!-- ═══ BOTTOM: With Chunked Prefill ═══ -->
+          <text x="530" y="235" text-anchor="middle" font-size="15" font-weight="700" fill="#059669">With Chunked Prefill (chunk_size=128)</text>
+          <text x="530" y="253" text-anchor="middle" font-size="11" fill="#64748b">Same scenario. X's 1K prefill split into chunk_count=8 steps of chunk_size=128 tokens.</text>
+
+          <!-- Time axis -->
+          <line x1="60" y1="270" x2="1020" y2="270" stroke="#cbd5e1" stroke-width="1"/>
+          <text x="60" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">0</text>
+          <text x="175" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">17ms</text>
+          <text x="290" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">34ms</text>
+          <text x="405" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">51ms</text>
+          <text x="520" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">68ms</text>
+          <text x="635" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">85ms</text>
+          <text x="750" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">102ms</text>
+          <text x="865" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">119ms</text>
+          <text x="980" y="265" text-anchor="middle" font-size="9" fill="#94a3b8">136ms</text>
+
+          <!-- Row labels -->
+          <text x="30" y="295" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="700">GPU</text>
+          <text x="30" y="340" text-anchor="middle" font-size="10" fill="#2563eb">User X</text>
+          <text x="30" y="385" text-anchor="middle" font-size="10" fill="#059669">A,B,C</text>
+
+          <!-- GPU row: alternating prefill chunks + decode -->
+          <rect x="60"  y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="118" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk1(128) + A,B,C</text>
+
+          <rect x="175" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="233" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk2(128) + A,B,C</text>
+
+          <rect x="290" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="348" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk3(128) + A,B,C</text>
+
+          <rect x="405" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="463" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk4(128) + A,B,C</text>
+
+          <rect x="520" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="578" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk5(128) + A,B,C</text>
+
+          <rect x="635" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="693" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk6(128) + A,B,C</text>
+
+          <rect x="750" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="808" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk7(128) + A,B,C</text>
+
+          <rect x="865" y="280" width="115" height="24" rx="4" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="923" y="296" text-anchor="middle" font-size="8" fill="#92400e" font-weight="700">chunk8(128) + A,B,C</text>
+
+          <!-- User X: building KV cache across chunks, first decode token at end -->
+          <rect x="60"  y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="118" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 0-127</text>
+          <rect x="175" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="233" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 128-255</text>
+          <rect x="290" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="348" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 256-383</text>
+          <rect x="405" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="463" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 384-511</text>
+          <rect x="520" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="578" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 512-639</text>
+          <rect x="635" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="693" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 640-767</text>
+          <rect x="750" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="808" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 768-895</text>
+          <rect x="865" y="325" width="115" height="20" rx="3" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+          <text x="923" y="339" text-anchor="middle" font-size="7" fill="#dc2626">tok 896-999</text>
+
+          <!-- A,B,C: get a token EVERY step -->
+          <rect x="60"  y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="118" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="175" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="233" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="290" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="348" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="405" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="463" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="520" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="578" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="635" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="693" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="750" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="808" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+          <rect x="865" y="370" width="115" height="20" rx="3" fill="#dcfce7" stroke="#059669" stroke-width="1"/>
+          <text x="923" y="384" text-anchor="middle" font-size="8" fill="#059669" font-weight="700">tok</text>
+
+          <!-- Annotations -->
+          <text x="118" y="410" text-anchor="middle" font-size="9" fill="#059669" font-weight="700">&uarr; 17ms</text>
+          <text x="233" y="410" text-anchor="middle" font-size="9" fill="#059669" font-weight="700">&uarr; 17ms</text>
+          <text x="348" y="410" text-anchor="middle" font-size="9" fill="#059669" font-weight="700">&uarr; 17ms</text>
+          <text x="530" y="410" text-anchor="middle" font-size="9" fill="#64748b">...</text>
+
+          <!-- Bottom summary -->
+          <rect x="60" y="425" width="460" height="80" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+          <text x="290" y="448" text-anchor="middle" font-size="13" font-weight="700" fill="#dc2626">Without chunking</text>
+          <text x="290" y="468" text-anchor="middle" font-size="11" fill="#475569">A,B,C gap: 88ms (entire prefill)</text>
+          <text x="290" y="488" text-anchor="middle" font-size="11" fill="#475569">X's TTFT: 88ms</text>
+
+          <rect x="560" y="425" width="460" height="80" rx="8" fill="#f0fdf4" stroke="#059669" stroke-width="2"/>
+          <text x="790" y="448" text-anchor="middle" font-size="13" font-weight="700" fill="#059669">With chunking (chunk_size=128)</text>
+          <text x="790" y="468" text-anchor="middle" font-size="11" fill="#475569">A,B,C gap: 17ms per step (within 50ms SLO)</text>
+          <text x="790" y="488" text-anchor="middle" font-size="11" fill="#475569">X's TTFT: 8 &times; 17ms = 136ms (slower, but smooth)</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Latency Impact</h3>
+        <p>Chunked prefill trades slightly higher TTFT for one request to prevent catastrophic latency spikes for every other concurrent request:</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th>Without Chunked Prefill</th>
+                <th>With Chunked Prefill</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>User X's TTFT (1K context)</td>
+                <td>88 ms (one forward pass: 2&times;70B&times;1000/1,582T)</td>
+                <td>136 ms (ceil(1000/128)=8 chunks &times; 17ms)</td>
+              </tr>
+              <tr>
+                <td>User X's TTFT (32K context)</td>
+                <td>~3.0s (one forward pass: 2&times;70B&times;32K/1,582T)</td>
+                <td>~4.4s (ceil(32768/128)=256 chunks &times; 17ms)</td>
+              </tr>
+              <tr>
+                <td>Users A, B, C inter-token latency</td>
+                <td><strong>88 ms stall (1K) / 3.0s stall (32K)</strong></td>
+                <td>17 ms per step (chunk_size=128, combined with decode)</td>
+              </tr>
+              <tr>
+                <td>p99 inter-token latency (system-wide)</td>
+                <td>&gt;1,000 ms (any long prefill spikes everyone)</td>
+                <td>&lt;50 ms (17ms per step, within SLO)</td>
+              </tr>
+              <tr>
+                <td>SLO violations during long prefill</td>
+                <td>ALL concurrent users</td>
+                <td>None</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout callout-info">
+          <p><strong>The key tradeoff:</strong> Chunked prefill trades slightly higher TTFT for one request to prevent catastrophic latency spikes for everyone else. This is individual latency vs. system-wide latency &mdash; almost always worth it in production.</p>
+        </div>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Fleet impact:</strong> Flash Attention + Chunked Prefill don't increase steady-state throughput (still 12 req/sec/node, still 928 H100s). Their value is latency quality &mdash; they fix p99 inter-token latency from >1 second to &lt;50ms and enable long-context requests without disrupting the batch. This is what makes the system production-ready.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 4: INT8 Quantization                               -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration4">
+    <div class="container">
+      <h2>Iteration 4: INT8 Quantization &mdash; Halve the Fleet</h2>
+      <p>Our bottleneck is memory bandwidth: loading 140 GB of model weights through HBM every single decode step. The weights dominate the data movement. What if we made the weights smaller?</p>
+
+      <div>
+        <h3>Weight Quantization</h3>
+        <p>Quantization reduces each weight from FP16 (16 bits, 2 bytes) to INT8 (8 bits, 1 byte). The idea is simple: most weights cluster in a narrow range, so we can represent them with fewer bits and a per-group scale factor.</p>
+        <pre class="line-numbers"><code class="language-text">Per-group quantization (group_size = 128):
+
+For each group of 128 consecutive weights:
+  1. Find the maximum absolute value:
+     scale = max(|W_group|) / 127
+
+  2. Quantize: divide by scale and round to integer
+     W_int8 = round(W_group / scale)
+     (result fits in [-127, 127], stored as 8-bit integer)
+
+  3. At inference: dequantize on-the-fly before matmul
+     W_approx = W_int8 &times; scale
+
+Worked example:
+  W_group = [0.52, -1.20, 0.81, 2.10, -0.33, ...]
+
+  scale = 2.10 / 127 = 0.01654
+
+  W_int8 = [round(0.52/0.01654),   &rarr;  31
+            round(-1.20/0.01654),  &rarr; -73
+            round(0.81/0.01654),   &rarr;  49
+            round(2.10/0.01654),   &rarr;  127
+            round(-0.33/0.01654),  &rarr; -20, ...]
+
+  Reconstructed:
+  W_approx = [31&times;0.01654,  -73&times;0.01654,  49&times;0.01654, ...]
+           = [0.513,       -1.207,       0.810,      ...]
+
+  Max error: |0.52 - 0.513| = 0.007 (1.3%)
+  Average error across all weights: ~0.5%
+  Perplexity increase: &lt;1% &mdash; negligible quality impact</code></pre>
+        <pre class="line-numbers"><code class="language-text">Memory savings:
+  FP16: 70B parameters &times; 2 bytes = 140 GB
+  INT8: 70B parameters &times; 1 byte  =  70 GB  (+ ~0.5 GB for scales)
+
+  Per GPU (TP=4): 70 GB / 4 = 17.5 GB (down from 35 GB)
+  Remaining HBM per GPU: 80 - 17.5 = 62.5 GB for KV cache
+  (was 45 GB before &mdash; 39% more KV cache budget!)</code></pre>
+      </div>
+
+      <div>
+        <h3>Throughput Impact</h3>
+        <p>INT8 quantization delivers a triple win: faster decode, larger batches, and lower cost &mdash; all at once.</p>
+        <pre class="line-numbers"><code class="language-text">1. FASTER DECODE (2&times;)
+   Before (FP16):
+     Weight load per step = 140 GB / 13.4 TB/s = 10.4 ms/token
+   After (INT8):
+     Weight load per step = 70 GB / 13.4 TB/s = 5.2 ms/token
+     &rarr; 2&times; faster decode!
+
+   For 500 output tokens:
+     FP16: 500 &times; 10.4ms = 5,200ms decode
+     INT8: 500 &times; 5.2ms  = 2,600ms decode
+
+2. LARGER BATCHES (2&times;)
+   Extra KV budget per GPU: 62.5 - 45 = 17.5 GB more
+
+   KV cache per sequence (1,500 tokens avg):
+     1,500 &times; 320 KB = 480 MB total, 120 MB per GPU (TP=4)
+
+   Old max batch (FP16): 45 GB / 120 MB = 375 sequences
+     (limited to ~64 by compute in practice)
+   New max batch (INT8): 62.5 GB / 120 MB = 520 sequences
+     batch=128 easily fits: 128 &times; 120 MB = 15.4 GB/GPU
+
+3. COMBINED THROUGHPUT
+   Total request time:
+     Prefill: 88ms (1K input, UNCHANGED &mdash; prefill is compute-bound,
+       and quantization doesn't reduce FLOPs. INT8 weights are
+       dequantized to FP16 before matmul, same compute.
+       Load halves (10.4&rarr;5.2ms) but was never the bottleneck:
+       max(5.2, 88) = 88ms, same as max(10.4, 88) = 88ms.)
+     Decode:  500 &times; 5.2ms = 2,600ms
+     Total:   2,688ms &asymp; 2.7s per request
+
+   batch=128 concurrent:
+     128 slots / 2.7s per request &asymp; 47 req/sec per node
+
+4. FLEET SIZING
+   Nodes needed: 2,778 / 47 = 59 nodes
+   H100s: 59 &times; 4 = 236 GPUs
+   Cost: 236 &times; $2/hr &times; 24hr &times; 30 days = $340K/month</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>INT8 quantization is the single biggest win in this entire optimization stack.</strong> It delivers 2&times; faster decode, 2&times; larger batch capacity, and 4&times; cheaper fleet &mdash; all for less than 1% quality degradation. The fleet drops from 928 to 236 H100s, saving nearly $1M/month. This is why every production LLM serving system uses quantization.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 5: Speculative Decoding                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration5">
+    <div class="container">
+      <h2>Iteration 5: Speculative Decoding &mdash; Break the 1-Token-per-Step Barrier</h2>
+      <p>Every optimization so far accepts a fundamental constraint: the target model produces one token per forward pass. Speculative decoding challenges this directly &mdash; by using a small, fast "draft" model to guess multiple tokens, then verifying them all in a single pass of the large model.</p>
+
+      <div>
+        <h3>Draft-then-Verify</h3>
+        <p>The mechanism uses a small <strong>draft model</strong> (Llama-3 8B, fits on 1 GPU with TP=1) to rapidly generate K=5 candidate tokens. Then the full 70B <strong>target model</strong> verifies all 5 tokens in a single forward pass.</p>
+        <p><strong>Why verification costs the same as generating 1 token:</strong> the target model processes a sequence of 5 tokens in parallel &mdash; exactly like prefill. It produces logits (probability distributions) for each of the 5 positions simultaneously. We then compare the draft model's choice against what the target model would have chosen.</p>
+        <h4>Acceptance Rule (Modified Rejection Sampling)</h4>
+        <p>For each drafted token at position <em>i</em>, given the draft model's probability P<sub>draft</sub>(t) and the target model's probability P<sub>target</sub>(t) for token <em>t</em>:</p>
+        <pre class="line-numbers"><code class="language-text">For position i = 1 to K:
+  t = draft_token[i]
+
+  If P_target(t) &ge; P_draft(t):
+    ACCEPT token t (target agrees or is even more confident)
+
+  Else:
+    Draw random number r ~ Uniform(0, 1)
+    If r &lt; P_target(t) / P_draft(t):
+      ACCEPT token t (probabilistic acceptance)
+    Else:
+      REJECT token t
+      Sample a corrected token from an adjusted distribution:
+        P_corrected(x) = max(0, P_target(x) - P_draft(x))
+                         (normalized)
+      Discard all remaining positions i+1 through K.
+      STOP.
+
+After processing all K positions:
+  If all K were accepted, sample one BONUS token from
+  the target model's distribution at position K+1.
+
+Result: accepted tokens + 1 corrected/bonus token</code></pre>
+        <p><strong>This is mathematically lossless</strong> &mdash; the output distribution is identical to running the 70B model alone, token by token. The rejection sampling procedure guarantees this: accepted tokens match the target distribution exactly, and rejected tokens are replaced by samples from the corrected distribution that compensates for the draft model's bias.</p>
+      </div>
+
+      <div>
+        <h3>Concrete Example</h3>
+        <p>The draft model (8B) generates 5 tokens. The target model (70B) verifies them all in one forward pass:</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Pos</th>
+                <th>Draft Token</th>
+                <th>P<sub>draft</sub></th>
+                <th>P<sub>target</sub></th>
+                <th>Accept?</th>
+                <th>Reasoning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>"The"</td>
+                <td>0.35</td>
+                <td>0.42</td>
+                <td style="color:#16a34a;font-weight:600;">YES</td>
+                <td>P<sub>target</sub> &ge; P<sub>draft</sub> &rarr; always accept</td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td>"model"</td>
+                <td>0.28</td>
+                <td>0.31</td>
+                <td style="color:#16a34a;font-weight:600;">YES</td>
+                <td>P<sub>target</sub> &ge; P<sub>draft</sub> &rarr; always accept</td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>"processes"</td>
+                <td>0.22</td>
+                <td>0.08</td>
+                <td style="color:#dc2626;font-weight:600;">NO</td>
+                <td>ratio = 0.08/0.22 = 0.36, drew r=0.71 &gt; 0.36</td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>"each"</td>
+                <td>&mdash;</td>
+                <td>&mdash;</td>
+                <td style="color:#64748b;">SKIP</td>
+                <td>Discarded &mdash; pos 3 was rejected, so pos 4+ are invalid
+                  (they were conditioned on the wrong token "processes")</td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td>"token"</td>
+                <td>&mdash;</td>
+                <td>&mdash;</td>
+                <td style="color:#64748b;">SKIP</td>
+                <td>Discarded &mdash; same reason, built on wrong context</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <pre class="line-numbers"><code class="language-text">Result: 2 accepted + 1 corrected token = 3 tokens from ONE target forward pass
+
+Cost breakdown:
+  Draft:  5 steps &times; ~0.5 ms/step = 2.5 ms
+    (8B model, INT8 = 8 GB. Per GPU: 8/4 = 2 GB.
+     Load: 2 GB / 3,350 GB/s &asymp; 0.6 ms. Compute: negligible.)
+  Verify: 1 forward pass of 70B      = 5.2 ms
+    (processes all 5 drafted tokens at once, like a mini-prefill.
+     Still load-bound: Load = 70 GB / 13.4T = 5.2 ms,
+     Compute = 2&times;70B&times;5 / 1,582T = 0.44 ms. max(5.2, 0.44) = 5.2 ms.
+     Same cost as 1 token because load dominates at 5 tokens.)
+  Total:  7.7 ms for 3 tokens &rarr; 2.6 ms per token
+
+  Without speculative decoding:       5.2 ms per token
+  Speedup on this example:            5.2 / 2.6 = 2.0&times;</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Speedup Math</h3>
+        <p>The expected number of tokens generated per target model forward pass depends on the per-token acceptance rate &alpha;:</p>
+        <pre class="line-numbers"><code class="language-text">Expected tokens per verify step:
+
+  E[accepted] = &alpha; + &alpha;&sup2; + &alpha;&sup3; + ... + &alpha;^K  (geometric series)
+  Plus 1 corrected or bonus token at the end.
+
+  For large K:  E[tokens] &asymp; 1 / (1 - &alpha;)
+
+Llama-3 8B drafting for Llama-3 70B:
+  These models share architecture and training data.
+  Typical per-token acceptance rate: &alpha; &asymp; 0.70-0.80
+
+  At &alpha; = 0.75:
+    E[tokens per verify step] = 1 / (1 - 0.75) = 4.0 tokens
+
+Time per speculative iteration:
+  Draft:  K=5 tokens &times; 0.5 ms  = 2.5 ms
+  Verify: 1 forward pass          = 5.2 ms
+  Total:  7.7 ms per iteration (always the same cost)
+
+  The concrete example above got 3 tokens in 7.7 ms (that specific case).
+  On AVERAGE with &alpha;=0.75: E[tokens] = 4.0 per iteration.
+  Effective: 7.7 ms / 4.0 tokens = 1.93 ms/token
+
+  Speedup: 5.2 ms / 1.93 ms = 2.7&times;
+
+For 500 output tokens:
+  Without speculative: 500 tokens &times; 5.2 ms     = 2,600 ms
+  With speculative:    500/4 = 125 iterations
+                       125 &times; 7.7 ms              =   963 ms
+
+  Total request time:
+    Prefill:  88 ms
+    Decode:  963 ms
+    Total: 1,051 ms &asymp; 1.05 seconds (down from 2.7s &mdash; 2.6&times; faster!)</code></pre>
+      </div>
+
+      <div>
+        <h3>When Speculative Decoding Helps</h3>
+        <p>The speedup depends entirely on how well the draft model predicts the target model's output. Predictable text &rarr; high &alpha; &rarr; big speedup:</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Task</th><th>&alpha; (typical)</th><th>Tokens/step</th><th>Speedup</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>Code completion</strong></td><td>0.85+</td><td>~6.7</td><td>~5-6&times;</td></tr>
+              <tr><td><strong>Factual Q&amp;A</strong></td><td>0.75</td><td>~4.0</td><td>~2.7&times;</td></tr>
+              <tr><td><strong>Translation</strong></td><td>0.70</td><td>~3.3</td><td>~2.5&times;</td></tr>
+              <tr><td><strong>Summarization</strong></td><td>0.70</td><td>~3.3</td><td>~2.5&times;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>When It Doesn't Help</h3>
+        <ul>
+          <li><strong>Creative writing / brainstorming:</strong> low predictability, &alpha; &lt; 0.50 &rarr; less than 1.5&times; speedup. The draft model's guesses are frequently wrong, so most tokens get rejected and we pay the draft cost for little benefit.</li>
+          <li><strong>The draft model adds GPU cost:</strong> each serving node now needs 1 extra H100 for the 8B draft model (it runs on a separate GPU to avoid contending with the target model's memory bandwidth).</li>
+          <li><strong>High batch sizes (&gt;64):</strong> the verify step processes K=5 tokens for every sequence in the batch simultaneously. At batch=128, this is 640 token positions &mdash; the verify step shifts from memory-bandwidth-bound to compute-bound, reducing the speed advantage.</li>
+          <li><strong>Very short outputs:</strong> the fixed overhead of running the draft model matters more when there are fewer tokens to amortize it over.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Final Fleet with Speculative Decoding</h3>
+        <pre class="line-numbers"><code class="language-text">With speculative decoding (&alpha; = 0.75, K = 5):
+
+  Request time:
+    Prefill: 88 ms
+    Decode:  125 speculative iterations &times; 7.7 ms = 963 ms
+      (500 output tokens / 4.0 tokens per iteration = 125 iterations.
+       4.0 = E[tokens per step] = 1/(1-&alpha;) = 1/(1-0.75), from above.)
+    Total:   1,051 ms &asymp; 1.05 seconds per request
+
+  Batch size: 128 concurrent sequences (fits in KV cache)
+
+  Throughput per node:
+    128 slots / 1.05s = ~122 req/sec per node
+
+  But: each node now needs 5 GPUs instead of 4
+    4 &times; H100 for the 70B target model (TP=4)
+    1 &times; H100 for the 8B draft model (TP=1)
+
+  Fleet:
+    Nodes needed: 2,778 / 122 = 23 nodes
+    Total GPUs:   23 &times; 5 = 115 H100s
+    Cost:         115 &times; $2/hr &times; 24hr &times; 30 days = $166K/month</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 900 550" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block;" font-family="system-ui, -apple-system, sans-serif" font-size="13">
+          <defs>
+            <marker id="arr-fd" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+              <path d="M0,0 L10,3.5 L0,7z" fill="#64748b"/>
+            </marker>
+          </defs>
+
+          <!-- Request Queue -->
+          <rect x="310" y="10" width="280" height="44" rx="22" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+          <text x="450" y="28" text-anchor="middle" font-weight="bold" fill="#7c3aed">Request Queue</text>
+          <text x="450" y="44" text-anchor="middle" font-size="11" fill="#64748b">2,778 peak req/sec</text>
+          <line x1="450" y1="54" x2="450" y2="74" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+
+          <!-- Scheduler -->
+          <rect x="250" y="74" width="400" height="48" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+          <text x="450" y="94" text-anchor="middle" font-weight="bold" fill="#7c3aed">Scheduler</text>
+          <text x="450" y="110" text-anchor="middle" font-size="11" fill="#64748b">Continuous batching + chunked prefill (512 tokens/chunk)</text>
+
+          <!-- Fan-out to nodes -->
+          <line x1="300" y1="122" x2="150" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+          <line x1="450" y1="122" x2="450" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+          <line x1="600" y1="122" x2="750" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+
+          <!-- Node 1 -->
+          <rect x="50" y="160" width="200" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="150" y="182" text-anchor="middle" font-weight="bold" fill="#2563eb">Node 1: 4&times;H100</text>
+          <text x="150" y="200" text-anchor="middle" font-size="11" fill="#64748b">Llama-3 70B (INT8, TP=4)</text>
+
+          <!-- Draft GPU Node 1 -->
+          <rect x="60" y="218" width="180" height="28" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+          <text x="150" y="237" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">+ 1&times;H100: 8B Draft Model</text>
+
+          <!-- Node 2 -->
+          <rect x="350" y="160" width="200" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="450" y="182" text-anchor="middle" font-weight="bold" fill="#2563eb">Node 2: 4&times;H100</text>
+          <text x="450" y="200" text-anchor="middle" font-size="11" fill="#64748b">Llama-3 70B (INT8, TP=4)</text>
+
+          <!-- Draft GPU Node 2 -->
+          <rect x="360" y="218" width="180" height="28" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+          <text x="450" y="237" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">+ 1&times;H100: 8B Draft Model</text>
+
+          <!-- Node 23 -->
+          <rect x="650" y="160" width="200" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="750" y="182" text-anchor="middle" font-weight="bold" fill="#2563eb">Node 23: 4&times;H100</text>
+          <text x="750" y="200" text-anchor="middle" font-size="11" fill="#64748b">Llama-3 70B (INT8, TP=4)</text>
+
+          <!-- Draft GPU Node 23 -->
+          <rect x="660" y="218" width="180" height="28" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+          <text x="750" y="237" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">+ 1&times;H100: 8B Draft Model</text>
+
+          <!-- Ellipsis -->
+          <text x="300" y="195" text-anchor="middle" font-size="20" fill="#94a3b8">...</text>
+          <text x="600" y="195" text-anchor="middle" font-size="20" fill="#94a3b8">...</text>
+
+          <!-- Arrow down from Node 1 (representative) -->
+          <line x1="150" y1="246" x2="150" y2="276" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+
+          <!-- Per-Node Stack (centered, detailed) -->
+          <rect x="200" y="276" width="500" height="210" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+          <text x="450" y="296" text-anchor="middle" font-weight="bold" font-size="12" fill="#64748b">Per-Node Inference Stack</text>
+
+          <!-- PagedAttention -->
+          <rect x="220" y="306" width="460" height="34" rx="6" fill="#ccfbf1" stroke="#0891b2" stroke-width="1.5"/>
+          <text x="450" y="328" text-anchor="middle" font-weight="bold" fill="#0891b2">PagedAttention KV Cache Manager</text>
+          <text x="680" y="320" font-size="10" fill="#64748b">(eliminates fragmentation)</text>
+          <line x1="450" y1="340" x2="450" y2="352" stroke="#94a3b8" stroke-width="1" marker-end="url(#arr-fd)"/>
+
+          <!-- Flash Attention -->
+          <rect x="220" y="352" width="460" height="34" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="450" y="374" text-anchor="middle" font-weight="bold" fill="#2563eb">Flash Attention 2 Kernels</text>
+          <text x="680" y="366" font-size="10" fill="#64748b">(tiled SRAM compute)</text>
+          <line x1="450" y1="386" x2="450" y2="398" stroke="#94a3b8" stroke-width="1" marker-end="url(#arr-fd)"/>
+
+          <!-- INT8 Dequant -->
+          <rect x="220" y="398" width="460" height="34" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="450" y="420" text-anchor="middle" font-weight="bold" fill="#2563eb">INT8 Dequantize-on-the-Fly</text>
+          <text x="680" y="412" font-size="10" fill="#64748b">(70 GB weights, 2&times; speed)</text>
+          <line x1="450" y1="432" x2="450" y2="444" stroke="#94a3b8" stroke-width="1" marker-end="url(#arr-fd)"/>
+
+          <!-- Speculative -->
+          <rect x="220" y="444" width="460" height="34" rx="6" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+          <text x="450" y="466" text-anchor="middle" font-weight="bold" fill="#7c3aed">Speculative: Draft &rarr; Verify &rarr; Accept/Reject</text>
+          <text x="680" y="458" font-size="10" fill="#64748b">(2.7&times; decode speed)</text>
+
+          <!-- Output -->
+          <line x1="450" y1="486" x2="450" y2="500" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr-fd)"/>
+          <rect x="310" y="500" width="280" height="34" rx="17" fill="#dcfce7" stroke="#059669" stroke-width="1.5"/>
+          <text x="450" y="522" text-anchor="middle" font-weight="bold" fill="#059669">Stream Tokens via SSE</text>
+
+          <!-- Legend connecting line -->
+          <line x1="250" y1="276" x2="150" y2="276" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3"/>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Complete Optimization Stack</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Layer</th>
+                <th>Technique</th>
+                <th>Before</th>
+                <th>After</th>
+                <th>Improvement</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Caching</td>
+                <td>KV Cache</td>
+                <td>~110 sec/req (compute-bound)</td>
+                <td>~5.3 sec/req (memory-bound)</td>
+                <td>21&times; per request</td>
+              </tr>
+              <tr>
+                <td>Scheduling</td>
+                <td>Continuous Batching</td>
+                <td>~1.5 req/sec/node</td>
+                <td>3 req/sec/node</td>
+                <td>2&times;</td>
+              </tr>
+              <tr>
+                <td>Memory</td>
+                <td>PagedAttention</td>
+                <td>batch=16</td>
+                <td>batch=64</td>
+                <td>2&times; throughput</td>
+              </tr>
+              <tr>
+                <td>Compute</td>
+                <td>Flash Attention 2</td>
+                <td>2.8s prefill (32K)</td>
+                <td>1.0s</td>
+                <td>2.8&times;</td>
+              </tr>
+              <tr>
+                <td>Scheduling</td>
+                <td>Chunked Prefill</td>
+                <td>1s decode stall</td>
+                <td>26ms inter-token</td>
+                <td>p99 latency fixed</td>
+              </tr>
+              <tr>
+                <td>Weights</td>
+                <td>INT8 Quantization</td>
+                <td>10.4 ms/tok, batch=64</td>
+                <td>5.2 ms/tok, batch=128</td>
+                <td>2&times; decode, 2&times; batch</td>
+              </tr>
+              <tr>
+                <td>Decode</td>
+                <td>Speculative Decoding</td>
+                <td>5.2 ms/tok</td>
+                <td>1.9 ms/tok effective</td>
+                <td>2.7&times; latency</td>
+              </tr>
+              <tr style="font-weight:700;background:#f0fdf4;">
+                <td>Combined</td>
+                <td>&mdash;</td>
+                <td>0.009 req/sec/node</td>
+                <td>122 req/sec/node</td>
+                <td>~13,500&times;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Fleet Comparison</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Design</th>
+                <th>req/sec/node</th>
+                <th>Nodes</th>
+                <th>H100s</th>
+                <th>Monthly Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Naive (no KV cache, TP=2)</td>
+                <td>~0.009</td>
+                <td>309,000</td>
+                <td>618,000</td>
+                <td>$890M</td>
+              </tr>
+              <tr>
+                <td>+ KV Cache (static batching)</td>
+                <td>~1.5</td>
+                <td>1,852</td>
+                <td>7,408</td>
+                <td>$10.7M</td>
+              </tr>
+              <tr>
+                <td>+ Continuous Batching</td>
+                <td>3</td>
+                <td>926</td>
+                <td>3,704</td>
+                <td>$5.3M</td>
+              </tr>
+              <tr>
+                <td>+ PagedAttention</td>
+                <td>12</td>
+                <td>232</td>
+                <td>928</td>
+                <td>$1.34M</td>
+              </tr>
+              <tr>
+                <td>+ Flash Attn + Chunked Prefill</td>
+                <td>12 (+ latency fix)</td>
+                <td>232</td>
+                <td>928</td>
+                <td>$1.34M</td>
+              </tr>
+              <tr>
+                <td>+ INT8 Quantization</td>
+                <td>47</td>
+                <td>59</td>
+                <td>236</td>
+                <td>$340K</td>
+              </tr>
+              <tr style="font-weight:700;background:#f0fdf4;">
+                <td>+ Speculative Decoding</td>
+                <td>122</td>
+                <td>23</td>
+                <td>115</td>
+                <td>$166K</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>From 618,000 GPUs ($890M/month) to 115 GPUs ($166K/month)</strong> &mdash; a 5,374&times; cost reduction &mdash; through six software and algorithmic optimizations. KV caching is the foundational enabler; each subsequent technique addresses a different bottleneck (scheduling, memory management, memory bandwidth, compute, decode parallelism). Every technique described here is deployed in production systems today (vLLM, TensorRT-LLM, TGI).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="key-takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+
+      <ol class="full-width" style="line-height:1.7;">
+        <li><strong>Start with the bottleneck.</strong> LLM decode is memory-bandwidth-bound. Every optimization in this scenario targets one of three strategies: (a) reducing bytes loaded per step (quantization), (b) amortizing the load across more useful tokens (batching, PagedAttention), or (c) producing more tokens per load (speculative decoding).</li>
+        <li><strong>KV cache is the enabling trick AND the central challenge.</strong> It turns O(n&sup2;) recomputation into O(n) cached lookup, but the cache itself grows linearly with sequence length &times; batch size and becomes the memory bottleneck. Managing this cache efficiently (PagedAttention) is the single highest-ROI serving optimization.</li>
+        <li><strong>PagedAttention is the answer you give in every inference interview.</strong> It is pure software &mdash; no quality loss, no hardware changes &mdash; and it roughly doubles serving capacity by eliminating memory fragmentation. This is why vLLM became the default serving framework.</li>
+        <li><strong>Quantization is the highest-ROI for cost.</strong> INT8 halves weight memory, doubles decode speed, AND frees memory for larger batches &mdash; a triple win for less than 1% quality degradation. It is the single largest cost reduction in the stack.</li>
+        <li><strong>Speculative decoding breaks the 1-token-per-step wall.</strong> Verification is parallel (same cost as generating 1 token). The draft model's acceptance rate &alpha; determines the speedup: 1/(1&minus;&alpha;). The output distribution is mathematically lossless.</li>
+        <li><strong>Flash Attention + Chunked Prefill are about tail latency, not throughput.</strong> They don't increase steady-state req/sec, but they prevent catastrophic p99 spikes when long-context requests arrive. Without them, a single 32K-token request stalls every other user for a full second.</li>
+        <li><strong>Layer the optimizations.</strong> Each technique addresses a different bottleneck (scheduling, memory management, memory bandwidth, compute, decode parallelism). Combined, they compound multiplicatively: 3&times; (batching) &times; 4&times; (paging) &times; 4&times; (quantization) &times; 2.7&times; (speculative) &asymp; 130&times;, plus the latency fixes from Flash Attention and chunked prefill that make the system production-ready.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+
+      <div class="topic-grid full-width">
+        <a href="../llm-inference.html" class="card topic-card">
+          <h3>LLM Inference</h3>
+          <p>Deep dive into every technique mentioned here &mdash; attention mechanisms, KV cache internals, quantization methods, and serving frameworks.</p>
+        </a>
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>Cache eviction strategies (LRU, LFU, ARC) parallel KV cache management. PagedAttention borrows directly from OS page replacement.</p>
+        </a>
+        <a href="../os-concepts.html" class="card topic-card">
+          <h3>OS Concepts</h3>
+          <p>Virtual memory and paging &mdash; the direct inspiration for PagedAttention's block-based memory management.</p>
+        </a>
+        <a href="../load-balancing.html" class="card topic-card">
+          <h3>Load Balancing</h3>
+          <p>Request routing to GPU nodes, least-connections for uneven request sizes, and health checking inference servers.</p>
+        </a>
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>Token streaming architecture, backpressure handling, and request queuing for bursty inference traffic.</p>
+        </a>
+        <a href="../rate-limiting.html" class="card topic-card">
+          <h3>Rate Limiting</h3>
+          <p>Per-user and per-tier throttling for inference APIs &mdash; token bucket for request rate, sliding window for token budget.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+
+</body>
+</html>

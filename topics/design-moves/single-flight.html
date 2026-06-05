@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Single-Flight on Miss — Design Move</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="index.html">Design Moves</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Single-Flight on Miss</h1>
+      <p class="hero-subtitle">When N concurrent requests miss the same key, only one fetches; the rest wait or get stale-while-revalidate. The canonical defense against cache stampede, dogpile, and any "thundering herd to a slow origin" pattern. This is a source-of-truth page; scenarios link here instead of redefining the move.</p>
+      <p class="hero-meta">~6 min reference</p>
+    </div>
+  </section>
+
+  <!-- Trigger conditions -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Reach for It (the Trigger)</h2>
+      <p>You should recognize this move from the <em>shape of the bottleneck</em>, not from the name of the system. The trigger is any of:</p>
+      <ul>
+        <li><strong>Read-heavy + power-law + cacheable origin.</strong> A hot key's TTL expires; the next millisecond, every reader misses simultaneously and stampedes the origin. The origin's QPS for one key jumps from 1/TTL to N · QPS<sub>read</sub>.</li>
+        <li><strong>Slow or expensive origin.</strong> Origin call costs &gt; 100 ms or &gt; $0.001/call (e.g., LLM inference, ML feature compute, full-text search backend, S3 GET). The cost of N parallel origin calls dwarfs the cost of N − 1 waits.</li>
+        <li><strong>Idempotent fetch.</strong> The origin call is read-only or naturally idempotent — the answer doesn't depend on which caller asked.</li>
+        <li><strong>Coalescable result.</strong> The fetched value is small enough to broadcast to the waiting callers (not a streaming/chunked response).</li>
+      </ul>
+      <p>Negative trigger — <em>do not</em> reach for single-flight when:</p>
+      <ul>
+        <li>The fetch is per-caller (personalized, authenticated to the caller).</li>
+        <li>The origin is cheap (sub-ms in-process compute) — the lease overhead exceeds the saving.</li>
+        <li>You'd block on the slowest waiter and the SLO doesn't tolerate the lease-holder's latency.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Mechanism -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Mechanism (One Paragraph)</h2>
+      <p>On miss for key <code>k</code>, the cache atomically issues a <strong>lease token</strong> to the first caller (CAS / SETNX / Redis <code>SET NX EX</code>). The lease-holder fetches from origin and writes back to the cache. Concurrent callers for the same <code>k</code> see "lease pending" and either (a) wait (block on a Redis pub/sub or short-poll the cache) or (b) immediately return the previous stale value (<em>stale-while-revalidate</em>) and let the lease-holder refresh in the background. Lease has a short TTL (typ. 2–10 s) so a crashed lease-holder doesn't permanently block the key. Lease-holder must release the lease atomically on success or failure.</p>
+    </div>
+  </section>
+
+  <!-- Worked example -->
+  <section class="section">
+    <div class="container">
+      <h2>Worked Example: Cache Stampede Math</h2>
+      <p>Suppose a hot key (one celebrity profile) has read QPS = 50,000. Origin fetch latency = 200 ms. TTL = 60 s.</p>
+
+      <h3>Without single-flight</h3>
+      <pre><code class="language-text">At each TTL expiry:
+  Concurrent in-flight readers during the 200 ms fetch window:
+    50,000 QPS × 0.200 s = 10,000 readers all miss
+
+  All 10,000 issue origin GETs in parallel.
+    Origin sees a 10,000-RPS spike on this one key
+    (vs steady-state 1/60 = 0.017 RPS)
+    Spike multiplier = 10,000 / 0.017 = 600,000×
+
+  Origin must be sized for the spike, not the steady state.
+  If the origin can serve 1,000 RPS, the cache layer just DDoS'd it.</code></pre>
+
+      <h3>With single-flight (lease + wait)</h3>
+      <pre><code class="language-text">At each TTL expiry:
+  First miss acquires lease (Redis SET NX EX 5).
+  10,000 − 1 = 9,999 concurrent readers see lease present, wait on pub/sub.
+  Lease-holder fetches from origin (200 ms), writes to cache, publishes.
+  All 9,999 waiters wake, read from cache, return.
+
+  Origin sees: 1 RPS during the 200 ms window.
+  Worst-case latency for waiters: 200 ms (= origin latency, not origin × N).
+  Origin spike multiplier = 1 (vs 600,000× without).</code></pre>
+
+      <h3>With single-flight (stale-while-revalidate)</h3>
+      <pre><code class="language-text">At TTL expiry, instead of evicting, mark "stale, refresh-in-progress."
+  First miss acquires lease and refreshes in background.
+  9,999 concurrent readers get the *stale* value immediately (zero added latency).
+  When refresh completes (200 ms later), cache flips to the new value.
+
+  Origin spike: 1 RPS.
+  Reader p99 latency: unchanged from cache hit case.
+  Cost: readers see up to 200 ms-old data during the refresh window.</code></pre>
+    </div>
+  </section>
+
+  <!-- Alternatives -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Alternatives Considered</h2>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Alternative</th><th>Mechanism</th><th>Why pick it</th><th>Why <em>not</em> pick it</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Single-flight (lease + wait)</strong></td>
+            <td>First miss locks; others wait.</td>
+            <td>Strong correctness; one origin call per TTL.</td>
+            <td>Waiters absorb origin latency; lease-holder death blocks for TTL.</td>
+          </tr>
+          <tr>
+            <td><strong>Stale-while-revalidate</strong></td>
+            <td>Serve stale; one background refresh.</td>
+            <td>Zero added p99; ideal for cacheable read-mostly content.</td>
+            <td>Up to TTL of staleness visible. Unacceptable for strong-consistency reads.</td>
+          </tr>
+          <tr>
+            <td><strong>Refresh-ahead</strong></td>
+            <td>Background job refreshes before TTL expires.</td>
+            <td>No miss ever happens for predictably hot keys.</td>
+            <td>Wastes refresh budget on keys that won't be read again. Pair with hot-key detector.</td>
+          </tr>
+          <tr>
+            <td><strong>Probabilistic early expiration</strong></td>
+            <td>Each reader independently rolls a die to refresh slightly before TTL.</td>
+            <td>No coordination needed; works without a lease store.</td>
+            <td>Doesn't bound origin RPS — just smooths the spike. Not enough at extreme scale.</td>
+          </tr>
+          <tr>
+            <td><strong>Negative caching only</strong></td>
+            <td>Cache "miss" with short TTL.</td>
+            <td>Defends against floods of invalid keys, not stampedes on valid hot keys.</td>
+            <td>Solves a different problem. Often deployed <em>alongside</em> single-flight.</td>
+          </tr>
+          <tr>
+            <td><strong>Do nothing; over-provision origin</strong></td>
+            <td>Size origin for the worst-case stampede.</td>
+            <td>Simplest; works for cheap origins.</td>
+            <td>Cost. For a $0.01-per-call origin and 10,000× spikes, this is the company's biggest line item.</td>
+          </tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Pitfalls -->
+  <section class="section">
+    <div class="container">
+      <h2>What Breaks (and How to Recognize It in a Design)</h2>
+      <ul>
+        <li><strong>Lease-holder death.</strong> Lease TTL is your bound on how long a key can be blocked. Pick TTL = 2× expected fetch latency; on TTL expiry, next caller acquires a fresh lease.</li>
+        <li><strong>Lease store is itself a stampede target.</strong> Single-flight requires an atomic CAS — typically Redis. If every miss in your fleet hits one Redis key, you've moved the stampede from origin to Redis. Mitigate by making the lease store the same shard as the cache value (one round-trip, one node).</li>
+        <li><strong>Wait queue unboundedness.</strong> Waiters can pile up indefinitely if origin hangs. Cap waiter count per key; shed beyond cap with 503 + Retry-After.</li>
+        <li><strong>Wrong granularity.</strong> Lease per <em>key</em> is correct. Lease per <em>endpoint</em> serializes unrelated requests. Lease per <em>caller</em> defeats the purpose.</li>
+        <li><strong>Personalization sneaks in.</strong> The day someone adds a per-caller header to the cache key, single-flight stops coalescing because every caller has a unique key. Audit cache key composition when adding new request dimensions.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Per-node complexity -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Per-Node Complexity</h2>
+      <ul>
+        <li><strong>Lease acquire:</strong> O(1) — single CAS.</li>
+        <li><strong>Wait:</strong> O(1) memory per waiter (one pub/sub subscription); O(0) origin cost.</li>
+        <li><strong>Origin call amplification:</strong> N concurrent readers → 1 origin call (vs N without).</li>
+        <li><strong>Steady-state lease overhead:</strong> 2 extra Redis ops per miss (acquire + release). Negligible vs origin call.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Where it appears -->
+  <section class="section">
+    <div class="container">
+      <h2>Where It Appears (Cross-References)</h2>
+      <p>Scenario pages whose iteration arc reaches for this move:</p>
+      <ul>
+        <li><a href="../scenarios/21-distributed-cache.html">21-distributed-cache</a> — canonical cache stampede defense; the <a href="../scenarios/21-distributed-cache.html#hot-key-iteration">hot-key iteration</a> combines it with hot-key replication.</li>
+        <li><a href="../scenarios/27-thundering-herd.html">27-thundering-herd</a> — the named pathology this move defends against.</li>
+        <li><a href="../scenarios/41-home-timeline-fanout.html">41-home-timeline-fanout</a> — celebrity timeline assembly on cache miss.</li>
+        <li><a href="../scenarios/45-autocomplete-suggest.html">45-autocomplete-suggest</a> — edge POP cache miss for hot prefix.</li>
+      </ul>
+      <p>Closely related design moves:</p>
+      <ul>
+        <li><a href="refresh-ahead.html">Refresh-ahead</a> — proactive variant; pairs with single-flight via hot-key detection.</li>
+        <li><a href="negative-caching.html">Negative caching</a> — orthogonal defense against invalid-key floods.</li>
+        <li><a href="hedged-requests.html">Hedged requests</a> — opposite end of the spectrum (issue <em>more</em> requests to cut tail latency on slow backends).</li>
+      </ul>
+      <p>Foundational pages:</p>
+      <ul>
+        <li><a href="../caching.html">Caching</a> — the substrate this move sits on.</li>
+        <li><a href="../canonicals/access-patterns.html#power-law">Access patterns: power-law</a> — the trigger condition.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Self-check -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Self-Check (Did You Learn the Move, or Just Read It?)</h2>
+      <ol>
+        <li>Without rereading: what is the <em>signal in the bottleneck numbers</em> that tells you to reach for single-flight (not just "I cached and there's still load")?</li>
+        <li>What is the upper bound on how long a key can be blocked, and what parameter sets it?</li>
+        <li>Name two production systems where you'd pick stale-while-revalidate over lease-and-wait, and one where you must pick lease-and-wait.</li>
+        <li>You've added a <code>X-User-Region</code> header to the cache key for personalization. What just happened to the move's effectiveness, and how would you detect it?</li>
+        <li>Single-flight moves the stampede from origin to ___. What's the mitigation?</li>
+      </ol>
+    </div>
+  </section>
+
+</body>
+</html>

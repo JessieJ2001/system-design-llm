@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K16 — Batch-Inference Pipelines — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K16 &mdash; Batch-Inference Pipelines <span style="font-weight:400;font-size:.55em;color:#64748b;">(the inverted roofline: throughput is the only goal)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable</em> offline/bulk generation pipeline (eval, labeling, synthetic data, embedding backfill) &mdash; where there is <em>no latency SLO</em> and GPU throughput is the only goal &mdash; by inverting every online assumption (push the batch far past <code>B*</code> so decode is compute-bound at peak MFU), running it on the cheapest capacity, and surviving multi-hour preemptible jobs?</strong> This page derives the inverted roofline, then D29 (checkpoint/straggler/spot resilience) and D44 (batch on the online fleet&rsquo;s idle troughs &mdash; the economic core).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; the same engine as <a href="K4_continuous-batching-and-scheduling.html">K4</a> at the <em>opposite</em> operating point &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K4_continuous-batching-and-scheduling.html">K4</a> / <a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> / <a href="K14_quantization.html">K14</a> &bull; <strong>the inverted roofline is derived here</strong> from K1&rsquo;s <code>B*</code>/MFU &bull; dedicated scenario: <strong>L6</strong> &bull; ~16 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the inverted-roofline chain). Approve / redirect the arc, the <strong>inverted-roofline derivation</strong>, deep-dive placement (<strong>D29 offline-batch resilience; D44 batch-on-idle-troughs &mdash; the economic core</strong>), the <strong>rule-11 operating-point spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Throughput (tokens/s) (primary)</strong> &mdash; remove the latency SLO &rArr; push the batch far past <code>B*</code> &rArr; N&times; the online tokens/s on the <em>same</em> GPU.</li>
+          <li><strong>MFU</strong> &mdash; past the compute-bound ridge decode runs at peak MFU (the inverted roofline).</li>
+          <li><strong>Cost-shape ($/job)</strong> &mdash; run on the cheapest capacity (spot, or the online fleet&rsquo;s idle troughs at &asymp; marginal cost &mdash; D44).</li>
+          <li><strong>Explicitly NOT per-request TTFT / TPOT</strong> &mdash; there is no per-request latency SLO; stating this is the whole point of the page (the inversion).</li>
+          <li><strong>Makespan (job completion time) (constraint, not free)</strong> &mdash; the per-request SLO is replaced by a <em>job-level deadline</em>; it bounds scale-out degree and the capacity tier (D44), it is not infinite.</li>
+          <li><strong>Determinism (for eval jobs)</strong> &mdash; batch-size-dependent FP nondeterminism (<a href="K17_attention-kernels-and-cuda-graphs.html#d10">K17/D10</a>) corrupts &ldquo;did the model improve or did the batch change?&rdquo; &mdash; an eval-batch gate alongside accuracy.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> With no <em>per-request</em> latency SLO (a job makespan deadline replaces it) every online assumption inverts: push the batch until HBM-limited (decode becomes compute-bound, MFU &rarr; peak), exploit what online can&rsquo;t &mdash; length-sort the whole dataset and reuse the one shared prefix &mdash; quantize aggressively (only the offline accuracy/determinism gate binds), run prefill-heavy; then run it on the cheapest capacity <em>and</em> the cheapest GPU type &mdash; spot, or the online fleet&rsquo;s idle troughs at lowest priority &mdash; and survive the multi-hour preemptible job with checkpoint/resume.</p>
+      <ul>
+        <li><strong>Is:</strong> the inverted roofline derived from K1&rsquo;s <code>B*</code>/MFU; D29 (offline-batch resilience &mdash; checkpoint/resume, straggler mitigation, spot-interruption mid-batch); D44 (batch on the online fleet&rsquo;s idle troughs / preemptible co-tenancy &mdash; the economic core: consume only otherwise-wasted GPU-hours); the operating-point rule-11 spectrum.</li>
+        <li><strong>Is not:</strong> the online latency-SLO scheduler (<a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; K16 is the <em>no-SLO inversion</em> of the same engine); the DAG <em>orchestration engine</em> (Airflow / Dagster / Flyte &mdash; data-eng; <strong>K16 owns each GPU stage&rsquo;s operating point and the fuse-vs-materialize composition, the workflow scheduler that runs the DAG is out</strong>) and non-GPU stages (CPU dedup/filter/SQL &mdash; data-eng); training-data generation <em>as training</em> (training-side &mdash; serving the generation is here, the training that consumes it is not).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The <code>B*</code>/MFU roofline the inversion is read against is <a href="K1_serving-fundamentals.html#roofline">K1</a>&rsquo;s &mdash; this page <em>reads it past the ridge</em>, it does not re-derive it. The scheduler/engine is <a href="K4_continuous-batching-and-scheduling.html">K4</a>&rsquo;s (low-priority preemptible scheduling + chunked prefill = the D44 mechanism); fleet-level priority/placement and spot are <a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a>&rsquo;s; aggressive quant is <a href="K14_quantization.html">K14</a>&rsquo;s (here it is ~free &mdash; only the D16 accuracy gate binds, no latency A/B); spot interruption as an induced fault is <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a>&rsquo;s. <strong>This page owns the operating-point inversion, the per-stage roofline + fuse-vs-materialize composition of a multi-stage GPU DAG, batch-job resilience (D29), and the trough-economics (D44) &mdash; nothing else.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Batch-Inference Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>Offline/bulk generation where throughput is the goal and there is no <em>per-request</em> latency SLO &mdash; but there <em>is</em> a job-level makespan deadline</strong> (the dataset must be done before the next training run / the 6&nbsp;am report). The deadline, not &ldquo;infinite patience&rdquo;, is the real time constraint (eval, labeling, synthetic data, embedding backfill).</li>
+        <li>&rarr; <strong>invert every online assumption</strong>: max batch &amp; MFU, no per-request latency, aggressive quant, prefill-heavy.</li>
+        <li><strong>The workload shape sets the operating point</strong> (not &ldquo;remove the SLO&rdquo; alone): prefill-heavy jobs (classification / extraction / scoring / LLM-as-judge &mdash; long in, short out) are <em>already</em> compute-bound at <code>B=1</code>; decode-heavy jobs (synthetic-data / long-form gen) stay memory-bound until <code>B</code> is pushed up. <em>What binds</em> decides what &ldquo;max batch&rdquo; buys.</li>
+        <li><strong>And there isn&rsquo;t one stage</strong> &mdash; batch jobs are often GPU DAGs (embed&rarr;generate&rarr;judge, encode(ViT)&rarr;generate), each stage a <em>different</em> roofline &rarr; run each at its own operating point / precision / GPU type, then decide <strong>fuse</strong> (overlapped, with per-stage fleets sized to balance throughput &mdash; min-stage is the bottleneck) <strong>vs materialize</strong> (independent, separately-tuned, separately-resumable per-stage jobs; the materialised intermediate <em>is</em> a free D29 stage-boundary checkpoint).</li>
+        <li><strong>The inverted roofline (per stage):</strong> push <code>B</code> past <code>B*</code> &rarr; decode becomes compute-bound &rarr; MFU &rarr; peak &rArr; N&times; the online tokens/s on the same GPU.</li>
+        <li><strong>Offline you hold the entire dataset &rarr; length-sort &amp; bucket into homogeneous batches</strong> &mdash; kills the ragged-batch / decode-convoy MFU loss online serving structurally <em>cannot</em> avoid (it can&rsquo;t see future requests). The single biggest offline-only throughput lever.</li>
+        <li><strong>One shared prefix covers the whole dataset</strong> &mdash; the same system / rubric / few-shot prompt prepends every row &rarr; compute its KV <strong>once</strong>, reuse it for every request (<a href="K2_kv-cache.html">K2</a> Role&nbsp;2). For prefill-heavy batch this is the dominant cost lever, not batch size.</li>
+        <li>&rarr; run it on the <strong>cheapest capacity</strong> (spot, or the online fleet&rsquo;s idle troughs at lowest priority) <em>and the <strong>cheapest GPU type</strong></em> (batch optimises tokens/$, so an older/cheaper SKU often wins &mdash; the opposite of latency-bound online), subject to <strong>spot capacity availability</strong> (multi-region/cloud chase + on-demand fallback when spot is unobtainable).</li>
+        <li><strong>Problem:</strong> multi-hour jobs on preemptible hardware &mdash; an interruption at hour 5 loses everything; one slow shard gates the job.</li>
+        <li>&rarr; <strong>checkpoint/resume + straggler mitigation + spot-interruption handler, with exactly-once output on resume</strong> (D29).</li>
+        <li><strong>The economic win:</strong> <em>filling idle GPU-hours</em>, not buying new ones &mdash; batch as the lowest-priority co-tenant on the online fleet&rsquo;s troughs (D44).</li>
+        <li><strong>Objective:</strong> maximise tokens/$ <em>within the job deadline</em>, at the most aggressive operating point that still passes the <em>offline</em> accuracy gate (and, for eval jobs, the <strong>determinism gate</strong> &mdash; batch-size-dependent FP nondeterminism, <a href="K17_attention-kernels-and-cuda-graphs.html#d10">K17/D10</a>, makes &ldquo;did the model improve or did the batch change?&rdquo; unanswerable).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>no per-request SLO but a job makespan deadline &rarr; invert every online assumption &rarr; the workload shape (prefill- vs decode-heavy) sets what binds &rarr; the job is often a multi-stage GPU DAG, each stage its own roofline: fuse vs materialize &rarr; the inverted roofline (per stage): B past B* &rarr; compute-bound, peak MFU &rarr; offline-only lever: length-sort &amp; bucket the whole dataset &rarr; shared-prefix lever: compute the one dataset-wide prefix once (K2 Role 2) &rarr; run on the cheapest capacity AND cheapest GPU type &rarr; problem: multi-hour preemptible jobs lose work + stragglers &rarr; checkpoint/resume + straggler + spot-handler + exactly-once (D29) &rarr; economic core: fill idle GPU-hours not buy new (D44) &rarr; objective: max tokens/$ within the deadline, passing the offline accuracy + (eval) determinism gate</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 1020" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="210" y="16" width="820" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Offline/bulk generation &mdash; no per-request latency SLO, but a job makespan deadline</text>
+        <text class="s" x="620" y="58" text-anchor="middle">eval &middot; labeling &middot; synthetic data &middot; embedding backfill &mdash; throughput within a deadline &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="100"/>
+        <text class="l" x="636" y="90">invert</text>
+
+        <rect class="bp" x="250" y="100" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="124" text-anchor="middle">Invert every online assumption</text>
+        <text class="s" x="620" y="142" text-anchor="middle">max batch &amp; MFU &middot; no per-request latency &middot; aggressive quant &middot; prefill-heavy &middot; §2</text>
+
+        <line x1="620" y1="156" x2="620" y2="184"/>
+        <text class="l" x="636" y="174">what binds?</text>
+
+        <rect class="bp" x="210" y="184" width="820" height="56" rx="8"/>
+        <text class="t" x="620" y="208" text-anchor="middle">Workload shape sets the operating point</text>
+        <text class="s" x="620" y="226" text-anchor="middle">prefill-heavy (already compute-bound, B=1) vs decode-heavy (needs max batch) &middot; §2</text>
+
+        <line x1="620" y1="240" x2="620" y2="268"/>
+        <text class="l" x="636" y="258">one stage? or many?</text>
+
+        <rect class="bp" x="190" y="268" width="860" height="56" rx="8"/>
+        <text class="t" x="620" y="292" text-anchor="middle">Often a multi-stage GPU DAG &mdash; each stage its own roofline</text>
+        <text class="s" x="620" y="310" text-anchor="middle">fuse (balanced per-stage fleets) vs materialize (independent jobs; free checkpoint) &middot; §2</text>
+
+        <line x1="620" y1="324" x2="620" y2="352"/>
+        <text class="l" x="636" y="342">inverted roofline (per stage)</text>
+
+        <rect class="bp" x="250" y="352" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="376" text-anchor="middle">Push B past B* &rarr; decode compute-bound &rarr; MFU &rarr; peak (per stage)</text>
+        <text class="s" x="620" y="394" text-anchor="middle">N&times; the online tokens/s on the SAME GPU (K1 B*/MFU) &middot; §2</text>
+
+        <line x1="620" y1="408" x2="620" y2="436"/>
+        <text class="l" x="636" y="426">offline-only lever</text>
+
+        <rect class="bp" x="210" y="436" width="820" height="56" rx="8"/>
+        <text class="t" x="620" y="460" text-anchor="middle">Hold the whole dataset &rarr; length-sort &amp; bucket into homogeneous batches</text>
+        <text class="s" x="620" y="478" text-anchor="middle">kills the ragged-batch / decode-convoy MFU loss online can&rsquo;t avoid &middot; §2</text>
+
+        <line x1="620" y1="492" x2="620" y2="520"/>
+        <text class="l" x="636" y="510">shared-prefix lever</text>
+
+        <rect class="bp" x="210" y="520" width="820" height="56" rx="8"/>
+        <text class="t" x="620" y="544" text-anchor="middle">One shared prefix covers the whole dataset &rarr; compute its KV once, reuse</text>
+        <text class="s" x="620" y="562" text-anchor="middle">same system/rubric/few-shot prompt every row &mdash; K2 Role 2 (dominant prefill lever) &middot; §2</text>
+
+        <line x1="620" y1="576" x2="620" y2="604"/>
+        <text class="l" x="636" y="594">cheapest capacity</text>
+
+        <rect class="bp" x="210" y="604" width="820" height="56" rx="8"/>
+        <text class="t" x="620" y="628" text-anchor="middle">Run on the cheapest capacity AND the cheapest GPU type (per stage)</text>
+        <text class="s" x="620" y="646" text-anchor="middle">spot / idle troughs, lowest priority; older/cheaper SKU; multi-region + on-demand fallback &middot; §3</text>
+
+        <line x1="620" y1="660" x2="620" y2="688"/>
+        <text class="l" x="636" y="678">problem</text>
+
+        <rect class="bd" x="250" y="688" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="712" text-anchor="middle">Multi-hour preemptible jobs lose work; one slow shard gates the job</text>
+        <text class="s" x="620" y="730" text-anchor="middle">spot pull at hour 5 = restart from zero (catastrophic) &middot; §3</text>
+
+        <line x1="620" y1="744" x2="620" y2="772"/>
+        <text class="l" x="636" y="762">fix (D29)</text>
+
+        <rect class="bs" x="230" y="772" width="780" height="56" rx="8"/>
+        <text class="t" x="620" y="796" text-anchor="middle">D29 &mdash; checkpoint/resume + straggler mitigation + spot-handler</text>
+        <text class="s" x="620" y="814" text-anchor="middle">exactly-once output on resume &middot; interval &asymp; &radic;(2&middot;ckpt_cost / interrupt_rate) &middot; §3</text>
+
+        <line x1="620" y1="828" x2="620" y2="856"/>
+        <text class="l" x="636" y="846">economic core (D44)</text>
+
+        <rect class="bs" x="230" y="856" width="780" height="56" rx="8"/>
+        <text class="t" x="620" y="880" text-anchor="middle">D44 &mdash; batch on the online fleet&rsquo;s idle troughs (preemptible co-tenancy)</text>
+        <text class="s" x="620" y="898" text-anchor="middle">consume only wasted GPU-hours at &asymp; marginal cost &middot; §3</text>
+
+        <line x1="620" y1="912" x2="620" y2="940"/>
+
+        <rect class="bc" x="260" y="940" width="720" height="64" rx="8"/>
+        <text class="t" x="620" y="964" text-anchor="middle">Objective: max tokens/$ within the job deadline</text>
+        <text class="s" x="620" y="982" text-anchor="middle">most aggressive point passing the OFFLINE accuracy + (eval) determinism gate &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; offline/bulk generation; no <em>per-request</em> latency SLO, but a job-level makespan deadline (eval / labeling / synthetic data / embedding backfill).</li>
+        <li><span class="bp">&#9313;</span> <strong>Invert</strong> &mdash; every online assumption flips: max batch &amp; MFU, no per-request latency, aggressive quant, prefill-heavy.</li>
+        <li><span class="bp">&#9314;</span> <strong>Workload shape</strong> &mdash; prefill-heavy (long in / short out &mdash; already compute-bound at B=1) vs decode-heavy (needs the max batch); what binds sets the operating point.</li>
+        <li><span class="bp">&#9315;</span> <strong>Multi-stage GPU DAG</strong> &mdash; not one stage: embed&rarr;generate&rarr;judge / encode&rarr;generate, each a different roofline &rarr; per-stage operating point + <strong>fuse</strong> (balanced per-stage fleets) <strong>vs materialize</strong> (independent jobs; the intermediate is a free D29 checkpoint).</li>
+        <li><span class="bp">&#9316;</span> <strong>Inverted roofline (per stage)</strong> &mdash; B past <code>B*</code> &rarr; decode compute-bound &rarr; peak MFU &rArr; N&times; tokens/s, same GPU (K1).</li>
+        <li><span class="bp">&#9317;</span> <strong>Length-sort &amp; bucket</strong> &mdash; offline holds the whole dataset &rarr; sort by length, form homogeneous batches &rarr; kill the ragged-batch/convoy loss online can&rsquo;t avoid.</li>
+        <li><span class="bp">&#9318;</span> <strong>Shared-prefix lever</strong> &mdash; one dataset-wide system/rubric/few-shot prefix &rarr; compute its KV once, reuse for every row (<a href="K2_kv-cache.html">K2</a> Role 2) &mdash; dominant prefill-heavy cost lever.</li>
+        <li><span class="bp">&#9319;</span> <strong>Cheapest capacity &amp; GPU type</strong> &mdash; spot / idle troughs at lowest priority (K4 preemption + K15 priority); older/cheaper SKU per stage; multi-region + on-demand fallback.</li>
+        <li><span class="bd">&#9320;</span> <strong>Problem</strong> &mdash; multi-hour preemptible jobs lose work on interruption; a straggler shard gates the job.</li>
+        <li><span class="bs">&#9321;</span> <strong>D29</strong> &mdash; checkpoint/resume + straggler mitigation + spot-interruption handler + exactly-once output on resume; the &radic; checkpoint-interval optimum.</li>
+        <li><span class="bs">&#9322;</span> <strong>D44</strong> &mdash; the economic core: batch as the lowest-priority co-tenant on idle troughs &rarr; &asymp; marginal cost.</li>
+        <li><span class="bc">&#9323;</span> <strong>Objective</strong> &mdash; max tokens/$ within the job deadline, at the most aggressive point still passing the offline accuracy + (eval) determinism gate (rule 11).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> a huge class of GPU generation work &mdash; offline eval, dataset labeling, synthetic-data generation, embedding backfill &mdash; has <em>no</em> per-request latency SLO, only a total-throughput / cost target; running it on an online-tuned stack wastes most of the GPU because the online latency SLO caps the batch far below the compute-bound ridge. <b>Solution (what the page builds):</b> a pipeline that removes the latency constraint, runs the same engine at the opposite operating point (max batch, peak MFU, aggressive quant), on the cheapest capacity, and survives multi-hour preemptible execution.<span class="meta">number: online B_SLO &laquo; B* &rArr; the N&times; tokens/s gap on the trace (the throughput the page recovers) &mdash; cites K1 #roofline (B*/MFU) &middot; canonical: gpu-inference-cost-shapes.html ($ via filling idle GPU-hours)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where batch inference lives &mdash; the same K4 engine, opposite operating point (not a new engine)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader expects a different system; it is the <em>same</em> one. <b>Solution:</b> batch inference is the K4 continuous-batching engine with the latency SLO removed &mdash; nothing in the forward pass changes; what changes is the operating point (batch pushed to the HBM limit, quant aggressive, lowest scheduler priority). State this before any math (cite <a href="K4_continuous-batching-and-scheduling.html">K4</a> for the engine, <a href="K1_serving-fundamentals.html#roofline">K1</a> for the roofline it is read against).<span class="meta">no number (placement fact) &mdash; cites K4 (the engine), K1 #roofline (the ridge it is read past) &middot; diagram: the K4 engine with the &ldquo;latency SLO&rdquo; constraint struck out and the batch knob pushed past B*</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; one row online vs in a batch job</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> The canonical prompt T1 <code>&quot;I like cat, why?&quot;</code> is now <em>one row of a million-row labeling job</em>. <b>Online:</b> a TTFT/TPOT SLO caps the batch at <code>B_SLO &laquo; B*</code> &rarr; decode is memory-bound, MFU low &rarr; this row is generated at the online tokens/s. <b>In the batch job:</b> no latency SLO &rarr; this row sits in a batch of thousands pushed past <code>B*</code> &rarr; decode is compute-bound, MFU &rarr; peak &rArr; the <em>same</em> prompt on the <em>same</em> GPU completes at N&times; the aggregate tokens/s &mdash; purely by removing the latency constraint (its own wall-clock latency is irrelevant). Show with-vs-without explicitly on this row; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (rule-11 puts the operating-point numbers in) &middot; diagram: the row in a B_SLO batch (memory-bound, low MFU) vs in a B&gg;B* batch (compute-bound, peak MFU) on the K1 roofline</span></p>
+
+      <h3 id="derive">The inverted roofline (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> engineers carry online intuition (small batch, low MFU is &ldquo;normal&rdquo;) into batch work and leave most of the GPU idle. <b>Solution, derived:</b> (a) online &mdash; a latency SLO caps batch at <code>B_SLO &laquo; B*</code> &rArr; decode runs <em>below</em> the compute-bound ridge (memory-bound, low MFU); (b) batch &mdash; no latency SLO &rArr; push <code>B</code> until HBM-limited, far <em>past</em> <code>B*</code> &rArr; decode becomes <strong>compute-bound</strong>, MFU &rarr; peak; (c) therefore the same model on the same GPU does N&times; the tokens/s in batch mode purely by removing the latency constraint (cite <a href="K1_serving-fundamentals.html#roofline">K1 B*/MFU</a> &mdash; read past the ridge, not re-derived). This single inversion is <em>why</em> batch needs its own page, fleet posture, and scheduler stance.<span class="meta">number: B_SLO, B*, B_HBM and the resulting MFU_online vs MFU_batch &rarr; the N&times; on the trace &mdash; cites K1 #roofline &middot; diagram: the roofline with B_SLO (memory-bound) and B_HBM (compute-bound) both marked, the tokens/s gap shaded</span></p>
+
+      <h3 id="workload-shape">The workload shape sets the operating point (D &mdash; refines the roofline; not &ldquo;remove the SLO&rdquo; alone)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> &ldquo;push B past B* &rarr; decode compute-bound&rdquo; is <em>not</em> universal &mdash; it depends on the job&rsquo;s in/out token ratio, which engineers ignore. <b>Solution, derived:</b> (a) <strong>prefill-heavy</strong> jobs (classification / extraction / scoring / LLM-as-judge &mdash; long prompt, &le;few output tokens) are <em>already</em> compute-bound at <code>B=1</code>; the lever is <em>not</em> batch size but prefill MFU + the shared-prefix reuse below &mdash; max-batch barely moves it; (b) <strong>decode-heavy</strong> jobs (synthetic-data / long-form generation) stay memory-bound until <code>B</code> is pushed far up &mdash; here the inverted roofline is the whole story. State <em>what binds</em> first; the operating point follows from it (cite <a href="K1_serving-fundamentals.html#prefill">K1 #prefill</a>/<a href="K1_serving-fundamentals.html#roofline">#roofline</a>).<span class="meta">number: prefill-heavy (s_in&raquo;s_out) MFU at B=1 vs B=B_HBM (&asymp;flat) vs decode-heavy tokens/s at B_SLO vs B_HBM (N&times;) on the trace &mdash; cites K1 #prefill/#roofline &middot; diagram: two roofline points, prefill-heavy already at the ridge vs decode-heavy climbing to it</span></p>
+
+      <h3 id="multistage">The multi-stage GPU DAG &mdash; each stage its own roofline; fuse vs materialize (generalises D)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (generalises D &mdash; not one stage, N).</span> <b>Problem:</b> the page so far assumes <em>one</em> GPU stage, but real batch jobs are DAGs of GPU stages with <em>different rooflines</em> &mdash; embed&rarr;generate&rarr;judge (LLM-as-judge eval), encode(ViT)&rarr;generate (multimodal labeling), generate&rarr;score. One config / fleet / GPU-type is wrong for at least one stage, and if naively fused the whole pipeline runs at the <em>slowest</em> stage&rsquo;s throughput while the rest idle. <b>Solution:</b> run each stage at its <em>own</em> operating point (its own batch config, precision, and GPU type &mdash; encoder stage compute-bound on a cheap SKU, generate stage decode-bound on H100, judge stage a small model on a tiny GPU), then decide <strong>fuse vs materialize</strong>: <em>fuse</em> = keep intermediates on-GPU/in-memory, overlap stages behind a bounded-queue backpressure &mdash; highest utilisation <em>iff</em> per-stage fleets are sized so stage throughputs match (min-stage is the bottleneck); <em>materialize</em> = write each stage&rsquo;s output to storage and run the next as an independent, separately-tuned, separately-resumable job &mdash; the materialised intermediate <em>is</em> a free D29 stage-boundary checkpoint. <b>Crossover:</b> materialize when <code>roofline/SKU-mismatch idle-cost + coupled-failure cost &gt; intermediate storage + re-read I/O</code> &mdash; very different per-stage rooflines or long spot jobs &rArr; materialize; balanced, similar-roofline stages &rArr; fuse.<span class="meta">number: a 2-stage generate(decode-bound, H100)&rarr;judge(small model) job &mdash; naive-fused throughput = min(stage) vs balanced per-stage fleets vs materialized; the I/O-vs-idle crossover on the trace &mdash; cites K1 #roofline (per-stage), K6/K12 (encoder-stage roofline &mdash; rule of two), K15 #d43 (heterogeneous per-stage fleet/bin-packing), D29 (stage boundary = free checkpoint) &middot; real: Ray Data multi-stage GPU pipelines, NVIDIA NeMo-Curator, Spark-on-GPU, lm-eval-harness LLM-as-judge + URLs &middot; <b>scope:</b> the per-stage GPU operating point + fuse/materialize is K16; the DAG <em>orchestration engine</em> (Airflow/Dagster/Flyte) and non-GPU stages stay out (data-eng)</span></p>
+
+      <h3 id="length-sort">Length-sort &amp; bucket the whole dataset (B &mdash; the defining offline-only lever)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> a ragged batch of mixed-length requests wastes MFU to the wave-quantization / decode-convoy tail (a long generation holds slots while short ones drain &mdash; the K4 convoy); <em>online cannot avoid this</em> because it can&rsquo;t see future requests. <b>Solution:</b> offline you hold the <em>entire</em> dataset &rarr; sort by (predicted) length and bin into homogeneous batches so every batch drains together at near-peak occupancy &mdash; the single biggest batch-only throughput lever, structurally unavailable to online serving. Composes with output-length-unknown straggler handling (D29) and the K4 ragged-batch wave-balance (cite, don&rsquo;t re-derive).<span class="meta">number: MFU of a length-mixed batch vs a length-bucketed batch on the trace (the convoy loss recovered) &mdash; cites K4 (ragged-batch/convoy &mdash; rule of two), K1 (MFU) &middot; real: vLLM offline length-sorting, HF sortish sampler, Ray Data sort + URLs</span></p>
+
+      <h3 id="shared-prefix">The shared-prefix lever &mdash; one dataset-wide prefix, computed once (C &mdash; dominant prefill-heavy cost lever)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> a labeling / eval / scoring job prepends the <em>same</em> system + rubric + few-shot prompt (often 2&ndash;8k tokens) to every one of millions of rows; recomputing that prefill per row is the bulk of the GPU cost in a prefill-heavy job. <b>Solution:</b> compute the shared prefix&rsquo;s KV <strong>once</strong> and reuse it for every request (<a href="K2_kv-cache.html">K2</a> Role&nbsp;2 prefix reuse) &rArr; per-row prefill collapses to only the unique-suffix tokens; in batch the hit rate is &asymp;100% (the prefix is identical by construction), so this beats batch size as the prefill-heavy cost lever. <b>Crossover:</b> reuse pays whenever <code>shared_prefix_tokens &gt; unique_suffix_tokens</code> &mdash; i.e. essentially always for templated batch.<span class="meta">number: per-row prefill GPU-s with vs without shared-prefix reuse for a 4k-token rubric + 200-token row over 1 M rows &mdash; cites K2 Role 2 (mechanism; rule of two &mdash; K2 owns the cache), K1 #prefill (the saved FLOPs) &middot; real: vLLM/SGLang APC in offline mode + URLs</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where batch inference sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> A job runner shards the dataset into idempotent request keys, <em>length-sorted</em> (B) and prefixed by the one shared-prefix KV (C) &rarr; a <strong>dynamic work-stealing queue</strong> (not a static partition &mdash; a static shard + a straggler gates the job) feeds the K4 engine at lowest scheduler priority, on the <strong>cheapest GPU <em>type</em></strong> (batch is tokens/$-bound, so an older/cheaper SKU often beats the latency-optimal H100) on spot GPUs <em>or</em> the online fleet&rsquo;s idle replicas (D44); a checkpoint store records completed-row offsets; a spot-interruption handler drains+checkpoints on the ~30 s notice (ties <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a>). Spot is acquired across regions/clouds with an on-demand fallback when unobtainable.<span class="meta">no new number &mdash; cites K4 (engine + preemption + work-stealing/ragged-batch), K15 (spot/priority/multi-region placement, GPU-type selection), K22 (interruption = induced fault) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; job runner, sharded dataset, checkpoint store</strong>dataset &rarr; idempotent shards &rarr; K4 engine (lowest priority, spot/troughs) &rarr; checkpoint store; spot-interruption handler with the 30 s drain. Drawn after arc approval.</div>
+
+      <h3 id="d29" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D29 &mdash; offline-batch resilience: checkpoint / straggler / spot-interruption</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a 6-hour job on spot loses a node at hour 5 &rarr; restart-from-zero is catastrophic; and stragglers come in <em>two</em> kinds &mdash; a slow/failed <em>node</em>, and an unknown-length <em>generation</em> (the offline analog of K19&rsquo;s bimodal output-length problem) &mdash; either gates the whole job&rsquo;s completion. <b>Solution:</b> periodic checkpoint of completed-request offsets (resume from last checkpoint, not zero) + idempotent request keys with <strong>exactly-once output semantics on resume</strong> (re-emitted rows deduped on the idempotent key &mdash; double-counting silently corrupts an eval); node-straggler mitigation (speculative re-exec / work-stealing); length-straggler mitigation (predicted-length sort + a max-token cap); spot-interruption handler (drain + checkpoint on the ~30 s notice &mdash; ties <a href="K22_fault-tolerance-multi-gpu-inference.html#d23">D3/K22</a>). <b>Crossover:</b> checkpoint interval &asymp; <code>&radic;(2&middot;checkpoint_cost / interrupt_rate)</code> (the classic optimum) &mdash; too frequent = overhead, too rare = lost work.<span class="meta">number: 6 h job, 30 s spot notice, checkpoint every N &rarr; expected wasted work; the &radic; optimum on the trace &mdash; cites K1 (throughput for checkpoint_cost), K22 (interruption), K19 (output-length straggler &mdash; rule of two) &middot; real: Ray Data, Spark-on-GPU, AWS Batch, SkyPilot managed-spot + URLs</span></p>
+
+      <h3 id="d44" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D44 &mdash; batch on the online fleet&rsquo;s idle troughs (preemptible co-tenancy) &mdash; the economic core</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a dedicated batch fleet doubles GPU spend; the online fleet is 10:1 diurnal &rarr; huge idle troughs sit wasted. <b>Solution:</b> run batch as the <em>lowest-priority</em> tenant on the online fleet, instantly preemptible by interactive (<a href="K4_continuous-batching-and-scheduling.html">K4</a> preemption + <a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> priority) &rarr; batch consumes only otherwise-wasted GPU-hours at &asymp; marginal cost. <b>Crossover:</b> dedicated/spot-batch-fleet cost vs trough-capacity throughput net of preemption-churn overhead &mdash; when batch volume exceeds the troughs a dedicated/spot fleet wins; below it, co-tenancy is &asymp; free.<span class="meta">number: trough GPU-hours available at 10:1 vs batch volume &rarr; the crossover where a dedicated fleet wins &mdash; cites K1 (cost), K15 (priority/placement) &middot; real: harvest/defrag schedulers, borrowed-capacity batch + URLs &middot; cross-link L5 (its core cost lever)</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the operating-point spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> small-batch-FP16 (online-like &mdash; wastes batch&rsquo;s no-SLO freedom) &rarr; max-batch-FP8 (throughput-optimal default) &rarr; max-batch-INT4 + all-spot (cheapest; accuracy + interruption risk). Two-sided cliff: too conservative forfeits the no-SLO freedom; too aggressive trips the accuracy gate (<a href="K14_quantization.html#d16">K14/D16</a>) or the restart cost (D29). Pick the most aggressive point that passes the <em>offline</em> accuracy gate.<span class="meta">number: tokens/$ at each operating point on the trace, with the accuracy-gate floor &mdash; cites K1 (throughput), K14 #d16 (accuracy gate) &middot; real: vLLM/TRT-LLM offline mode, Ray Data batch + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Batch size:</b> push to the HBM limit (past B*) &mdash; capped by KV+activation memory (the K18/D46 prefill-activation OOM at huge batch &times; long prompt, not latency). <b>Precision:</b> the rule-11 operating point; floor = the offline accuracy <em>and</em> (eval) determinism gate. <b>Batch composition:</b> length-sorted &amp; bucketed (B) &mdash; cliff: too-coarse buckets re-introduce the convoy, too-fine buckets lose batch fill. <b>Shared-prefix reuse:</b> on whenever the templated prefix dominates (C). <b>GPU type:</b> the SKU maximising tokens/$ (often older/cheaper, the opposite of latency-bound online). <b>Checkpoint interval:</b> the D29 &radic; optimum. <b>Capacity tier:</b> troughs vs spot vs dedicated &mdash; the D44 crossover, bounded by the job deadline. <b>Scheduler priority:</b> lowest (preemptible by interactive). Each with its chosen value, reason, and cliff on each side.<span class="meta">numbers: per-knob crossover (composes with B / C / D29 / D44 / rule-11) &middot; cites K18 #d46 (activation-OOM cap), K17 #d10 (determinism gate)</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Run batch on the online-tuned stack as-is</b> &mdash; disq: the online latency-SLO caps the batch &rarr; leaves the N&times; on the table; <em>wins</em> never for pure batch (only if the job piggybacks transparently on live traffic with no separate run). (b) <b>A dedicated on-demand batch fleet</b> &mdash; disq: doubles GPU spend vs filling troughs; <em>wins</em> when batch volume durably exceeds the online fleet&rsquo;s troughs (the D44 crossover). (c) <b>All-spot dedicated</b> &mdash; disq: interruption risk + checkpoint overhead; <em>wins</em> for very large, latency-insensitive jobs where spot discount &gt; restart cost. (d) <b>Treat the whole multi-stage job as one fused fleet/config</b> &mdash; disq: stages have different rooflines &rarr; one config starves the mismatched stage and the pipeline runs at the slowest stage; <em>wins</em> only when stages are throughput-balanced and similar-roofline (else per-stage fleets / materialize &mdash; the multi-stage node). The DAG <em>orchestration engine</em> itself (Airflow/Dagster/Flyte) and non-GPU stages remain out of scope &mdash; flag that boundary precisely.<span class="meta">number: the crossover disqualifying each (N&times; for (a); trough vs volume for (b); spot-discount vs restart for (c); min-stage vs balanced/materialize for (d)) &mdash; cites K1, K15, D29 &middot; contrast L6 (dedicated home)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Restart-from-zero on spot pull</b> &mdash; no checkpoint &rarr; hours of GPU-work lost; first move: periodic offset checkpoint + idempotent keys (gpu-failure-modes.html &mdash; spot interruption). <b>Straggler shard gates the job</b> &mdash; one slow/failed shard holds the whole job&rsquo;s completion; first move: speculative re-exec / work-stealing (llm-bottlenecks.html). <b>Silent accuracy regression at aggressive quant</b> &mdash; the operating point trips the offline accuracy gate unnoticed; first move: the K14/D16 gate on a held-out eval set (gpu-inference-cost-shapes.html). <b>Batch starves interactive (priority inversion)</b> &mdash; batch not actually preempted by live traffic &rarr; online SLO breach; first move: strict lowest priority + instant preemption (gpu-failure-modes.html). <b>Trough disappears mid-job</b> &mdash; online burst reclaims all troughs &rarr; batch makes no progress; first move: fall back to spot/dedicated with checkpoint resume (llm-bottlenecks.html).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (straggler, trough-starvation), llm/canonicals/gpu-failure-modes.html (spot-pull restart, priority inversion), llm/canonicals/gpu-inference-cost-shapes.html (accuracy-gate trip) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> vLLM / TensorRT-LLM offline batch mode (max-batch, no-SLO), Ray Data + Ray Serve batch, Spark-on-GPU, AWS Batch, SkyPilot managed-spot (checkpoint/resume + spot orchestration), harvest/borrowed-capacity schedulers (trough co-tenancy). Each: which operating point / resilience strategy it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L6-embedding-retrieval-service.html">L6</a> (dedicated home &mdash; embedding backfill; D29 + D44 are its spine); <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (cost &mdash; filling troughs with batch is its core cost lever). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; the same engine; low-priority preemptible scheduling = the D44 mechanism; chunked prefill maximises batch MFU.</li>
+        <li><a href="K1_serving-fundamentals.html#roofline">K1</a> &mdash; the <code>B*</code>/MFU roofline the inversion is read past (not re-derived); #prefill for the workload-shape split (D).</li>
+        <li><a href="K2_kv-cache.html">K2</a> &mdash; Role&nbsp;2 prefix reuse: the one dataset-wide shared prefix is computed once and reused for every row (C; rule of two &mdash; K2 owns the cache).</li>
+        <li><a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> &mdash; the fleet-level priority/placement D44 rides on; spot, multi-region/cloud placement, cheapest-GPU-type selection, and #d43 heterogeneous per-stage-fleet bin-packing for the multi-stage DAG.</li>
+        <li><a href="K12_multimodal-and-image-offload.html">K12</a> / <a href="K6_parallelism-overview.html">K6</a> &mdash; the encoder/embedding stage&rsquo;s roofline (compute-bound, no KV, fixed shape) when it is a stage of a multi-stage DAG (rule of two &mdash; K16 owns the per-stage operating point, not the encoder itself).</li>
+        <li><a href="K14_quantization.html#d16">K14</a> &mdash; aggressive quant is ~free here (no latency SLO) &mdash; only the D16 accuracy gate binds.</li>
+        <li><a href="K17_attention-kernels-and-cuda-graphs.html#d10">K17</a> &mdash; D10 batch-invariance: the determinism gate for eval batch (batch-size-dependent FP nondeterminism corrupts eval comparisons).</li>
+        <li><a href="K18_residual-networks-serving.html#d46">K18</a> &mdash; D46: at the huge batch &times; long prompt, prefill-activation memory (not latency) is what caps batch size.</li>
+        <li><a href="K19_reasoning-model-serving.html">K19</a> &mdash; the unknown-output-length straggler is the offline analog of K19&rsquo;s bimodal-length problem (D29; rule of two).</li>
+        <li><a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a> &mdash; spot interruption = an induced fault; D29 ties D3/D23.</li>
+        <li><strong>Out of scope (named, not covered):</strong> the online latency-SLO scheduler (<a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; K16 is the inversion); dataset/ETL orchestration above the GPU (data-eng layer); training-data generation <em>as training</em> (training-side).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

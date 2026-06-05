@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Rate Limiter — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="../leetcode.md">LeetCode coverage</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Distributed Rate Limiter at Scale</h1>
+      <p class="hero-subtitle">Enforce per-customer rate limits across 10,000 API servers with less than 5% error and under 1 ms of added latency &mdash; without melting your Redis cluster. We start from the LC #362 / #359 single-machine kernels (a sliding-window hit counter and a 1-in-N-seconds gate), lift them onto one process, then iterate to local-first counting with periodic async reconcile, adaptive sync, and a fail-open degradation contract.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~18 min read &bull; LC #362 (Design Hit Counter) + LC #359 (Logger Rate Limiter)</p>
+    </div>
+  </section>
+
+  <!-- LC kernel banner -->
+  <section class="section dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>LC kernel &mdash; two of them, one primitive.</strong> A rate limiter is a hit counter plus a gate. <em>LC #362 &ldquo;Design Hit Counter&rdquo;</em>: count hits in the last 5&nbsp;minutes &mdash; a deque (or ring) of timestamped buckets; on <code>hit(t)</code> push/merge into the bucket for <code>t</code>; on <code>getHits(t)</code> evict buckets older than <code>t&minus;window</code> and sum the rest. O(1) amortized, O(window/bucket) space per series &mdash; that is the <strong>sliding-window counter</strong>. <em>LC #359 &ldquo;Logger Rate Limiter&rdquo;</em>: print a message only if it hasn't been printed in the last N seconds &mdash; a hashmap <code>key &rarr; last_allowed_time</code>; on <code>shouldPrint(t, key)</code>, allow iff <code>t &ge; last[key] + N</code>, then set <code>last[key] = t</code>. O(1), O(#distinct keys) space &mdash; that is the <strong>1-in-N gate</strong>, which is just a token bucket of capacity&nbsp;1 refilling one token every N seconds. They are the <em>same primitive at different granularities</em>: a deque of buckets is the fine-grained version; a single <code>(count, window_start)</code> pair is the coarse version; a <code>(tokens, last_refill)</code> pair is the token-bucket version. <strong>Properties that break at 10,000 servers / 50&nbsp;M req/sec:</strong> (1) <em>one counter doesn't fit / can't take the QPS</em> &mdash; one customer's limit is a single hot key; a global atomic increment on it serializes the whole platform; (2) <em>a per-request round trip to a central store eats the latency budget</em> &mdash; 0.5&nbsp;ms &times; 50&nbsp;M/sec is both a bandwidth wall on the store and 0.5&nbsp;ms of head-of-line latency on every API call; (3) <em>sliding-window-<strong>log</strong> (the exact version &mdash; store every hit's timestamp) is exact but O(window&times;rate) memory per key</em> &mdash; a 1&nbsp;M-req/sec customer would need a million timestamps in flight; you must approximate; (4) <em>the limiter can't take down the API</em> &mdash; it must fail <em>open</em> (admit everything) on its own outage, never fail closed. The C8 production cousin: a deque-on-one-machine becomes a <em>local per-pod approximate counter</em> (a count + a window start, or a token bucket) checked in-process with zero network, periodically reconciled against a <em>sharded regional counter</em> (Redis&nbsp;Cluster + Lua) that holds the eventually-consistent global view &mdash; with a fail-open fallback to a conservative local limit when that store is unreachable. The Logger-Rate-Limiter 1-in-N gate is the same machinery applied per-(IP, endpoint, message) instead of per-tenant &mdash; see <a href="42-error-aggregation-dedupe.html">#42</a> for it applied to per-customer error quotas.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You run an API platform (like Stripe, Twilio, or AWS API Gateway). Customers purchase rate limit tiers. A large enterprise customer might have a limit of 1 million requests per second. A free-tier user might have 100 requests per second. You must enforce these limits globally across your entire fleet &mdash; and hierarchically: a tenant has a global limit and per-API-key sub-limits, plus per-IP and per-endpoint limits layered on top.</p>
+      <p><strong>System class:</strong> infra primitive &mdash; an <em>embedded library</em> in every API server (the per-request allow/deny check, which must be local and lock-free) plus a <em>thin distributed-counter backend</em> (the reconciliation store). The FR vocabulary is <em>operations + semantics</em> (what calls it exposes, what guarantees they make), not user-facing capabilities; the load-bearing NFRs are per-request added latency, the QPS the backend can take, approximation error, and fail-open behaviour.</p>
+
+      <div class="full-width">
+        <h3>Concrete Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Parameter</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>API servers</td><td>10,000</td></tr>
+              <tr><td>Total customers</td><td>10,000</td></tr>
+              <tr><td>Max rate limit (enterprise tier)</td><td>1,000,000 req/sec per customer</td></tr>
+              <tr><td>Total platform traffic</td><td>~50 million req/sec (aggregate)</td></tr>
+              <tr><td>Accuracy requirement</td><td>&lt; 5% error margin (neither over-allow nor under-allow by more than 5%)</td></tr>
+              <tr><td>Latency overhead budget</td><td>&lt; 1 ms per request</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Why This Is Hard</h3>
+        <p>If all 10,000 servers were one machine, rate limiting is trivial &mdash; it's exactly LC #362 / #359: keep a counter (or a deque of buckets, or a token bucket) per customer, increment on each request, reject when over. But with 10,000 servers, a single customer's requests are scattered across many machines; no single server sees the full picture. How do you count globally without adding latency to every request &mdash; and without a single hot counter becoming the bottleneck?</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Requirements (C1)                                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="requirements">
+    <div class="container">
+      <h2>Requirements &amp; Scope (C1)</h2>
+
+      <div class="full-width">
+        <h3>Functional requirements (operations + semantics)</h3>
+        <ul>
+          <li><strong><code>allow(scope_key, cost=1) &rarr; ALLOW | DENY(retry_after_s, limit, remaining, reset_at)</code></strong> &mdash; called in-process on every API request, for each applicable scope; must be O(1), no network call on the hot path. <code>scope_key</code> = <code>(tenant_id)</code> or <code>(tenant_id, api_key_id)</code> or <code>(ip)</code> or <code>(endpoint, tenant_id)</code> &mdash; the same machinery, different keys. Hierarchical: a request is allowed only if it passes <em>every</em> scope it falls under (tenant global AND its key's sub-limit AND per-IP AND per-endpoint).</li>
+          <li><strong><code>set_limit(scope_key, limit_per_sec, window)</code></strong> &mdash; control plane sets/updates a scope's limit; propagates to all API servers within seconds (eventual).</li>
+          <li><strong><code>peek(scope_key) &rarr; {limit, remaining, reset_at}</code></strong> &mdash; for the <code>X-RateLimit-*</code> response headers; reads local state, no round trip.</li>
+          <li><strong>backend: <code>report_and_fetch(scope_key, local_delta) &rarr; global_count</code></strong> &mdash; the reconciliation call: a server tells the regional counter how many it's allowed since last sync and reads back the approximate global total. Called from a background thread, batched, never on the request path.</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> the API gateway / auth / routing the limiter lives inside (upstream); <em>quota</em> as opposed to <em>rate</em> (monthly request <em>budgets</em> with billing semantics &mdash; that's a metering pipeline, a different durability class, see <a href="42-error-aggregation-dedupe.html">#42</a>); WAF / bot-detection / abuse-scoring (a security layer that may <em>feed</em> the limiter but isn't it); the load balancer's choice of which server sees a request (we consume that distribution, we don't control it); cross-region <em>strong</em> consistency on the count (we deliberately accept slight over-admission &mdash; see flagged assumptions); long-term retention of per-request decisions (the analysis/billing pipeline, downstream).</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) &ldquo;&lt; 5% error&rdquo; is a <em>soft</em> SLO and slight <em>over</em>-admission is preferred to <em>under</em>-admission (rejecting a paying customer's legitimate traffic is worse than letting a few extra through) &mdash; the design optimizes for &ldquo;don't under-admit&rdquo;; (2) a customer's traffic clusters on a subset of servers (~100&ndash;500 of 10,000), not uniformly &mdash; this is the number that breaks naive local-only limiting; (3) NTP keeps clock skew &lt; ~10&nbsp;ms fleet-wide &mdash; windows depend on clocks; (4) the limit catalog is small (~10,000 tenants &times; a few scope types &asymp; tens of thousands of limits, ~tens of KB) and changes rarely; (5) the limiter must fail <em>open</em> &mdash; its own outage admits everything rather than denying everything (a revenue-generating API can survive un-enforced limits for a few minutes; it cannot survive a self-inflicted total outage).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Non-functional requirements (the five that bind)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>NFR</th><th>Target</th><th>Where it bites</th></tr></thead>
+            <tbody>
+              <tr><td>Added latency per request</td><td>&lt; 1&nbsp;ms (target: ~1&nbsp;&micro;s &mdash; an in-memory hash lookup)</td><td>the hot path: must be local, lock-free; called 50&nbsp;M&times;/sec &mdash; a 0.5&nbsp;ms round trip is both a per-call latency hit and a 50&nbsp;M-op/sec wall on the store</td></tr>
+              <tr><td>Backend QPS</td><td>the reconciliation store handles the offered load on commodity Redis-class nodes (~150&nbsp;k ops/sec each), &lt; ~$10&nbsp;k/mo</td><td>the sync frequency &times; #servers &times; #scopes-per-server &mdash; naive per-request gives 50&nbsp;M ops/sec (333 nodes); periodic batched sync gives ~50&nbsp;k pipeline calls/sec (~10 nodes)</td></tr>
+              <tr><td>Approximation error</td><td>&le; 5% over- or under-admission for a customer actively sending at their limit</td><td>the sync interval and the &ldquo;how many active servers&rdquo; estimate &mdash; staler sync = more over-admission; bad active-server estimate = under-admission</td></tr>
+              <tr><td>Limit-config freshness</td><td>a limit change is live fleet-wide within seconds; eventual, not atomic</td><td>the config push path + per-server apply</td></tr>
+              <tr><td>Availability / fail-open</td><td>a backend outage must NOT block API traffic &mdash; servers fall back to a conservative local limit and keep serving</td><td>the degradation contract; the local fallback; the reconnect path</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Quantified requirements (derived):</strong> peak offered load &asymp; 50&nbsp;M req/sec aggregate (from Scenario); peak per-customer &asymp; 1&nbsp;M req/sec (enterprise tier); per-server scope count &asymp; 100&ndash;500 active scopes (a server sees ~100&ndash;500 customers at a time, not all 10,000); reconciliation traffic &asymp; #servers &times; #active-scopes &times; 2&nbsp;ops &divide; sync_interval &mdash; the number every iteration recomputes.</p>
+        <p><strong>Out-of-scope NFRs (named):</strong> strong consistency on the count (deliberately AP &mdash; we accept bounded over-admission); durability of a server's in-memory counters (pure function of the synced config + recent local traffic &mdash; rebuilt on restart from the next reconcile, a few hundred ms of slightly-stale limits); cross-region exactness (per-region quotas, periodically rebalanced &mdash; see Iteration 3 / pushbacks).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarification ledger</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Question</th><th>Assumed answer</th><th>If it flips</th></tr></thead>
+            <tbody>
+              <tr><td>Over- or under-admission &mdash; which is worse?</td><td>Under-admission (rejecting legit traffic) is worse; slight over is fine.</td><td>If it must be <em>exact</em> (e.g., a hard contractual ceiling, or it doubles as billing): drop local-first, use a central CP counter per request &mdash; pay the latency and the cost (the &ldquo;exact for billing&rdquo; pushback).</td></tr>
+              <tr><td>Fail open or fail closed on a backend outage?</td><td>Fail <em>open</em> &mdash; admit, fall back to a conservative local limit.</td><td>For a security-control rate limiter (login attempts, password reset) you may want fail <em>closed</em> on <em>that scope only</em> &mdash; a per-scope policy bit, not a global one.</td></tr>
+              <tr><td>Burst at the window boundary?</td><td>Use a sliding-window <em>counter</em> (weighted blend of two fixed windows) &mdash; bounds the boundary burst to &lt; 2&times; without per-hit storage.</td><td>If even &lt; 2&times; is unacceptable: token bucket (smooths to a true rate) or sliding-window <em>log</em> (exact, but O(window&times;rate) memory &mdash; the constraint that disqualifies it at 1&nbsp;M req/sec).</td></tr>
+              <tr><td>How many servers does a customer's traffic hit?</td><td>~100&ndash;500 of 10,000 (clustered, not uniform).</td><td>If genuinely uniform: local-only with <code>limit/N</code> would work and you'd skip the backend entirely &mdash; but real LBs don't give you that.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Ideal vs Reality</h3>
+<pre class="line-numbers"><code class="language-text">Ideal distribution for a customer with 1M req/sec limit:
+  1,000,000 req/sec ÷ 10,000 servers = 100 req/sec per server.
+
+  If we set each server's local limit to 100 req/sec, it works IF
+  traffic is perfectly uniform across all 10,000 servers.
+
+Reality: traffic is NOT uniform.
+  A customer's traffic might hit only 100-500 of the 10,000 servers
+  (depending on load balancer configuration, client behavior, etc.)
+
+  If traffic hits 200 servers instead of 10,000:
+    Each of those 200 servers sees: 1M / 200 = 5,000 req/sec.
+    But local limit is set to: 1M / 10,000 = 100 req/sec.
+    Each server thinks: "5,000 > 100 → reject!"
+    Customer effectively gets: 200 servers × 100 req/sec = 20,000 req/sec.
+    That is 2% of their 1M limit. Absurdly under-allowing.</code></pre>
+      </div>
+
+      <div>
+        <h3>The Fundamental Problem</h3>
+<pre class="line-numbers"><code class="language-text">The fundamental problem:
+  Local limits = global_limit / total_servers works only with
+  perfectly uniform distribution. In practice, traffic clusters
+  on a subset of servers, causing massive under-allowance.</code></pre>
+      </div>
+
+      <div>
+        <h3>Algorithm Taxonomy (cite, don't restate)</h3>
+        <p>Fixed-window-counter, sliding-window-log, sliding-window-counter, token-bucket, leaky-bucket, GCRA &mdash; the comparison (memory, burst behaviour, smoothness, edge cases) is the source-of-truth page <a href="../rate-limiting.html">rate-limiting.html</a>; this page picks among them with scenario-specific numbers and won't re-derive the algorithms. What matters here for the BOE: <strong>sliding-window-log is the only <em>exact</em> one</strong> (store every hit's timestamp, evict the old ones, count) &mdash; and it costs O(window&times;rate) memory per key, so a 1&nbsp;M&nbsp;req/sec customer over a 1-second window needs ~1&nbsp;M timestamps in flight. That disqualifies it at scale; everything else is an <em>approximation</em>, which is fine given the &lt; 5% soft SLO. We'll name the specific choice (sliding-window-counter, with token-bucket as the alternative) when we get to the iteration that needs it &mdash; the Naive Design below uses the dumbest exact thing (a per-request central INCR with a fixed 1-second window) so every later improvement is measurable.</p>
+      </div>
+
+      <div class="full-width">
+        <svg viewBox="0 0 720 280" style="width:100%;max-width:720px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowRed" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+          </defs>
+          <!-- Title -->
+          <text x="360" y="20" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Why Local-Only Rate Limiting Fails</text>
+
+          <!-- Customer -->
+          <rect x="10" y="60" width="110" height="50" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="65" y="82" text-anchor="middle" font-weight="600" fill="#2563eb">Customer</text>
+          <text x="65" y="98" text-anchor="middle" fill="#64748b" font-size="11">1M req/sec limit</text>
+
+          <!-- Arrow to LB -->
+          <line x1="120" y1="85" x2="175" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="148" y="78" text-anchor="middle" fill="#64748b" font-size="10">1M rps</text>
+
+          <!-- Load Balancer -->
+          <rect x="178" y="60" width="90" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="223" y="82" text-anchor="middle" font-weight="600" fill="#334155">Load</text>
+          <text x="223" y="98" text-anchor="middle" fill="#334155">Balancer</text>
+
+          <!-- Fan out to 200 servers (show 4 representative) -->
+          <line x1="268" y1="72" x2="330" y2="47" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="268" y1="80" x2="330" y2="87" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="268" y1="90" x2="330" y2="137" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="268" y1="98" x2="330" y2="187" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+
+          <!-- Server 1 -->
+          <rect x="333" y="30" width="160" height="40" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="413" y="47" text-anchor="middle" fill="#334155" font-size="12">Server 1</text>
+          <text x="413" y="62" text-anchor="middle" fill="#ef4444" font-size="10">5,000 rps &gt; limit 100</text>
+
+          <!-- Server 2 -->
+          <rect x="333" y="75" width="160" height="40" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="413" y="92" text-anchor="middle" fill="#334155" font-size="12">Server 2</text>
+          <text x="413" y="107" text-anchor="middle" fill="#ef4444" font-size="10">5,000 rps &gt; limit 100</text>
+
+          <!-- Ellipsis -->
+          <text x="413" y="132" text-anchor="middle" fill="#64748b" font-size="16">...</text>
+
+          <!-- Server 200 -->
+          <rect x="333" y="170" width="160" height="40" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="413" y="187" text-anchor="middle" fill="#334155" font-size="12">Server 200</text>
+          <text x="413" y="202" text-anchor="middle" fill="#ef4444" font-size="10">5,000 rps &gt; limit 100</text>
+
+          <!-- Reject arrows -->
+          <line x1="493" y1="50" x2="550" y2="50" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+          <line x1="493" y1="95" x2="550" y2="95" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+          <line x1="493" y1="190" x2="550" y2="190" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+
+          <!-- Reject labels -->
+          <text x="555" y="54" fill="#ef4444" font-size="11">REJECT 98%</text>
+          <text x="555" y="99" fill="#ef4444" font-size="11">REJECT 98%</text>
+          <text x="555" y="194" fill="#ef4444" font-size="11">REJECT 98%</text>
+
+          <!-- Bottom annotation -->
+          <rect x="333" y="225" width="370" height="40" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+          <text x="518" y="243" text-anchor="middle" fill="#ef4444" font-weight="600" font-size="12">Local limit = 1M / 10,000 = 100 per server</text>
+          <text x="518" y="258" text-anchor="middle" fill="#ef4444" font-size="11">Customer gets only 20K of their 1M limit (2%)</text>
+
+          <!-- Servers 9,801-10,000 annotation -->
+          <rect x="333" y="138" width="160" height="26" rx="4" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="413" y="155" text-anchor="middle" fill="#94a3b8" font-size="10">Servers 201-10,000: 0 rps</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The core tension:</strong> Accurate rate limiting requires knowing the <em>global</em> request count. But checking a global counter on every request is expensive. We need to find a middle ground between &ldquo;check globally on every request&rdquo; (accurate but slow) and &ldquo;count locally only&rdquo; (fast but inaccurate).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Centralized Redis Counter</h2>
+      <p>The most straightforward approach: every request, before processing, increments a counter in Redis. If the counter exceeds the limit, reject the request.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 700 160" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlueNaive" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGrayNaive" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+          <!-- Client -->
+          <rect x="10" y="50" width="90" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="55" y="73" text-anchor="middle" font-weight="600" fill="#334155">Client</text>
+          <text x="55" y="90" text-anchor="middle" fill="#64748b" font-size="11">API request</text>
+
+          <!-- Arrow Client -> API Server -->
+          <line x1="100" y1="78" x2="150" y2="78" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayNaive)"/>
+
+          <!-- API Server -->
+          <rect x="153" y="40" width="120" height="75" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="213" y="62" text-anchor="middle" font-weight="600" fill="#2563eb">API Server</text>
+          <text x="213" y="80" text-anchor="middle" fill="#64748b" font-size="11">1. Receive req</text>
+          <text x="213" y="96" text-anchor="middle" fill="#64748b" font-size="11">2. Check Redis</text>
+          <text x="213" y="108" text-anchor="middle" fill="#64748b" font-size="11">3. Allow/Reject</text>
+
+          <!-- Arrow API Server -> Redis (every request!) -->
+          <line x1="273" y1="78" x2="380" y2="78" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlueNaive)"/>
+          <text x="327" y="68" text-anchor="middle" fill="#ef4444" font-weight="600" font-size="11">EVERY request</text>
+          <text x="327" y="98" text-anchor="middle" fill="#64748b" font-size="10">INCR + check</text>
+
+          <!-- Redis -->
+          <rect x="383" y="40" width="140" height="75" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="453" y="62" text-anchor="middle" font-weight="600" fill="#ef4444">Redis</text>
+          <text x="453" y="80" text-anchor="middle" fill="#64748b" font-size="11">rate:cust1:ts = 42</text>
+          <text x="453" y="96" text-anchor="middle" fill="#64748b" font-size="11">50M ops/sec!</text>
+
+          <!-- Annotation -->
+          <rect x="540" y="45" width="150" height="65" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+          <text x="615" y="63" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">Bottleneck</text>
+          <text x="615" y="78" text-anchor="middle" fill="#334155" font-size="10">Needs 333 instances</text>
+          <text x="615" y="93" text-anchor="middle" fill="#334155" font-size="10">0.3-0.5ms per call</text>
+          <text x="615" y="106" text-anchor="middle" fill="#334155" font-size="10">$166K/month</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Redis Counter Code</h3>
+<pre class="line-numbers"><code class="language-python">import redis
+import time
+
+r = redis.Redis(host='rate-limiter.redis.cluster')
+
+def check_rate_limit(customer_id, limit):
+    """Check if request is within rate limit. Returns True if allowed."""
+    current_second = int(time.time())
+    key = f"rate:{customer_id}:{current_second}"
+
+    # Atomic increment + get
+    # Using Lua script to avoid race condition between INCR and GET
+    lua_script = """
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+        redis.call('EXPIRE', KEYS[1], 2)
+    end
+    return current
+    """
+    count = r.eval(lua_script, 1, key)
+
+    if count > limit:
+        return False  # Rate limited!
+    return True  # Allowed</code></pre>
+      </div>
+
+      <div>
+        <h3>Why Lua Script Instead of Separate INCR + EXPIRE?</h3>
+<pre class="line-numbers"><code class="language-text">Race condition with separate commands:
+
+  Thread A: INCR "rate:cust1:1710000000" → returns 1 (first request this second)
+  Thread A: (about to call EXPIRE, but gets preempted)
+  Thread B: INCR "rate:cust1:1710000000" → returns 2
+  Thread B: (key already exists, doesn't need EXPIRE)
+  Thread A: EXPIRE "rate:cust1:1710000000" 2 → sets TTL
+
+  This particular interleaving works fine. But consider:
+
+  Thread A: INCR "rate:cust1:1710000000" → returns 1
+  — Server crashes before calling EXPIRE —
+
+  The key has no TTL → it persists forever → counter never resets →
+  customer is permanently rate-limited!
+
+  The Lua script runs atomically on the Redis server:
+  INCR + conditional EXPIRE happen as one operation.
+  No partial execution possible.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; the algorithm</h3>
+        <p>The Naive Design's one decision: <em>which algorithm, run centrally, on every request</em>. We pick the dumbest exact one (fixed-window INCR) on purpose. The space (comparison details &rarr; <a href="../rate-limiting.html">rate-limiting.html</a>):</p>
+        <ul>
+          <li><strong>Fixed-window counter (central INCR, 1-second key) &mdash; chosen for Naive.</strong> One key per <code>(scope, second)</code>, INCR + compare, EXPIRE for cleanup. Exact within a window, trivial, O(1) memory per key. Disqualifying flaw for production: a burst straddling a window edge (900&nbsp;k at <code>0:59.5</code>, 900&nbsp;k at <code>1:00.5</code>) is ~2&times; the limit over any 1-second span &mdash; fixed in the Final Design with sliding-window-counter. (And it's <em>central</em>, the bottleneck this whole page fixes.)</li>
+          <li><strong>Sliding-window <em>log</em> (sorted set of hit timestamps) &mdash; rejected.</strong> Exact, no boundary problem &mdash; but O(window&times;rate) memory per key (a <code>ZADD</code> per request, a <code>ZREMRANGEBYSCORE</code> to evict) &rarr; ~1&nbsp;M members in flight for a 1&nbsp;M&nbsp;req/sec / 1-second customer, and the per-request work is now O(log&nbsp;n) not O(1). The exactness isn't worth that cost given the soft SLO.</li>
+          <li><strong>Sliding-window <em>counter</em> (weighted blend of current + previous fixed window) &mdash; deferred to the Final Design.</strong> Two counters per key; estimated count = <code>prev &times; overlap_fraction + curr</code>. O(1) memory, bounds the boundary burst to &lt; 2&times; the limit, no per-hit storage. The right approximation &mdash; but it doesn't fix the <em>central</em> problem, so it's a Final-Design refinement on top of the local-first architecture, not a Naive choice.</li>
+          <li><strong>Token bucket / leaky bucket (a <code>(tokens, last_refill)</code> pair) &mdash; the production alternative.</strong> Refill <code>rate</code> tokens/sec up to <code>capacity</code>; allow iff <code>tokens &ge; cost</code>, then deduct. O(1) memory, smooths to a true rate (no boundary burst at all &mdash; <code>capacity</code> is the explicit burst allowance), and it's exactly the LC #359 1-in-N gate generalized (capacity&nbsp;1, refill 1/N). We'd choose this over sliding-window-counter when callers <em>want</em> a configurable burst allowance; the two are interchangeable in this design &mdash; both are O(1)-per-key local state. (GCRA &mdash; the &ldquo;virtual scheduling time&rdquo; reformulation of leaky-bucket &mdash; is the same thing with one number instead of two; <a href="../rate-limiting.html">rate-limiting.html</a> has it.)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+
+      <div>
+        <h3>Redis Cannot Handle the Load</h3>
+<pre class="line-numbers"><code class="language-text">Every request triggers a Redis call:
+  50 million req/sec × 1 Redis operation = 50 million Redis ops/sec.
+
+Redis capacity (single instance):
+  ~100,000-200,000 ops/sec for simple commands.
+
+Instances needed:
+  50,000,000 / 150,000 = 333 Redis instances.
+
+  That's 333 Redis servers JUST for rate limiting.
+  At ~$500/month each = $166,500/month.
+  And this doesn't account for Redis cluster overhead,
+  failover, or the complexity of managing 333 instances.</code></pre>
+      </div>
+
+      <div>
+        <h3>Latency Is Too High</h3>
+<pre class="line-numbers"><code class="language-text">Each Redis call:
+  Network round trip (same DC): ~0.2-0.5 ms
+  Redis processing:              ~0.01 ms
+  Total:                         ~0.3-0.5 ms
+
+  Our budget: &lt; 1 ms. A single Redis call is within budget,
+  but BARELY. And that's best case — under load with 333 instances,
+  some calls will be slower.
+
+  The real problem: 0.5 ms added to EVERY request, 50 million times/sec.
+  That's 25,000 seconds of aggregate latency per second.
+  Each request is 0.5 ms slower than it needs to be.</code></pre>
+      </div>
+
+      <div>
+        <h3>Redis Is a Single Point of Failure</h3>
+<pre class="line-numbers"><code class="language-text">If Redis is down, what do you do?
+
+  Option A: Block all traffic.
+    → 50 million req/sec rejected. Every customer is down.
+    → Unacceptable for a revenue-generating API platform.
+
+  Option B: Allow all traffic.
+    → Rate limits not enforced. Customers can consume unlimited resources.
+    → A single abusive customer could overload your entire backend.
+
+  Option C: ???
+    → We need a fallback that degrades gracefully.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Classified against the canonical taxonomies</h3>
+        <ul>
+          <li><strong>One counter, the whole platform's QPS &rarr; <a href="../canonicals/bottlenecks.html#hot-key">hot key</a> + <a href="../canonicals/bottlenecks.html#lock-contention">lock contention</a>.</strong> One customer's limit is a single key; a 1&nbsp;M&nbsp;req/sec customer means 1&nbsp;M atomic INCRs/sec on one key on one shard &mdash; the key (and the shard owning it) is pegged regardless of how many Redis nodes you add. Per <a href="../canonicals/bottleneck-to-decisions.html">bottleneck-to-decisions</a>: client-side coalescing &mdash; count locally, sync periodically &mdash; is the first move (Iteration&nbsp;1).</li>
+          <li><strong>A round trip on every request &rarr; <a href="../canonicals/bottlenecks.html#network-rtt-bound">network-RTT-bound</a>.</strong> p50 added latency &asymp; 1&times;RTT &asymp; 0.2&ndash;0.5&nbsp;ms intra-DC; the API server's CPU is idle waiting. First move: move the decision closer (in-process) and batch the sync &mdash; Iteration&nbsp;1.</li>
+          <li><strong>The store as a hard dependency &rarr; <a href="../canonicals/failure-modes.html#slow-dependency">slow dependency</a> / <a href="../canonicals/failure-modes.html#leader-loss">leader loss</a>.</strong> Redis failover takes seconds; during it, every API request blocks on the limiter. The fix is a degradation contract that treats unreachable-counter as &ldquo;use the local fallback,&rdquo; never &ldquo;block&rdquo; &mdash; Iteration&nbsp;3.</li>
+          <li><strong>Clients retrying a 429 in a tight loop &rarr; <a href="../canonicals/failure-modes.html#retry-storm">retry storm</a>.</strong> A denied client that ignores <code>Retry-After</code> and re-sends immediately doubles its own offered load &mdash; mitigated by the response contract (mandatory <code>Retry-After</code>; cite <a href="../canonicals/api-design-patterns.html#rate-limit-response">api-design-patterns#rate-limit-response</a>) plus per-caller backoff guidance.</li>
+          <li><strong>Windows depend on wall clocks &rarr; <a href="../canonicals/failure-modes.html#clock-skew">clock skew</a>.</strong> Two servers disagreeing on &ldquo;which second is it&rdquo; by &gt; the sync interval over-admit; NTP keeps skew &lt; ~10&nbsp;ms, which the accuracy math (Iteration&nbsp;1) folds in as a small term.</li>
+          <li><strong>Access pattern.</strong> The increment stream is <a href="../canonicals/access-patterns.html#write-heavy-uniform">write-heavy</a> (all writes, no reads on the hot path) but <a href="../canonicals/access-patterns.html#power-law">power-law</a> across keys (a few huge tenants dominate) and <a href="../canonicals/access-patterns.html#bursty">bursty</a> (10&times; spikes) &mdash; which is why the design is local-first (absorbs the write rate and the burst) plus adaptive sync (spends backend ops on the few keys near their limit).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Local Counters with Periodic Sync                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Local Counters with Periodic Sync</h2>
+      <p>The key insight: instead of checking Redis on every request, <strong>count locally and sync periodically</strong>. Each server maintains local counters per customer. Every sync interval (e.g., 500 ms), it reports its local count to Redis, fetches the global count, and adjusts its local allowance.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 760 310" style="width:100%;max-width:760px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlueSync" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGreenSync" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+            <marker id="arrowGraySync" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+          <!-- Title -->
+          <text x="380" y="20" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Local Counters + Periodic Sync</text>
+
+          <!-- Client -->
+          <rect x="10" y="80" width="80" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="50" y="102" text-anchor="middle" font-weight="600" fill="#334155">Client</text>
+          <text x="50" y="118" text-anchor="middle" fill="#64748b" font-size="10">requests</text>
+
+          <!-- Arrow to server -->
+          <line x1="90" y1="105" x2="140" y2="105" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGraySync)"/>
+
+          <!-- API Server box -->
+          <rect x="143" y="45" width="260" height="220" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="273" y="68" text-anchor="middle" font-weight="700" fill="#2563eb">API Server (each of 10,000)</text>
+
+          <!-- Local rate limiter inside -->
+          <rect x="163" y="82" width="220" height="75" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="273" y="100" text-anchor="middle" font-weight="600" fill="#1e40af" font-size="12">Local Rate Limiter (in-process)</text>
+          <text x="273" y="118" text-anchor="middle" fill="#334155" font-size="11">local_count[cust_id]  +1 per req</text>
+          <text x="273" y="134" text-anchor="middle" fill="#334155" font-size="11">local_limit[cust_id]  check</text>
+          <text x="273" y="150" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">O(1) in-memory -- no network</text>
+
+          <!-- Hot path label -->
+          <rect x="163" y="168" width="220" height="25" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+          <text x="273" y="185" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">Hot path: ~0.001 ms per request</text>
+
+          <!-- Background sync box -->
+          <rect x="163" y="200" width="220" height="50" rx="6" fill="#fefce8" stroke="#eab308" stroke-width="1"/>
+          <text x="273" y="218" text-anchor="middle" font-weight="600" fill="#854d0e" font-size="11">Background Sync Thread</text>
+          <text x="273" y="234" text-anchor="middle" fill="#854d0e" font-size="10">Every 500ms: REPORT + FETCH + ADJUST</text>
+
+          <!-- Arrow from sync to Redis -->
+          <line x1="383" y1="225" x2="470" y2="155" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowBlueSync)"/>
+          <text x="445" y="200" text-anchor="middle" fill="#2563eb" font-size="10" transform="rotate(-30 445 200)">async sync</text>
+
+          <!-- Redis -->
+          <rect x="473" y="100" width="160" height="110" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="553" y="125" text-anchor="middle" font-weight="600" fill="#334155">Redis (1 instance)</text>
+          <text x="553" y="145" text-anchor="middle" fill="#64748b" font-size="11">Global counts</text>
+          <text x="553" y="163" text-anchor="middle" fill="#64748b" font-size="11">per customer</text>
+          <text x="553" y="181" text-anchor="middle" fill="#64748b" font-size="11">per window</text>
+          <text x="553" y="200" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">40K ops/sec</text>
+
+          <!-- Comparison annotation -->
+          <rect x="473" y="230" width="270" height="60" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+          <text x="608" y="250" text-anchor="middle" fill="#16a34a" font-weight="600" font-size="12">1,250x reduction in Redis ops</text>
+          <text x="608" y="268" text-anchor="middle" fill="#334155" font-size="11">50M ops/sec (naive) --> 40K ops/sec (sync)</text>
+          <text x="608" y="283" text-anchor="middle" fill="#334155" font-size="11">333 instances --> 1 instance</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>How It Works</h3>
+<pre class="line-numbers"><code class="language-text">Each API server maintains:
+  - local_count[customer_id]: requests seen since last sync
+  - local_limit[customer_id]: how many more requests to allow before next sync
+
+Sync cycle (every 500 ms):
+
+  1. REPORT: Server sends its local_count to Redis.
+     Redis command: INCRBY "global:cust1:window" local_count
+     → Redis now has the approximate global count.
+
+  2. FETCH: Server reads the global count from Redis.
+     Redis command: GET "global:cust1:window"
+     → Server knows: "globally, 450,000 requests have been counted this window."
+
+  3. ADJUST: Server calculates its local limit for the next 500 ms.
+     remaining_global = global_limit - global_count
+     my_fair_share = remaining_global / estimated_active_servers
+     local_limit = my_fair_share × sync_interval
+
+  4. RESET: local_count = 0. Start counting fresh.
+
+Between syncs: pure local operations, zero network calls.
+  if local_count < local_limit:
+      allow request
+  else:
+      reject request</code></pre>
+      </div>
+
+      <div>
+        <h3>Redis Load Calculation</h3>
+<pre class="line-numbers"><code class="language-text">With periodic sync every 500 ms:
+
+  Operations per sync per server: 2 (INCRBY + GET)
+  Servers: 10,000
+  Syncs per second: 2 (every 500 ms)
+
+  Total Redis ops/sec: 10,000 servers × 2 ops × 2 syncs/sec = 40,000 ops/sec
+
+  Compare to naive approach: 50,000,000 ops/sec
+
+  Reduction: 50,000,000 / 40,000 = 1,250× fewer Redis operations!
+
+  One Redis instance (150K ops/sec capacity) handles this trivially.
+  We need exactly 1 Redis instance (with a replica for failover).</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The tradeoff:</strong> We reduced Redis load by 1,250&times;, but we introduced a window of uncertainty. Between syncs (up to 500 ms), each server makes decisions based on stale global data. How much error does this cause?</p>
+      </div>
+
+      <div>
+        <h3>Accuracy Analysis</h3>
+<pre class="line-numbers"><code class="language-text">Worst-case over-allowance scenario:
+  Customer limit: 1,000,000 req/sec.
+  Customer traffic hits 200 servers evenly: 5,000 req/sec each.
+  Sync interval: 500 ms.
+
+  Between two syncs (500 ms window):
+    Each server allows up to: local_limit requests.
+    After a sync, each server gets a fair share:
+      remaining = 1,000,000 - current_global_count
+      local_limit = (remaining / 200 servers) × 0.5 seconds
+
+  At the start of a second (global_count ≈ 0):
+    local_limit per server = (1,000,000 / 200) × 0.5 = 2,500 per server per 500ms
+
+  In the first 500 ms, all 200 servers allow 2,500 each:
+    Total allowed = 200 × 2,500 = 500,000 (exactly half the limit for half the second) ✓
+
+  After sync at 500 ms:
+    Global count reported: 500,000.
+    Remaining: 500,000. Each server gets 2,500 again.
+    Total for the second: 1,000,000. Exactly at the limit. ✓
+
+  But what if servers sync at different times (clock skew)?
+    Worst case: all servers count locally for a full sync interval
+    BEFORE any of them report to Redis.
+    Over-allowance per interval ≈ local_limit × num_active_servers × clock_skew_fraction
+
+    With NTP-synchronized clocks (skew < 10 ms):
+    Over-allowance ≈ 2,500 × 200 × (10/500) = 10,000 requests.
+    That's 10,000 / 1,000,000 = 1% error. Within the 5% budget. ✓</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Implementation</h3>
+<pre class="line-numbers"><code class="language-python">import threading
+import time
+import redis
+
+class DistributedRateLimiter:
+    def __init__(self, redis_client, sync_interval_ms=500):
+        self.redis = redis_client
+        self.sync_interval = sync_interval_ms / 1000.0
+        self.local_counts = {}    # customer_id → count since last sync
+        self.local_limits = {}    # customer_id → allowed until next sync
+        self.customer_limits = {} # customer_id → global limit per second
+        self.lock = threading.Lock()
+
+        # Start background sync thread
+        self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
+        self.sync_thread.start()
+
+    def allow_request(self, customer_id):
+        """Returns True if request is allowed. O(1), no network call."""
+        with self.lock:
+            count = self.local_counts.get(customer_id, 0)
+            limit = self.local_limits.get(customer_id, self._default_limit(customer_id))
+
+            if count < limit:
+                self.local_counts[customer_id] = count + 1
+                return True
+            return False
+
+    def _sync_loop(self):
+        """Background thread: sync with Redis every sync_interval."""
+        while True:
+            time.sleep(self.sync_interval)
+            self._sync_all_customers()
+
+    def _sync_all_customers(self):
+        """Report local counts to Redis, fetch global, adjust limits."""
+        with self.lock:
+            customers_to_sync = dict(self.local_counts)
+            self.local_counts = {}  # Reset local counts
+
+        pipe = self.redis.pipeline()
+        window_key = f"window:{int(time.time())}"
+
+        for customer_id, local_count in customers_to_sync.items():
+            key = f"rate:{customer_id}:{window_key}"
+            pipe.incrby(key, local_count)  # Report local count
+            pipe.get(key)                   # Fetch global count
+            pipe.expire(key, 3)             # Auto-cleanup
+
+        results = pipe.execute()
+
+        with self.lock:
+            for i, (customer_id, _) in enumerate(customers_to_sync.items()):
+                global_count = int(results[i * 3 + 1] or 0)
+                global_limit = self.customer_limits.get(customer_id, 1000)
+                remaining = max(0, global_limit - global_count)
+                # Estimate active servers from the ratio
+                estimated_servers = max(1, global_count / max(1, local_count))
+                fair_share = remaining / estimated_servers
+                self.local_limits[customer_id] = int(fair_share * self.sync_interval)
+
+    def _default_limit(self, customer_id):
+        """Conservative default before first sync."""
+        global_limit = self.customer_limits.get(customer_id, 1000)
+        # Assume 1000 active servers (conservative)
+        return int((global_limit / 1000) * self.sync_interval)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; the topology</h3>
+        <p>The bottleneck (from What Breaks): one hot counter, a round trip per request. The decision: <em>where does the count live, and when does coordination happen</em>. Options:</p>
+        <ul>
+          <li><strong>Local-first with async reconcile &mdash; chosen.</strong> Each server counts in-memory (the LC kernel, lifted), checks locally (zero network on the hot path), and a background thread periodically reports its delta to a shared counter and reads back the global total to re-budget. Properties: hot path is ~1&nbsp;&micro;s and lock-free; backend QPS drops by the sync ratio (~1,250&times;); the cost is bounded over-admission proportional to the sync interval. The standard pattern (this is what Cloudflare, Stripe, Envoy's global rate limiter all do in spirit).</li>
+          <li><strong>Central store on every request (the Naive Design) &mdash; rejected.</strong> Exact, but it's the hot-key + RTT bottleneck this iteration exists to fix.</li>
+          <li><strong>Local-only with no backend, just gossip &mdash; rejected.</strong> Servers gossip their counts peer-to-peer; no central store. Removes the SPOF but: a 10,000-node all-to-all gossip is its own scaling problem (O(N&sup2;) messages), convergence is slow (seconds), and the &ldquo;how many servers are active for this customer&rdquo; estimate &mdash; the thing that makes local limits accurate &mdash; is exactly what gossip is bad at delivering quickly. A central counter <em>is</em> the aggregator; it's cheap because each server talks to it ~twice per sync interval, not to every peer.</li>
+          <li><strong>Redis Cluster with a Lua check-and-increment per request (no local layer) &mdash; rejected.</strong> Moves the atomic INCR+compare server-side (one round trip instead of two, no race) &mdash; but it's still a round trip per request and still a hot key per customer. It's the right <em>backend</em> for the reconcile store (we use it for that), just not on the hot path.</li>
+          <li><strong>Hierarchical reconcile (per-rack aggregator &rarr; regional counter) &mdash; deferred.</strong> A two-tier sync (servers &rarr; rack-local aggregator &rarr; region) would cut the regional store's connection count further; worth it only if the regional store's connection count (not its op rate) becomes the limit &mdash; it doesn't at 10&nbsp;k servers. Named here so it's not a surprise at 100&nbsp;k.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Bad active-server estimate &rarr; <a href="../canonicals/failure-modes.html#replica-divergence">divergent local budgets</a>.</strong> The <code>my_fair_share = remaining / estimated_active_servers</code> step depends on guessing how many servers are currently serving this customer. Guess too high &rarr; each server's slice is tiny &rarr; the customer is under-admitted (gets &lt; 90% of their paid limit); guess too low &rarr; over-admission. Defence: derive the estimate from the ratio Redis reports back (<code>global_count / local_count</code> &asymp; #active servers) rather than a static constant; floor it at 1; cap the per-server slice at the global limit. Blast radius: one customer, until the next sync (&le; the sync interval); detection: per-customer over/under-admission gauges (already in the monitoring list).</li>
+          <li><strong>Server restart loses local counts &rarr; brief over-admission.</strong> A server that restarts re-starts its <code>local_count</code> at 0; until its next sync it hasn't reported its in-flight traffic, so the global count is slightly low and everyone's slice is slightly generous. Bounded by (traffic on that server) &times; (sync interval) &mdash; tiny. Defence: on startup, sync immediately (don't wait a full interval); detection: a spike in a customer's sync-reported-delta after a deploy.</li>
+          <li><strong>Sync thread stalls / GC pause &rarr; stale budget held too long.</strong> If a server's background thread is blocked (GC, a slow Redis call), it keeps using its last <code>local_limit</code> &mdash; which is fine for under-admission but causes over-admission proportional to the stall length. Defence: a watchdog &mdash; if the last successful sync is older than 5&times; the interval, shrink the local limit toward the conservative fallback (treat &ldquo;stale&rdquo; like &ldquo;degraded&rdquo;); detection: sync-age gauge per server (alert at p99 &gt; 5&times; interval).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Adaptive Sync Frequency                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Adaptive Sync Frequency</h2>
+      <p>Not all customers need the same sync frequency. A customer using 10% of their limit does not need frequent syncs. A customer at 90% of their limit needs tight synchronization to avoid over-allowance.</p>
+
+      <div>
+        <h3>Adaptive Strategy</h3>
+<pre class="line-numbers"><code class="language-text">Utilization = global_count / global_limit
+
+  Utilization &lt; 50%:   sync every 2,000 ms (2 seconds)
+    Customer is well under limit. Coarse-grained counting is fine.
+    Error margin at 2s sync: up to ~4% over-allowance. Acceptable.
+
+  Utilization 50-80%:  sync every 500 ms
+    Getting close. Standard sync interval.
+    Error margin: ~1% over-allowance.
+
+  Utilization 80-95%:  sync every 100 ms
+    Near the limit. Need tight control.
+    Error margin: ~0.2% over-allowance.
+
+  Utilization &gt; 95%:   sync every 50 ms
+    At the limit. Maximize accuracy.
+    Error margin: ~0.1% over-allowance.</code></pre>
+      </div>
+
+      <div>
+        <h3>Redis Load with Adaptive Sync</h3>
+<pre class="line-numbers"><code class="language-text">Assume customer distribution:
+    8,000 customers at &lt;50% utilization:  sync every 2s
+    1,500 customers at 50-80%:             sync every 500ms
+    400 customers at 80-95%:               sync every 100ms
+    100 customers at &gt;95%:                 sync every 50ms
+
+  Redis ops per second per server:
+    8,000 × (2 ops / 2s)    = 8,000 ops/s
+    1,500 × (2 ops / 0.5s)  = 6,000 ops/s
+    400 × (2 ops / 0.1s)    = 8,000 ops/s
+    100 × (2 ops / 0.05s)   = 4,000 ops/s
+    Total per server:         26,000 ops/s
+
+  Wait — that's per server. With 10,000 servers?
+  No! Each server only tracks customers it has seen recently.
+  A server typically sees traffic from ~100-500 customers, not all 10,000.
+
+  Revised calculation per server (tracking 300 customers):
+    ~240 at &lt;50%:  240 × 1 = 240 ops/s
+    ~45 at 50-80%: 45 × 4  = 180 ops/s
+    ~12 at 80-95%: 12 × 20 = 240 ops/s
+    ~3 at &gt;95%:    3 × 40  = 120 ops/s
+    Total per server: ~780 ops/s
+
+  Total across all servers: 10,000 × 780 = 7,800,000 ops/s.
+
+  Hmm, that's too many. We need Redis sharding.
+
+  With a Redis cluster of 50 shards (each handling 200K ops/s):
+    7.8M / 50 = 156,000 ops/s per shard. Feasible.</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>Important correction:</strong> Adaptive sync increases accuracy for high-utilization customers but increases Redis load. The 50-shard Redis cluster costs more than the single instance in Iteration 1, but far less than the 333 instances of the naive approach. The tradeoff is justified because high-utilization customers (those near their limit) are the ones who care most about accuracy.</p>
+      </div>
+
+      <div>
+        <h3>Batching Reduces Redis Load Further</h3>
+<pre class="line-numbers"><code class="language-text">Instead of one Redis call per customer per sync:
+  Batch all customers into a single Redis pipeline per sync.
+
+  Server syncs 300 customers in one pipeline:
+    300 INCRBY + 300 GET = 600 commands in 1 pipeline.
+    Redis processes pipelines much faster than individual commands:
+    1 pipeline ≈ 1 network round trip, regardless of command count.
+
+  Effective Redis ops/sec with pipelining:
+    10,000 servers × ~5 pipeline calls/sec = 50,000 pipeline calls/sec.
+    Each pipeline has ~100 commands.
+
+    Redis throughput with pipelining: 500K-1M commands/sec per instance.
+    Need: 50,000 × 100 = 5,000,000 commands/sec.
+    With 10 Redis instances: 500K each. Feasible with pipelining.
+
+  Down from 333 instances (naive) to 10 instances (batched adaptive sync).</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Sharding the counter space (cite, don't restate)</h3>
+        <p>The 10-shard cluster shards keys by <code>hash(scope_key)</code> &mdash; <a href="../canonicals/sharding-strategies.html#hash">hash sharding</a>, with consistent hashing so adding a shard moves only ~1/N of keys (detail: <a href="../consistent-hashing.html">consistent-hashing.html</a>). Hash, not range: there's no range-scan query here, only point increments, and uniform load is the priority. A single huge tenant is still one key on one shard &mdash; a <a href="../canonicals/bottlenecks.html#hot-key">hot key</a> &mdash; but the local-first layer (Iteration&nbsp;1) already absorbed the per-request rate; the shard now sees only ~2 ops per server per sync interval for that key, not 1&nbsp;M/sec. If <em>that</em> ever became hot (it won't at these numbers), the move is to shard the customer's counter into <code>k</code> sub-counters (<code>scope_key + ":" + rand(k)</code>) and sum on read &mdash; the standard hot-key-with-salt move.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>A customer oscillating around the utilization band thresholds &rarr; <a href="../canonicals/failure-modes.html#lease-expiry-storm">sync-rate flapping</a>.</strong> A customer hovering at exactly 80% utilization flips between 500&nbsp;ms and 100&nbsp;ms sync &mdash; 5&times; the backend ops, oscillating. Defence: hysteresis on the band edges (enter the faster tier at 80%, leave it only below 75%) and a minimum dwell time per tier (don't change the interval more than once per few seconds). Blast radius: one customer's worth of extra backend ops; detection: sync-interval-change rate per customer.</li>
+          <li><strong>A burst pushes thousands of customers into the fast tier simultaneously &rarr; <a href="../canonicals/failure-modes.html#stampede">backend stampede</a>.</strong> A platform-wide traffic spike (a popular event) raises everyone's utilization at once &rarr; the adaptive logic switches a large fraction of scopes to 50&nbsp;ms sync &rarr; backend ops jump ~10&times;. Defence: a fleet-wide ceiling on aggregate sync rate &mdash; if the regional store's load is near its budget, cap the fastest tier for everyone (accept ~4% error fleet-wide rather than overloading the store); this is exactly the DEGRADED state in Iteration&nbsp;3. Detection: regional-store ops/sec vs its budget.</li>
+          <li><strong>Pipeline batches a slow customer behind a fast one &rarr; head-of-line in the sync.</strong> Batching all of a server's scopes into one pipeline means a near-limit customer's reconcile waits for the whole pipeline to complete; a slow shard delays the urgent update. Defence: split the pipeline by shard (one per Redis shard, sent in parallel) so a slow shard only delays its own keys; and put near-limit scopes in their own small high-priority pipeline. Detection: per-shard sync latency.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Graceful Degradation                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Graceful Degradation and Failover</h2>
+      <p>What happens when Redis is unreachable? The system must degrade gracefully rather than fail catastrophically.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 750 200" style="width:100%;max-width:750px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowTransition" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+          </defs>
+          <!-- Title -->
+          <text x="375" y="18" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Redis Health State Machine</text>
+
+          <!-- State 1: HEALTHY -->
+          <rect x="10" y="50" width="150" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+          <text x="85" y="72" text-anchor="middle" font-weight="700" fill="#16a34a">HEALTHY</text>
+          <text x="85" y="90" text-anchor="middle" fill="#334155" font-size="10">Adaptive sync</text>
+          <text x="85" y="102" text-anchor="middle" fill="#334155" font-size="10">&lt;1% error</text>
+
+          <!-- Arrow HEALTHY -> DEGRADED -->
+          <line x1="160" y1="80" x2="200" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowTransition)"/>
+          <text x="180" y="72" text-anchor="middle" fill="#64748b" font-size="9">latency &gt;10ms</text>
+
+          <!-- State 2: DEGRADED -->
+          <rect x="203" y="50" width="150" height="60" rx="8" fill="#fefce8" stroke="#eab308" stroke-width="2"/>
+          <text x="278" y="72" text-anchor="middle" font-weight="700" fill="#ca8a04">DEGRADED</text>
+          <text x="278" y="90" text-anchor="middle" fill="#334155" font-size="10">2s sync for all</text>
+          <text x="278" y="102" text-anchor="middle" fill="#334155" font-size="10">~4% error</text>
+
+          <!-- Arrow DEGRADED -> UNREACHABLE -->
+          <line x1="353" y1="80" x2="393" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowTransition)"/>
+          <text x="373" y="72" text-anchor="middle" fill="#64748b" font-size="9">conn fail</text>
+
+          <!-- State 3: UNREACHABLE -->
+          <rect x="396" y="50" width="150" height="60" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+          <text x="471" y="72" text-anchor="middle" font-weight="700" fill="#ef4444">UNREACHABLE</text>
+          <text x="471" y="90" text-anchor="middle" fill="#334155" font-size="10">Local-only limits</text>
+          <text x="471" y="102" text-anchor="middle" fill="#334155" font-size="10">~80% under-allow</text>
+
+          <!-- Arrow UNREACHABLE -> RECOVERING -->
+          <line x1="546" y1="80" x2="586" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowTransition)"/>
+          <text x="566" y="72" text-anchor="middle" fill="#64748b" font-size="9">reconnect</text>
+
+          <!-- State 4: RECOVERING -->
+          <rect x="589" y="50" width="150" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="664" y="72" text-anchor="middle" font-weight="700" fill="#2563eb">RECOVERING</text>
+          <text x="664" y="90" text-anchor="middle" fill="#334155" font-size="10">Stagger sync</text>
+          <text x="664" y="102" text-anchor="middle" fill="#334155" font-size="10">over 30 seconds</text>
+
+          <!-- Arrow RECOVERING -> HEALTHY (curved below) -->
+          <path d="M 664 110 Q 664 165 375 165 Q 85 165 85 110" fill="none" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowTransition)"/>
+          <text x="375" y="160" text-anchor="middle" fill="#16a34a" font-size="10">all syncs restored</text>
+
+          <!-- Arrow DEGRADED back to HEALTHY (above) -->
+          <path d="M 278 50 Q 278 35 180 35 Q 85 35 85 50" fill="none" stroke="#16a34a" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowTransition)"/>
+          <text x="180" y="30" text-anchor="middle" fill="#16a34a" font-size="9">latency recovers</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Failover Strategy</h3>
+<pre class="line-numbers"><code class="language-text">Redis health states and corresponding behavior:
+
+State 1: HEALTHY (normal operation)
+  - Sync with Redis at adaptive intervals.
+  - Full accuracy (&lt;1% error for near-limit customers).
+
+State 2: DEGRADED (Redis responding slowly, >10ms latency)
+  - Increase sync interval to 2 seconds for ALL customers.
+  - Reduce Redis load. Accept up to ~4% error for all customers.
+  - Alert the on-call team.
+
+State 3: UNREACHABLE (Redis connection failed)
+  - Fall back to LOCAL-ONLY rate limiting.
+  - Each server enforces: local_limit = global_limit / estimated_num_servers.
+
+  Estimated servers: use a reasonable default, e.g., 1,000 (not 10,000).
+    Why 1,000 and not 10,000? Because traffic isn't uniform.
+    A customer's requests hit ~100-500 servers, not all 10,000.
+    Using 1,000 is a conservative middle ground.
+
+    Customer with 1M limit: local_limit = 1M / 1,000 = 1,000 req/sec per server.
+
+    If customer hits 200 servers: effective limit = 200 × 1,000 = 200,000.
+    That's 20% of their actual limit — under-allowing by 80%.
+
+    Not ideal, but the customer gets SOME service.
+    Better than Option A (block all) or Option B (allow all).
+
+State 4: RECOVERING (Redis back online)
+  - Gradually resume syncing (one customer group at a time).
+  - Don't slam Redis with all 10,000 servers syncing simultaneously.
+  - Stagger reconnection over 30 seconds.</code></pre>
+      </div>
+
+      <div>
+        <h3>The &ldquo;Allow or Block?&rdquo; Decision</h3>
+<pre class="line-numbers"><code class="language-text">When rate limiting infrastructure fails, you face a choice:
+
+  "Fail open" (allow all traffic):
+    + Customers experience no disruption.
+    - An abusive customer could overload your backend.
+    - You are charging for rate limits you're not enforcing.
+    → Use for: low-risk APIs, internal services.
+
+  "Fail closed" (block all traffic):
+    + No risk of backend overload.
+    - ALL customers are down. This is a self-inflicted outage.
+    → Use for: almost never. This is worse than the problem it prevents.
+
+  "Fail conservative" (local-only with conservative limits):
+    + Customers get partial service.
+    + Backend is protected (conservative limits prevent overload).
+    - Customers may see more rejections than expected.
+    → Use for: most production API platforms. This is the right default.</code></pre>
+      </div>
+
+      <div>
+        <h3>Monitoring and Alerting</h3>
+<pre class="line-numbers"><code class="language-text">Key metrics to monitor:
+
+  1. Sync latency (p50, p99):
+     Normal: &lt;1 ms. Alert if p99 > 5 ms.
+
+  2. Sync success rate:
+     Normal: >99.9%. Alert if &lt;99%.
+
+  3. Over-allowance rate per customer:
+     Track: (actual requests allowed - limit) / limit.
+     Alert if any customer exceeds 5% over-allowance.
+
+  4. Under-allowance rate per customer:
+     Track: (limit - actual requests allowed) / limit,
+     when customer is actively sending at their limit.
+     Alert if any customer gets &lt;90% of their paid limit.
+
+  5. Redis memory usage:
+     Each key ≈ 100 bytes. Keys per second window × TTL of 3s:
+     10,000 customers × 3 windows = 30,000 keys × 100B = 3 MB.
+     Redis memory usage for rate limiting is negligible.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract &mdash; fail OPEN, with a cap</h3>
+        <p>The headline guarantee: <em>a rate-limiter outage admits traffic; it never denies it.</em> Concretely &mdash; (1) <strong>regional counter slow</strong> (&gt; 10&nbsp;ms or timing out) &rarr; DEGRADED: every scope syncs at the slow interval (2&nbsp;s), accepting ~4% over-admission fleet-wide, alert on-call; the hot path is unaffected (it never touched the counter). (2) <strong>regional counter unreachable</strong> &rarr; LOCAL-ONLY: each server enforces <code>local_limit = global_limit / estimated_servers</code> with a deliberately <em>generous</em> estimate (e.g., 1,000, not 10,000 &mdash; assume traffic clusters), so a customer keeps getting partial service rather than being throttled to nothing; the backend is still protected (the cap is conservative enough that even a customer hitting all 10,000 servers gets at most 10&times; their limit, not unbounded). (3) <strong>config-push down</strong> &rarr; keep the last-known limit catalog indefinitely; new tenants just don't get a limit until config flows. (4) <strong>the limiter library itself faults</strong> (a bug, an exception in <code>allow()</code>) &rarr; the API server's middleware catches it and <em>admits</em> the request &mdash; a limiter bug must never 500 a customer's API call. (5) <strong>recovery</strong> &rarr; servers re-sync on a jittered schedule over ~30&nbsp;s, not all at once (no thundering herd on the recovering counter). The one exception: a per-scope policy bit can mark a <em>security</em> scope (login attempts, password reset, signup) as fail-<em>closed</em> &mdash; for those, &ldquo;can't check the counter&rdquo; means &ldquo;deny&rdquo;, because the cost of over-admitting an attacker outweighs the cost of blocking a few legit logins. The invariant: <em>the limiter degrades to staler / coarser / more-permissive &mdash; never to &ldquo;the API is down&rdquo;.</em> Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a> + <a href="../canonicals/failure-modes.html#stampede">#stampede</a>.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; multi-region</h3>
+        <p>The platform spans regions; a customer's traffic hits multiple. Where does the global count live? Options:</p>
+        <ul>
+          <li><strong>Per-region quotas with periodic rebalance &mdash; chosen.</strong> Split a customer's global limit into per-region sub-limits (proportional to recent regional traffic); each region runs the local-first design above against its <em>own</em> regional counter (a regional Redis cluster); a slow background job (every few seconds to a minute) measures actual per-region usage and rebalances the split &mdash; a region using 10% of its quota donates headroom to a region at 95%. Properties: zero cross-region traffic on the hot path or the per-request sync; bounded over-admission = the sum of per-region over-admissions plus the rebalance lag. The standard approach. Worked: a 1&nbsp;M&nbsp;req/sec customer with traffic 70% in us-east, 30% in eu-west &rarr; quotas 700&nbsp;k / 300&nbsp;k; if eu-west traffic doubles to 60% before the next rebalance, eu-west over-admits by up to (its real usage &minus; its 300&nbsp;k quota) for one rebalance interval &mdash; bounded, and the rebalance closes it.</li>
+          <li><strong>One global CP counter (Spanner / a Raft group) the per-request path reads &mdash; rejected.</strong> Exact globally &mdash; but a cross-region read on every request is 60&ndash;200&nbsp;ms (<a href="../canonicals/bottlenecks.html#cross-region">cross-region latency</a>), violating the &lt; 1&nbsp;ms budget by two orders of magnitude, and the consensus group is a global SPOF. Exactness across regions isn't worth that; the soft SLO permits the per-region split's small slop.</li>
+          <li><strong>One global eventually-consistent CRDT counter (a g-counter replicated cross-region) &mdash; rejected as the primary mechanism.</strong> A grow-only counter merges cleanly across regions with no coordination &mdash; appealing &mdash; but each region still needs the count <em>fast</em> on the reconcile path, so you're back to per-region replicas of it; and a pure g-counter never decreases, so windowing (resetting the count each second) needs a per-window counter, which is what the per-region quota scheme already is, minus the cross-region replication overhead. CRDTs are the right tool when regions must <em>see each other's</em> count; here they don't &mdash; they only need their own quota.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 780 340" style="width:100%;max-width:780px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowFinalBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowFinalGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowFinalGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- Client -->
+          <rect x="10" y="130" width="90" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="55" y="155" text-anchor="middle" font-weight="600" fill="#334155">Client</text>
+          <text x="55" y="172" text-anchor="middle" fill="#64748b" font-size="11">API request</text>
+
+          <!-- Arrow Client -> LB -->
+          <line x1="100" y1="158" x2="140" y2="158" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowFinalGray)"/>
+
+          <!-- Load Balancer -->
+          <rect x="143" y="130" width="100" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="193" y="152" text-anchor="middle" font-weight="600" fill="#334155">Load</text>
+          <text x="193" y="170" text-anchor="middle" fill="#334155">Balancer</text>
+
+          <!-- Arrow LB -> API Server -->
+          <line x1="243" y1="158" x2="280" y2="158" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowFinalGray)"/>
+
+          <!-- API Server boundary -->
+          <rect x="283" y="40" width="240" height="270" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="403" y="65" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="14">API Server</text>
+
+          <!-- Local Rate Limiter -->
+          <rect x="303" y="80" width="200" height="90" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="403" y="100" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="12">Local Rate Limiter</text>
+          <text x="403" y="118" text-anchor="middle" fill="#334155" font-size="11">(in-process)</text>
+          <text x="403" y="138" text-anchor="middle" fill="#334155" font-size="11">local_counts + local_limits</text>
+          <text x="403" y="155" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">O(1) check, ~0.001 ms</text>
+
+          <!-- Hot path label -->
+          <rect x="303" y="178" width="200" height="22" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="403" y="193" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">Hot path: NO network call</text>
+
+          <!-- Background Sync box -->
+          <rect x="303" y="210" width="200" height="55" rx="6" fill="#fefce8" stroke="#eab308" stroke-width="1"/>
+          <text x="403" y="230" text-anchor="middle" font-weight="600" fill="#854d0e" font-size="11">Background Sync Thread</text>
+          <text x="403" y="248" text-anchor="middle" fill="#854d0e" font-size="10">Adaptive: 50ms - 2,000ms</text>
+          <text x="403" y="260" text-anchor="middle" fill="#854d0e" font-size="10">Pipeline INCRBY + GET</text>
+
+          <!-- Arrow sync -> Redis -->
+          <line x1="523" y1="237" x2="580" y2="180" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowFinalBlue)"/>
+          <text x="565" y="220" text-anchor="middle" fill="#2563eb" font-size="10" transform="rotate(-35 565 220)">async sync</text>
+
+          <!-- Redis Cluster -->
+          <rect x="583" y="100" width="180" height="120" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="673" y="125" text-anchor="middle" font-weight="700" fill="#334155">Redis Cluster</text>
+          <text x="673" y="143" text-anchor="middle" fill="#64748b" font-size="11">(10 shards)</text>
+          <text x="673" y="165" text-anchor="middle" fill="#334155" font-size="11">Global counts</text>
+          <text x="673" y="183" text-anchor="middle" fill="#334155" font-size="11">per customer / per window</text>
+          <text x="673" y="208" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">~50K pipeline calls/sec</text>
+
+          <!-- Failover label -->
+          <rect x="583" y="235" width="180" height="55" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="673" y="253" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">On Redis failure:</text>
+          <text x="673" y="270" text-anchor="middle" fill="#334155" font-size="10">Fall back to local-only</text>
+          <text x="673" y="283" text-anchor="middle" fill="#334155" font-size="10">(conservative limits)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Request Path (Hot Path &mdash; No Network Call)</h3>
+<pre class="line-numbers"><code class="language-text">1. API server receives request from customer C.
+2. Look up C in local rate limiter:
+     local_counts[C] += 1
+     if local_counts[C] > local_limits[C]:
+         return HTTP 429 Too Many Requests
+     else:
+         process request normally
+3. Total added latency: ~0.001 ms (in-memory hash map lookup).
+   Well under the 1 ms budget.</code></pre>
+      </div>
+
+      <div>
+        <h3>Sync Path (Background &mdash; Async)</h3>
+<pre class="line-numbers"><code class="language-text">Every sync_interval (adaptive: 50ms to 2000ms):
+  1. Batch all local counts into a Redis pipeline.
+  2. Send pipeline: INCRBY + GET for each active customer.
+  3. Receive global counts.
+  4. Recalculate local_limits based on remaining budget and utilization.
+  5. Reset local counts.
+  6. Adjust sync_interval based on new utilization levels.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Final Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Naive (Redis per request)</th><th>Final Design</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Redis ops/sec</td><td>50,000,000</td><td>~50,000 pipeline calls</td></tr>
+              <tr><td>Redis instances needed</td><td>333</td><td>10 (with pipelining)</td></tr>
+              <tr><td>Added latency per request</td><td>0.3&ndash;0.5 ms</td><td>~0.001 ms</td></tr>
+              <tr><td>Accuracy (near limit)</td><td>Exact</td><td>&lt; 1% error (50ms sync)</td></tr>
+              <tr><td>Accuracy (well under limit)</td><td>Exact</td><td>&lt; 4% error (2s sync)</td></tr>
+              <tr><td>Redis failure impact</td><td>Total outage</td><td>Degrades to local-only</td></tr>
+              <tr><td>Cost (Redis infrastructure)</td><td>~$166,500/mo</td><td>~$5,000/mo</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Sliding Window Counter Implementation</h3>
+        <p>The local per-pod counter is a <strong>sliding-window counter</strong> &mdash; the O(1)-memory approximation that avoids the fixed-window boundary burst without storing every hit (the algorithm comparison is <a href="../rate-limiting.html">rate-limiting.html</a>; token bucket is the interchangeable alternative, see the Naive-Design C4). Per-pod state is two integers per scope: the current 1-second window's count and the previous window's count. Scenario-specific worked numbers:</p>
+
+<pre class="line-numbers"><code class="language-text">Fixed window problem:
+  Window 1: [0:00, 1:00)  — Customer sends 900K requests at 0:59.
+  Window 2: [1:00, 2:00)  — Customer sends 900K requests at 1:01.
+  Both windows under 1M limit individually.
+  But in the 2-second span [0:59, 1:01): 1.8M requests. Nearly 2× the limit!
+
+Sliding window counter solution:
+  At time T, calculate:
+    count = (previous_window_count × overlap_fraction) + current_window_count
+
+    overlap_fraction = 1 - (seconds_into_current_window / window_size)
+
+  Example at time 1:15 (15 seconds into the current 60-second window):
+    previous_window_count = 800,000
+    current_window_count = 200,000
+    overlap_fraction = 1 - (15/60) = 0.75
+
+    estimated_count = (800,000 × 0.75) + 200,000 = 800,000
+
+    If limit is 1,000,000: 800,000 < 1,000,000 → allow.
+
+  This is an approximation but eliminates the boundary burst problem.
+  Error is bounded by the distribution of requests within the previous window.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel &rarr; production cousin (property trade)</h3>
+        <p>What changed when the single-machine LC #362 deque / LC #359 hashmap became a distributed approximate counter:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property</th><th>Textbook (LC #362 / #359, one machine)</th><th>Production cousin</th><th>Why the swap</th></tr></thead>
+            <tbody>
+              <tr><td>Exactness</td><td>exact &mdash; the deque holds every hit's bucket; the hashmap holds the precise last-allowed time</td><td>bounded over-admission &mdash; sliding-window <em>counter</em> (or token bucket) per pod, reconciled to an eventually-consistent global count</td><td>the exact version (sliding-window-<em>log</em>) is O(window&times;rate) memory per key &mdash; ~1&nbsp;M timestamps for a 1&nbsp;M&nbsp;req/sec customer; and a global exact count needs a round trip per request. The &lt; 5% soft SLO buys the approximation.</td></tr>
+              <tr><td>Memory per key</td><td>O(window/bucket) for the deque; O(1) for the logger hashmap entry</td><td>O(1) &mdash; two integers (current + previous window count) or two for a token bucket (<code>tokens</code>, <code>last_refill</code>)</td><td>at 10&nbsp;k tenants &times; several scopes &times; 10&nbsp;k servers, the per-key footprint has to be a handful of bytes, not a window's worth of buckets</td></tr>
+              <tr><td>Placement</td><td>in-process on the one node that owns the data</td><td>local-first: an in-process counter on every API server (the hot-path check) + an async-reconciled regional counter (the global view)</td><td>the requests are scattered across 10&nbsp;k servers; no one server sees the customer's whole traffic, but the check still has to be a local lookup</td></tr>
+              <tr><td>Failure mode</td><td>a crash just loses the deque/hashmap &mdash; no consequence beyond a cold start</td><td>fail <em>open</em> + a conservative local fallback limit; the regional counter going down admits traffic, never blocks it; a limiter-library exception admits the request</td><td>at scale the limiter is on the critical path of a revenue API &mdash; its outage must degrade to &ldquo;limits un-enforced for a few minutes,&rdquo; never to &ldquo;the API is down&rdquo;</td></tr>
+              <tr><td>Decision latency</td><td>a deque op / a hashmap lookup &mdash; nanoseconds</td><td>still a local hashmap/atomic lookup &mdash; ~1&nbsp;&micro;s, NEVER a network round trip on the hot path; the round trip moved to the background reconcile thread</td><td>0.5&nbsp;ms &times; 50&nbsp;M/sec is both a per-call latency tax and a bandwidth wall on any central store &mdash; the whole architecture exists to keep the round trip off the request</td></tr>
+              <tr><td>Granularity</td><td>one counter / one gate</td><td>hierarchical &mdash; per-tenant AND per-key sub-limit AND per-IP AND per-endpoint; a request passes only if it clears every scope it falls under</td><td>real limits are layered (a tenant's total, a key's slice, abuse protection per IP, expensive endpoints capped) &mdash; the same O(1) machinery, just keyed differently and AND-ed</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; schema / API sketch</h3>
+<pre class="line-numbers"><code class="language-text">// --- Local per-pod state (in-RAM, lock-free; request threads use atomics) ---
+struct ScopeCounter {                         // one per active scope_key on this pod
+  curr_window_start: i64;  curr_count: u32;   // sliding-window-counter form ...
+  prev_count: u32;                            // ... estimated = prev*overlap + curr
+  // (token-bucket alt: tokens: f32; last_refill: i64;  refill = rate*(now-last_refill))
+  local_limit: u32;                           // budget until next sync (re-derived each reconcile)
+  reported_delta: u32;                        // allowed-since-last-sync, to report
+}
+map[scope_key -&gt; ScopeCounter]  local;        // ~100-500 entries per pod; LRU-evict cold scopes
+map[scope_key -&gt; {limit_per_sec, window, policy}]  limits;   // synced from the control plane
+
+// --- Regional counter store (Redis Cluster, sharded by hash(scope_key)) ---
+// Key shape:  rl:{scope_key}:{window_id}     window_id = floor(epoch_sec / window)
+// Lua: atomic report-delta + read-global  (one round trip per scope per sync, batched in a pipeline):
+//   local c = redis.call('INCRBY', KEYS[1], ARGV[1])      -- ARGV[1] = local reported_delta
+//   if c == tonumber(ARGV[1]) then redis.call('EXPIRE', KEYS[1], ARGV[2]) end   -- ARGV[2] = TTL (2-3 windows)
+//   return c                                              -- the approximate global count
+
+// --- Control-plane store (limit catalog; tiny, relational; ~tens of KB) ---
+CREATE TABLE limits ( scope_type text, scope_id text, limit_per_sec bigint, window_sec int,
+                      fail_policy text DEFAULT 'open',   -- 'open' | 'closed' (security scopes)
+                      parent_scope text,                 -- hierarchy: a key's parent is its tenant
+                      version bigint, PRIMARY KEY (scope_type, scope_id) );
+
+// --- The rate-limit RESPONSE (cite api-design-patterns#rate-limit-response -- do not restate) ---
+// On DENY:  HTTP 429
+//   Retry-After: (seconds until the scope's window resets / next token)     -- mandatory
+//   X-RateLimit-Limit: (limit_per_sec for the binding scope)
+//   X-RateLimit-Remaining: max(0, limit - estimated_count)                  -- from peek(), local read
+//   X-RateLimit-Reset: (epoch when the window resets)
+//   body: RFC 7807 Problem Details { type, title, status:429, detail, retry_after_seconds, trace_id }
+// On ALLOW: the same X-RateLimit-* headers (so well-behaved clients self-throttle before they hit 429).
+</code></pre>
+        <p>Headers and body shape: <a href="../canonicals/api-design-patterns.html#rate-limit-response">api-design-patterns#rate-limit-response</a> (and the <a href="../canonicals/api-design-patterns.html#errors">error model</a> for the 7807 body). Note <code>peek()</code> reads <em>local</em> state &mdash; the <code>X-RateLimit-*</code> numbers are this pod's view, approximate, never a round trip.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>C10 &mdash; concrete technology, justified</h3>
+        <ul>
+          <li><strong>Regional counter store: Redis Cluster + Lua &mdash; chosen.</strong> An atomic INCRBY+EXPIRE+read in one server-side script, ~150&nbsp;k&ndash;200&nbsp;k ops/sec/node, sharded by key, replica for failover, microsecond-class ops, ubiquitous ops experience. The reconcile traffic (~50&nbsp;k pipeline calls/sec, ~10 nodes) fits comfortably. Versus: <strong>a CRDT g-counter (Riak / Redis Enterprise CRDTs)</strong> &mdash; merges across regions without coordination, but we don't <em>need</em> cross-region merge (per-region quotas), and a g-counter doesn't decrease, so windowing reintroduces per-window counters anyway; net complexity for no benefit here. <strong>DynamoDB atomic counters (<code>UpdateItem ADD</code>)</strong> &mdash; managed, durable, scales &mdash; but ~5&ndash;10&nbsp;ms per write (vs &lt;1&nbsp;ms Redis), partition-key throughput caps make a hot tenant's key a hot partition, and we don't want durability we're paying for (the count is ephemeral, rebuilt every window). <strong>A custom in-memory sharded counter service</strong> &mdash; could be leaner, but it's a new stateful fleet to operate for a job Redis already does; build it only if Redis's per-key hot-shard ceiling is genuinely hit (it isn't). <strong>Envoy's global rate limiter / lyft&#8203;/ratelimit</strong> &mdash; this <em>is</em> essentially that design (a gRPC ratelimit service in front of a Redis backend); we'd use it off-the-shelf in practice; the from-scratch derivation here is to understand its knobs (descriptor keys = our scope keys; the local cache = its &ldquo;local rate limit&rdquo; filter; the shadow mode = our DEGRADED state).</li>
+          <li><strong>Local cache: in-process library, not a sidecar &mdash; chosen.</strong> The hot-path check must be a function call (~1&nbsp;&micro;s, no IPC); a sidecar adds a localhost round trip (~50&ndash;100&nbsp;&micro;s) &times; 50&nbsp;M/sec &mdash; tolerable latency-wise but a needless CPU and complexity tax for state that's tiny and pod-local. A sidecar is the right call only when the limiter must be polyglot-shared across many runtimes that can't link the same library &mdash; then accept the localhost hop. (Envoy's design splits it: the <em>local</em> rate-limit filter is in-process in the proxy; the <em>global</em> one calls the ratelimit service &mdash; mirroring our local-first split.)</li>
+          <li><strong>Control-plane store: a small relational DB (Postgres) &mdash; chosen.</strong> The limit catalog is ~tens of KB, changes rarely, has a hierarchy (a key's parent is its tenant) the validation walks &mdash; relational fits; pushed to pods via a config-distribution stream. Not etcd (the catalog isn't a coordination problem), not in Redis (it's config, not a hot counter).</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>Two angles: (a) rate limiting <em>as</em> a security control &mdash; per-IP / per-credential limits on login, signup, password-reset are <em>fail-closed</em> scopes (the <code>fail_policy</code> bit), since over-admitting an attacker is worse than blocking a few legit attempts; (b) the limiter's own surface &mdash; <code>set_limit</code> is RBAC'd + audit-logged, the config-push stream is signed (a compromised channel can't lower a tenant's limit to 0 or raise it to &infin;). Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>Per-IP scopes use the client IP as a key &mdash; IPs are PII in some jurisdictions; the limiter <em>stores nothing durable</em> (counters are ephemeral, TTL'd within a few windows), so there's no retention to manage; per-request decision logs (which carry the IP) belong to the downstream analysis pipeline, which TTLs them. No PII in the limit catalog. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>The only durable state is the limit catalog (small, relational &mdash; standard Postgres HA + backups; RPO &asymp; replication lag, RTO &asymp; minutes); the regional counters and the in-pod state are ephemeral (rebuilt within a window from live traffic) &mdash; RPO = &infin; / RTO &asymp; one window; and the limiter keeps working on last-known-good limits + local fallback throughout. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>A freshly-deployed API server starts with no local counters &rarr; syncs immediately on startup, then on the adaptive schedule; brief over-admission until the first sync (bounded, tiny). The regional counter cluster is sized for the reconcile rate (~50&nbsp;k pipeline calls/sec) + headroom for the DEGRADED&ndash;to&ndash;all-fast-tier surge + 2&times; fleet growth; capacity floor so an autoscaler glitch doesn't drop it below the reconcile load. Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>Each API server's reconcile thread connects to all ~10 regional-counter shards (it has keys on each) &mdash; 10&nbsp;k servers &times; 10 shards = 100&nbsp;k connections, well under the 10&#8310; threshold, so no subsetting needed; named because at 100&nbsp;k servers you'd want the hierarchical (per-rack aggregator) reconcile from the Iteration&nbsp;1 C4. Cite <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>Each region is a cell &mdash; its own counter cluster, its own control-plane replica; a regional counter failure is contained (that region degrades to LOCAL-ONLY, other regions unaffected); per-tenant per-region quotas also make a single tenant's surge a per-cell event. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>Limit-config distribution is push (a stream from the control plane to every API server, ~seconds convergence); the request path is request/response &mdash; no push to clients. N/A as a <em>real-time-push</em> design otherwise. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>Highly relevant: the cheapest place to shed obviously-over-limit traffic is the CDN / edge POP &mdash; a coarse per-IP / per-tenant limit at the edge (Cloudflare Workers + Durable Objects, or the CDN's native rate-limit rules) absorbs floods before they reach the origin fleet, with the precise hierarchical check still at the API server. The edge limiter is itself an instance of this design (local-first per-POP + eventual sync), just with looser limits and a coarser key. Cite <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> Hot-path added latency p50/p99 (&rarr; the &lt;1&nbsp;ms NFR &mdash; should be ~1&nbsp;&micro;s; if it's not, you've accidentally put a network call on the path); per-customer over-admission rate <code>(allowed &minus; limit)/limit</code> and under-admission rate <code>(limit &minus; allowed)/limit when sending at the limit</code> (&rarr; the &le;5% accuracy NFR &mdash; alert per-customer breach); sync success rate + sync age p99 per server (&rarr; staleness &mdash; alert at p99 &gt; 5&times; interval); regional-counter ops/sec vs its budget (&rarr; backend QPS NFR + the stampede detector); active-scope count per server (memory bound on the local map); fraction of fleet in DEGRADED / LOCAL-ONLY (&rarr; the fail-open path is engaged); config-version histogram across servers (&rarr; limit-freshness NFR); 429 rate per scope + the Retry-After-honoured fraction (retry-storm detector).</li>
+          <li><strong>Rollout.</strong> Two surfaces: (1) <em>the limiter binary/library</em> &mdash; canary a few API servers, watch hot-path latency + accuracy + ejection-to-LOCAL-ONLY rate, ramp; rollback is a redeploy. (2) <em>a limit change</em> &mdash; <code>set_limit</code> is validated (positive, hierarchy-consistent &mdash; a key's sub-limit &le; its tenant's total), versioned, pushed; a tenant-facing limit <em>decrease</em> rolls out behind a soft window (the new lower limit logs-but-doesn't-enforce for a grace period, then enforces) so a misconfigured decrease doesn't instantly throttle a customer; a one-command rollback re-publishes the prior version.</li>
+          <li><strong>Migration.</strong> From a single-Redis per-request limiter (the Naive Design) to the local-first design without an incident: ship the new library with the local layer behind a flag and the regional sync pointed at the <em>same</em> Redis (now used for reconcile, not per-request); turn on the local layer for a subset of API servers &mdash; they stop hammering Redis per request and start syncing; watch Redis ops/sec drop and accuracy hold; ramp server-by-server; once the whole fleet is local-first, swap the single Redis for the sharded cluster (consistent-hash add-a-shard moves only 1/N of keys). A bad batch of servers flips the flag back &mdash; they revert to per-request Redis, which still works (just hot). The migration is &ldquo;flag per server, then re-shard the backend&rdquo; &mdash; no big-bang.</li>
+          <li><strong>Headroom.</strong> The regional counter cluster carries headroom for the worst case &mdash; a platform-wide burst pushing a large fraction of scopes to the 50&nbsp;ms tier at once (~10&times; baseline reconcile); plus rolling-deploy churn (1/3 of API servers re-syncing on startup); plus 2&times; organic fleet growth. The local map has a hard cap (LRU-evict to a conservative default) so a server seeing an unusually large customer fan-in can't OOM. Reason stated inline at each: burst, deploy churn, growth.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text">This component's marginal cost (the limiter rides inside API servers that exist for the API anyway -- it's <1% of their CPU):
+  Naive (central INCR per request):    333 Redis nodes x ~$500/mo  = ~$166,500/mo
+  Iteration 1 (1 Redis + replica):     2 nodes x ~$500/mo          = ~$1,000/mo
+  Iteration 2 (10-shard cluster, HA):  ~20 nodes x ~$500/mo        = ~$10,000/mo  (adaptive sync trades $ for accuracy where it matters)
+  Final (~10 shards + replicas + a small Postgres for the catalog): ~$5,000-10,000/mo
+
+Dominant cost shape (cite cost-shapes.html): this is a cache-heavy / coordination-light primitive -- the backend is a small fleet of
+  in-memory counters, not a database; its job is to make the EXPENSIVE thing (the API backend it protects) cheaper by keeping abusive
+  load off it. Don't size it by its own bill; size it by the backend overload it prevents -- an un-rate-limited API needs the backend
+  provisioned for "any customer might send 10x" instead of "limits hold", which is the real money.
+
+Cost-vs-accuracy knob: the sync interval / the adaptive bands. Tighter sync = more backend ops = more $ = less over-admission. We spend
+  the ops on the few customers near their limit (50ms sync) and almost nothing on the many well under it (2s sync) -- the adaptive bands
+  ARE the cost/accuracy dial. There is no latency knob -- the hot path is already a ~1us local lookup.
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Real-system comparison</h3>
+        <p>This is essentially <strong>Envoy's rate-limiting subsystem</strong> re-derived: the in-process <em>local rate limit</em> filter (a token bucket per descriptor, no network) is our local-first layer; the <em>global rate limit</em> filter calling the <strong>lyft&#8203;/ratelimit</strong> gRPC service backed by Redis is our reconcile path; descriptor keys are our hierarchical scope keys; shadow mode is our DEGRADED state. Cloudflare's rate limiter does the same shape at the edge (per-POP local count + eventual aggregation). Stripe's published design (a token-bucket per key in Redis with a Lua script, plus a local in-process layer for the highest-volume endpoints) is the same local-first/central-reconcile split. The from-scratch derivation here exists to understand <em>why</em> each of those has a local layer and an eventual-sync layer and a fail-open story &mdash; so when Envoy's accuracy looks off you know to check the local-cache TTL and the descriptor granularity, and when Redis is hot you know it's a hot-key-per-tenant question, not a &ldquo;need more Redis&rdquo; one.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p>Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal.</p>
+
+      <div>
+        <h3>What if offered load were 100&times; &mdash; 5&nbsp;billion req/sec? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>The hot path is unbothered &mdash; it's a local lookup, it scales with the API fleet, which is sized for the API anyway. The reconcile load scales with <em>#servers &times; #active-scopes &divide; sync_interval</em>, not with request rate &mdash; 100&times; the requests on roughly the same fleet means roughly the same reconcile traffic. What does grow: the API server count (say 1&nbsp;M servers) &rarr; 1&nbsp;M &times; 10 shards = 10&#8310; connections to the regional cluster, which is the subsetting threshold &mdash; now you want the hierarchical reconcile (servers &rarr; per-rack aggregator &rarr; regional counter) from the Iteration&nbsp;1 C4, so the regional cluster sees ~thousands of aggregator connections, not millions. And per-key hot-shard pressure on a single mega-tenant: shard that tenant's counter into <code>k</code> sub-counters with a random suffix, sum on read &mdash; standard hot-key-with-salt. Nothing structural breaks; two known levers (hierarchical reconcile, counter salting) come off the shelf.</p>
+      </div>
+
+      <div>
+        <h3>Why approximate at all &mdash; why not exact? <span style="font-weight:normal;font-size:0.85em;">(correctness)</span></h3>
+        <p>Exact means one of two things, both disqualified at this scale: (1) sliding-window-<em>log</em> &mdash; store every hit's timestamp, evict, count &mdash; which is O(window&times;rate) memory per key (a million timestamps for a 1&nbsp;M&nbsp;req/sec customer over a 1-second window) and turns the per-request check from O(1) into O(log&nbsp;n); (2) a global exact count read per request &mdash; a round trip on every call, which is both the latency budget blown by 100&times; and a bandwidth wall on the store. The &lt; 5% soft SLO exists precisely so we don't have to pay either. And approximate <em>in the right direction</em>: the design biases toward slight over-admission (let a few extra through) over under-admission (reject paying customers' legit traffic) &mdash; because the latter is the worse failure for an API platform.</p>
+      </div>
+
+      <div>
+        <h3>A tenant disputes their bill &mdash; what if it must be exact for billing? <span style="font-weight:normal;font-size:0.85em;">(exact-for-money)</span></h3>
+        <p>Then it's no longer a rate <em>limiter</em> &mdash; it's a usage <em>meter</em>, a different system with a different durability class. Rate limiting answers &ldquo;allow this request right now?&rdquo; in microseconds, approximately; billing answers &ldquo;how many requests did tenant X make in May?&rdquo; durably, exactly, reconcilably &mdash; that's an append-only event log (every request emits a metered event), aggregated offline, with idempotent dedup and a correction path. They share nothing but the input: <em>don't make the rate limiter authoritative for money.</em> The limiter can emit a per-request counter as a side-effect that feeds the meter, but the meter's source of truth is the durable event stream, not the limiter's ephemeral counters. (This is the boundary with <a href="42-error-aggregation-dedupe.html">#42</a>'s metering side and a metrics/billing pipeline generally.)</p>
+      </div>
+
+      <div>
+        <h3>The regional counter cluster dies right now &mdash; fail open or closed? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Open, with a cap &mdash; per the degradation contract. Concretely: each API server immediately falls back to LOCAL-ONLY: <code>local_limit = global_limit / 1,000</code> (a deliberately generous active-server estimate &mdash; assume traffic clusters, don't divide by 10,000), so a customer keeps getting partial service rather than being throttled to ~2% of their limit; the backend is still protected because even a customer hitting all 10,000 servers gets at most ~10&times; their limit (10,000 &times; limit/1,000), not unbounded. Servers detect the outage by sync failures, switch within one failed sync, and on recovery re-sync on a jittered 30-second ramp (no herd on the recovering cluster). The single exception: scopes marked <code>fail_policy = closed</code> (login/signup/password-reset abuse limits) deny on &ldquo;can't check&rdquo; &mdash; for those, over-admitting an attacker is the worse outcome. What you do <em>not</em> do: block all traffic (a self-inflicted total outage, strictly worse than un-enforced limits for a few minutes).</p>
+      </div>
+
+      <div>
+        <h3>Where's the cost, and which knob moves it? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>This component is ~$5&ndash;10&nbsp;k/mo (a ~10-shard Redis cluster with replicas + a tiny Postgres for the limit catalog) &mdash; cheap; the limiter rides inside API servers that exist for the API regardless, at &lt;1% of their CPU. The relevant lever is the adaptive sync bands: tighter sync &rarr; more backend ops &rarr; more $ &rarr; less over-admission &mdash; and the design already spends those ops only on the few customers near their limit (50&nbsp;ms) and almost none on the many well under it (2&nbsp;s). The <em>real</em> money is elsewhere: an API without working rate limits has to be provisioned for &ldquo;any customer might 10&times; us,&rdquo; so the limiter's job is to make the expensive backend cheaper by holding load flat &mdash; size the limiter by the overload it prevents, not its own bill. Cite <a href="../design-moves/cost-shapes.html#cache-heavy">cost-shapes#cache-heavy</a>.</p>
+      </div>
+
+      <div>
+        <h3>How do you migrate from a single-Redis limiter to the local-first design? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Flag per server, then re-shard the backend &mdash; no big-bang. Ship the new library with the local layer behind a per-server flag, pointing its reconcile at the <em>existing</em> single Redis (now doing INCRBY-deltas, not per-request INCRs). Flip the flag on a handful of servers: they stop hitting Redis per request and start syncing &asymp; twice per interval &mdash; watch Redis ops/sec fall and per-customer accuracy hold (the over/under-admission gauges). Ramp server-by-server; a bad batch flips back to per-request Redis, which still works (hot, but correct). Once the whole fleet is local-first, swap the single Redis for the 10-shard cluster &mdash; consistent-hash add-a-shard moves only ~1/N of keys, and a wrong global count for a moment during the cutover just means slightly stale budgets, self-healing within a window. The control-plane limit catalog migrates separately (it's tiny config).</p>
+      </div>
+
+      <div>
+        <h3>A tenant says they're being throttled wrongly &mdash; where do you look? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>Decision tree off the SLI dashboard: (1) Check their <em>under</em>-admission gauge &mdash; if they're getting &lt; 90% of their paid limit while sending at it, the <code>estimated_active_servers</code> is too high (each server's slice is too small) &rarr; check the global_count/local_count ratio the reconcile uses, and whether their traffic is hitting an unusual number of servers (an LB change?). (2) Check which <em>scope</em> is binding &mdash; the 429's <code>X-RateLimit-Limit</code> header names it; a tenant fine on their global limit can be hitting a per-key sub-limit, a per-IP limit (shared NAT?), or a per-endpoint cap &mdash; the hierarchy means &ldquo;throttled&rdquo; isn't always the obvious scope. (3) Check the fleet's DEGRADED/LOCAL-ONLY fraction &mdash; if the regional counter is down, <em>everyone</em> is on the conservative fallback; the fix is restoring the counter, not touching this tenant. (4) Check the config-version histogram &mdash; if a limit change is half-propagated, some servers enforce the old (lower?) limit. (5) Check their sync-age &mdash; a wedged sync thread on the servers they hit holds a stale (possibly too-tight) budget. Each branch maps to a What-Breaks entry and a runbook step; the over/under-admission and per-scope-429 instruments exist precisely so this is a dashboard read, not archaeology.</p>
+      </div>
+
+      <div>
+        <h3>A burst right at the window boundary doubles the effective rate &mdash; how do you handle it? <span style="font-weight:normal;font-size:0.85em;">(boundary burst)</span></h3>
+        <p>This is the fixed-window flaw the Final Design's sliding-window-counter fixes: 900&nbsp;k requests at <code>0:59.5</code> and 900&nbsp;k at <code>1:00.5</code> are each under a 1&nbsp;M/sec limit <em>per fixed window</em> but ~1.8&nbsp;M over the 1-second span straddling the edge. The sliding-window counter estimates <code>count = prev_window &times; overlap_fraction + curr_window</code> &mdash; at <code>1:00.5</code>, <code>overlap_fraction = 0.5</code>, so the estimate is <code>900k&times;0.5 + 900k = 1.35M</code> &gt; 1&nbsp;M &rarr; deny &mdash; the boundary burst is bounded to &lt; 2&times; (and in practice well under, since real traffic isn't a single spike). If even &lt; 2&times; is too loose, switch the per-key state to a <em>token bucket</em> (refill at the rate, capacity = the explicit burst allowance you actually want) &mdash; it smooths to a true rate with no boundary at all; it's the interchangeable O(1)-per-key alternative (Naive-Design C4). Note the approximation here is purely <em>local</em> &mdash; it's orthogonal to the local-first/reconcile architecture, which handles the <em>distribution</em> problem, not the <em>windowing</em> one.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul class="full-width">
+        <li><strong>A rate limiter is a hit counter plus a gate &mdash; LC #362 and LC #359, same primitive at different granularities.</strong> A deque of timestamped buckets (fine), a <code>(count, window_start)</code> pair (coarse), and a <code>(tokens, last_refill)</code> token bucket (rate-smoothed) are three views of the same O(1)-per-key state. Production keeps the O(1) form (a count + a timestamp), not the deque &mdash; the exact version (sliding-window-<em>log</em>) is O(window&times;rate) memory per key.</li>
+        <li><strong>Pure centralized rate limiting does not scale &mdash; it's a hot key plus an RTT tax.</strong> Checking a central store on every request at 50M req/sec is 333 Redis nodes and 0.5&nbsp;ms on every API call; one big customer's limit is a single key one shard owns. Cost and latency both unacceptable.</li>
+        <li><strong>Pure local rate limiting is too inaccurate.</strong> Without coordination, each server must guess how many others serve the same customer; traffic clusters on ~100&ndash;500 of 10,000 servers, so naive <code>limit/N</code> under-admits massively (customers get ~2% of their limit).</li>
+        <li><strong>Local-first with async reconcile is the middle ground.</strong> Count in-process (the LC kernel, lifted &mdash; zero network on the hot path, ~1&nbsp;&micro;s), sync a batched delta to a sharded regional counter ~twice per interval. Backend load drops ~1,250&times;; over-admission is bounded by the sync interval; the hot path is a lock-free hash lookup.</li>
+        <li><strong>Adaptive sync is the cost/accuracy dial.</strong> Sync fast (50&nbsp;ms) for the few customers near their limit (accuracy matters); slow (2&nbsp;s) for the many well under it (it doesn't). Spends backend ops where they buy accuracy; there is no latency knob &mdash; the hot path is already a local lookup.</li>
+        <li><strong>Fail OPEN, with a cap &mdash; not fail closed, not fail unbounded.</strong> A limiter outage admits traffic on a conservative local fallback (a generous active-server estimate so customers get partial service; conservative enough that the backend is still protected). A limiter-library exception admits the request &mdash; never 500s a customer's API call. Security scopes (login/signup) can opt into fail-closed per-scope. Blocking all traffic on a limiter outage is a self-inflicted outage, strictly worse than the problem.</li>
+        <li><strong>Don't make the rate limiter authoritative for money.</strong> Rate limiting is microsecond, approximate, ephemeral; billing is durable, exact, reconcilable &mdash; a separate metering pipeline over an append-only event log. They share only the input.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../rate-limiting.html" class="card topic-card">
+          <h3>Rate Limiting</h3>
+          <p>Token bucket, leaky bucket, sliding window (log &amp; counter), and GCRA algorithms &mdash; the source-of-truth comparison this page cites.</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#hot-key" class="card topic-card">
+          <h3>Bottleneck: hot key</h3>
+          <p>Why one big customer's limit is a single hot counter, and why local-first counting (not more Redis) is the fix.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>Sharding the counter space across a cluster so add-a-shard moves only ~1/N of keys.</p>
+        </a>
+        <a href="../canonicals/api-design-patterns.html#rate-limit-response" class="card topic-card">
+          <h3>API patterns: rate-limit response</h3>
+          <p>The 429 + Retry-After + X-RateLimit-* contract this design emits &mdash; cited, not restated.</p>
+        </a>
+        <a href="40-experiment-bucket-router.html" class="card topic-card">
+          <h3>#40 Edge backend picker &amp; bucket router</h3>
+          <p>The sibling per-request edge primitive &mdash; selection + assignment instead of admission; same &ldquo;cheap, lock-free, fail-static&rdquo; discipline; token-bucket reused there for self-defense.</p>
+        </a>
+        <a href="42-error-aggregation-dedupe.html" class="card topic-card">
+          <h3>#42 Error aggregation &amp; dedupe</h3>
+          <p>Sentry-style &mdash; per-customer token buckets are this design applied; the Logger-Rate-Limiter 1-in-N gate is the same primitive, here gating per-customer error quotas.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+
+</body>
+</html>

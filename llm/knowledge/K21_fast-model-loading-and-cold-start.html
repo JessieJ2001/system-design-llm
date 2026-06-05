@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K21 — Fast Model Loading &amp; Cold Start — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K21 &mdash; Fast Model Loading &amp; Cold Start <span style="font-weight:400;font-size:.55em;color:#64748b;">(scale-to-zero is worthless if cold start blows the SLO)</span></h1>
+      <p class="hero-subtitle"><strong>How do you make scale-to-zero / autoscaling actually usable &mdash; when a 140 GB model takes tens of seconds to reach HBM and a cold start blows the SLO &mdash; by decomposing where the cold-start time goes into a <em>budget</em>, attacking the dominant leg, and (fastest) restoring a fully-warmed snapshot instead of replaying the whole pipeline?</strong> This page derives the cold-start budget, then D49 (warm snapshot/restore) and the K21 half of D12 (cold-start time <em>is</em> the autoscale headroom floor).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; supplies the cold-start <em>budget</em> <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a> consumes &bull; cites <a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> / <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> / <a href="K14_quantization.html">K14</a> &bull; dedicated scenario: <strong>L5</strong> &bull; ~16 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the cold-start chain). Approve / redirect the arc, the <strong>where-the-time-goes budget derivation</strong>, deep-dive placement (<strong>D49 warm snapshot/restore; D12 K21-half &mdash; co-host K15</strong>), the <strong>rule-11 cold-start-mitigation spectrum</strong> (its endpoint = the scale-to-zero&harr;keep-warm crossover), and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Cold-start time (primary)</strong> &mdash; the first-token latency of a freshly-spawned replica; the budget every leg here attacks.</li>
+          <li><strong>TTFT on the first request after scale-up</strong> &mdash; a blown cold start <em>is</em> a blown TTFT for that request (and every request queued behind it).</li>
+          <li><strong>Cost-shape ($/mo)</strong> &mdash; a small cold-start budget is what makes scale-to-zero economically usable instead of paying keep-warm idle GPU-hours.</li>
+          <li><strong>Feeds K15&rsquo;s headroom floor</strong> &mdash; <code>min_headroom = cold_start &times; peak_ramp_rate</code> and the spot-reclaim drain window are exactly this budget (the D12 K21-half).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Decompose cold start into legs (object/image pull &rarr; host&rarr;HBM copy &rarr; communicator-init &rarr; CUDA-context + compile/graph warm-up &rarr; KV-pool alloc + profiling forward &rarr; first forward); the sum is the cold-start budget &mdash; and at frontier scale it is <em>not</em> one sum but <code>max over ranks + barrier</code> for a sharded replica; attack the dominant leg (usually the pull, the HBM copy, or compile-when-cold); the fastest path is restoring a fully-warmed snapshot (skip the whole pipeline, ~1 s) at the price of a large, version-brittle artifact; this budget is exactly K15&rsquo;s headroom floor.</p>
+      <ul>
+        <li><strong>Is:</strong> the cold-start budget derived as a sum of legs (and its slowest-rank-barrier shape for a sharded replica + the N-way-pull-vs-rank-0-broadcast crossover); D49 (warm snapshot/restore of a GPU process &mdash; mechanism + pitfalls + the snapshot-vs-streaming crossover); the K21 half of D12 (cold-start time <em>is</em> the autoscale budget; co-host <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a>); the cold-start-mitigation rule-11 spectrum (incl. GDS, compile-artifact cache, image-bake, rank-0 broadcast), whose endpoint is the scale-to-zero&harr;keep-warm economic crossover; the don&rsquo;t-serve-until-warm readiness contract (the budget&rsquo;s consumer side).</li>
+        <li><strong>Is not:</strong> the autoscale <em>policy/signal</em> (<a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> &mdash; K21 owns only the <em>budget</em> it feeds; rule of two on D12); the graph-capture <em>machinery</em> (<a href="K17_attention-kernels-and-cuda-graphs.html#d22">K17</a> &mdash; K21 only <em>includes</em> graph warm-up as a leg); model download/distribution infra (artifact registry &mdash; named, not designed); the model <em>format</em> design (safetensors as a named tool, not its spec).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The autoscale signal/policy is <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a>&rsquo;s &mdash; D12 is co-hosted: K21 owns the cold-start <em>budget</em>, K15 owns the <em>signal/policy</em> that consumes it. Graph capture / engine build is <a href="K17_attention-kernels-and-cuda-graphs.html#d22">K17</a>&rsquo;s &mdash; K21 only counts its warm-up as a leg. Quantized weights = fewer bytes to load &rArr; shorter cold start is the <a href="K14_quantization.html">K14</a> cascade reaching here (cite, don&rsquo;t re-derive). <strong>K21 owns the budget, snapshot/restore (D49), and the mitigation spectrum &mdash; nothing else.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Cold-Start Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>A 140 GB model takes tens of seconds to load to HBM.</strong></li>
+        <li>&rarr; scale-to-zero / autoscaling are <em>worthless</em> if a cold start blows the SLO.</li>
+        <li>&rarr; <strong>decompose where the time goes</strong>: object/image pull &rarr; host&rarr;HBM copy &rarr; <strong>NCCL communicator init</strong> &rarr; CUDA-context + compile/graph warm-up (the K17 leg) &rarr; <strong>KV-pool alloc + profiling forward</strong> &rarr; first forward &mdash; the sum is the cold-start budget.</li>
+        <li>&rarr; <strong>at scale this is not a single sum</strong>: a TP&times;PP replica is cold until the <em>slowest rank</em> is warm (a barrier); per-rank shard pull is N-way object-store pull (intra-replica thundering herd) <em>vs</em> rank-0 pull + NVLink/IB broadcast.</li>
+        <li>&rarr; <strong>attack each leg</strong>: zero-copy mmap, GPUDirect-Storage (skip the host bounce), weight streaming, local NVMe/host-RAM cache, persisted compile-artifact cache, weights baked into the machine image.</li>
+        <li>&rarr; the fastest path: restore a <strong>warm snapshot</strong> (skip the whole pipeline, ~1 s) (D49).</li>
+        <li><strong>Problem:</strong> the snapshot is large + driver/GPU-coupled + captured-graph-invalidation-brittle (D49).</li>
+        <li><strong>And:</strong> cold-start time <em>is</em> K15&rsquo;s autoscale headroom floor and the spot-reclaim drain window (the D12 K21-half).</li>
+        <li><strong>Objective:</strong> the mitigation point whose cold-start &le; the SLO/headroom budget at acceptable cost &amp; portability (the rule-11 endpoint = the scale-to-zero&harr;keep-warm crossover).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>140 GB &rarr; tens of s to HBM &rarr; scale-to-zero worthless if cold-start &gt; SLO &rarr; decompose the legs (pull, host&rarr;HBM, communicator-init, compile/graph warm-up, KV-pool+profiling, first forward) = the budget &rarr; at scale it is <strong>not a single sum</strong>: a TP&times;PP replica is cold until the slowest rank is warm, and shard pull is N-way vs rank-0-broadcast &rarr; attack each leg (mmap / GDS / stream / NVMe+compile cache / image-bake) &rarr; fastest: restore a warm snapshot (D49) &rarr; problem: snapshot is large/version-brittle (D49) &rarr; cold-start time IS K15&rsquo;s headroom floor (D12 K21-half) &rarr; objective: the mitigation point whose cold-start &le; the budget at acceptable cost (rule-11; endpoint = scale-to-zero&harr;keep-warm)</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 910" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="300" y="16" width="640" height="54" rx="8"/>
+        <text class="t" x="620" y="38" text-anchor="middle">A 140 GB model takes tens of seconds to load to HBM</text>
+        <text class="s" x="620" y="56" text-anchor="middle">§1</text>
+
+        <line x1="620" y1="70" x2="620" y2="98"/>
+        <text class="l" x="636" y="88">consequence</text>
+
+        <rect class="bd" x="250" y="100" width="740" height="54" rx="8"/>
+        <text class="t" x="620" y="122" text-anchor="middle">Scale-to-zero / autoscaling are WORTHLESS if cold-start blows the SLO</text>
+        <text class="s" x="620" y="140" text-anchor="middle">cold-start &gt; SLO &rArr; the scaled-up replica is useless when it arrives &middot; §1</text>
+
+        <line x1="620" y1="154" x2="620" y2="182"/>
+        <text class="l" x="636" y="172">decompose</text>
+
+        <rect class="bp" x="170" y="184" width="900" height="78" rx="8"/>
+        <text class="t" x="620" y="208" text-anchor="middle">The cold-start budget = a sum of legs (each = bytes/BW or a fixed cost)</text>
+        <text class="s" x="620" y="228" text-anchor="middle">object/image pull &middot; host&rarr;HBM &middot; NCCL communicator init &middot; CUDA + compile/graph warm-up &middot; KV-pool alloc + profiling forward &middot; first forward</text>
+        <text class="s" x="620" y="246" text-anchor="middle">find the dominant leg &mdash; usually the pull or the HBM copy (or compile, if the artifact cache is cold) &middot; §2</text>
+
+        <line x1="620" y1="262" x2="620" y2="290"/>
+        <text class="l" x="636" y="280">and at scale</text>
+
+        <rect class="bp" x="160" y="292" width="920" height="78" rx="8"/>
+        <text class="t" x="620" y="316" text-anchor="middle">At scale this is NOT one sum: a TP&times;PP replica is cold until the SLOWEST rank is warm (a barrier)</text>
+        <text class="s" x="620" y="336" text-anchor="middle">per-rank shard pull: N-way object-store pull (intra-replica thundering herd) vs rank-0 pull + NVLink/IB broadcast</text>
+        <text class="s" x="620" y="354" text-anchor="middle">communicator-init is a fixed leg that grows with the group size &middot; §2</text>
+
+        <line x1="620" y1="370" x2="620" y2="398"/>
+        <text class="l" x="636" y="388">attack each leg</text>
+
+        <rect class="bp" x="210" y="400" width="820" height="54" rx="8"/>
+        <text class="t" x="620" y="422" text-anchor="middle">Attack each leg &mdash; mmap &middot; GPUDirect-Storage &middot; streaming &middot; NVMe/host-RAM + compile-artifact cache</text>
+        <text class="s" x="620" y="440" text-anchor="middle">skip the host bounce; overlap layer load with first forward; skip the object-store pull &middot; §3</text>
+
+        <line x1="620" y1="454" x2="620" y2="482"/>
+        <text class="l" x="636" y="472">fastest path (D49)</text>
+
+        <rect class="bs" x="250" y="484" width="740" height="54" rx="8"/>
+        <text class="t" x="620" y="506" text-anchor="middle">D49 &mdash; restore a WARM snapshot (skip the whole pipeline, ~1 s)</text>
+        <text class="s" x="620" y="524" text-anchor="middle">weights in HBM + CUDA context + captured graphs, restored &middot; §3</text>
+
+        <line x1="620" y1="538" x2="620" y2="566"/>
+        <text class="l" x="636" y="556">problem (D49)</text>
+
+        <rect class="bd" x="270" y="568" width="700" height="54" rx="8"/>
+        <text class="t" x="620" y="590" text-anchor="middle">Snapshot is large + driver/GPU-coupled + graph-invalidation-brittle</text>
+        <text class="s" x="620" y="608" text-anchor="middle">snapshot-vs-streaming crossover = SLO tightness &times; deploy cadence &middot; §3</text>
+
+        <line x1="620" y1="622" x2="620" y2="650"/>
+        <text class="l" x="636" y="640">feeds K15 (D12)</text>
+
+        <rect class="bs" x="270" y="652" width="700" height="54" rx="8"/>
+        <text class="t" x="620" y="674" text-anchor="middle">D12 K21-half &mdash; cold-start time IS K15&rsquo;s headroom floor</text>
+        <text class="s" x="620" y="692" text-anchor="middle">min_headroom = cold_start &times; peak_ramp; + the spot-reclaim drain window &middot; §3</text>
+
+        <line x1="620" y1="706" x2="620" y2="734"/>
+        <text class="l" x="636" y="724">policy varies</text>
+
+        <rect class="bs" x="170" y="736" width="900" height="78" rx="8"/>
+        <text class="t" x="620" y="760" text-anchor="middle">Rule 11 &mdash; the cold-start-mitigation spectrum</text>
+        <text class="s" x="620" y="780" text-anchor="middle">serial &rarr; mmap &rarr; GDS &rarr; streaming &rarr; NVMe/RAM + compile-cache &rarr; image-bake &rarr; rank-0 broadcast &rarr; snapshot &rarr; keep-warm</text>
+        <text class="s" x="620" y="798" text-anchor="middle">each: cold-start s vs cost/portability cliff + named system &middot; §3</text>
+
+        <line x1="620" y1="814" x2="620" y2="842"/>
+
+        <rect class="bc" x="290" y="844" width="660" height="58" rx="8"/>
+        <text class="t" x="620" y="868" text-anchor="middle">Objective: cold-start &le; the SLO/headroom budget</text>
+        <text class="s" x="620" y="888" text-anchor="middle">at acceptable cost &amp; portability (= the scale-to-zero&harr;keep-warm crossover) &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; a 140 GB model takes tens of seconds to load to HBM.</li>
+        <li><span class="bd">&#9313;</span> <strong>Consequence</strong> &mdash; scale-to-zero/autoscaling are worthless if cold-start blows the SLO.</li>
+        <li><span class="bp">&#9314;</span> <strong>The budget</strong> &mdash; pull + host&rarr;HBM + NCCL communicator-init + CUDA/compile-graph warm-up + KV-pool alloc &amp; profiling forward + first forward; find the dominant leg.</li>
+        <li><span class="bp">&#9315;</span> <strong>At scale</strong> &mdash; not one sum: a TP&times;PP replica is cold until the slowest rank is warm (barrier); shard pull = N-way object pull vs rank-0 + broadcast; communicator-init grows with group size.</li>
+        <li><span class="bp">&#9316;</span> <strong>Attack each leg</strong> &mdash; mmap, GPUDirect-Storage, weight streaming, NVMe/host-RAM cache, persisted compile-artifact cache.</li>
+        <li><span class="bs">&#9317;</span> <strong>D49</strong> &mdash; restore a warm snapshot (skip the whole pipeline, ~1 s).</li>
+        <li><span class="bd">&#9318;</span> <strong>D49 problem</strong> &mdash; snapshot large + driver/GPU-coupled + graph-invalidation-brittle; the snapshot-vs-streaming crossover.</li>
+        <li><span class="bs">&#9319;</span> <strong>D12 K21-half</strong> &mdash; cold-start time <em>is</em> K15&rsquo;s headroom floor + the spot-reclaim drain window (co-host K15).</li>
+        <li><span class="bs">&#9320;</span> <strong>Rule 11</strong> &mdash; the mitigation spectrum (incl. GDS, compile-cache, image-bake, rank-0 broadcast); endpoint is the scale-to-zero&harr;keep-warm economic crossover.</li>
+        <li><span class="bc">&#9321;</span> <strong>Objective</strong> &mdash; cold-start &le; the SLO/headroom budget at acceptable cost &amp; portability.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> every cost lever in the curriculum &mdash; scale-to-zero, spot, autoscaling &mdash; assumes a replica can come online fast; but a 140 GB model takes tens of seconds to pull, copy to HBM, and warm up, so the freshly-spawned replica is useless exactly when it is needed and the first request (plus its queue) blows the SLO. <b>Solution (what the page builds):</b> a decomposition of the cold-start time into a budget, the lever that attacks the dominant leg, and the warm-snapshot path that skips the pipeline &mdash; making scale-to-zero actually usable.<span class="meta">number: the ~tens-of-seconds cold-start budget for a 140 GB model on the trace + which leg dominates &mdash; cites K1 (BW for each leg) &middot; canonical: gpu-inference-cost-shapes.html (keep-warm vs scale-to-zero $)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where cold start lives &mdash; the replica lifecycle before the first forward (not a layer)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader needs to see that cold start is everything <em>before</em> token 1 of a fresh replica. <b>Solution:</b> it is the replica lifecycle &mdash; spawn &rarr; pull weights (object/image) &rarr; copy to HBM &rarr; form NCCL communicators (if sharded) &rarr; init CUDA context &rarr; compile / capture graphs / autotune (the K17 warm-up leg) &rarr; alloc the KV pool + profiling forward &rarr; <em>then</em> the first token. No layer changes; what changes is how fast a new replica &mdash; possibly a whole TP&times;PP group, gated on its slowest rank &mdash; reaches its first token. K21 owns the budget; <a href="K17_attention-kernels-and-cuda-graphs.html#d22">K17</a> owns the graph machinery (one leg); <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a> owns the policy that consumes the budget. State this before any math.<span class="meta">no number (placement fact) &mdash; cites K17 (graph warm-up = a leg), K15 (consumes the budget) &middot; diagram: the replica lifecycle timeline with each leg as a segment, &ldquo;first token&rdquo; marked at the end</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; the first request to a cold replica, with vs without mitigation</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> The canonical request T1 <code>&quot;I like cat, why?&quot;</code> is the <em>first</em> request to hit a scaled-to-zero (cold) replica. <b>Without mitigation:</b> object/image pull (140 GB / few GB/s) &rarr; host&rarr;HBM copy &rarr; communicator-init (if sharded) &rarr; CUDA-context + compile/graph warm-up &rarr; KV-pool alloc + profiling forward &rarr; <em>only then</em> the first forward emits &ldquo;Cats&rdquo; &rArr; TTFT = tens of seconds (minutes if compile is cold), SLO blown for this request and everything queued behind it. <b>With warm snapshot/restore:</b> a fully-warmed process (weights in HBM, context, graphs) is restored in ~1 s &rArr; the <em>same</em> request meets TTFT. Show with-vs-without explicitly on this one request; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (the budget derivation + D49 put the per-leg seconds + the ~1 s restore in) &middot; diagram: the request&rsquo;s wait under full-pipeline cold start vs snapshot restore, legs drawn to scale</span></p>
+
+      <h3 id="derive">Where the cold-start time goes &mdash; the budget derived as a sum of legs (the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> &ldquo;cold start is slow&rdquo; is not actionable; you cannot attack what you have not decomposed. <b>Solution, derived:</b> the budget is the sum of legs, each <code>= bytes/BW</code> or a fixed cost &mdash; (a) <strong>object/image pull</strong> (S3&rarr;host, ~GB/s; the weights may ship inside the container image &rarr; the image-pull leg); (b) <strong>host&rarr;HBM copy</strong> (PCIe/NVLink-bound; pageable&rarr;pinned doubles it &mdash; pinned + double-buffered, or GPUDirect-Storage NVMe&rarr;HBM to skip the host bounce); (c) <strong>NCCL/communicator init</strong> (TP/PP/EP communicator formation + topology discovery + collective warm-up &mdash; a fixed cost that <em>grows with group size</em>; absent on one GPU); (d) <strong>CUDA-context init + compile / kernel-autotune / graph capture</strong> (the <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> warm-up; the first-ever <code>torch.compile</code>/TensorRT engine build is <em>minutes</em>, not seconds, unless a persisted compile-artifact cache is warm); (e) <strong>KV-pool alloc + profiling forward</strong> (the big <code>cudaMalloc</code> of the paged-KV arena + the max-batch profiling run that sizes it &mdash; e.g. vLLM <code>determine_num_available_blocks</code>); (f) <strong>first forward</strong>. Sum = the cold-start budget; derive the trace number (&asymp; tens of s for 140 GB; minutes if compile is cold) and <em>which leg dominates</em> (usually the pull or the HBM copy, or compile when its cache is cold) &mdash; that is the leg to attack, and this budget is exactly <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a>&rsquo;s minimum-headroom input (cite <a href="K1_serving-fundamentals.html">K1</a> for the per-leg BW).<span class="meta">number: per-leg seconds for a 140 GB model on the trace, summed &rarr; the dominant leg &rarr; K15&rsquo;s min-headroom input; +the compile-cold &rarr; minutes case &mdash; cites K1 (BW per leg), K17 (warm-up/compile leg) &middot; diagram: a stacked-bar budget, each leg sized to its trace seconds, the dominant leg highlighted</span></p>
+
+      <h3 id="distributed">At scale the budget is <em>not a single sum</em> &mdash; distributed (parallel-replica) cold start</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the budget-shape correction at frontier scale &mdash; Must-cover, K21 scope; not a new D-number).</span> <b>Problem:</b> a frontier replica is sharded across a TP&times;PP(&times;EP) group, so the single-GPU sum above is wrong: the replica is cold until the <em>slowest rank</em> finishes &rarr; cold-start = <code>max over ranks(&Sigma; legs) + communicator-init + barrier sync</code>, not one node&rsquo;s sum &mdash; one straggler rank stalls the whole replica. <b>Solution (the design crossover this surfaces):</b> per-rank shard pull is a real choice &mdash; <strong>(i) N-way object-store pull</strong> (every rank pulls its shard from S3 &rarr; N&times; aggregate egress, intra-replica thundering herd, S3/registry throttling) <em>vs</em> <strong>(ii) rank-0 pull + NVLink/IB broadcast tree</strong> (one egress, then a fast in-fabric broadcast at NVLink BW); plus communicator-init is its own fixed leg that scales with group size. <b>Rule of two:</b> K21 owns the cold-start <em>budget shape</em>; the parallelism degrees are <a href="K6_parallelism-overview.html">K6</a>/<a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a>&rsquo;s, the fabric BW is <a href="K20_interconnect-and-collectives.html">K20</a>&rsquo;s &mdash; cite, don&rsquo;t re-derive.<span class="meta">number: per-rank shard bytes = total/N (parallel pull helps) but cold-start = max-rank + comm-init; N-way-S3 egress vs rank-0+NVLink-broadcast crossover on the trace &mdash; cites K1 (BW), K20 (NVLink/IB BW for the broadcast), K6/K7/K8 (the group) &middot; would be the formal-deep-dive home L1 (400B MoE TP&times;PP&times;EP replica) / L5 (the cold-start scenario) if promoted to a D-number &middot; diagram: per-rank lifelines with the slowest-rank barrier marked; N-way-pull vs rank-0-broadcast side by side</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where cold-start mitigation sits (the must-cover map)</h3>
+      <p class="stub"><span class="ps">Stub (the Must-cover list, condensed).</span> Where time goes (object/image pull &rarr; host RAM &rarr; HBM &rarr; communicator-init &rarr; CUDA/compile-graph warm-up &rarr; KV-pool alloc + profiling forward &rarr; first-token); levers: safetensors / zero-copy mmap, <strong>GPUDirect-Storage</strong> (NVMe&rarr;HBM, skip the host bounce) + pinned double-buffered H2D, weight streaming (overlap layer load with first forward &mdash; with the streaming-BW-vs-compute stall risk noted), local-NVMe &amp; host-RAM weight cache, <strong>persisted compile-artifact cache</strong> (Inductor / TRT engine cache), <strong>weights baked into the machine/container image</strong> or a pre-puller DaemonSet / shared RO volume (the fix for the cold-disk-on-a-new-autoscaled-node case), snapshot/restore of a warm process (CRIU / GPU snapshot), pre-warmed pools &amp; keep-warm vs scale-to-zero economics, <strong>multi-tenant base-weight sharing so only adapters cold-load</strong> and the <strong>multi-model warm-set / model-swap</strong> cost (evict model A&rsquo;s weights to load B &mdash; K15/L4 owns fleet placement, K21 owns the per-swap cost), <strong>readiness-gating</strong> (the LB must route around a half-warm replica + a post-load golden-output validation probe before &ldquo;ready&rdquo; &mdash; LB owns routing, K21 owns the don&rsquo;t-serve-until-warm contract; ties <a href="K22_fault-tolerance-multi-gpu-inference.html#d50">K22/D50</a>); the autoscaler&rsquo;s reaction-time budget (cold-start time sets the minimum headroom + the spot-reclaim drain window &mdash; &rarr; K15, L5).<span class="meta">no new number &mdash; cites K15 (headroom/drain + model-swap placement), K17 (graph/compile warm-up), K14 (quant = fewer bytes &rarr; shorter pull/copy, minus the dequant/repack-on-load counter-cost), K20 (broadcast-tree BW), K22/D50 (post-load validation) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the cold-start mitigation stack</strong>object store &rarr; (NVMe/host-RAM cache) &rarr; HBM &rarr; CUDA/graph warm-up &rarr; first token; the snapshot path drawn as a shortcut bypassing the whole chain; base-weight-shared adapters cold-loading only the delta. Drawn after arc approval.</div>
+
+      <h3 id="d49" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D49 &mdash; warm snapshot/restore of a GPU process</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> even with streaming, first-token after a cold start is seconds (full pipeline + graph warm-up) &rarr; scale-to-zero is unusable under a tight SLO. <b>Solution:</b> snapshot a fully-warmed process (weights in HBM, CUDA context, captured CUDA graphs) and restore in ~1 s. <b>Pitfalls, derived:</b> snapshot size &asymp; the full HBM footprint (storage + restore-BW cost); CUDA-context / driver-version coupling (a snapshot is tied to the GPU model + driver &mdash; a portability constraint); captured-graph invalidation on any shape/version change. <b>Crossover:</b> snapshot-restore (fast; large, version-brittle artifact) vs weight-streaming (slower first token; no artifact, portable) &mdash; pick by SLO tightness &times; deploy cadence.<span class="meta">number: ~30 s full pipeline vs ~1 s restore on the trace; snapshot size = HBM footprint; the SLO&times;cadence crossover &mdash; cites K1 (HBM footprint/BW), K17 (graph invalidation) &middot; real: ServerlessLLM, vLLM sleep-mode, CRIU-CUDA, Run:ai + URLs</span></p>
+
+      <h3 id="d12" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D12 (K21 half) &mdash; cold-start time IS the autoscale budget (co-host <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> the autoscaler must add capacity <em>before</em> the SLO breaches, but it cannot add it faster than a cold start. <b>Solution (K21&rsquo;s owned half):</b> cold-start time sets <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a>&rsquo;s <code>min_headroom = cold_start &times; peak_ramp_rate</code> and the spot-reclaim drain window (<a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a>/L5) &mdash; shrink the budget (snapshot/cache) and the required headroom (and idle cost) shrinks with it. <b>Rule of two:</b> cite <a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15/D12</a> for the autoscale <em>signal/policy</em>; K21 owns the <em>budget</em> it consumes.<span class="meta">number: how the headroom (and its $) shrinks as the cold-start budget drops from ~30 s &rarr; ~1 s on the trace &mdash; cites K15/D12 (the policy side), K1 (cost) &middot; real: predictive prewarm + snapshot pools (ServerlessLLM, Run:ai) + URLs</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the cold-start-mitigation spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub (its endpoint is the scale-to-zero&harr;keep-warm crossover).</span> naive serial load (slowest) &rarr; safetensors / zero-copy mmap + parallel pull &rarr; <strong>GPUDirect-Storage</strong> (NVMe&rarr;HBM, collapse the host-bounce leg) &rarr; weight streaming (overlap layer load with first forward) &rarr; local-NVMe / host-RAM weight cache + <strong>persisted compile-artifact cache</strong> (skip the object-store pull and the minutes-scale build) &rarr; <strong>weights baked into the machine image</strong> (a new node is born warm-on-disk) &rarr; <strong>rank-0 pull + NVLink/IB broadcast</strong> (the parallel-replica point: kill the N-way S3 egress) &rarr; warm snapshot/restore (skip everything; SoTA, version-brittle) &rarr; keep-warm (no cold start; max idle cost). Each: cold-start time vs cost/portability cliff + named system; the endpoint <em>is</em> the scale-to-zero&harr;keep-warm economic crossover.<span class="meta">number: cold-start seconds + $/idle for each point on the trace &rarr; the scale-to-zero&harr;keep-warm crossover &mdash; cites K1 (BW + cost), K20 (broadcast BW), gpu-inference-cost-shapes.html &middot; real: serial, safetensors mmap, GDS/cuFile, streaming, NVMe + Inductor/TRT engine cache, image-baked weights, rank-0 broadcast, ServerlessLLM snapshot, keep-warm pool + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Mitigation point:</b> the rule-11 spectrum; floor set by the SLO/headroom budget. <b>Snapshot vs streaming:</b> the D49 SLO&times;cadence crossover. <b>Cache tier (NVMe vs host-RAM vs none):</b> capacity vs hit-rate vs $ &mdash; <em>and</em> a freshly autoscaled node&rsquo;s NVMe is empty (the lever silently doesn&rsquo;t apply to the scale-up it exists for &rarr; image-bake / pre-puller). <b>Shard-pull strategy:</b> N-way object pull vs rank-0 + NVLink broadcast (S3 egress/throttle vs broadcast BW). <b>Compile-artifact cache:</b> persisted vs rebuilt-per-cold-start (minutes vs seconds; invalidated on shape/version change). <b>Keep-warm pool size:</b> the scale-to-zero&harr;keep-warm $ crossover (= the rule-11 endpoint, = K15&rsquo;s headroom). <b>Warm-set size (multi-model):</b> resident models vs model-swap cold-start (K15/L4 placement). <b>Base-weight sharing:</b> only adapters cold-load (K15/L4). Each with its chosen value, reason, and cliff on each side.<span class="meta">numbers: per-knob crossover (composes with D49 / D12 / rule-11; +N-way-vs-broadcast, +compile-cache hit) &middot; cites K20 (broadcast BW), K15/L4 (warm-set placement)</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Keep every replica warm (never scale to zero)</b> &mdash; disq: pays idle GPU-hours 24/7; <em>wins</em> when traffic is steady and the SLO is unforgiving and a snapshot is impractical. (b) <b>Naive serial load on every scale-up</b> &mdash; disq: tens of seconds &rarr; the autoscaler is structurally too slow (K15); <em>wins</em> never for GPU LLM (only tiny models where load &laquo; SLO). (c) <b>Smaller / quantized model to shrink the pull+copy</b> &mdash; disq: changes the model / accuracy (K14 gate), and a dequant/repack-on-load step (AWQ/GPTQ repack, FP8 scale compute) partially offsets the pull saving; <em>wins</em> as a complement (the cascade reaches cold start), not a substitute. (d) <b>A faster artifact registry / CDN</b> &mdash; disq: that is distribution infra, not the GPU cold-start path; <em>out of scope</em> &mdash; name it, flag the boundary, do not cover. (e) <b>Multi-component stacks (target + draft K13; encoder K12)</b> &mdash; cold-start = max/sum over components, sized differently; <em>compose</em>, don&rsquo;t re-derive &mdash; cite K13/K12.<span class="meta">number: the crossover disqualifying each (idle-$ for (a); load-vs-SLO for (b); accuracy delta minus repack-cost for (c); component-max for (e)) &mdash; cites K1, K15 (autoscaler), K14 (quant + repack-on-load counter-cost), K13/K12 (multi-component) &middot; contrast L5 (dedicated home)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Cold-start &gt; SLO on scale-up</b> &mdash; the scaled-up replica is useless when it arrives &rarr; sustained TTFT breach through the ramp; first move: shrink the budget (snapshot/cache) + size K15 headroom to it (gpu-inference-cost-shapes.html). <b>Snapshot version skew</b> &mdash; D49: a snapshot restored on a different driver/GPU/shape &rarr; broken graphs or wrong kernels; first move: pin driver+GPU+shape in the snapshot key, fall back to streaming (gpu-failure-modes.html &mdash; version-mismatch). <b>Thundering-herd cold start</b> &mdash; a burst scales many replicas (or all N ranks of one replica) that pull from the object store / image registry at once &rarr; the pull leg dominates even worse and the registry throttles; first move: rank-0 + broadcast, NVMe/host-RAM cache + staggered warm-up (llm-bottlenecks.html). <b>Cold disk on a freshly autoscaled node</b> &mdash; a new VM&rsquo;s local NVMe is empty so the cache lever silently doesn&rsquo;t apply to the scale-up it was built for &rarr; always pays the full pull; first move: bake weights into the machine image / pre-puller DaemonSet / shared RO volume (gpu-inference-cost-shapes.html). <b>Slowest-rank straggler</b> &mdash; one slow rank&rsquo;s load stalls the whole TP&times;PP replica (barrier); first move: parallel shard pull + per-rank load-time monitoring, evict + reschedule the straggler (llm-bottlenecks.html). <b>Partial / corrupt load served</b> &mdash; a truncated S3 object or a bit-flip loads &rarr; the replica goes &ldquo;ready&rdquo; and ships plausible garbage (worse than a slow load); first move: a post-load golden-output validation probe before &ldquo;ready&rdquo; + a per-shard hash manifest (cite K22/D50; gpu-failure-modes.html). <b>Graph re-capture / compile rebuild on every cold start</b> &mdash; the compile leg is minutes when its artifact cache is cold; first move: persist the compile-artifact cache + snapshot the captured graphs (cite K17; llm-bottlenecks.html).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (thundering-herd pull, slowest-rank straggler, graph/compile rebuild), llm/canonicals/gpu-failure-modes.html (snapshot version skew, partial/corrupt load), llm/canonicals/gpu-inference-cost-shapes.html (cold-start &gt; SLO, cold-disk-on-new-node) &middot; K22/D50 (post-load validation, hash manifest) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> ServerlessLLM (snapshot/restore + tiered loading), vLLM sleep-mode (warm-process retention), Run:ai (snapshot + fast scheduling), CRIU-CUDA (process snapshot), safetensors zero-copy mmap, AWS/GCP serverless GPU offerings (cold-start economics). Each: which rule-11 mitigation point / which D49 mechanism it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (dedicated home &mdash; cold-start-vs-SLO is its spine; D49/D12 load-bearing); <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a> (rolling deploy = fleet-wide cold-load of the new version + double-fleet &mdash; D49 fast restore); <a href="../scenarios/L4-multi-tenant-lora-platform.html">L4</a> (base-weight sharing so only adapters cold-load &mdash; cite K15/L4). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K15_gpu-fleet-autoscaling-multitenancy.html#d12">K15</a> &mdash; autoscale consumes this budget; D12 co-host (K21 owns the <em>budget</em>, K15 owns the <em>signal/policy</em> &mdash; rule of two).</li>
+        <li><a href="K17_attention-kernels-and-cuda-graphs.html#d22">K17</a> &mdash; graph capture / compile / engine-build warm-up is a cold-start leg (K21 counts it + owns the persisted compile-artifact-cache lever; K17 owns the machinery).</li>
+        <li><a href="K14_quantization.html">K14</a> &mdash; quantized weights = fewer bytes to load &rarr; shorter pull+copy (the cascade reaches here), minus the dequant/repack-on-load counter-cost.</li>
+        <li><a href="K20_interconnect-and-collectives.html">K20</a> &mdash; the NVLink/IB BW the rank-0-broadcast shard-pull strategy and the communicator-init leg ride on (K21 owns the budget shape, K20 owns the fabric).</li>
+        <li><a href="K6_parallelism-overview.html">K6</a>/<a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a> &mdash; the TP&times;PP(&times;EP) group whose slowest-rank barrier makes cold-start <code>max over ranks</code>, not one sum (K21 cites the degrees, owns the budget).</li>
+        <li><a href="K22_fault-tolerance-multi-gpu-inference.html#d50">K22</a> &mdash; the post-load golden-output validation probe + per-shard hash manifest that guards against a partial/corrupt load going &ldquo;ready&rdquo; (D50 SDC).</li>
+        <li><a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a>/<a href="../scenarios/L4-multi-tenant-lora-platform.html">L4</a> &mdash; multi-model warm-set &amp; model-swap: K15/L4 owns fleet placement, K21 owns the per-swap cold-start cost.</li>
+        <li><a href="K1_serving-fundamentals.html">K1</a> &mdash; the per-leg BW + HBM footprint the budget rests on.</li>
+        <li><strong>Out of scope (named, not covered):</strong> the autoscale <em>policy/signal</em> (<a href="K15_gpu-fleet-autoscaling-multitenancy.html">K15</a> &mdash; K21 owns only the budget); model download/distribution infra (artifact registry / CDN &mdash; named, not designed); request <em>routing</em> around a cold replica (the LB owns routing; K21 owns only the don&rsquo;t-serve-until-warm readiness contract); the model <em>format</em> design (safetensors as a tool, not its spec).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

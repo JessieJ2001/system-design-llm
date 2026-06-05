@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Time Complexity for LLM Serving — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="stylesheet" href="../css/diagrams.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../llm/index.html">LLM Serving</a></li>
+        <li><a href="design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Time Complexity <span style="font-weight:400;color:#64748b;">(for LLM serving)</span></h1>
+      <p class="hero-subtitle">The data-structure choices that decide whether a KV-cache block manager, scheduler, or router stays <strong>O(log n)</strong> per request or silently degrades to <strong>O(n)</strong> under load. Every row here is a question an interviewer can ask <em>"which structure, and what does it cost?"</em> &mdash; and the wrong answer is usually a sorted array.</p>
+      <p class="hero-meta">~10 min read &bull; data-structure reference</p>
+    </div>
+  </section>
+
+  <!-- Why this matters -->
+  <section class="section">
+    <div class="container">
+      <h2>Why This Page Exists</h2>
+      <p><strong>TL;DR:</strong> The hot loops of an LLM serving stack are mostly <em>"pick the best/worst item out of n, then update one item's priority"</em> &mdash; evict the coldest KV-cache block, admit the highest-priority waiting request, find the least-loaded replica. Get the structure right and each operation is <code>O(log n)</code> or <code>O(1)</code>; get it wrong (a sorted array, a linear scan) and you pay <code>O(n)</code> per token, per step, per request.</p>
+      <ul>
+        <li><strong>n is not small.</strong> A single 80&nbsp;GB GPU holds tens of thousands of KV-cache blocks; a router fronts thousands of in-flight requests. An <code>O(n)</code> per-token operation inside the decode loop is a latency bug that only shows up under production load.</li>
+        <li><strong>The interview tell.</strong> &ldquo;How do you evict the coldest block?&rdquo; is really &ldquo;do you reach for a sorted array (wrong) or a heap/LRU (right), and can you state the cost of each operation?&rdquo;</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- The eviction question -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Eviction Priority Queue: &ldquo;Find the Lowest-Score Block&rdquo;</h2>
+      <p><strong>The setup:</strong> a KV-cache block manager keeps <code>n</code> blocks, each with a score (recency, hit count, or a composite priority). On every allocation that runs out of free blocks it must (1) find the lowest-score block and (2) evict it; meanwhile scores keep changing as blocks are touched. The naive instinct &mdash; &ldquo;keep them sorted by score&rdquo; &mdash; is the trap.</p>
+
+      <h4 style="margin-top:1.5rem;">Why a sorted container is the wrong answer</h4>
+      <ul>
+        <li><strong>Array-backed list (e.g. a Python <code>list</code>): O(n) overall.</strong> Finding the insert position via binary search is <code>O(log n)</code>, but inserting <em>shifts every later element</em> &mdash; <code>O(n)</code>, and that shift dominates.</li>
+        <li><strong>Linked list: also O(n) overall.</strong> The insertion itself is <code>O(1)</code> once you hold the node, but you <em>cannot binary search a linked list</em> (no random access), so finding the spot is an <code>O(n)</code> linear scan.</li>
+        <li><strong>The fix:</strong> don't keep the items fully sorted. Use a <strong>min-heap</strong> (what a real priority-based block evictor does) or a similar <code>O(log n)</code> structure. A heap keeps only the <em>minimum</em> cheap to find, not the whole order &mdash; which is all eviction needs.</li>
+      </ul>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Structure</th><th>Insert</th><th>Pop-min</th><th>Update score</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Sorted array</td><td><code>O(n)</code></td><td><code>O(1)</code></td><td><code>O(n)</code></td><td>Terrible for inserts &mdash; every insert shifts the tail</td></tr>
+          <tr><td>Sorted linked list</td><td><code>O(n)</code></td><td><code>O(1)</code></td><td><code>O(n)</code></td><td>Same problem &mdash; no binary search, linear scan to place</td></tr>
+          <tr><td><strong>Min-heap</strong></td><td><strong><code>O(log n)</code></strong></td><td><strong><code>O(log n)</code></strong></td><td><code>O(n)</code></td><td>The right default &mdash; update is the one weak spot (fixed below)</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Plain min-heap -->
+  <section class="section">
+    <div class="container">
+      <h2>Plain Min-Heap Operations</h2>
+      <p>A binary min-heap is just an array where <code>parent(i) &le; children(i)</code>. The minimum is always at the root (index 0); every other operation is a logarithmic walk up or down the tree's height (<code>log n</code>).</p>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Op</th><th>Cost</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Insert</td><td><code>O(log n)</code></td><td>Append to the end, then <em>sift up</em> while smaller than parent</td></tr>
+          <tr><td>Pop-min</td><td><code>O(log n)</code></td><td>Swap root with last element, drop the last, then <em>sift down</em> the new root</td></tr>
+          <tr><td>Peek-min</td><td><code>O(1)</code></td><td>Read the root &mdash; no mutation</td></tr>
+          <tr><td><strong>Find arbitrary</strong></td><td><strong><code>O(n)</code></strong></td><td>The heap is only partially ordered, so locating a non-root item means scanning the array</td></tr>
+          <tr><td><strong>Update arbitrary</strong></td><td><strong><code>O(n)</code></strong></td><td><code>O(n)</code> to find it + <code>O(log n)</code> to re-sift &mdash; the find dominates</td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="callout callout-warning">
+        <p><strong>The catch for eviction:</strong> KV-cache scores change constantly (every block touch bumps recency). A plain heap makes <em>"a block I already hold just got hotter, fix its position"</em> an <code>O(n)</code> operation &mdash; because you first have to find it. That find is the bottleneck, and it's what the indexed heap removes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Indexed min-heap -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Indexed Min-Heap (Heap + Hashmap)</h2>
+      <p><strong>The one trick:</strong> alongside the heap array, maintain a side hashmap <code>block_id &rarr; heap_array_index</code>. Every swap during sift-up/sift-down updates two entries in that map, so you always know where any block lives in the array. The <code>O(n)</code> &ldquo;find arbitrary&rdquo; scan becomes an <code>O(1)</code> map lookup &mdash; which collapses update and delete from <code>O(n)</code> to <code>O(log n)</code>.</p>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Op</th><th>Plain heap</th><th>Indexed heap</th></tr></thead>
+        <tbody>
+          <tr><td>Insert</td><td><code>O(log n)</code></td><td><code>O(log n)</code></td></tr>
+          <tr><td>Pop-min</td><td><code>O(log n)</code></td><td><code>O(log n)</code></td></tr>
+          <tr><td>Peek-min</td><td><code>O(1)</code></td><td><code>O(1)</code></td></tr>
+          <tr><td><strong>Find arbitrary</strong></td><td><code>O(n)</code></td><td><strong><code>O(1)</code></strong></td></tr>
+          <tr><td><strong>Update arbitrary</strong></td><td><code>O(n)</code></td><td><strong><code>O(log n)</code></strong></td></tr>
+          <tr><td><strong>Delete arbitrary</strong></td><td><code>O(n)</code></td><td><strong><code>O(log n)</code></strong></td></tr>
+        </tbody>
+      </table></div>
+      <p style="margin-top:1rem;">The extra map costs <code>O(n)</code> memory and a constant-factor write on every swap &mdash; cheap insurance against an <code>O(n)</code> per-touch hot loop.</p>
+    </div>
+  </section>
+
+  <!-- LRU -->
+  <section class="section">
+    <div class="container">
+      <h2>LRU &mdash; Least Recently Used (all O(1))</h2>
+      <p><strong>Implementation:</strong> one hashmap (<code>key &rarr; node</code>) + one doubly linked list (DLL) ordered by recency, most-recent at the head. The two structures cover each other's weakness: the hashmap gives <code>O(1)</code> lookup, the DLL gives <code>O(1)</code> splice.</p>
+      <ul>
+        <li><strong>Add (put): O(1)</strong> &mdash; hashmap insert + push the node to the head of the DLL.</li>
+        <li><strong>Get / access: O(1)</strong> &mdash; hashmap lookup, then move the node to the head.</li>
+        <li><strong>Remove: O(1)</strong> &mdash; hashmap lookup gets the node, then unlink it from the DLL. No scan needed: DLL nodes carry <code>prev</code>/<code>next</code> pointers.</li>
+        <li><strong>Eviction: O(1)</strong> &mdash; the tail node is the least-recently-used; pop it and delete its hashmap entry.</li>
+      </ul>
+      <p>LRU is the default policy for prefix-cache block reuse in LLM serving: a block touched by a recent prompt is likely to be reused by the next similar prompt, and the tail is exactly what's safe to drop.</p>
+    </div>
+  </section>
+
+  <!-- LFU -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>LFU &mdash; Least Frequently Used (all O(1))</h2>
+      <p><strong>Implementation:</strong> a <code>key &rarr; node</code> hashmap, a <code>freq &rarr; DLL</code> hashmap (one DLL per frequency value), a <code>minFreq</code> integer, and a <code>capacity</code> integer. Each node stores <code>key</code>, <code>value</code>, <code>freq</code> (its current count), plus <code>prev</code>/<code>next</code> pointers for its DLL. Ties within a frequency are broken by LRU (the DLL order inside each bucket).</p>
+
+      <h4 style="margin-top:1.5rem;">How the structures interact</h4>
+      <ul>
+        <li><strong>On get:</strong> look up the node via the <code>key&rarr;node</code> map &rarr; read its <code>freq</code> <code>f</code> &rarr; unlink from the <code>freq[f]</code> DLL &rarr; append to the <code>freq[f+1]</code> DLL &rarr; if <code>freq[f]</code> is now empty <em>and</em> <code>f == minFreq</code>, increment <code>minFreq</code>.</li>
+        <li><strong>On evict:</strong> go to the <code>freq[minFreq]</code> DLL &rarr; pop its tail node (the least-recently-used among the least-frequent) &rarr; delete its entry from the <code>key&rarr;node</code> map.</li>
+      </ul>
+
+      <h4 style="margin-top:1.5rem;">Costs</h4>
+      <ul>
+        <li><strong>Add (put): O(1)</strong> &mdash; insert the node into the frequency-1 bucket, update the <code>key&rarr;node</code> map, set <code>minFreq = 1</code>.</li>
+        <li><strong>Get / access: O(1)</strong> &mdash; look up the node, move it from bucket <code>f</code> to bucket <code>f+1</code>, bump <code>minFreq</code> if the old bucket emptied.</li>
+        <li><strong>Remove (eviction): O(1)</strong> &mdash; <code>minFreq</code> points straight at the least-frequent bucket; evict its tail and delete from the maps.</li>
+      </ul>
+
+      <div class="callout callout-info">
+        <p><strong>Caveat:</strong> the <code>O(1)</code> design above (<code>key&rarr;node</code> map + <code>freq&rarr;DLL</code> map + <code>minFreq</code> counter) is the standard interview/production answer. A <em>naive</em> LFU built on a heap or a sorted-by-count list is <code>O(log n)</code> per op &mdash; if you reach for a heap here, say why the bucketed version beats it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Other LLM-serving complexities -->
+  <section class="section">
+    <div class="container">
+      <h2>Other Complexities Worth Knowing for LLM Serving</h2>
+      <p>The same &ldquo;which structure, what's the cost&rdquo; reflex shows up across the stack. These are the high-value ones interviewers probe.</p>
+
+      <h3 style="margin-top:1.5rem;">1. KV cache vs. recompute &mdash; the reason the cache exists</h3>
+      <ul>
+        <li><strong>Without a KV cache:</strong> generating each new token re-attends over all prior tokens <em>and recomputes their keys/values</em>. Step <code>t</code> costs <code>O(t)</code>, so producing <code>n</code> tokens is <code>O(n²)</code> in attention work (and the per-step matmuls make naive recompute even worse).</li>
+        <li><strong>With a KV cache:</strong> prior keys/values are stored, so step <code>t</code> only computes attention of the <em>one</em> new query against <code>t</code> cached entries &mdash; still <code>O(t)</code> reads, but no recompute of the prefix. The cache trades GPU memory (<code>O(n)</code> per sequence) for cutting redundant compute.</li>
+        <li><strong>Prefill vs. decode:</strong> prefill attention over a prompt of length <code>s</code> is <code>O(s²)</code> (every token attends to every earlier token, done in one parallel pass); each decode step is <code>O(s)</code> against the cache. This is why prefill is compute-bound and decode is memory-bandwidth-bound. See <a href="../llm/knowledge/K2_kv-cache.html">K2 (KV cache)</a>.</li>
+      </ul>
+
+      <h3 style="margin-top:1.5rem;">2. Prefix-cache lookup &mdash; &ldquo;has this prompt prefix been seen?&rdquo;</h3>
+      <ul>
+        <li><strong>Radix tree (RadixAttention):</strong> longest-prefix match is <code>O(L)</code> in the query length <code>L</code> (in blocks), <em>independent of how many prompts are cached</em>. A hash map cannot do longest-prefix match; this is why prefix caches use a trie. See <a href="radix-tree.html">Radix Tree</a>.</li>
+        <li><strong>Block-hash chain:</strong> hashing prompt blocks and looking each up in a <code>hash &rarr; block</code> map is <code>O(1)</code> per block, <code>O(L)</code> for the whole prefix &mdash; the common production shortcut when you only need exact-block reuse, not arbitrary-position matching.</li>
+      </ul>
+
+      <h3 style="margin-top:1.5rem;">3. Paged KV allocation &mdash; the block table</h3>
+      <ul>
+        <li><strong>Allocate / free a block:</strong> <code>O(1)</code> &mdash; pull from / push to a free-list stack. PagedAttention's whole point is that physical blocks are interchangeable, so allocation never needs a search or compaction.</li>
+        <li><strong>Logical&rarr;physical translation:</strong> <code>O(1)</code> per block via the per-sequence block table (an array indexed by logical block number).</li>
+      </ul>
+
+      <h3 style="margin-top:1.5rem;">4. Scheduler / continuous batching admission</h3>
+      <ul>
+        <li><strong>Plain FIFO waiting queue:</strong> dequeue next request is <code>O(1)</code>.</li>
+        <li><strong>Priority scheduling</strong> (deadline, fairness, SLO tier): a min-heap over <code>W</code> waiting requests gives <code>O(log W)</code> admit/insert &mdash; the eviction-queue argument above applies verbatim, don't sort.</li>
+        <li><strong>Per-step batch assembly:</strong> <code>O(B)</code> in the running batch size <code>B</code> to gather the active sequences each decode step.</li>
+      </ul>
+
+      <h3 style="margin-top:1.5rem;">5. Routing to a replica</h3>
+      <ul>
+        <li><strong>Consistent hashing</strong> (cache-affinity routing, so a tenant's prompts hit the replica that already holds their prefix): <code>O(log T)</code> to find the owning replica via binary search over <code>T</code> points on the ring. See <a href="consistent-hashing.html">Consistent Hashing</a>.</li>
+        <li><strong>Least-loaded / power-of-two-choices:</strong> sampling 2 replicas and picking the lighter is <code>O(1)</code> and avoids the <code>O(T)</code> scan of checking every replica's load.</li>
+        <li><strong>Bloom filter</strong> (&ldquo;does this replica hold tenant X's prefix?&rdquo; gossip): <code>O(k)</code> membership test for <code>k</code> hash functions &mdash; constant, independent of set size. See <a href="bloom-filters.html">Bloom Filters</a>.</li>
+      </ul>
+
+      <h3 style="margin-top:1.5rem;">6. Sampling the next token over vocabulary V</h3>
+      <ul>
+        <li><strong>Greedy / argmax:</strong> <code>O(V)</code> single pass over the logits.</li>
+        <li><strong>Top-k:</strong> <code>O(V)</code> with a size-<code>k</code> min-heap (or <code>O(V + k log k)</code> with partial selection) &mdash; you don't sort the whole vocabulary, you keep only the <code>k</code> largest.</li>
+        <li><strong>Top-p (nucleus):</strong> needs the sorted tail, so <code>O(V log V)</code> in the worst case, though kernels prune aggressively in practice.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Trie vs Radix tree -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Trie vs. Radix Tree &mdash; Prefix Structures in Detail</h2>
+      <p><strong>TL;DR:</strong> both answer <em>&ldquo;is this sequence (or a prefix of it) already stored?&rdquo;</em> in <code>O(L)</code> &mdash; <em>independent of how many keys are stored</em> &mdash; which is exactly what a prefix cache needs and what a hash map cannot do (a hash map only matches whole keys, not longest prefixes). They differ in <strong>space</strong>: a trie spends one node per symbol; a radix tree collapses every non-branching run of symbols into a single edge, so its node count tracks the <em>number of keys</em>, not their length. For LLM prefix caches (RadixAttention/SGLang) the &ldquo;symbols&rdquo; are KV-block hashes and keys are long, so that collapse is the whole reason the radix tree wins.</p>
+
+      <h4 style="margin-top:1.5rem;">Notation</h4>
+      <ul>
+        <li><code>L</code> &mdash; length of the query/key in symbols (tokens, or KV-cache <em>blocks</em> for a prefix cache).</li>
+        <li><code>N</code> &mdash; number of distinct keys currently stored.</li>
+        <li><code>&Sigma;&#8467;</code> &mdash; total symbols across all stored keys (sum of key lengths).</li>
+        <li><code>&sigma;</code> &mdash; branching factor / alphabet size: how many distinct children a node can have (26 for lowercase text; effectively unbounded for block-hash keys).</li>
+        <li><code>f</code> &mdash; the per-step <em>child-dispatch</em> cost (how you pick the next child), set by the children representation &mdash; see the table below.</li>
+      </ul>
+
+      <h4 style="margin-top:1.5rem;">Same five keys, two shapes</h4>
+      <p>Insert <code>{test, team, toast}</code>. The trie spends a node on every character; the radix tree keeps a node only at the root, at <em>branch points</em>, and at leaves &mdash; the runs <code>s&#8209;t</code>, <code>a&#8209;m</code>, <code>o&#8209;a&#8209;s&#8209;t</code> each collapse to one edge. 10 nodes vs. 5.</p>
+
+      <div class="svg-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 300" role="img" aria-label="Left: a trie for the keys test, team and toast using one node per character, 10 nodes. Right: the equivalent radix tree where non-branching character runs are compressed onto single edges, 5 nodes.">
+          <style>
+            .nlbl { font-size: 13px; font-weight: 700; fill: #1e293b; text-anchor: middle; dominant-baseline: central; }
+            .elbl { font-size: 12px; font-family: 'JetBrains Mono', monospace; fill: #2563eb; text-anchor: middle; }
+            .ttl  { font-size: 13px; font-weight: 700; fill: #334155; text-anchor: middle; }
+            .edge { stroke: #94a3b8; stroke-width: 1.5; }
+            .node { fill: #fff; stroke: #64748b; stroke-width: 1.5; }
+            .end  { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.8; }
+          </style>
+
+          <!-- ===== TRIE (left) ===== -->
+          <text class="ttl" x="135" y="18">Trie &mdash; 1 node / character (10 nodes)</text>
+          <!-- edges -->
+          <line class="edge" x1="110" y1="44" x2="110" y2="71"/>
+          <line class="edge" x1="110" y1="89" x2="72"  y2="116"/>
+          <line class="edge" x1="110" y1="89" x2="182" y2="116"/>
+          <line class="edge" x1="70"  y1="134" x2="47" y2="161"/>
+          <line class="edge" x1="70"  y1="134" x2="97" y2="161"/>
+          <line class="edge" x1="45"  y1="179" x2="45" y2="206"/>
+          <line class="edge" x1="95"  y1="179" x2="95" y2="206"/>
+          <line class="edge" x1="182" y1="134" x2="182" y2="161"/>
+          <line class="edge" x1="182" y1="179" x2="182" y2="206"/>
+          <line class="edge" x1="182" y1="224" x2="182" y2="251"/>
+          <!-- nodes -->
+          <circle class="node" cx="110" cy="35"  r="9"/>
+          <circle class="node" cx="110" cy="80"  r="13"/><text class="nlbl" x="110" y="80">t</text>
+          <circle class="node" cx="70"  cy="125" r="13"/><text class="nlbl" x="70"  y="125">e</text>
+          <circle class="node" cx="182" cy="125" r="13"/><text class="nlbl" x="182" y="125">o</text>
+          <circle class="node" cx="45"  cy="170" r="13"/><text class="nlbl" x="45"  y="170">s</text>
+          <circle class="node" cx="95"  cy="170" r="13"/><text class="nlbl" x="95"  y="170">a</text>
+          <circle class="node" cx="182" cy="170" r="13"/><text class="nlbl" x="182" y="170">a</text>
+          <circle class="end"  cx="45"  cy="215" r="13"/><text class="nlbl" x="45"  y="215">t</text>
+          <circle class="end"  cx="95"  cy="215" r="13"/><text class="nlbl" x="95"  y="215">m</text>
+          <circle class="node" cx="182" cy="215" r="13"/><text class="nlbl" x="182" y="215">s</text>
+          <circle class="end"  cx="182" cy="260" r="13"/><text class="nlbl" x="182" y="260">t</text>
+
+          <!-- divider -->
+          <line x1="390" y1="20" x2="390" y2="285" stroke="#e2e8f0" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+          <!-- ===== RADIX (right) ===== -->
+          <text class="ttl" x="565" y="18">Radix tree &mdash; runs compressed (5 nodes)</text>
+          <!-- edges + substring labels -->
+          <line class="edge" x1="560" y1="44" x2="560" y2="76"/><text class="elbl" x="572" y="64">t</text>
+          <line class="edge" x1="554" y1="93" x2="505" y2="131"/><text class="elbl" x="518" y="112">e</text>
+          <line class="edge" x1="572" y1="93" x2="638" y2="131"/><text class="elbl" x="624" y="112">oast</text>
+          <line class="edge" x1="490" y1="153" x2="462" y2="201"/><text class="elbl" x="463" y="180">st</text>
+          <line class="edge" x1="510" y1="153" x2="552" y2="201"/><text class="elbl" x="546" y="180">am</text>
+          <!-- nodes -->
+          <circle class="node" cx="560" cy="35"  r="9"/>
+          <circle class="node" cx="560" cy="85"  r="11"/>
+          <circle class="node" cx="497" cy="142" r="11"/>
+          <circle class="end"  cx="650" cy="142" r="9"/><text class="elbl" x="650" y="166" fill="#1e293b">toast</text>
+          <circle class="end"  cx="455" cy="210" r="9"/><text class="elbl" x="455" y="234" fill="#1e293b">test</text>
+          <circle class="end"  cx="560" cy="210" r="9"/><text class="elbl" x="560" y="234" fill="#1e293b">team</text>
+        </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9711;</span><strong>Plain node</strong> &mdash; internal / branch point; tiny circle at top is the root.</li>
+        <li><span class="b">&#9673;</span><strong>Blue node</strong> &mdash; end of a stored key (<code>test</code>, <code>team</code>, <code>toast</code>).</li>
+        <li><span class="b">e/oast</span><strong>Edge label</strong> &mdash; in a radix tree an edge carries a whole <em>substring</em>, not one character.</li>
+      </ul>
+
+      <h4 style="margin-top:1.5rem;">Time complexity (identical asymptotically)</h4>
+      <p>Both walk at most <code>L</code> symbols from the root, so every operation is <code>O(L)</code> &mdash; crucially <em>not</em> a function of <code>N</code>. The radix tree touches <em>fewer nodes</em> on the path (only branch points), but it must compare an edge's whole substring, and those substring lengths sum to <code>&le; L</code> &mdash; so the symbol count, and the bound, is the same.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Operation</th><th>Trie</th><th>Radix tree</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Insert (key len <code>L</code>)</td><td><code>O(L&middot;f)</code></td><td><code>O(L&middot;f)</code></td><td>One step per symbol; radix may <em>split</em> an edge at a new branch point (still <code>O(L)</code>)</td></tr>
+          <tr><td>Exact lookup</td><td><code>O(L&middot;f)</code></td><td><code>O(L&middot;f)</code></td><td>Walk the key to a key-end node</td></tr>
+          <tr><td><strong>Longest-prefix match</strong></td><td><strong><code>O(L&middot;f)</code></strong></td><td><strong><code>O(L&middot;f)</code></strong></td><td>Walk until an edge stops matching &mdash; <em>independent of <code>N</code></em>; a hash map cannot do this</td></tr>
+          <tr><td>Delete</td><td><code>O(L&middot;f)</code></td><td><code>O(L&middot;f)</code></td><td>Radix may <em>merge</em> an edge back when a branch point loses a child</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4 style="margin-top:1.5rem;">The per-step factor <code>f</code> &mdash; how children are stored</h4>
+      <p>&ldquo;<code>O(L)</code>&rdquo; hides the cost of choosing the next child at each of the <code>L</code> steps. That cost is a design choice, and the same choice sets the per-node memory:</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Children representation</th><th>Per-step <code>f</code></th><th>Per-node space</th><th>Trade-off</th></tr></thead>
+        <tbody>
+          <tr><td>Fixed array <code>[&sigma;]</code></td><td><code>O(1)</code></td><td><code>O(&sigma;)</code></td><td>Fastest dispatch, wastes memory on sparse nodes &mdash; fatal when <code>&sigma;</code> is large (block hashes)</td></tr>
+          <tr><td>Hash map</td><td><code>O(1)</code> avg</td><td><code>O(#children)</code></td><td>The default for large/sparse <code>&sigma;</code> &mdash; only pays for children that exist</td></tr>
+          <tr><td>Balanced BST / sorted</td><td><code>O(log &sigma;)</code></td><td><code>O(#children)</code></td><td>Compact + ordered iteration, but adds a <code>log&nbsp;&sigma;</code> factor to every step</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4 style="margin-top:1.5rem;">Space complexity (where they diverge)</h4>
+      <p><strong>The headline:</strong> a trie's node count scales with the total <em>length</em> of all keys (<code>&Sigma;&#8467;</code>); a radix tree's node count scales with the <em>number</em> of keys (<code>N</code>). A compressed trie holding <code>N</code> keys has at most <code>2N&minus;1</code> nodes (&le; <code>N</code> leaves + &le; <code>N&minus;1</code> branch points), because every internal node has &ge; 2 children. The characters themselves move from nodes onto edge labels, totalling <code>O(&Sigma;&#8467;)</code> stored symbols either way &mdash; but the radix tree stops paying a <em>node</em> (with its children container, pointers, and bookkeeping) for every single symbol.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Metric</th><th>Trie</th><th>Radix tree</th></tr></thead>
+        <tbody>
+          <tr><td>Node count</td><td><code>O(&Sigma;&#8467;)</code> &mdash; up to one per character (minus shared prefixes)</td><td><strong><code>O(N)</code></strong> &mdash; &le; <code>2N&minus;1</code>, key-count bound</td></tr>
+          <tr><td>Symbol storage</td><td>1 char implicit per node</td><td><code>O(&Sigma;&#8467;)</code> on edge labels</td></tr>
+          <tr><td>Per-node overhead</td><td>paid <code>&Sigma;&#8467;</code> times</td><td>paid <code>O(N)</code> times</td></tr>
+          <tr><td>Worst-case total (array children)</td><td><code>O(&Sigma;&#8467;&middot;&sigma;)</code></td><td><code>O(N&middot;&sigma; + &Sigma;&#8467;)</code></td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="callout callout-info">
+        <p><strong>Why a prefix cache picks the radix tree.</strong> In RadixAttention/SGLang the &ldquo;symbols&rdquo; are KV-cache <em>block hashes</em> (so <code>&sigma;</code> is effectively unbounded &rarr; array children are out, hash-map children are mandatory) and keys are long prompts (large <code>L</code>). A plain trie would allocate one node &mdash; a child map plus pointers &mdash; <em>per block on every non-shared run</em>; across thousands of long prompts that is millions of nodes. The radix tree collapses each unbranched run of blocks into a single edge, so node count tracks the number of <em>distinct prompt shapes</em>, not total blocks cached, while keeping the same <code>O(L)</code> longest-prefix match. A hash map is still out <em>for arbitrary-position matching</em>: it matches whole keys, never longest prefixes &mdash; but a <em>chained</em> hash sidesteps that, which is the third option below. Full walk-through on the <a href="radix-tree.html">Radix Tree</a> page.</p>
+      </div>
+
+      <h4 style="margin-top:1.75rem;">The third option: block-hash chaining (the flat, production shortcut)</h4>
+      <p><strong>Problem:</strong> a tree (trie/radix) is awkward to <em>distribute</em> &mdash; sharding a pointer-linked structure across a fleet of KV-store tasks and keeping it consistent is real work. <strong>Solution:</strong> drop the tree and use a flat <code>block_hash &rarr; physical_block</code> hash map, where each block's hash is <em>chained</em> over all preceding blocks. The chaining is the trick that lets a plain hash map do prefix matching after all.</p>
+
+      <h5 style="margin-top:1rem;">How the chained hash works (worked example)</h5>
+      <p>Tokenize the prompt and pack it into fixed-size KV blocks <code>B&#8320;, B&#8321;, B&#8322;, &hellip;</code> (say 16 tokens each). The hash of block <code>i</code> folds in the hash of block <code>i&minus;1</code>, so it encodes the <em>entire prefix up to and including block <code>i</code></em>, not just block <code>i</code>'s own tokens:</p>
+      <ul>
+        <li><code>h&#8320; = H(B&#8320;)</code></li>
+        <li><code>h&#8321; = H(h&#8320;, B&#8321;)</code></li>
+        <li><code>h&#8322; = H(h&#8321;, B&#8322;)</code> &nbsp;&hellip; and so on.</li>
+      </ul>
+      <p>Two prompts that share the first two blocks produce <em>identical</em> <code>h&#8320;, h&#8321;</code> and diverge at <code>h&#8322;</code> &mdash; so equal hashes <em>are</em> a shared prefix. That is what makes a flat map able to answer &ldquo;longest cached prefix&rdquo; that an <em>un</em>chained per-block hash could not: each key already carries its position and history.</p>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Compute prefix hashes (<code>L</code> blocks)</td><td><code>O(L)</code></td><td>One chained fold per block, <code>O(1)</code> each (block size is fixed)</td></tr>
+          <tr><td><strong>Longest cached prefix</strong></td><td><strong><code>O(L)</code></strong></td><td>Probe <code>h&#8320;, h&#8321;, &hellip;</code> in the map, stop at the first miss &mdash; <code>O(1)</code> avg per probe, <em>independent of <code>N</code></em></td></tr>
+          <tr><td>Insert a block</td><td><code>O(1)</code></td><td>One map put: <code>h&#8345; &rarr; physical block</code></td></tr>
+          <tr><td>Collision verify (rare)</td><td><code>O(block size)</code></td><td>On a hash hit, compare the block's tokens to rule out a false match (needs a strong/wide hash)</td></tr>
+        </tbody>
+      </table></div>
+
+      <h5 style="margin-top:1rem;">Block-hash chain vs. radix tree &mdash; same <code>O(L)</code> time, different shape</h5>
+      <ul>
+        <li><strong>Time: a tie.</strong> Both are <code>O(L)</code> longest-prefix match, independent of the number of cached keys <code>N</code>. The chain trades the tree's pointer-walk for a per-block hash computation + flat-map probe.</li>
+        <li><strong>Space: <code>O(M)</code> flat entries</strong> (<code>M</code> = distinct cached blocks) with <em>no tree pointers or child containers</em> &mdash; a flatter constant factor than the radix tree's <code>O(N)</code> nodes, though it loses the radix tree's prefix de-duplication of the keys themselves.</li>
+        <li><strong>Granularity:</strong> block-level only (matches at fixed block boundaries), vs. the radix tree's arbitrary token-level prefixes. Fine here &mdash; KV reuse is block-granular anyway.</li>
+        <li><strong>Distribution is the real win:</strong> a block hash is a flat, routable key, so you shard the map across a KV-store fleet via <a href="consistent-hashing.html">consistent hashing</a> and gossip hashes between tasks &mdash; far easier than sharding a tree. This is why production exact-reuse caches (vLLM-style automatic prefix caching, and this curriculum's <a href="../llm/custom_scenario/implementment/distributed_kv_cache.html">distributed KV cache</a>) chain hashes instead of maintaining a distributed radix tree.</li>
+        <li><strong>What you give up:</strong> the tree's structured, subtree-aware eviction and child enumeration. A flat map evicts per block (LRU/LFU over blocks &mdash; see above) rather than per subtree.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Cheat sheet -->
+  <section class="section">
+    <div class="container">
+      <h2>One-Screen Cheat Sheet</h2>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Task in the stack</th><th>Right structure</th><th>Cost</th><th>The wrong answer</th></tr></thead>
+        <tbody>
+          <tr><td>Evict lowest-score KV block</td><td>Indexed min-heap</td><td><code>O(log n)</code></td><td>Sorted array (<code>O(n)</code> insert)</td></tr>
+          <tr><td>Recency eviction</td><td>Hashmap + DLL (LRU)</td><td><code>O(1)</code></td><td>Scan for oldest (<code>O(n)</code>)</td></tr>
+          <tr><td>Frequency eviction</td><td><code>key&rarr;node</code> + <code>freq&rarr;DLL</code> + <code>minFreq</code></td><td><code>O(1)</code></td><td>Heap-by-count (<code>O(log n)</code>)</td></tr>
+          <tr><td>Longest cached prefix</td><td>Radix tree (<code>O(N)</code> nodes)</td><td><code>O(L)</code></td><td>Hash map (can't prefix-match) / plain trie (<code>O(&Sigma;&#8467;)</code> nodes)</td></tr>
+          <tr><td>Exact block reuse</td><td><code>hash&rarr;block</code> map</td><td><code>O(1)</code>/block</td><td>Linear search</td></tr>
+          <tr><td>Allocate KV block</td><td>Free-list stack</td><td><code>O(1)</code></td><td>Compaction / search</td></tr>
+          <tr><td>Priority admission</td><td>Min-heap over waiters</td><td><code>O(log W)</code></td><td>Re-sort the queue (<code>O(W log W)</code>)</td></tr>
+          <tr><td>Cache-affinity routing</td><td>Consistent-hash ring</td><td><code>O(log T)</code></td><td>Modulo (reshuffles on resize)</td></tr>
+          <tr><td>Next-token top-k</td><td>Size-k min-heap</td><td><code>O(V)</code></td><td>Full sort (<code>O(V log V)</code>)</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Takeaways -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>Never keep a hot collection fully sorted.</strong> A sorted array is <code>O(n)</code> per insert (tail shift); a sorted linked list is <code>O(n)</code> per insert (no binary search). Eviction only needs the extreme, so use a heap.</li>
+        <li><strong>A plain min-heap is <code>O(log n)</code> for insert/pop but <code>O(n)</code> to find or update an arbitrary item</strong> &mdash; the killer when scores change in place.</li>
+        <li><strong>Add a <code>key &rarr; heap-index</code> hashmap</strong> to get an indexed heap: find drops to <code>O(1)</code>, update/delete to <code>O(log n)</code>.</li>
+        <li><strong>LRU and LFU are both achievable at <code>O(1)</code></strong> by pairing a hashmap with doubly linked list(s) &mdash; one DLL for LRU, one DLL per frequency (plus a <code>minFreq</code> counter) for LFU. The naive heap-based LFU is only <code>O(log n)</code>.</li>
+        <li><strong>Trie and radix tree share the same <code>O(L)</code> time</strong> (independent of the number of keys <code>N</code>) for lookup and longest-prefix match &mdash; the win a hash map can't give. They diverge on <em>space</em>: a trie spends <code>O(&Sigma;&#8467;)</code> nodes (one per character), a radix tree only <code>O(N)</code> (&le; <code>2N&minus;1</code>, by compressing non-branching runs onto edges) &mdash; which is why long-key prefix caches use the radix tree.</li>
+        <li><strong>The KV cache itself is the headline complexity win:</strong> it turns <code>O(n²)</code> attention recompute over a generation into per-step <code>O(t)</code> cache reads, at the cost of <code>O(n)</code> memory per sequence.</li>
+        <li><strong>Across routing, scheduling, prefix lookup, and sampling, the same reflex pays off:</strong> name the structure, state the cost, and call out the <code>O(n)</code> trap you avoided.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container-wide">
+      <p>System Design Interview Prep. Built for engineers, by engineers.</p>
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+</body>
+</html>

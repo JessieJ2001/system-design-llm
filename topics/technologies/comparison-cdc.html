@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CDC &amp; ETL: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad { color: var(--color-danger); font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>CDC &amp; ETL: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">"How do I get data from the production DB to the warehouse?" has two answers: log-based CDC (Debezium / Maxwell / Canal / cloud DMS) for low-latency, ordered, complete capture; query-based / managed connectors (Fivetran / Airbyte) for SaaS sources and batch comfort. Pick by source type and freshness need.</p>
+      <p class="hero-meta">Debezium &bull; Maxwell &bull; Canal &bull; AWS DMS / Datastream / Synapse Link &bull; Fivetran / Airbyte / Stitch</p>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <div class="full-width">
+        <svg viewBox="0 0 1240 480" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs><marker id="arCD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker></defs>
+
+          <rect x="470" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="620" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">Need to move data</text>
+
+          <rect x="470" y="120" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="620" y="146" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Source type?</text>
+          <text x="620" y="164" text-anchor="middle" fill="#64748b" font-size="11">DB / SaaS / files / events</text>
+          <line x1="620" y1="76" x2="620" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="20" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="160" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">DB &rarr; downstream</text>
+          <text x="160" y="284" text-anchor="middle" fill="#64748b" font-size="11">Postgres / MySQL / Mongo / Oracle</text>
+          <line x1="500" y1="170" x2="280" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="20" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="85" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Debezium</text>
+          <text x="85" y="382" text-anchor="middle" fill="#64748b" font-size="10">via Kafka Connect</text>
+          <line x1="100" y1="300" x2="85" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="160" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="225" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">DMS / Datastream /</text>
+          <text x="225" y="382" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Synapse Link</text>
+          <line x1="220" y1="300" x2="225" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="320" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="460" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">SaaS &rarr; warehouse</text>
+          <text x="460" y="284" text-anchor="middle" fill="#64748b" font-size="11">Stripe, Salesforce, GA, etc.</text>
+          <line x1="600" y1="180" x2="500" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="320" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="460" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Fivetran / Airbyte / Stitch</text>
+          <line x1="460" y1="300" x2="460" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="620" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="760" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Streaming events</text>
+          <text x="760" y="284" text-anchor="middle" fill="#64748b" font-size="11">Kafka / Kinesis / Pub/Sub</text>
+          <line x1="700" y1="180" x2="730" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="620" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="760" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Flink / Spark Streaming / Dataflow</text>
+          <line x1="760" y1="300" x2="760" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="930" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="1070" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Files (S3 / FTP / API dumps)</text>
+          <text x="1070" y="284" text-anchor="middle" fill="#64748b" font-size="11">batch loads</text>
+          <line x1="770" y1="180" x2="1010" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="930" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1070" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Airbyte / Glue / Dataproc / Spark</text>
+          <line x1="1070" y1="300" x2="1070" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCD)"/>
+
+          <rect x="200" y="430" width="800" height="40" rx="8" fill="#fef9c3" stroke="#ca8a04"/>
+          <text x="600" y="455" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Don't dual-write to DB and Kafka. Use the outbox pattern via CDC for atomicity.</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Dimension</th><th>Debezium</th><th>Maxwell</th><th>Canal</th><th>AWS DMS</th><th>GCP Datastream</th><th>Fivetran</th><th>Airbyte</th></tr></thead>
+          <tbody>
+            <tr><td>Family</td><td>Log-based CDC</td><td>Log-based (MySQL only)</td><td>Log-based (MySQL only)</td><td>Managed CDC + bulk load</td><td>Managed CDC</td><td>Managed connectors (mostly query-based)</td><td>Open-source / managed connectors</td></tr>
+            <tr><td>Sources</td><td>PG, MySQL, Mongo, Oracle, SQL Server, Cassandra, Vitess</td><td>MySQL only</td><td>MySQL only</td><td>~12 RDBMS + S3 + Kinesis</td><td>PG, MySQL, Oracle, SQL Server</td><td>300+ SaaS + DB</td><td>300+ connectors (varying maturity)</td></tr>
+            <tr><td>Sinks</td><td>Kafka topics (then anywhere)</td><td>Kafka, Kinesis, RabbitMQ, etc.</td><td>Kafka, RocketMQ, etc.</td><td>RDS, Redshift, Kinesis, S3, etc.</td><td>BigQuery, GCS, Pub/Sub</td><td>Warehouses (Snowflake, BQ, Redshift)</td><td>Warehouses + DBs</td></tr>
+            <tr><td>Latency</td><td>Sub-second</td><td>Sub-second</td><td>Sub-second</td><td>Seconds</td><td>Seconds</td><td>Minutes (often 15-min cycles)</td><td>Minutes (configurable)</td></tr>
+            <tr><td>Initial snapshot</td><td>Yes (consistent)</td><td>Yes</td><td>Yes</td><td>Yes (full + CDC)</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+            <tr><td>Schema evolution</td><td>Schema Registry; alters propagate</td><td>Limited</td><td>Limited</td><td>Per-task transformation</td><td>Auto-handle most</td><td>Handles most</td><td>Handles most</td></tr>
+            <tr><td>Ordering guarantee</td><td>Per-table partition (Kafka)</td><td>Per-table</td><td>Per-table</td><td>Per-replication-task</td><td>Per-table</td><td>Per-table sync</td><td>Per-stream</td></tr>
+            <tr><td>Exactly-once</td><td>At-least-once + idempotent sink</td><td>At-least-once</td><td>At-least-once</td><td>At-least-once</td><td>At-least-once</td><td>Per-cycle, idempotent target</td><td>Per-sync, idempotent target</td></tr>
+            <tr><td>Throughput</td><td>~100k events/sec/connector</td><td>~50k/sec</td><td>Similar</td><td>Cloud-managed</td><td>Cloud-managed</td><td>Bulk + incremental</td><td>Per-connector</td></tr>
+            <tr><td>Multi-tenant</td><td>Connect cluster</td><td>Single instance</td><td>Single instance</td><td>Per-task</td><td>Per-stream</td><td>Per-account</td><td>Per-deployment</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>3 (Connect cluster)</td><td>2</td><td>3</td><td>2</td><td>1</td><td>1</td><td>2 self-host, 1 Cloud</td></tr>
+            <tr><td>Cost driver</td><td>Connect workers + Kafka</td><td>Instance hours</td><td>Instance hours</td><td>Replication-instance hours</td><td>Per-GB processed</td><td>Per-MAR (monthly active rows)</td><td>Per-GB or per-row (Cloud)</td></tr>
+            <tr><td>Cloud equivalents</td><td>MSK Connect, Confluent Connect</td><td>Self-host</td><td>Self-host (Alibaba origin)</td><td>(this is the cloud)</td><td>(this is the cloud)</td><td>SaaS</td><td>Airbyte Cloud</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Postgres / MySQL &rarr; warehouse (low latency)</td><td>Debezium &rarr; Kafka &rarr; sink</td><td>DMS / Datastream</td><td>Debezium for self-host control; cloud-managed for ops simplicity</td></tr>
+            <tr><td>SaaS &rarr; warehouse</td><td>Fivetran</td><td>Airbyte</td><td>Fivetran for breadth + reliability; Airbyte for cost / customization</td></tr>
+            <tr><td>Outbox pattern</td><td>Debezium</td><td>Custom polling</td><td>Debezium tails the WAL atomic with the txn</td></tr>
+            <tr><td>Cross-DB replication (PG &rarr; PG, region migration)</td><td>Logical replication / pg_dump+restore</td><td>Debezium / DMS</td><td>Native PG repl is simplest if both sides PG</td></tr>
+            <tr><td>Stream into stream processor</td><td>Kafka topic from Debezium &rarr; Flink</td><td>Datastream &rarr; Dataflow</td><td>Match cloud + existing stack</td></tr>
+            <tr><td>Reverse ETL (warehouse &rarr; ops DB)</td><td>Hightouch / Census</td><td>Custom Airflow</td><td>Reverse ETL is a different shape; use specialized tools</td></tr>
+            <tr><td>Mongo CDC</td><td>Debezium Mongo</td><td>Mongo Atlas Stream Processing</td><td>Atlas if SaaS; Debezium if self-host</td></tr>
+            <tr><td>Files (S3 / FTP) &rarr; warehouse</td><td>Glue / Dataproc / Snowpipe</td><td>Airflow + Spark</td><td>Cloud-native ingest is simplest</td></tr>
+            <tr><td>Real-time materialized view from CDC</td><td>Debezium &rarr; Kafka &rarr; Kafka Streams / Flink</td><td>ksqlDB</td><td>Stream processor builds the projection table</td></tr>
+            <tr><td>Tens of micro-services emitting events</td><td>Kafka with each service publishing</td><td>Outbox + Debezium</td><td>Outbox pattern preserves DB-event atomicity</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Pattern</th><th>Debezium</th><th>DMS / Datastream</th><th>Fivetran</th><th>Airbyte</th></tr></thead>
+          <tbody>
+            <tr><td>Sub-second freshness</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-bad">&#10005;</span> 15min</td><td><span class="pat-warn">&#9888;</span> 5min minimum</td></tr>
+            <tr><td>Bulk initial snapshot</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>SaaS sources (Stripe, Salesforce)</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Schema evolution (DDL)</td><td><span class="pat-good">&#10003;</span> with Schema Registry</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Many tables (1000s)</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> task limits</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>High-throughput row writes (10k/sec)</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> batch lag</td><td><span class="pat-warn">&#9888;</span></td></tr>
+            <tr><td>Cross-region (DB &rarr; far warehouse)</td><td><span class="pat-good">&#10003;</span> via Kafka MirrorMaker</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Schema-less source</td><td><span class="pat-warn">&#9888;</span> JSON path filters</td><td><span class="pat-warn">&#9888;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Large tables snapshot &gt; 1 TB</td><td><span class="pat-warn">&#9888;</span> long-running</td><td><span class="pat-good">&#10003;</span> parallel snapshot</td><td><span class="pat-warn">&#9888;</span> slow first sync</td><td><span class="pat-warn">&#9888;</span></td></tr>
+            <tr><td>Strict ordering across tables</td><td><span class="pat-warn">&#9888;</span> per-table only</td><td><span class="pat-warn">&#9888;</span></td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-bad">&#10005;</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend"><span class="pat-good">&#10003;&#10003;</span> excellent <span class="pat-good">&#10003;</span> handles <span class="pat-warn">&#9888;</span> with effort <span class="pat-bad">&#10005;</span> wrong tool</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Debezium (PG)</td><td>Replication slot lag</td><td>WAL fills; PG runs out of disk</td><td>Multiple slots; slot monitoring; max_slot_wal_keep_size</td></tr>
+            <tr><td>Debezium (MySQL)</td><td>Binlog purge before consumed</td><td>Connector falls behind; needs re-snapshot</td><td>Longer binlog retention; faster connector</td></tr>
+            <tr><td>Kafka Connect</td><td>Many connectors</td><td>Worker JVM heap; one bad task affects others</td><td>Distributed mode; isolate via topic ACLs; bigger workers</td></tr>
+            <tr><td>DMS</td><td>Replication-instance saturation</td><td>Log positions fall behind; cliff on PG WAL</td><td>Larger instance; multiple tasks</td></tr>
+            <tr><td>Fivetran</td><td>MAR (monthly active rows)</td><td>Bill scales with row mutations &mdash; can be brutal</td><td>Filter columns; reduce sync frequency; consolidate tables</td></tr>
+            <tr><td>Airbyte (sync)</td><td>Per-connector instance</td><td>Long-running syncs block scheduler</td><td>Sharded deployment; managed Airbyte Cloud</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <ul>
+        <li><strong>Polling &rarr; CDC:</strong> common modernization. Replace nightly batch dumps with Debezium/DMS for sub-second freshness.</li>
+        <li><strong>Self-host Debezium &rarr; managed (DMS / Datastream):</strong> when ops cost outweighs control.</li>
+        <li><strong>Fivetran &rarr; Airbyte:</strong> cost-driven; works for many DB sources but fewer SaaS connectors are battle-tested.</li>
+        <li><strong>Custom dual-write &rarr; outbox + Debezium:</strong> the canonical "we had data inconsistencies" rewrite.</li>
+        <li><strong>DMS &rarr; Zero-ETL (Aurora &rarr; Redshift):</strong> AWS now supports zero-ETL for some pairs &mdash; eliminates the replication-instance entirely.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Debezium self-host</td><td>Connect workers + Kafka cluster</td><td>Kafka cross-AZ traffic dominates; scale Connect workers separately from brokers</td></tr>
+            <tr><td>DMS</td><td>Replication-instance hours + storage</td><td>Multi-AZ replication instance doubles cost</td></tr>
+            <tr><td>Datastream</td><td>Per-GB processed</td><td>Cheaper than DMS for steady-state; can spike on backfill</td></tr>
+            <tr><td>Fivetran</td><td>MAR (monthly active rows)</td><td>Bursty source = bursty bill; consolidate tables to reduce MAR</td></tr>
+            <tr><td>Airbyte Cloud</td><td>Per-credit + per-row</td><td>Cheaper than Fivetran usually; less polished</td></tr>
+            <tr><td>Stitch</td><td>Per-row</td><td>Now part of Talend; price competitive at small scale</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>Outbox + Debezium (the gold standard)</h3>
+          <p>App writes business row + outbox row in one DB transaction. Debezium tails the WAL/binlog, publishes outbox rows to Kafka. Solves dual-write atomicity.</p>
+        </div>
+        <div>
+          <h3>CDC &rarr; warehouse + ops cache</h3>
+          <p>One Debezium stream forks to two sinks: warehouse (analytics) and Redis / DDB (ops cache). CQRS via CDC.</p>
+        </div>
+        <div>
+          <h3>Debezium &rarr; Flink &rarr; materialized view</h3>
+          <p>Stream processor builds a projection (denormalized read model) and writes to a serving DB. Read scale + denormalization without dual-writes.</p>
+        </div>
+        <div>
+          <h3>Fivetran for SaaS + Debezium for DB</h3>
+          <p>Most teams end up with two CDC layers: Fivetran for the long tail of SaaS data sources; Debezium for the production DBs.</p>
+        </div>
+        <div>
+          <h3>Reverse ETL (Hightouch / Census)</h3>
+          <p>Take warehouse-computed segments and push them back into ops tools (Salesforce, HubSpot, Iterable). Bidirectional &mdash; CDC out, Reverse ETL in.</p>
+        </div>
+        <div>
+          <h3>Snowpipe Streaming</h3>
+          <p>Snowflake's row-stream API ingests Kafka topics directly into Snowflake. Skip the warehouse-load step entirely for streaming sources.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"Dual-write to DB and Kafka"</h3>
+          <p>Inevitable inconsistencies. Use outbox + CDC.</p>
+        </div>
+        <div>
+          <h3>"Polled the DB every 30s"</h3>
+          <p>Misses deletes; misses fast-changing rows; loads the DB. Switch to CDC.</p>
+        </div>
+        <div>
+          <h3>"Unmonitored replication slot"</h3>
+          <p>Connector dies; slot accumulates WAL; PG runs out of disk. Always monitor slot lag.</p>
+        </div>
+        <div>
+          <h3>"Trust at-least-once without idempotent sink"</h3>
+          <p>Duplicate inserts in warehouse; analytics off. Sinks must be idempotent (upserts on PK).</p>
+        </div>
+        <div>
+          <h3>"Schema change broke the pipeline"</h3>
+          <p>No schema registry; downstream consumers blind to ALTER. Use Confluent Schema Registry or equivalent + compat policies.</p>
+        </div>
+        <div>
+          <h3>"Used CDC for app-to-app (instead of events)"</h3>
+          <p>Coupling: every consumer reads the DB schema. Better to publish domain events from the app.</p>
+        </div>
+        <div>
+          <h3>"Ran Fivetran on a DB without read replica"</h3>
+          <p>Fivetran's full-table queries hammer prod. Use a read replica or switch to log-based CDC.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>DB &rarr; downstream: Debezium (self-host) or DMS / Datastream (managed).</strong> Always log-based, never polling.</li>
+          <li><strong>SaaS &rarr; warehouse: Fivetran or Airbyte.</strong> Pick by cost / connector breadth.</li>
+          <li><strong>Outbox + Debezium for "DB and event bus must agree."</strong></li>
+          <li><strong>CDC sinks must be idempotent.</strong> At-least-once + idempotent = exactly-once.</li>
+          <li><strong>Always monitor replication slot / binlog lag.</strong></li>
+          <li><strong>Use a schema registry for streaming events.</strong></li>
+          <li><strong>Don't use CDC for app-to-app integration; publish domain events instead.</strong></li>
+          <li><strong>Reverse ETL is a different shape; use Hightouch / Census, not custom Airflow.</strong></li>
+          <li><strong>Initial snapshot of huge tables is the slowest part &mdash; plan parallel snapshot.</strong></li>
+          <li><strong>Stream processor (Flink) on top of CDC builds the read-side projections.</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../technologies.html">All Technologies</a></li>
+        <li><a href="comparison-messaging.html">Messaging comparison</a></li>
+        <li><a href="comparison-stream-processing.html">Stream processing comparison</a></li>
+        <li><a href="comparison-analytics.html">Analytics comparison</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K17 — Attention Kernels &amp; CUDA Graphs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K17 &mdash; Attention Kernels &amp; CUDA Graphs <span style="font-weight:400;font-size:.55em;color:#64748b;">(where the roofline meets achieved MFU/MBU)</span></h1>
+      <p class="hero-subtitle"><strong>How do you actually <em>hit</em> the K1 roofline &mdash; when the same model on the same GPU runs 2&ndash;4&times; faster or slower depending on the <em>kernel</em> (tiling, the paged gather, the split-axis) and the <em>launch strategy</em> (thousands of &micro;s-scale launches vs one CUDA-graph replay) &mdash; and how do those two factors impose shape-rigidity that every upstream scheduling decision must respect?</strong> This page derives achieved&nbsp;=&nbsp;roofline&times;kernel-eff&times;launch-eff, then D51 (the attention-parallelization design space), D22 (graphs under dynamic batching), D10 (batch-invariance), D45 (the shape-coverage cliff).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; converts <a href="K1_serving-fundamentals.html#roofline">K1</a>&rsquo;s roofline <em>ceiling</em> into <em>achieved</em> MFU/MBU &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> / <a href="K2_kv-cache.html#d31">K2</a> / <a href="K4_continuous-batching-and-scheduling.html">K4</a> &bull; <strong>applies K0&rsquo;s online-softmax (never re-derives it)</strong> &bull; dedicated scenario: <strong>L6</strong> (D10) &bull; ~22 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the kernel chain). Approve / redirect the arc, the <strong>achieved=roofline&times;kernel-eff&times;launch-eff derivation</strong>, deep-dive placement (<strong>D51 split-M/split-KV/persistent &mdash; the big one, cites K4/K2/K0; D22 graphs-under-dynamic-batch; D10 batch-invariance &mdash; co-host K4; D45 shape-coverage cliff</strong>), the two rule-of-two boundaries (<strong>K2/D31 layout-vs-kernel, K4/D22+D51 schedule-vs-kernel</strong>), the <strong>rule-11 kernel/compile-strategy spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>MFU / MBU (primary)</strong> &mdash; <code>achieved = roofline &times; kernel_efficiency &times; launch_efficiency</code>; this page is those two multipliers (60% MFU vs 20% is decided here). <code>kernel_efficiency</code> = tiling <em>+ Tensor-Core utilization (FA-3 path) + the right per-variant kernel</em> (GQA/MLA/SWA), not tiling alone. <span style="color:#9a3412;">[ADDED]</span></li>
+          <li><strong>TPOT / ITL</strong> &mdash; the decode attention kernel + per-launch overhead set the decode step; FlashDecoding/split-KV (D51) + CUDA graphs (D22) cut it.</li>
+          <li><strong>Throughput</strong> &mdash; load-balanced CTA scheduling (persistent/stream-K, D51) keeps a long sequence from starving short ones in a batched decode.</li>
+          <li><strong>Determinism (cache/eval correctness)</strong> &mdash; batch-invariant kernels (D10) keep the same prompt &rarr; same output across batch sizes (not an SLI, a correctness gate for K2/D5 &amp; L6).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> The roofline is a ceiling; achieved MFU/MBU is <code>roofline &times; kernel_eff &times; launch_eff</code>. FlashAttention tiles so HBM traffic is O(N) not O(N&sup2;); the paged KV is non-contiguous so the kernel must gather; decode is a thin GEMV so you split the KV dimension (FlashDecoding) and load-balance CTAs (persistent/stream-K, D51); per-launch overhead forces CUDA graphs, which need static shapes, which constrain the scheduler (D22) and break determinism (D10); the fastest kernel depends on shape, so a dispatcher with an off-distribution cliff (D45).</p>
+      <ul>
+        <li><strong>Is:</strong> the achieved-vs-peak derivation (incl. <em>feeding the Tensor Cores</em> &mdash; WGMMA/TMA/FP8, FA-3&ne;FA-2 <span style="color:#9a3412;">[ADDED]</span>); the <strong>attention-variant kernel match</strong> &mdash; GQA/MQA-packed, MLA, sliding-window, sink + in-register KV-dtype dequant <span style="color:#9a3412;">[ADDED]</span>; D51 (split-M vs split-KV/FlashDecoding vs fixed-chunk split-KV + persistent/stream-K &mdash; the Q-thickness-set parallelization axis + the batched-variable-length load-balancer + the chunked-prefill &lsquo;append&rsquo; 3rd regime); D22 (CUDA-graph capture under dynamic batching &mdash; incl. spec-decode tree-attention &amp; graph&otimes;NCCL/TP); D10 (batch-invariance / numeric determinism, incl. the D51 coupling; co-host <a href="K4_continuous-batching-and-scheduling.html">K4</a>); D45 (the kernel-dispatch / autotune shape-coverage cliff); the kernel/compile-strategy rule-11 spectrum (eager &hellip; <em>persistent megakernel</em> <span style="color:#9a3412;">[ADDED endpoint]</span>); the non-attention decode tail (logits/sampling over a 128k&ndash;256k vocab) <span style="color:#9a3412;">[ADDED]</span>.</li>
+        <li><strong>Is not:</strong> writing CUDA/Triton kernels (we name FlashAttention/FlashInfer + their <em>serving consequence</em>, not kernel programming); the online-softmax <em>math</em> (<a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> owns the derivation &mdash; K17 applies it); the KV <em>layout + block-table gather contract</em> (<a href="K2_kv-cache.html#d31">K2/D31</a> &mdash; K2 owns the layout, K17 owns the kernel that reads it); the continuous-batching <em>scheduler</em> + batch composition (<a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; K4 snaps to bucket / owns wave-balance, K17 owns capture + the split-axis); autograd/training kernels (training-side).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule (two rule-of-two boundaries stated up front).</strong> (1) <strong>K2&harr;K17 (D31):</strong> <a href="K2_kv-cache.html#d31">K2</a> owns the physical KV <em>layout + block-table gather contract</em>; K17 owns the <em>kernel</em> that parallelizes over it &mdash; cite, don&rsquo;t duplicate. (2) <strong>K4&harr;K17 (D22, D51):</strong> <a href="K4_continuous-batching-and-scheduling.html#d22">K4</a> owns the scheduler <em>snap-to-bucket</em> and <em>batch-composition / wave-balance</em>; K17 owns the graph <em>capture/piecewise machinery</em> and the <em>split-axis (M vs KV)</em> choice. The online-softmax recurrence is <a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a>&rsquo;s &mdash; K17 applies it (it makes the split-KV epilogue <em>exact</em>), never re-derives it. The roofline/ridge is <a href="K1_serving-fundamentals.html#roofline">K1</a>&rsquo;s.</div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Kernel Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>Roofline (K1) is a <em>ceiling</em>; achieved MFU/MBU is set here.</strong></li>
+        <li>Naive attention materializes the <code>[N,N]</code> score matrix &rarr; O(N&sup2;) HBM &rarr; <strong>FlashAttention tiles + online-softmax (K0)</strong> &rarr; O(N) HBM. <strong>kernel_eff is also &ldquo;do you feed the Tensor Cores&rdquo;</strong> &mdash; WGMMA/TMA/async-warp-specialization/FP8 (FA-3 &ne; FA-2); and FlashAttention fixes <em>memory</em>, prefill <em>compute</em> is still O(N&sup2;) FLOPs. <span style="color:#9a3412;">[ADDED]</span></li>
+        <li>Paged KV is non-contiguous &rarr; the kernel must <strong>gather</strong> (the paging cost; K2/D31 owns the layout).</li>
+        <li><strong>There is no one &ldquo;attention kernel&rdquo; &mdash; the fast kernel is keyed by the model&rsquo;s <em>attention algorithm</em>:</strong> GQA/MQA-packed decode, MLA (frontier MoE), sliding-window, attention-sink each need a <em>matching</em> kernel (K0 owns the algorithm, K17 the kernel); the kernel must also read FP8/INT8 KV &amp; <strong>dequant in-register, never round-trip dequantized KV through HBM</strong>. A mismatch is a D45-class cliff at the <em>algorithm</em> axis. <span style="color:#9a3412;">[ADDED]</span></li>
+        <li>Decode is a thin GEMV: one query gives no M-parallelism &rarr; a single CTA underfills the GPU &rarr; <strong>split the KV dimension</strong> (FlashDecoding) with an online-softmax epilogue reduction.</li>
+        <li>Batched variable-length decode then needs <strong>load-balanced CTA scheduling</strong> (fixed-chunk split-KV + persistent / stream-K) so a long sequence doesn&rsquo;t starve short ones (D51); chunked-prefill&rsquo;s <strong>&ldquo;append&rdquo; kernel is a third Q-thickness regime</strong> (medium-Q chunk vs long cached KV; K4/D1 <em>requires</em> it). <span style="color:#9a3412;">[ADDED]</span></li>
+        <li>Per-launch overhead exceeds kernel runtime at small batch &rarr; <strong>CUDA graph</strong> replays the whole step as one launch.</li>
+        <li>Graphs need <strong>static shapes</strong> &rarr; bucketing constrains the scheduler (K4/D22) and breaks determinism (D10) &mdash; and is <strong>worse under tree-attention/variable-accept spec-decode (K13)</strong> and <strong>graphs containing the TP-group NCCL all-reduce</strong>. <span style="color:#9a3412;">[ADDED]</span></li>
+        <li>Determinism couples back: <strong>split-KV&rsquo;s non-fixed epilogue reduction (D51) is itself a source of D10</strong> &mdash; the same kernel decision that fills the GPU creates the reproducibility problem. <span style="color:#9a3412;">[ADDED]</span></li>
+        <li>Which kernel is fastest depends on shape &rarr; a <strong>dispatcher/autotune</strong>, with a cliff off the covered shapes (D45); the launch strategy spectrum ends at a <strong>persistent megakernel</strong> (dynamism in-kernel, dodges D22, answers K4/D33). <span style="color:#9a3412;">[ADDED]</span></li>
+        <li><strong>Objective:</strong> the kernel + launch strategy that maximises achieved MFU/MBU under the SLO, with shape-rigidity every upstream layer must respect.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>roofline is a ceiling &rarr; naive attention is O(N&sup2;) HBM &rarr; FlashAttention tiles + feeds the Tensor Cores (O(N) HBM, K0 online-softmax; prefill compute still O(N&sup2;) FLOPs) &rarr; paged KV non-contiguous &rarr; gather &rarr; <strong>which attention <em>algorithm</em>? GQA/MLA/sliding-window/sink kernel match + in-register KV-dtype dequant</strong> &rarr; decode thin GEMV, single CTA starves GPU &rarr; split-KV/FlashDecoding &rarr; batched variable-length + chunked-prefill &ldquo;append&rdquo; (D51) &rarr; per-launch overhead &rarr; CUDA graph &rarr; static shapes &rarr; bucket the scheduler (D22; worse under spec-decode tree-attention &amp; graph&otimes;NCCL/TP) + break determinism (D10; split-KV is itself a source) &rarr; shape-dependent fastest kernel &rarr; dispatcher + off-distribution cliff (D45) &rarr; the strategy spectrum (eager &hellip; persistent megakernel) &rarr; objective: max achieved MFU/MBU under the SLO</em>. Each box is a section below. <span style="color:#9a3412;">Boxes/edges marked [ADDED] are new realistic considerations folded into the skeleton this iteration.</span></p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 890" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          .add { font-size:10px; font-weight:700; fill:#9a3412; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+          path.cpl { stroke:#7c3aed; stroke-width:1.6; fill:none; stroke-dasharray:6 4; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="290" y="14" width="660" height="50" rx="8"/>
+        <text class="t" x="620" y="34" text-anchor="middle">Roofline (K1) is a CEILING &mdash; achieved MFU/MBU is set HERE</text>
+        <text class="s" x="620" y="52" text-anchor="middle">achieved = roofline &times; kernel_eff &times; launch_eff &middot; §1</text>
+
+        <line x1="620" y1="64" x2="620" y2="88"/>
+        <text class="l" x="636" y="80">naive is O(N&sup2;)</text>
+
+        <rect class="bp" x="255" y="88" width="730" height="52" rx="8"/>
+        <text class="t" x="620" y="109" text-anchor="middle">FlashAttention tiles + online-softmax (K0) + WGMMA/TMA/FP8 &rarr; O(N) HBM</text>
+        <text class="s" x="620" y="127" text-anchor="middle">FA-3 feeds the Tensor Cores (FA-2 &ne; FA-3); prefill compute still O(N&sup2;) FLOPs &middot; §2</text>
+
+        <line x1="620" y1="140" x2="620" y2="164"/>
+        <text class="l" x="636" y="156">paged KV</text>
+
+        <rect class="bp" x="280" y="164" width="680" height="50" rx="8"/>
+        <text class="t" x="620" y="184" text-anchor="middle">Paged KV is non-contiguous &rarr; the kernel must GATHER</text>
+        <text class="s" x="620" y="202" text-anchor="middle">K2/D31 owns the layout; K17 owns the kernel that reads it &middot; §3</text>
+
+        <line x1="620" y1="214" x2="620" y2="238"/>
+        <text class="l" x="636" y="230">which attn algorithm?</text>
+
+        <rect class="bd" x="235" y="238" width="770" height="58" rx="8"/>
+        <text class="add" x="998" y="252" text-anchor="end">[ADDED]</text>
+        <text class="t" x="620" y="262" text-anchor="middle">Attention-variant kernel MATCH &mdash; GQA/MQA-packed / MLA / sliding-window / sink</text>
+        <text class="s" x="620" y="281" text-anchor="middle">K0 owns the algorithm, K17 the kernel; read FP8/INT8 KV &amp; dequant in-register &middot; §3</text>
+
+        <line x1="620" y1="296" x2="620" y2="318"/>
+        <text class="l" x="636" y="310">decode = thin GEMV</text>
+
+        <rect class="bs" x="240" y="318" width="760" height="58" rx="8"/>
+        <text class="t" x="620" y="341" text-anchor="middle">D51 &mdash; split-M (prefill) vs split-KV/FlashDecoding (decode) vs persistent/stream-K</text>
+        <text class="s" x="620" y="360" text-anchor="middle">Q-thickness sets the axis; + chunked-prefill &lsquo;append&rsquo; = the 3rd Q-regime (K4/D1) &middot; §3</text>
+
+        <line x1="620" y1="376" x2="620" y2="400"/>
+        <text class="l" x="636" y="392">per-launch overhead</text>
+
+        <rect class="bp" x="270" y="400" width="700" height="50" rx="8"/>
+        <text class="t" x="620" y="420" text-anchor="middle">Thousands of &micro;s-scale launches/token &rarr; CUDA graph = one replay</text>
+        <text class="s" x="620" y="438" text-anchor="middle">removes per-step host overhead, stabilizes TPOT &middot; §3</text>
+
+        <line x1="620" y1="450" x2="620" y2="474"/>
+        <text class="l" x="636" y="466">static shapes</text>
+
+        <rect class="bs" x="245" y="474" width="750" height="58" rx="8"/>
+        <text class="t" x="620" y="497" text-anchor="middle">D22 &mdash; graphs need static shapes &rarr; bucket the dynamic batch</text>
+        <text class="s" x="620" y="516" text-anchor="middle">K4 snaps, K17 captures; tree-attn/variable-accept (K13) &amp; graph&otimes;NCCL/TP worsen it &middot; §3</text>
+
+        <line x1="620" y1="532" x2="620" y2="554"/>
+        <text class="l" x="636" y="546">and reduction order</text>
+
+        <rect class="bs" x="245" y="554" width="750" height="58" rx="8"/>
+        <text class="t" x="620" y="577" text-anchor="middle">D10 &mdash; non-associative FP reduction &rarr; batch changes the output</text>
+        <text class="s" x="620" y="596" text-anchor="middle">split-KV&rsquo;s non-fixed epilogue (D51) is itself a source; breaks K2/D5 + eval &middot; §3</text>
+
+        <line x1="620" y1="612" x2="620" y2="634"/>
+        <text class="l" x="636" y="626">shape-dependent</text>
+
+        <rect class="bs" x="250" y="634" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="657" text-anchor="middle">D45 &mdash; the kernel-dispatch / autotune shape-coverage cliff</text>
+        <text class="s" x="620" y="675" text-anchor="middle">off-distribution shape &rarr; slow generic kernel &rarr; one slice 2&ndash;4&times; slower &middot; §3</text>
+
+        <line x1="620" y1="690" x2="620" y2="712"/>
+        <text class="l" x="636" y="704">strategy varies</text>
+
+        <rect class="bs" x="245" y="712" width="750" height="58" rx="8"/>
+        <text class="t" x="620" y="735" text-anchor="middle">Rule 11 &mdash; the kernel/compile-strategy spectrum</text>
+        <text class="s" x="620" y="754" text-anchor="middle">eager &rarr; CUDA graph &rarr; torch.compile &rarr; TRT-LLM build &rarr; persistent megakernel &middot; §3</text>
+
+        <line x1="620" y1="770" x2="620" y2="792"/>
+
+        <rect class="bc" x="280" y="792" width="660" height="62" rx="8"/>
+        <text class="t" x="620" y="816" text-anchor="middle">Objective: max achieved MFU/MBU under the SLO</text>
+        <text class="s" x="620" y="834" text-anchor="middle">+ the shape-rigidity every upstream layer must respect &middot; §4</text>
+
+        <!-- side coupling edge: D51 (split-KV) is itself a source of D10 -->
+        <path class="cpl" d="M1000,347 C1185,347 1185,583 997,583"/>
+        <text class="add" x="1150" y="450" text-anchor="middle">split-KV epilogue</text>
+        <text class="add" x="1150" y="464" text-anchor="middle">&rArr; D10 source</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; the roofline is a ceiling; achieved = roofline &times; kernel_eff &times; launch_eff is decided here.</li>
+        <li><span class="bp">&#9313;</span> <strong>FlashAttention</strong> &mdash; tile + online-softmax (K0) <em>+ feed the Tensor Cores</em> (WGMMA/TMA/FP8; FA-3&ne;FA-2) &rarr; O(N) HBM; prefill compute is still O(N&sup2;) FLOPs. <span style="color:#9a3412;">[ADDED clauses]</span></li>
+        <li><span class="bp">&#9314;</span> <strong>Paged gather</strong> &mdash; non-contiguous KV &rarr; the kernel gathers; K2/D31 owns the layout contract.</li>
+        <li><span class="bd">&#9315;</span> <strong>Attention-variant kernel match</strong> <span style="color:#9a3412;">[ADDED]</span> &mdash; GQA/MQA-packed / MLA / sliding-window / sink each need a <em>matching</em> kernel + in-register FP8/INT8-KV dequant; K0 owns the algorithm, K17 the kernel. A mismatch is a D45-class cliff at the <em>algorithm</em> axis.</li>
+        <li><span class="bs">&#9316;</span> <strong>D51</strong> &mdash; split-M vs split-KV/FlashDecoding vs persistent/stream-K; Q-thickness sets the axis; load-balance batched variable-length decode; <em>chunked-prefill &lsquo;append&rsquo; is the 3rd Q-regime</em>. <span style="color:#9a3412;">[ADDED clause]</span></li>
+        <li><span class="bp">&#9317;</span> <strong>CUDA graph</strong> &mdash; &micro;s-scale launches dominate at small batch &rarr; replay the whole step as one launch.</li>
+        <li><span class="bs">&#9318;</span> <strong>D22</strong> &mdash; graphs need static shapes &rarr; bucket the dynamic batch (K4 snaps, K17 captures); <em>worse under spec-decode tree-attention/variable-accept (K13) &amp; graphs containing the TP-group NCCL all-reduce</em>. <span style="color:#9a3412;">[ADDED clause]</span></li>
+        <li><span class="bs">&#9319;</span> <strong>D10</strong> &mdash; non-associative FP reduction &rarr; batch changes the output &rarr; breaks the K2/D5 cache + eval (co-host K4); <em>split-KV (D51) is itself a source</em>. <span style="color:#9a3412;">[ADDED clause]</span></li>
+        <li><span class="bs">&#9320;</span> <strong>D45</strong> &mdash; off-distribution shape falls to a slow generic kernel &rarr; one traffic slice 2&ndash;4&times; slower while p50 looks fine.</li>
+        <li><span class="bs">&#9321;</span> <strong>Rule 11</strong> &mdash; eager &rarr; CUDA graph &rarr; torch.compile &rarr; TRT-LLM engine build &rarr; <em>persistent megakernel</em> (dynamism in-kernel, dodges D22, answers K4/D33). <span style="color:#9a3412;">[ADDED endpoint]</span></li>
+        <li><span class="bc">&#9322;</span> <strong>Objective</strong> &mdash; max achieved MFU/MBU under the SLO, plus the shape-rigidity every upstream layer must respect.</li>
+        <li><span style="color:#7c3aed;font-weight:700;">&#8674;</span> <strong>Coupling edge (D51&nbsp;&rarr;&nbsp;D10)</strong> <span style="color:#9a3412;">[ADDED]</span> &mdash; the more you split-KV for occupancy, the worse the non-determinism: the same kernel decision that fills the GPU creates the reproducibility problem.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> the K1 roofline says what the GPU <em>could</em> do; the <em>same</em> model on the <em>same</em> GPU hits 60% MFU or 20% MFU depending entirely on the attention kernel (tiling, the paged gather, the split-axis) and the launch strategy (thousands of &micro;s-scale launches vs one CUDA-graph replay) &mdash; and whichever you pick imposes shape-rigidity that the scheduler and autoscaler must obey. <b>Solution (what the page builds):</b> the kernel + launch design that converts the roofline ceiling into achieved MFU/MBU, and the rule-of-two contracts that keep it consistent with K2&rsquo;s layout and K4&rsquo;s scheduler.<span class="meta">number: achieved MFU at naive vs FlashAttention+graph on the trace (the 20%&rarr;60% gap) &mdash; cites K1 #roofline (the ceiling) &middot; canonical: llm-bottlenecks.html (memory-bound decode, launch-overhead-bound small batch)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where kernels &amp; launch live &mdash; the attention compute + the launch layer wrapping the decode step</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader needs to separate three owners. <b>Solution:</b> the <em>math</em> of attention/softmax is <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>&rsquo;s; the physical <em>KV layout</em> the kernel reads is <a href="K2_kv-cache.html#d31">K2/D31</a>&rsquo;s; <strong>this page owns the <em>kernel</em> (how the attention compute is tiled/parallelized) and the <em>launch strategy</em> (eager vs CUDA-graph)</strong> &mdash; the two efficiency multipliers on the roofline. State this before any math.<span class="meta">no number (placement fact) &mdash; cites K0 (the softmax math), K2/D31 (the KV layout), K1 (the roofline being multiplied) &middot; diagram: the decode step with the attention kernel highlighted + the launch boundary (per-kernel vs graph) drawn around the whole step</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; naive vs FlashAttention; single-CTA vs split-KV decode</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 <code>&quot;I like cat, why?&quot;</code> (6 tokens). <b>Prefill, without FlashAttention:</b> compute and write the full <code>[6&times;6]</code> score matrix to HBM, read it back for softmax &rarr; O(N&sup2;) HBM traffic. <b>Prefill, with FlashAttention:</b> tile the scores, keep running max/sum in registers (online-softmax, cite <a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a>), never write the matrix &rarr; O(N) HBM. <b>Decode token 7, naive:</b> Q is a single row &rarr; one CTA per (batch,head) &rarr; a handful of CTAs on a ~132-SM GPU &rarr; the GPU is starved even though HBM has headroom. <b>Decode, split-KV/FlashDecoding:</b> split the KV dimension across many CTAs, combine with an online-softmax epilogue &rarr; the GPU fills. Show with-vs-without explicitly on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (D51 puts CTA counts vs N_SM + the MBU delta in) &middot; diagram: (a) [6&times;6] scores in HBM vs tiled-never-written; (b) 1 CTA vs split-KV many-CTA occupancy on a 132-SM grid</span></p>
+
+      <h3 id="derive">Achieved = roofline &times; kernel_eff &times; launch_eff (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> designers quote the roofline number and are surprised production is 2&ndash;4&times; below it. <b>Solution, derived:</b> (a) <strong>kernel factor</strong> &mdash; FlashAttention never materializes the <code>[N,N]</code> scores &rArr; HBM traffic O(N) not O(N&sup2;); derive via K0&rsquo;s online-softmax recurrence (cite <a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> &mdash; this page <em>applies</em> it, K0 owns the math); <span style="color:#9a3412;">[ADDED]</span> kernel_eff has a <em>second</em> half the original stub omitted: <strong>are you feeding the Tensor Cores?</strong> Tiling alone runs on CUDA cores; the fast path is WGMMA (Hopper warpgroup-MMA) + TMA (async bulk copy) + warp-specialization + FP8 &mdash; this is precisely <em>why FA-3 &ne; FA-2</em> on H100 (the difference is ~35% vs ~75% of peak, not a rounding error). Also state the boundary FlashAttention does <em>not</em> cross: it makes attention <em>memory</em> O(N), but prefill <em>compute</em> is still O(N&sup2;) FLOPs &mdash; at long context the quadratic FLOPs, not HBM, dominate (motivates block-sparse / sliding-window kernels, &sect;3). (b) <strong>launch factor</strong> &mdash; decode = thousands of ~5&ndash;10 &micro;s kernel launches/token &rArr; at small batch launch overhead &gt; compute &rArr; the GPU idles between kernels; the <em>minimum viable batch</em> is where launch overhead stops dominating. Achieved MFU = <code>roofline &times; kernel_eff &times; launch_eff</code> &mdash; this page is those two multipliers.<span class="meta">number: HBM traffic O(N&sup2;)&rarr;O(N) ratio on the trace; <strong>[ADDED]</strong> FA-2 vs FA-3 achieved-MFU on H100 (Tensor-Core/FP8 path); prefill O(N&sup2;)-FLOPs crossover where compute&gt;HBM; launch_overhead vs decode-kernel time &rarr; the minimum viable batch &mdash; cites K0 #softmax-online, K1 #roofline/#hardware (Tensor-Core TFLOPs, FP8) &middot; diagram: the roofline ceiling with two shrink arrows (kernel_eff = tiling &amp; Tensor-Core utilization, launch_eff) pulling achieved down, annotated with the trace numbers</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where the kernels &amp; the launch layer sit (the must-cover map)</h3>
+      <p class="stub"><span class="ps">Stub (the Must-cover list, condensed).</span> <b>Attention kernels:</b> FlashAttention-2/3 (tiling + online softmax + Tensor-Core/WGMMA/FP8 &rarr; O(N) HBM), FlashInfer / paged-attention kernels (gather over the K2/D31 block table), prefill vs decode vs <em>chunked-prefill &lsquo;append&rsquo;</em> kernels (the thin-GEMV problem &rarr; D51), kernel fusion (QKV, RMSNorm, RoPE, SwiGLU &rarr; fewer HBM round-trips + launches). <span style="color:#9a3412;">[ADDED] The non-attention decode tail</span> &mdash; once attention is fast, the final logits GEMM + sampling over a 128k&ndash;256k vocab (top-k/top-p, repetition-penalty scatter) is a measurable slice; a naive full-vocab top-p sort is a real latency line &rarr; fused sampling kernels / vocab-parallel logits, not a generic sort. <span style="color:#9a3412;">[ADDED] Long-context kernel families</span> &mdash; because prefill compute stays O(N&sup2;) FLOPs, block-sparse / sliding-window / linear-attention kernels exist (the <em>kernel</em> is K17&rsquo;s; the <em>choice</em> is a K0 model-architecture given &mdash; rule of two). <b>CUDA graphs:</b> record the decode step once, replay as one launch; the static-shape consequence &rarr; fixed batch buckets &rarr; constrains K4 &amp; K15; capture warm-up interacts with K21; dynamic-shape features (variable batch, spec-decode, guided decode) break graphs or need multiple captures. <b>The designer takeaway:</b> kernel + launch decide 60% vs 20% MFU, bound the minimum viable batch, and impose the shape-rigidity every upstream layer must respect.<span class="meta">no new number &mdash; cites K0 (#softmax-online; the attention-algorithm vocabulary), K2/D31 (gather), K1 (roofline), K14 (kernel must support the quant dtype), K19 (sampling-policy lives elsewhere &mdash; K17 owns the sampling <em>kernel</em>) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the kernel/launch map</strong>prefill-kernel + decode-kernel + fused ops on the K2/D31 block-table gather; the launch boundary (eager vs captured graph) wrapping the whole step; the shape-bucket arrow up into K4/K15. Drawn after arc approval.</div>
+
+      <h3 id="variant" style="border-top:3px solid #d97706;padding-top:.6rem;background:#fffbeb;border-left:4px solid #d97706;padding:.4rem .7rem;">Deep dive <span style="color:#9a3412;">[ADDED &mdash; candidate D-number, not yet catalogued]</span> &mdash; the attention-variant kernel match: GQA/MQA-packed, MLA, sliding-window, sink (<a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> owns the algorithm, K17 the kernel)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub [ADDED].</span> <b>Problem:</b> there is no single &ldquo;attention kernel&rdquo; &mdash; the fast kernel is keyed by the model&rsquo;s <em>attention algorithm</em>, and a mismatched kernel silently falls to a slow generic path (a D45-class cliff at the <em>algorithm</em> axis, not the shape axis). At decode, vanilla-MHA FlashDecoding on a <strong>GQA</strong> model re-reads each KV head once per query head and wastes the <code>n_q/n_kv</code> bandwidth advantage; the right kernel <strong>packs the query-head group sharing a KV head</strong> so cached KV is read once (raises decode arithmetic intensity &prop; group size). <strong>MLA</strong> (DeepSeek-V2/V3 &mdash; the dominant frontier-MoE attention, load-bearing in L1) needs a different kernel entirely (absorbed vs materialized low-rank-KV forms &mdash; the wrong form blows up either compute or KV bytes). <strong>Sliding-window</strong> (Mistral/Gemma) needs a windowed gather + tile structure attending only the last <code>W</code> tokens (the K2 block table must also be windowed). <strong>Attention sink / StreamingLLM</strong> keeps the first few + last <code>W</code>. <b>Solution:</b> a per-variant kernel selected from the model config &mdash; GQA-packed decode layout, MLA absorbed-form decode kernel, windowed/sink masks fused into the tile loop; <strong>+ the kernel must read FP8/INT8 KV and dequant in-register &mdash; never round-trip dequantized KV through HBM</strong> (that destroys the K2/K14 KV-quant cascade; the kernel side of D31/D42). <b>Rule of two:</b> <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> owns the attention <em>algorithm/shape</em> (MHA/MQA/GQA/MLA, the <code>n_kv_heads</code> vocabulary); K17 owns the <em>kernel that exploits it</em>; <a href="K2_kv-cache.html#d31">K2/D31</a> owns the (windowed) KV layout; <a href="K14_quantization.html">K14</a>/D42 owns the KV-precision <em>choice</em>, K17 the in-kernel dequant.<span class="meta">number: GQA-packed vs MHA-style decode MBU on the trace (group size G &rarr; KV-read &divide;G); MLA absorbed-vs-materialized KV bytes &amp; FLOPs; in-register vs HBM-round-trip FP8-KV decode-step delta &mdash; cites K0 (n_kv_heads/GQA/MLA), K1 (#decode/#roofline), K2/D31 (layout), K14/D42 (KV precision) &middot; real: FlashInfer GQA/MLA kernels, FlashAttention-3 GQA, DeepSeek <strong>FlashMLA</strong> (github.com/deepseek-ai/FlashMLA), vLLM sliding-window/MLA backends + URLs &middot; <b>candidate coverage:</b> L1 (MLA frontier-MoE decode), L3 (sliding-window long-context), L8 (GQA reasoning decode) &mdash; promote to a catalogued D-number on approval</span></p>
+
+      <h3 id="d51" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D51 &mdash; attention-kernel parallelization: split-M vs split-KV/FlashDecoding vs persistent/stream-K (cites <a href="K4_continuous-batching-and-scheduling.html">K4</a>/<a href="K2_kv-cache.html#d31">K2</a>/<a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub + selection sweep (the big one).</span> <b>Problem:</b> the attention output is a matmul-shaped problem; <em>which dimension you parallelize across CTAs</em> is set by Q-thickness, and the wrong axis underfills the GPU &mdash; prefill has a thick Q (1k&ndash;100k rows), decode a thin Q (1 row) &rArr; a Q-only kernel produces ~1 CTA per (batch,head) at decode on a ~132-SM GPU &rarr; occupancy collapses even with HBM headroom. Define <strong>CTA</strong> (cooperative-thread-array / threadblock &mdash; the unit the grid scheduler hands to an SM); throughput &asymp; <code>total_CTAs / num_SMs</code> per wave. <b>Solution &mdash; the spectrum, weakest&rarr;strongest, each with its two-sided cliff + a named system:</b> (0) <strong>split-M / query-parallel</strong> (thick-Q prefill, FA-2; cliff: ~1 CTA at decode &rarr; GPU starved); (1) <strong>split-KV / FlashDecoding</strong> (thin-Q decode; split the KV/contraction dim, online-softmax epilogue reduction &mdash; the cost split-M doesn&rsquo;t pay; cliff: reduction tax, only worth it when M-parallelism is insufficient); (2) <strong>fixed-chunk split-KV + persistent / stream-K</strong> (batched variable-length decode; work unit = a fixed KV chunk, work-steal across SMs; cliff: chunk too small &rarr; per-CTA overhead, too large &rarr; imbalance returns). <b>Composition + crossover:</b> split-M while <code>M_CTAs &ge; k&middot;N_SM</code>; below that add split-KV with <code>KV_chunks</code> s.t. <code>(M_CTAs&middot;KV_chunks) mod N_SM &asymp; 0</code>; switch to fixed-chunk+persistent the moment KV lengths vary. <b><span style="color:#9a3412;">[ADDED]</span> The 3rd Q-thickness regime &mdash; the chunked-prefill &ldquo;append&rdquo;/context kernel:</b> a <em>medium</em>-Q chunk attending a <em>long cached</em> KV across the chunk boundary with a boundary-spanning causal mask &mdash; K4/D1&rsquo;s chunked prefill <em>requires</em> it (it is neither pure split-M thick-Q nor pure split-KV thin-Q; it uses both). Named: FlashInfer <code>BatchPrefillWithPagedKVCache</code> / vLLM chunked-prefill attention. <b>Rule of two:</b> <a href="K4_continuous-batching-and-scheduling.html">K4</a> owns batch-composition / wave-balance and <em>the decision to chunk</em>; K17 owns the split-axis <em>and the append-kernel</em>. <a href="K2_kv-cache.html#d31">K2/D31</a> owns the per-chunk gather layout; <a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> owns the online-softmax that makes the epilogue exact.<span class="meta">number: decode S=1, n_heads&times;batch CTAs vs N_SM &rarr; the split-KV chunk count that fills the GPU + the MBU delta on the trace &mdash; cites K1 (roofline/ridge), K4 (wave-balance), K2/D31 (gather), K0 #softmax-online &middot; real: FlashDecoding (Stanford CRFM / PyTorch post), vLLM PagedAttention kernel, FlashInfer, CUTLASS stream-K + URLs</span></p>
+      <div class="svgph"><strong>TABLE PLANNED (required artifact) &mdash; the split-axis spectrum</strong>rows = (0) split-M / (1) split-KV-FlashDecoding / (2) fixed-chunk+persistent/stream-K; columns: <em>Q-thickness regime &middot; what is parallelized &middot; cross-CTA reduction? &middot; two-sided cliff &middot; named system</em>. Plus the composition rule + the fill-the-GPU crossover formula. Drawn after arc approval.</div>
+
+      <h3 id="d22" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D22 &mdash; CUDA-graph capture under dynamic batching</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> continuous batching changes shape every step; a captured graph needs <em>fixed</em> shapes; re-capturing per step is impossible. <b>Solution:</b> capture a <em>set</em> of graphs at bucketed batch sizes / seq tiers; the scheduler pads to the nearest bucket (<strong>K4 owns the snap, K17 owns the capture / piecewise-graph machinery &mdash; rule of two</strong>); piecewise graphs graph the static parts and leave attention dynamic. <b>Crossover:</b> bucket count &mdash; more buckets = less pad waste but more capture memory + warm-up; bucket-pad waste vs launch-overhead saved. <b><span style="color:#9a3412;">[ADDED]</span> Two production realities that make this worse:</b> (i) <strong>speculative / Medusa decode</strong> &mdash; a <em>tree-attention</em> kernel (custom non-causal tree mask) and a <em>variable accepted-token count</em> per step mean the per-step shape itself varies (the K13&harr;K17 boundary: K13 owns the acceptance math, K17 the tree-attn kernel + its bucket set), so the buckets must cover <code>(1+K)</code>-token shapes or spec-decode silently disables graphs; (ii) <strong>graphs that contain NCCL collectives</strong> &mdash; the captured decode step on a TP&ge;8 group includes the per-layer all-reduce; capture must use the NCCL graph-capture mode / a side stream and pins a memory pool (interacts with the K2 KV allocator) or it serializes/deadlocks &mdash; load-bearing in L1. <strong>Rule of two:</strong> K20 owns the collective, K17 owns capturing it.<span class="meta">number: decode kernel 8 &micro;s, launch 6 &micro;s &rarr; graph removes ~6 &micro;s/step &rarr; TPOT &minus;X% on the trace; bucket-pad vs launch-saved crossover; <strong>[ADDED]</strong> spec-decode (1+K)-shape bucket blow-up; graph&otimes;NCCL capture cost &mdash; cites K1 (step time), K4 #d22 (snap side), K13 (spec-decode shape), K20 (the TP all-reduce inside the graph) &middot; real: vLLM CUDA-graph capture, TensorRT-LLM, torch.compile(reduce-overhead), NCCL graph-capture mode + URLs</span></p>
+
+      <h3 id="d10" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D10 &mdash; batch-invariance / numeric determinism (co-host <a href="K4_continuous-batching-and-scheduling.html">K4</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> the same prompt yields a <em>different</em> output at a different batch size &mdash; non-associative FP reduction order changes with the kernel&rsquo;s tiling/batch &rarr; breaks eval reproducibility, breaks the K2 prefix-cache assumption (a prefix computed at batch B &ne; a fresh compute at B&prime;), breaks A/B tests. <b><span style="color:#9a3412;">[ADDED]</span> D51 is itself a source (the coupling the original stub missed):</b> split-KV/FlashDecoding combines partial-softmax results across CTAs via an epilogue reduction whose order is <em>not</em> fixed (atomics / variable chunk count) &mdash; so the more you split-KV for occupancy (D51), the <em>worse</em> this nondeterminism: <strong>the same kernel decision that fills the GPU creates the reproducibility problem</strong> (this is the dashed coupling edge in the spine SVG). A batch-invariant kernel must therefore also fix the <em>split-KV reduction</em> order, not just the batch-reduction order. <b>Solution:</b> batch-invariant kernels (fixed reduction order regardless of batch <em>and</em> split-KV chunking) or pin the batch on cache/eval-sensitive paths. <b>Crossover:</b> batch-invariant kernels cost ~5&ndash;15% throughput vs the reproducibility / cache-correctness they buy. <b>Rule of two:</b> K17 owns the kernel determinism (incl. the D51 epilogue order); K4 co-hosts the batch-pinning policy.<span class="meta">number: output divergence rate across batch sizes <em>and</em> split-KV chunk counts on the trace; the ~5&ndash;15% throughput cost of batch-invariant kernels &mdash; cites K1 (throughput), K2/D5 (the cache assumes reproducible KV), D51 (the split-KV epilogue is the in-page source) &middot; real: &ldquo;Defeating Nondeterminism in LLM Inference&rdquo; (Thinking Machines), batch-invariant FlashInfer + URLs &middot; cross-link L6 (stored/compared embeddings)</span></p>
+
+      <h3 id="d45" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D45 &mdash; the kernel-dispatch / autotune shape-coverage cliff</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a kernel is fastest only over a shape range (head_dim, seq_len, batch); serving sees a wide shape distribution; an autotuned / engine-built config covers the <em>captured</em> shapes &rarr; an off-distribution shape (an unusual prompt length, a rare batch) falls to a slow generic kernel &rarr; a specific traffic slice is 2&ndash;4&times; slower while aggregate p50 looks fine. <b>Solution:</b> a per-shape kernel dispatcher (FlashInfer&rsquo;s shape-specialized kernels), autotune over the <em>measured serving</em> shape distribution, a guaranteed-correct slow fallback, and <strong>per-shape-bucket latency monitoring</strong> (not just aggregate p99). <b>Crossover:</b> how many shapes to specialize/precompile &mdash; coverage vs build-time + binary size; cover the shapes carrying the traffic mass.<span class="meta">number: the off-distribution slice slowdown (2&ndash;4&times;) while p50 unchanged on the trace; shapes-to-specialize vs build-time crossover &mdash; cites K1 (per-shape kernel cost) &middot; real: FlashInfer, TensorRT-LLM engine build, Triton autotune + URLs</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the kernel/compile-strategy spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> eager (flexible, slowest, launch-bound) &rarr; CUDA graph (replay, fast, static-shape rigid) &rarr; torch.compile / reduce-overhead (fusion + graph, build step, partial dynamism) &rarr; TensorRT-LLM / engine build (peak perf, full autotune, heaviest build + most shape-rigid) &rarr; <b><span style="color:#9a3412;">[ADDED]</span> persistent megakernel</b> (fuse the whole decode step &mdash; all layers &mdash; into one persistent kernel that never returns to the host: no per-layer launch, no graph capture, <em>dynamism handled in-kernel</em> &rArr; it <strong>dodges the D22 static-shape problem entirely</strong> and is the strongest answer to K4/D33&rsquo;s CPU-stall tax; cliff: hardest to write/debug, one-model-specialized, immature tooling). Each: speed, flexibility, build cost, shape-rigidity cliff, named system.<span class="meta">number: achieved MFU + build cost + shape-rigidity per strategy on the trace; <strong>[ADDED]</strong> megakernel TPOT vs CUDA-graph (host-overhead fully removed) &mdash; cites K1 (MFU), K21 (build/warm-up = a cold-start leg), K4/D33 (the CPU-stall tax the megakernel removes) &middot; real: PyTorch eager, vLLM CUDA-graph, torch.compile, TensorRT-LLM, <strong>persistent/&ldquo;Megakernel&rdquo; low-latency-inference kernels (FlashInfer persistent; Hazy/Mirage megakernel)</strong> + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Split-axis (M / KV / chunked-persistent):</b> the D51 crossover (Q-thickness). <b>Launch strategy:</b> the rule-11 spectrum. <b>Graph bucket set:</b> the D22 crossover (pad waste vs launch saved). <b>Batch-invariance on/off:</b> the D10 crossover (throughput vs reproducibility). <b>Shapes specialized:</b> the D45 crossover (coverage vs build). Each with its chosen value, reason, and cliff on each side.<span class="meta">numbers: per-knob crossover (composes with D51 / D22 / D10 / D45) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Naive (materialized-scores) attention</b> &mdash; disq: O(N&sup2;) HBM &rarr; memory-bound and OOM at long context; <em>wins</em> never in serving (only short-seq pedagogy). (b) <b>Eager execution (no graph)</b> &mdash; disq: per-launch overhead dominates at small batch; <em>wins</em> when shapes are wildly dynamic (guided decode, heavy spec-decode) and batch is large enough that launch overhead is hidden. (c) <b>One generic kernel for all shapes</b> &mdash; disq: the D45 cliff &mdash; a traffic slice 2&ndash;4&times; slow; <em>wins</em> only when the shape distribution is genuinely narrow. (d) <b>Hand-writing CUDA/Triton kernels</b> &mdash; disq: this page is about kernel <em>selection &amp; its serving consequence</em>, not kernel programming; <em>out of scope</em> &mdash; name FlashAttention/FlashInfer, flag the boundary, do not cover.<span class="meta">number: the crossover disqualifying each (HBM O(N&sup2;) for (a); launch-overhead/batch for (b); slice-slowdown for (c)) &mdash; cites K1 #roofline, K0 #softmax-online &middot; contrast L1 (kernel at TPOT&le;30 ms)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Single-CTA decode starves the GPU</b> &mdash; thin-Q without split-KV &rarr; ~1 CTA on 132 SMs &rarr; MBU collapse while &ldquo;busy&rdquo;; first move: FlashDecoding / split-KV (D51; llm-bottlenecks.html &mdash; memory-bound decode underfill). <b>Off-distribution shape cliff</b> &mdash; D45: one prompt-length bucket 2&ndash;4&times; slow, p50 fine; first move: per-shape dispatcher + per-bucket monitoring (llm-bottlenecks.html). <b>Graph re-capture thrash</b> &mdash; too many buckets &rarr; capture-memory + warm-up storm; first move: bound the bucket set (gpu-failure-modes.html). <b>Nondeterministic output across batch</b> &mdash; D10: silently corrupts the K2/D5 prefix cache + eval; first move: batch-invariant kernels / pin batch (gpu-failure-modes.html &mdash; cache-correctness). <b>Kernel doesn&rsquo;t support the quant dtype</b> &mdash; falls to a slow path &rarr; the K14 cascade win evaporates (cite K14; gpu-failure-modes.html). <b><span style="color:#9a3412;">[ADDED]</span> Attention-variant kernel mismatch</b> &mdash; a GQA/MLA/sliding-window model on a vanilla-MHA kernel &rarr; slow generic path (the algorithm-axis D45); first move: per-variant dispatcher (llm-bottlenecks.html). <b><span style="color:#9a3412;">[ADDED]</span> FP8/INT8 KV round-tripped through HBM</b> &mdash; a decode kernel that materializes dequantized KV destroys the K2/K14 cascade; first move: in-register-dequant kernel (gpu-failure-modes.html). <b><span style="color:#9a3412;">[ADDED]</span> Graph&otimes;NCCL capture deadlock</b> &mdash; a TP-group graph capturing the all-reduce on the wrong stream &rarr; serialize/hang; first move: NCCL graph-capture mode + side stream (cite K20; gpu-failure-modes.html).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (decode underfill, shape cliff, <strong>[ADDED]</strong> variant-mismatch), llm/canonicals/gpu-failure-modes.html (capture thrash, nondeterminism, dtype-fallback, <strong>[ADDED]</strong> KV-dtype HBM round-trip, graph&otimes;NCCL deadlock) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> FlashAttention-2/3 (tiling + online softmax), FlashInfer (shape-specialized + paged kernels), FlashDecoding &amp; CUTLASS stream-K (the D51 split-KV / persistent points), vLLM PagedAttention kernel + CUDA-graph capture, TensorRT-LLM engine build, torch.compile(reduce-overhead), &ldquo;Defeating Nondeterminism in LLM Inference&rdquo; / batch-invariant kernels (D10). Each: which D51 split-axis / which rule-11 strategy it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> (kernel selection at TPOT &le; 30 ms &mdash; D45/D22; <strong>D51 FlashDecoding is <em>the</em> decode kernel for the decode-bound MoE</strong>); <a href="../scenarios/L2-multimodal-vlm-serving.html">L2</a> (ViT vs LLM kernels); <a href="../scenarios/L3-long-context-serving.html">L3</a> (FlashAttention&rsquo;s O(N) is <em>why</em> 1M context is feasible; D45 prefill-shape; <strong>D51 split-M&times;split-KV compose at 1M</strong>); <a href="../scenarios/L6-embedding-retrieval-service.html">L6</a> (dedicated home for D10 batch-invariance; D22 the <em>easy</em> fixed-shape graph case); <a href="../scenarios/L8-reasoning-model-serving.html">L8</a> (<strong>D51 persistent/stream-K load-balancing for batched variable-length reasoning decode</strong>). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html#roofline">K1</a> &mdash; the roofline this page converts to <em>achieved</em> MFU/MBU; the ridge.</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> &mdash; the online-softmax recurrence FlashAttention/FlashDecoding use; the O(N&sup2;) <code>#sdpa</code> shape. K17 <em>applies</em>, never re-derives.</li>
+        <li><a href="K2_kv-cache.html#d31">K2/D31</a> &mdash; the paged KV <em>layout + gather contract</em>; K17 owns the kernel that reads it (rule of two).</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html#d22">K4</a> &mdash; D22 (K4 snaps to bucket, K17 captures) &amp; D51 (K4 owns batch-composition/wave-balance, K17 owns the split-axis) &mdash; rule of two; D10 co-host.</li>
+        <li><a href="K14_quantization.html">K14</a> &mdash; the kernel must support the quant dtype + the read-path dequant (rule of two).</li>
+        <li><a href="K21_fast-model-loading-and-cold-start.html">K21</a> &mdash; graph capture / engine build warm-up is a cold-start leg.</li>
+        <li><strong>Out of scope (named, not covered):</strong> writing CUDA/Triton kernels (named, not programmed); the online-softmax <em>math</em> (<a href="K0_transformer-forward-pass-and-dimensions.html#softmax-online">K0</a> owns it); autograd/training kernels (training-side).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

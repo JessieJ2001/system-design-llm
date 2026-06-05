@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Networking Edge: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad  { color: var(--color-danger);  font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+        <li><a href="../load-balancing.html">Load Balancing</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- 1. Hero -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Networking Edge: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">"Use a load balancer" doesn't answer the question. The edge has at least five distinct layers &mdash; CDN, L4 LB, L7 reverse proxy, API gateway, service mesh &mdash; and each terminates TLS, routes, authenticates, and rate-limits. Pick the layer where each concern lives, then pick the product.</p>
+      <p class="hero-meta">CDNs &bull; Cloud LBs (ALB/NLB/GCLB) &bull; Nginx &bull; HAProxy &bull; Envoy &bull; Traefik &bull; Istio / Linkerd &bull; Kong / API Gateway</p>
+    </div>
+  </section>
+
+  <!-- 2. The layer cake -->
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. The edge layer cake (the picture to memorize)</h2>
+      <p>Every concern lives at a specific layer. If you can't say which layer terminates TLS, the design isn't done.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 1240 660" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <!-- User -->
+          <circle cx="80" cy="60" r="28" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="80" y="65" text-anchor="middle" fill="white" font-weight="700" font-size="13">User</text>
+
+          <!-- CDN -->
+          <rect x="180" y="30" width="220" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="290" y="55" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">1. CDN (edge POPs)</text>
+          <text x="290" y="73" text-anchor="middle" fill="#64748b" font-size="11">cache static, terminate TLS, DDoS, WAF</text>
+
+          <!-- L4 LB -->
+          <rect x="450" y="30" width="220" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="560" y="55" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">2. L4 LB (NLB / GCLB-TCP)</text>
+          <text x="560" y="73" text-anchor="middle" fill="#64748b" font-size="11">TCP/UDP routing, anycast IP</text>
+
+          <!-- L7 LB / Reverse Proxy -->
+          <rect x="720" y="30" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="840" y="55" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">3. L7 LB / Reverse Proxy</text>
+          <text x="840" y="73" text-anchor="middle" fill="#64748b" font-size="11">ALB / Nginx / HAProxy / Envoy: HTTP routing, TLS, headers</text>
+
+          <!-- API Gateway -->
+          <rect x="1010" y="30" width="220" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="1120" y="55" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">4. API Gateway</text>
+          <text x="1120" y="73" text-anchor="middle" fill="#64748b" font-size="11">authn/authz, quota, transform</text>
+
+          <!-- Arrows top row -->
+          <line x1="108" y1="60" x2="178" y2="60" stroke="#334155" stroke-width="2" marker-end="url(#arrE)"/>
+          <line x1="400" y1="60" x2="448" y2="60" stroke="#334155" stroke-width="2" marker-end="url(#arrE)"/>
+          <line x1="670" y1="60" x2="718" y2="60" stroke="#334155" stroke-width="2" marker-end="url(#arrE)"/>
+          <line x1="960" y1="60" x2="1008" y2="60" stroke="#334155" stroke-width="2" marker-end="url(#arrE)"/>
+          <defs>
+            <marker id="arrE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+            </marker>
+          </defs>
+
+          <!-- Service mesh (interior) -->
+          <rect x="240" y="170" width="760" height="200" rx="12" fill="#fef9c3" stroke="#ca8a04" stroke-dasharray="6 4"/>
+          <text x="620" y="195" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">5. Service Mesh (Istio / Linkerd / Consul Connect)</text>
+          <text x="620" y="213" text-anchor="middle" fill="#64748b" font-size="11">East-west traffic between services. Each pod has a sidecar proxy (Envoy / linkerd-proxy).</text>
+
+          <!-- Services with sidecars -->
+          <rect x="280" y="240" width="160" height="100" rx="8" fill="#fff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="265" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Service A</text>
+          <rect x="290" y="280" width="60" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+          <text x="320" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">app</text>
+          <rect x="370" y="280" width="60" height="40" rx="4" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="400" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">Envoy</text>
+
+          <rect x="500" y="240" width="160" height="100" rx="8" fill="#fff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="580" y="265" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Service B</text>
+          <rect x="510" y="280" width="60" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+          <text x="540" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">app</text>
+          <rect x="590" y="280" width="60" height="40" rx="4" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="620" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">Envoy</text>
+
+          <rect x="720" y="240" width="160" height="100" rx="8" fill="#fff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="800" y="265" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Service C</text>
+          <rect x="730" y="280" width="60" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+          <text x="760" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">app</text>
+          <rect x="810" y="280" width="60" height="40" rx="4" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="840" y="305" text-anchor="middle" fill="#1e293b" font-size="11" font-weight="700">Envoy</text>
+
+          <line x1="430" y1="300" x2="500" y2="300" stroke="#334155" stroke-width="1.5" marker-end="url(#arrE)"/>
+          <line x1="650" y1="300" x2="720" y2="300" stroke="#334155" stroke-width="1.5" marker-end="url(#arrE)"/>
+
+          <!-- Concerns table -->
+          <rect x="40" y="430" width="1180" height="200" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+          <text x="630" y="455" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Where each concern lives</text>
+
+          <text x="60" y="485" fill="#1e293b" font-weight="700" font-size="12">TLS termination:</text>
+          <text x="200" y="485" fill="#334155" font-size="12">CDN (most), then L7 LB. Re-encrypt to backend if compliance demands.</text>
+
+          <text x="60" y="510" fill="#1e293b" font-weight="700" font-size="12">DDoS / WAF:</text>
+          <text x="200" y="510" fill="#334155" font-size="12">CDN. Cloud LB has basic; specialized WAF (Cloudflare / Akamai) is the right layer.</text>
+
+          <text x="60" y="535" fill="#1e293b" font-weight="700" font-size="12">Path / host routing:</text>
+          <text x="200" y="535" fill="#334155" font-size="12">L7 LB (ALB / Nginx / Envoy). Don't do at L4.</text>
+
+          <text x="60" y="560" fill="#1e293b" font-weight="700" font-size="12">Authn / authz:</text>
+          <text x="200" y="560" fill="#334155" font-size="12">API Gateway (north-south); Service Mesh (east-west). Both via mTLS / JWT validation.</text>
+
+          <text x="60" y="585" fill="#1e293b" font-weight="700" font-size="12">Rate limiting:</text>
+          <text x="200" y="585" fill="#334155" font-size="12">CDN for cheap blanket; API Gateway for per-API/per-key; mesh for service-to-service.</text>
+
+          <text x="60" y="610" fill="#1e293b" font-weight="700" font-size="12">Observability (traces, metrics):</text>
+          <text x="290" y="610" fill="#334155" font-size="12">Service Mesh sidecars emit traces uniformly across all services.</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Feature matrix -->
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <p>Comparing the products you actually pick at each layer. Not all rows apply to every product (CDN doesn't do mesh stuff, mesh doesn't do edge stuff) &mdash; cells say "n/a" where it doesn't make sense.</p>
+
+      <div class="table-responsive comp-table">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>Nginx</th><th>HAProxy</th><th>Envoy</th><th>Traefik</th><th>Istio (Envoy)</th><th>Linkerd</th><th>Kong</th><th>ALB / GCLB / Azure App GW</th><th>NLB / GCLB-TCP</th><th>CDN (Cloudflare / CF / Fastly)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Layer</td><td>L4/L7</td><td>L4/L7</td><td>L7 (with L4)</td><td>L7</td><td>Mesh L7</td><td>Mesh L7</td><td>API GW (L7)</td><td>L7</td><td>L4</td><td>Edge L7</td></tr>
+            <tr><td>Underlying mechanism</td><td>Async event loop, single binary</td><td>Single-thread per worker, very low latency</td><td>L7 filter chain, xDS dynamic config</td><td>k8s/Consul-aware, auto-discovery</td><td>Sidecars + control plane (istiod)</td><td>Sidecars (Rust micro-proxy) + control plane</td><td>OpenResty / Nginx + Lua plugins</td><td>Cloud-managed</td><td>Cloud-managed (anycast)</td><td>Anycast PoPs, edge runtimes</td></tr>
+            <tr><td>Config model</td><td>Static <code>nginx.conf</code> (reload)</td><td>Static <code>haproxy.cfg</code> (graceful)</td><td>xDS API (live, no reload)</td><td>Auto from labels</td><td>k8s CRDs (VirtualService etc.)</td><td>k8s CRDs + serviceProfile</td><td>Admin API + DB or DB-less YAML</td><td>Cloud console / IaC</td><td>Cloud console / IaC</td><td>Vendor portal / API</td></tr>
+            <tr><td>Throughput</td><td>~50k req/sec/worker</td><td>~100k req/sec</td><td>~30k req/sec/CPU (heavier)</td><td>~30k req/sec</td><td>Adds ~1ms per hop</td><td>Adds ~0.5ms per hop</td><td>~10k req/sec (Lua plugin cost)</td><td>Auto-scales</td><td>Millions of pps</td><td>Effectively unlimited</td></tr>
+            <tr><td>Latency overhead</td><td>~0.1ms</td><td>~0.05ms</td><td>~0.5&ndash;1ms</td><td>~0.5ms</td><td>~1ms each side</td><td>~0.5ms each side</td><td>~1&ndash;5ms (plugins)</td><td>~1ms</td><td>~0.1ms</td><td>~5&ndash;30ms PoP-local</td></tr>
+            <tr><td>TLS termination</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes (auto Let's Encrypt)</td><td>Yes (mTLS auto)</td><td>Yes (mTLS auto)</td><td>Yes</td><td>Yes (ACM)</td><td>TLS passthrough only</td><td>Yes (vendor cert / BYOC)</td></tr>
+            <tr><td>HTTP/3 / QUIC</td><td>Plus / 1.25+</td><td>3.0+</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No (plain HTTP/2)</td><td>Via Nginx</td><td>ALB: yes; GCLB: yes</td><td>Passthrough</td><td>Yes</td></tr>
+            <tr><td>WebSocket / gRPC</td><td>Both</td><td>Both</td><td>Both (gRPC native)</td><td>Both</td><td>Both</td><td>Both</td><td>Both</td><td>ALB/GCLB: yes</td><td>Passthrough</td><td>Yes</td></tr>
+            <tr><td>Authn / authz</td><td>Modules (auth_request)</td><td>Limited</td><td>Filters (JWT, ext_authz)</td><td>Forward auth</td><td>RequestAuthentication CRD</td><td>Limited (mTLS only)</td><td>Plugins (key, JWT, OAuth2)</td><td>Cognito / IAP integrations</td><td>n/a</td><td>JWT, mTLS, IP allowlists</td></tr>
+            <tr><td>Rate limiting</td><td>Module (req_zone)</td><td>Stick tables</td><td>Local + global (RLS)</td><td>Plugin</td><td>Quota CRD via Envoy</td><td>No</td><td>Plugins</td><td>WAF rules</td><td>n/a</td><td>Per-zone / per-key</td></tr>
+            <tr><td>Service discovery</td><td>DNS / file</td><td>DNS / file</td><td>EDS (xDS)</td><td>Native (k8s/Consul)</td><td>Pilot/istiod</td><td>destination-controller</td><td>Native or DB</td><td>Cloud-native</td><td>Cloud-native</td><td>Origin pool</td></tr>
+            <tr><td>Observability</td><td>Access logs, stub_status</td><td>Stats socket</td><td>Stats + tracing native</td><td>Logs + metrics</td><td>Distributed tracing native</td><td>Built-in dashboard, golden metrics</td><td>Plugins (Prom, Datadog)</td><td>CloudWatch / Stackdriver</td><td>Same as L4</td><td>Vendor analytics</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>2</td><td>2</td><td>3 (raw); 4 with xDS</td><td>2 (in k8s)</td><td>4 (mesh ops)</td><td>3 (simpler than Istio)</td><td>3</td><td>1 (managed)</td><td>1</td><td>1 (vendor managed)</td></tr>
+            <tr><td>Cost driver</td><td>Instance hours</td><td>Instance hours</td><td>Instance hours</td><td>Instance hours</td><td>Sidecar CPU/RAM &times; pod count</td><td>Same</td><td>Instance + workspace</td><td>LCU-hours / fwd rules</td><td>Same</td><td>Egress + requests</td></tr>
+            <tr><td>Cloud equivalents</td><td>self-host, ELBv1 (legacy)</td><td>self-host</td><td>App Mesh / built into many</td><td>self-host (k8s)</td><td>App Mesh, Anthos Service Mesh</td><td>Buoyant Cloud</td><td>Konnect</td><td>(this is the cloud)</td><td>(this is the cloud)</td><td>(this is the cloud)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Workload patterns -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Internet-facing HTTPS LB (cloud)</td><td>ALB / GCLB / App Gateway</td><td>Nginx + NLB</td><td>Cloud LB if you want the cheapest managed; Nginx if you want full control</td></tr>
+            <tr><td>TCP / UDP LB (gaming, MQ)</td><td>NLB / GCLB-TCP</td><td>HAProxy</td><td>NLB for managed; HAProxy if cross-cloud</td></tr>
+            <tr><td>Static asset / image cache</td><td>CDN (CloudFront / Cloudflare / Fastly)</td><td>Varnish</td><td>CDN if global users; Varnish only if regional &amp; you don't want vendor lock</td></tr>
+            <tr><td>Public API surface (3rd-party devs)</td><td>API Gateway (Kong / AWS API GW / Apigee)</td><td>Nginx + Lua</td><td>Managed if quota/auth/billing built-in; self-host if cost matters</td></tr>
+            <tr><td>Internal east-west service traffic</td><td>Service Mesh (Linkerd / Istio)</td><td>Client-side LB (Finagle, gRPC)</td><td>Linkerd if you want simple + good defaults; Istio if you need policy richness</td></tr>
+            <tr><td>k8s ingress</td><td>Nginx Ingress / Traefik</td><td>Envoy + Ingress controller</td><td>Nginx for familiar; Traefik for auto-TLS; Envoy if you also run a mesh</td></tr>
+            <tr><td>WebSocket-heavy traffic</td><td>Envoy / ALB</td><td>HAProxy</td><td>Sticky sessions or session affinity required</td></tr>
+            <tr><td>gRPC services</td><td>Envoy</td><td>Linkerd</td><td>Envoy is gRPC-native; Linkerd transparent for mesh</td></tr>
+            <tr><td>Edge compute / personalization</td><td>Cloudflare Workers / Fastly Compute</td><td>Lambda@Edge</td><td>Workers/Compute@Edge for V8/WASM speed; Lambda@Edge for AWS-tight stack</td></tr>
+            <tr><td>DDoS / WAF</td><td>Cloudflare / Fastly / AWS WAF</td><td>CloudArmor</td><td>Cloudflare often cheapest; AWS WAF if AWS-only</td></tr>
+            <tr><td>Multi-region failover</td><td>Anycast at CDN/cloud LB</td><td>Route53 health-checked</td><td>Anycast wins on failover speed</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Pattern</th><th>Nginx / HAProxy</th><th>Envoy</th><th>Service Mesh</th><th>API Gateway</th><th>Cloud L7 LB</th><th>CDN</th></tr></thead>
+          <tbody>
+            <tr><td>Read-heavy uniform</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> sidecar overhead</td><td><span class="pat-warn">&#9888;</span> plugin cost</td><td><span class="pat-good">&#10003;&#10003;</span> auto-scale</td><td><span class="pat-good">&#10003;&#10003;</span> edge fan-out</td></tr>
+            <tr><td>Burst / spiky</td><td><span class="pat-good">&#10003;</span> if pre-scaled</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> sidecars start cold</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td></tr>
+            <tr><td>Long-lived connections (WS, SSE)</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> some don't support WS</td><td><span class="pat-good">&#10003;</span> ALB / GCLB do</td><td><span class="pat-good">&#10003;</span> CF Workers, Fastly</td></tr>
+            <tr><td>Sticky sessions</td><td><span class="pat-good">&#10003;</span> ip_hash / cookie</td><td><span class="pat-good">&#10003;</span> ring-hash</td><td><span class="pat-warn">&#9888;</span> avoid in mesh</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> stickiness option</td><td><span class="pat-warn">&#9888;</span> cardinality risk</td></tr>
+            <tr><td>Hot path / low latency</td><td><span class="pat-good">&#10003;&#10003;</span> ~0.1ms</td><td><span class="pat-good">&#10003;</span> ~0.5ms</td><td><span class="pat-warn">&#9888;</span> 2 sidecars = 1ms each side</td><td><span class="pat-bad">&#10005;</span> 1&ndash;5ms</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> if cache hit</td></tr>
+            <tr><td>Path/host based routing</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> via vendor rules</td></tr>
+            <tr><td>mTLS between services</td><td><span class="pat-warn">&#9888;</span> manual</td><td><span class="pat-good">&#10003;</span> filter</td><td><span class="pat-good">&#10003;&#10003;</span> automatic</td><td><span class="pat-warn">&#9888;</span> only at gateway</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-warn">&#9888;</span> origin only</td></tr>
+            <tr><td>Per-key rate limiting</td><td><span class="pat-warn">&#9888;</span> req_zone</td><td><span class="pat-good">&#10003;</span> RLS</td><td><span class="pat-good">&#10003;</span> via Envoy</td><td><span class="pat-good">&#10003;&#10003;</span> per consumer</td><td><span class="pat-warn">&#9888;</span> WAF rules</td><td><span class="pat-good">&#10003;</span> per zone</td></tr>
+            <tr><td>Authn (JWT validate)</td><td><span class="pat-warn">&#9888;</span> auth_request</td><td><span class="pat-good">&#10003;</span> jwt_authn</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span> with Cognito/IAP</td><td><span class="pat-good">&#10003;</span> Workers/Lambda@Edge</td></tr>
+            <tr><td>Canary / weighted</td><td><span class="pat-warn">&#9888;</span> upstream weight</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span> CRD-driven</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> weighted target groups</td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Outage isolation (one bad pod)</td><td><span class="pat-warn">&#9888;</span> health checks</td><td><span class="pat-good">&#10003;&#10003;</span> outlier detection</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> health checks</td><td><span class="pat-good">&#10003;</span> origin retry</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend">
+        <span class="pat-good">&#10003;&#10003;</span> excellent
+        <span class="pat-good">&#10003;</span> handles
+        <span class="pat-warn">&#9888;</span> works with effort
+        <span class="pat-bad">&#10005;</span> wrong layer
+      </p>
+    </div>
+  </section>
+
+  <!-- 5. Scaling cliffs -->
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Nginx (single instance)</td><td>~50k req/sec/worker</td><td>One instance bound by CPU + connection table</td><td>Add workers; add instances behind L4 LB</td></tr>
+            <tr><td>HAProxy</td><td>SSL handshake-bound at high RPS</td><td>TLS termination eats CPU</td><td>Offload to LB tier or use session resumption / TLS 1.3</td></tr>
+            <tr><td>Envoy</td><td>xDS config update size</td><td>Large clusters cause memory + CPU spikes on config push</td><td>Incremental xDS (delta-xDS); namespace</td></tr>
+            <tr><td>Service Mesh (Istio)</td><td>5,000+ pods</td><td>istiod CPU + xDS push storms</td><td>Sharded control plane; Ambient mode (no sidecar)</td></tr>
+            <tr><td>API Gateway (Kong)</td><td>Plugin chain length</td><td>Each plugin = Lua hook; latency adds up</td><td>Trim plugins; dedicate one Kong instance per use</td></tr>
+            <tr><td>ALB</td><td>~25k LCUs</td><td>Hard service limit (raise on request)</td><td>Multiple ALBs; route at DNS</td></tr>
+            <tr><td>NLB</td><td>Per-flow throughput</td><td>One TCP connection capped by source/dest hash</td><td>Multiple connections; warm up with traffic</td></tr>
+            <tr><td>CDN (cardinality)</td><td>VARY blowing up cache key</td><td>Hit rate drops to near 0</td><td>Normalize Vary; surrogate keys; edge functions</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Migration -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <ul>
+        <li><strong>Nginx &rarr; Envoy:</strong> typically when adopting a service mesh. Translate <code>nginx.conf</code> to Envoy YAML / xDS. Run side-by-side via DNS weighted, shift gradually.</li>
+        <li><strong>Self-host LB &rarr; Cloud LB (ALB/GCLB):</strong> point DNS at the cloud LB; deregister old. Validate sticky sessions, WS, gRPC, and slow-loris timeouts before cutover.</li>
+        <li><strong>Sidecar mesh &rarr; sidecarless (Istio Ambient / Cilium):</strong> reduces sidecar overhead; needs CNI integration. Roll namespace by namespace.</li>
+        <li><strong>API GW (self-host) &rarr; Managed:</strong> Kong &rarr; AWS API Gateway: rewrite plugins (Lua) as Lambda authorizers. Watch for rate-limit semantics differences.</li>
+        <li><strong>Add CDN in front:</strong> change DNS to CDN; CDN points to origin LB. The trick is making sure cache keys are right BEFORE you cut over (otherwise hit rate is 0 and origin gets crushed).</li>
+        <li><strong>Switch CDN providers:</strong> warm new CDN with mirrored traffic; DNS cutover with low TTL; surrogate-key purge syntax differs per vendor.</li>
+        <li><strong>Mesh A &rarr; Mesh B (e.g., Istio &rarr; Linkerd):</strong> per-namespace migration; remove old sidecars after verifying mTLS works on new.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7. Cost shape -->
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Nginx / HAProxy / Envoy (self-host)</td><td>Instance hours</td><td>You also pay for the LB tier above (NLB/ALB) and cross-AZ traffic</td></tr>
+            <tr><td>Service Mesh</td><td>Sidecar CPU/RAM &times; pod count</td><td>Sidecars at 1000 pods = 1000 extra containers; eats cluster capacity</td></tr>
+            <tr><td>ALB</td><td>LCU-hours (LCU = max of new conns, active conns, processed bytes, rules eval)</td><td>WS or long-lived connections drive active-conn LCU; rule-heavy ALBs drive rules-eval LCU</td></tr>
+            <tr><td>NLB</td><td>NLCU-hours</td><td>Cheaper per byte than ALB; idle LB still costs $</td></tr>
+            <tr><td>API Gateway managed</td><td>Per-million requests</td><td>$3.50/M (REST) is high vs ALB at scale; HTTP API cheaper</td></tr>
+            <tr><td>CDN</td><td>Egress GB + per-request</td><td>Egress dominates; cache miss % drives origin egress (often the real cost)</td></tr>
+            <tr><td>WAF / DDoS</td><td>Per-request + ruleset count</td><td>Bot scoring rules can be expensive; consider rate-limit-only first</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. Hybrid -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns ("layers stack")</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>CDN &rarr; Cloud LB &rarr; Nginx ingress &rarr; Service Mesh</h3>
+          <p>The canonical 4-layer modern web edge. CDN does TLS, WAF, static caching. Cloud LB does anycast IP and L7 routing. Nginx Ingress does k8s-aware routing. Service mesh handles east-west mTLS, retries, observability.</p>
+        </div>
+        <div>
+          <h3>API Gateway in front, Service Mesh inside</h3>
+          <p>Kong / AWS API GW handles north-south (3rd-party developers, quotas, billing). Inside the cluster, service mesh handles east-west (mTLS between microservices). Two distinct concerns; two distinct products.</p>
+        </div>
+        <div>
+          <h3>Anycast CDN for failover</h3>
+          <p>CDN PoPs serve from nearest healthy region; if a region fails, anycast rerouts in seconds (no DNS TTL wait). Origin cluster is multi-region active-active behind it.</p>
+        </div>
+        <div>
+          <h3>WAF separate from CDN</h3>
+          <p>Use CDN for caching, separate WAF (Cloudflare WAF, AWS WAF) on the LB. Splits concerns when WAF rules are sensitive (PCI, GDPR).</p>
+        </div>
+        <div>
+          <h3>Edge compute for personalization</h3>
+          <p>Cloudflare Workers / Fastly Compute@Edge run before the cache. Personalize on the fly without breaking cache cardinality &mdash; e.g., A/B test variant chosen at edge, content cached per variant.</p>
+        </div>
+        <div>
+          <h3>Sidecarless mesh</h3>
+          <p>Istio Ambient / Cilium Service Mesh push L4 mTLS into the kernel via eBPF; L7 only when needed. Cuts sidecar overhead; common at large clusters.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9. Anti-patterns -->
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"We did auth at the L7 LB"</h3>
+          <p>OK for simple cases, but bypasses the API Gateway (auth, quotas, billing). If you have 3rd-party developers, you need an API Gateway.</p>
+        </div>
+        <div>
+          <h3>"We didn't put a CDN in front"</h3>
+          <p>Origin handles all static asset traffic; latency for global users is bad. CDN is the single biggest user-facing latency win.</p>
+        </div>
+        <div>
+          <h3>"We use VARY: Cookie at the CDN"</h3>
+          <p>Cache key explodes; hit rate drops to 0. Either don't cache personalized pages or use edge functions.</p>
+        </div>
+        <div>
+          <h3>"We deployed Istio because it's standard"</h3>
+          <p>Istio's complexity is high. If the team doesn't have a mesh-ops person, Linkerd or going without is often better.</p>
+        </div>
+        <div>
+          <h3>"We rate-limit only at the API gateway"</h3>
+          <p>If a service can be DDoSed by another service in the mesh, you also need east-west rate limiting. Mesh policy or service-level limits.</p>
+        </div>
+        <div>
+          <h3>"We TLS-terminate in N places"</h3>
+          <p>Terminate at the edge (CDN), re-encrypt to origin if compliance demands; don't have 3 separate cert stores. Use ACM / cert-manager.</p>
+        </div>
+        <div>
+          <h3>"WS connections through ALB without idle-timeout tuning"</h3>
+          <p>Default 60s idle timeout disconnects WS. Bump to 4 hours or use heartbeats.</p>
+        </div>
+        <div>
+          <h3>"We made every service its own ALB"</h3>
+          <p>$$ multiplied; complex DNS. Use one ALB with path-based routing, or one Nginx ingress in k8s.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. Decision rules -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>Always say which layer terminates TLS.</strong> Default: CDN, then re-encrypt to origin if compliance requires.</li>
+          <li><strong>Default edge stack on cloud:</strong> CDN &rarr; Cloud LB (ALB/GCLB) &rarr; Nginx Ingress &rarr; service.</li>
+          <li><strong>Internal services need a service mesh once you have &gt;~10 services.</strong> Linkerd if simple, Istio if you need policy.</li>
+          <li><strong>API Gateway is for north-south concerns (3rd-party clients).</strong> Don't put it in front of internal-only services.</li>
+          <li><strong>L4 vs L7: L4 for raw TCP/UDP, low latency, no HTTP smarts. L7 for path/host routing.</strong></li>
+          <li><strong>WS/gRPC: Envoy is the safest pick.</strong></li>
+          <li><strong>Hot static path = CDN.</strong> Personalized = origin.</li>
+          <li><strong>Rate limiting: cheap blanket at CDN; per-key at API Gateway; per-service at mesh.</strong></li>
+          <li><strong>If you're picking Nginx vs Envoy: pick Nginx unless you need dynamic config (xDS) or are running a mesh.</strong></li>
+          <li><strong>Anycast at the CDN solves failover faster than DNS.</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../load-balancing.html">Load Balancing (concept)</a></li>
+        <li><a href="../proxies.html">Proxies (concept)</a></li>
+        <li><a href="../cdn.html">CDN (concept)</a></li>
+        <li><a href="../api-gateway.html">API Gateway (concept)</a></li>
+        <li><a href="../scenarios/08-l4-vs-l7-lb.html">Scenario: L4 vs L7</a></li>
+        <li><a href="../technologies.html">All Technologies</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

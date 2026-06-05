@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementing the Pooled KV Store &mdash; PoolConvIndex, the Direct-CH Lookup Path &amp; the Optional (§S1) Membership Summary</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.84rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .code-box { background:#f8fafc; color:#0f172a; border:1px solid #cbd5e1; border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.82rem; line-height:1.5;
+      white-space:pre-wrap; overflow-x:auto; }
+    .code-box .kw { color:#1d4ed8; font-weight:700; }
+    .code-box .cm { color:#64748b; font-style:italic; }
+    .code-box .lt { color:#b45309; }
+    .code-box .fn { color:#15803d; font-weight:700; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .gate-box { background:#fef2f2; border-left:4px solid #dc2626; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .q-box { background:#f5f3ff; border-left:6px solid #7c3aed; border-radius:8px;
+      padding:.7rem 1rem 0.4rem; margin:1rem 0; }
+    .q-box ol { margin:.4rem 0 .6rem 1.1rem; }
+    .q-box li { margin:.3rem 0; }
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+      font-weight:700; padding:.05rem .35rem; border-radius:4px; margin-left:.25rem;
+      vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-fa { color:#b45309; background:#fef3c7; border:1px solid #fcd34d; }
+    .tag-k  { color:#6b21a8; background:#f3e8ff; border:1px solid #d8b4fe; }
+    .iter-head { background:linear-gradient(90deg,#f5f3ff,#f8fafc); border-left:6px solid #7c3aed;
+      border-radius:8px; padding:.6rem 1rem; margin:1.5rem 0 .6rem; }
+    .iter-head h2 { margin:0; }
+    .iter-head .iter-meta { font-size:.85rem; color:#475569; margin-top:.25rem; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+    .var-row td:first-child { font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; }
+    .steps { counter-reset: step; list-style:none; padding-left:0; }
+    .steps > li { position:relative; padding:.35rem 0 .35rem 2.2rem; margin:.2rem 0; border-bottom:1px dashed #e2e8f0; }
+    .steps > li::before { counter-increment: step; content: counter(step); position:absolute; left:0; top:.35rem;
+      width:1.5rem; height:1.5rem; background:#7c3aed; color:#fff; border-radius:50%; text-align:center; font-weight:700; font-size:.82rem; line-height:1.5rem; }
+    .pick { color:#15803d; font-weight:700; }
+    .reject { color:#b91c1c; font-weight:700; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">&larr; Scenario page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#scope">Scope</a></li>
+          <li><a class="sidebar-section-link" href="#questions">Your three questions</a></li>
+          <li><a class="sidebar-section-link" href="#seat">1. Where the store sits</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter5b">&nbsp;&nbsp;Iter 5b &mdash; user_sys overflow</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter9-10">&nbsp;&nbsp;Iter 7&ndash;10 store deltas</a></li>
+          <li><a class="sidebar-section-link" href="#notation">2. Notation (typed)</a></li>
+          <li><a class="sidebar-section-link" href="#q1">3. Q1 &mdash; PoolConvIndex: built &amp; used</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-diagram">&nbsp;&nbsp;Build/use diagram</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-algo">&nbsp;&nbsp;index_put / get / del</a></li>
+          <li><a class="sidebar-section-link" href="#q2">4. Q2 &mdash; Who gossips to whom</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q2-diagram">&nbsp;&nbsp;Gossip-topology diagram</a></li>
+          <li><a class="sidebar-section-link" href="#q3">5. Q3 &mdash; Cuckoo filter: built &amp; used</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q3-diagram">&nbsp;&nbsp;Lookup-path diagram</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q3-algo">&nbsp;&nbsp;pull_or_recompute</a></li>
+          <li><a class="sidebar-section-link" href="#protocol">6. Protocol message catalog</a></li>
+          <li><a class="sidebar-section-link" href="#topology">7. Deployment topology</a></li>
+          <li><a class="sidebar-section-link" href="#failures">8. Failure modes</a></li>
+          <li><a class="sidebar-section-link" href="#crosslinks">9. Cross-links</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Implementing the Pooled KV Store</h1>
+      <p class="hero-subtitle"><code>PoolConvIndex</code>, the direct-CH-probe lookup path, and the optional membership summary (&sect;S1 sidecar) &mdash; the impl-detail page for the <code>kv-store-job</code> introduced at <a href="distributed_kv_cache.html#iter3b">scenario Iter&nbsp;3b</a>. Tracks <strong>(a)</strong> every data structure the store holds; <strong>(b)</strong> the main read path (a direct <code>CH(conv_id, pool_ring)</code> probe on local miss) and the <em>optional</em> §S1 membership summary that pre-checks it under burst load (built on the store tasks, fanned out to the prefill pool); <strong>(c)</strong> how a warm prefill <em>pulls-or-recomputes</em>.</p>
+      <p class="hero-meta">
+        Sibling impl pages: <a href="scheduler.html">scheduler.html</a> (the write-back / pull caller) &middot; <a href="router.html">router.html</a> (the gossip relay) &middot;
+        Cites <a href="../../knowledge/K2_kv-cache.html">K2</a> /
+        <a href="../../knowledge/K20_interconnect-and-collectives.html">K20</a> &middot;
+        ~25 min
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="scope">What this page is (and isn&rsquo;t)</h2>
+      <p><strong>TL;DR.</strong> The <a href="distributed_kv_cache.html#iter3b">scenario page</a> justifies <em>why</em> the pooled store exists (bottleneck B12 &mdash; the prefill/decode (P/D) split strands the assistant delta on the decode task) and <em>which</em> design choices win (write-back victim cache, <code>conv_id</code>-keyed, Cuckoo over Bloom). <a href="scheduler.html#iter3b">scheduler.html</a> implements the <em>caller</em> side (the decode task&rsquo;s write-back, the prefill task&rsquo;s pull). <em>This</em> page implements the <strong>store interior</strong>: the <code>PoolConvIndex</code> map, the Cuckoo filter&rsquo;s construction and fan-out, the tier layout, and the exact lookup path a warm prefill walks.</p>
+      <ul>
+        <li><strong>Is:</strong> the Pythonic typed data structures the <code>kv-store-job</code> holds; how <code>PoolConvIndex</code> is written and read; the membership-filter build + the four-hop gossip chain (store&nbsp;&rarr;&nbsp;broker&nbsp;&rarr;&nbsp;Router&nbsp;&rarr;&nbsp;prefill); the lookup decision flow; the message catalog (<code>KVWriteback</code> / <code>KVPull</code> / <code>PoolFilterUpdate</code>); the Borg-style deployment topology; failure modes.</li>
+        <li><strong>Is not:</strong> the design-choice debate behind write-back-vs-write-through / <code>conv_id</code>-vs-content-addressing / Cuckoo-vs-Bloom (those live in <a href="distributed_kv_cache.html#iter3b-dc">scenario &sect;9b.3 DC1&ndash;DC4</a>); the decode-side admission gate&rsquo;s <code>P(continue)</code> model and the prefill engine loop (those live in <a href="scheduler.html#iter3b-algo">scheduler.html &sect;10b.3</a>); the Router&rsquo;s ring + wait-time state (<a href="router.html">router.html</a>); the workload numbers <code>&lambda;</code> / <code>N<sub>active</sub></code> (<a href="distributed_kv_cache.html#s0-workload">scenario &sect;1.3</a>).</li>
+      </ul>
+
+      <div class="q-box">
+        <p style="margin:.1rem 0 .2rem"><strong id="questions">Your three questions &mdash; answered head-on.</strong> This page is organised around exactly the three things that were unclear on the scenario page:</p>
+        <ol>
+          <li><strong>How is <code>PoolConvIndex</code> built and used?</strong> &rarr; <a href="#q1">&sect;3</a> &mdash; who writes it, on what trigger, where the shard lives, and the single-RDMA read path.</li>
+          <li><strong>Who gossips to whom?</strong> &rarr; <a href="#q2">&sect;4</a> &mdash; the explicit four-hop chain <em>store task &rarr; broker &rarr; Router &rarr; prefill task</em>, with cadence and payload on every arrow.</li>
+          <li><strong>How is the Cuckoo existence filter built and used?</strong> &rarr; <a href="#q3">&sect;5</a> &mdash; per-shard construction, the union replica, and the local probe that gates every pull.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="seat">1. Where the store sits &mdash; the shared cross-task remote tier (L3 front / L5 back)</h2>
+      <p>Every serving task has a <em>local</em> ladder &mdash; HBM (High-Bandwidth Memory) &rarr; host DRAM &mdash; introduced at <a href="distributed_kv_cache.html#iter1a">scenario Iter&nbsp;1a</a>; the local NVMe tier it once had is <strong>retired at Iter&nbsp;3b (DC7)</strong>, so the local stack is HBM&nbsp;&rarr;&nbsp;DRAM only. That local ladder dies with the task and cannot be reached by a <em>different</em> task. The <code>kv-store-job</code> is the shared tier any serving task can reach over RDMA (Remote Direct Memory Access): on the scenario&rsquo;s 2-axis tier grid its RDMA <strong>DRAM front ranks L3-remote</strong> (above where local NVMe used to sit) and its <strong>NVMe back ranks L5-remote</strong> &mdash; it outranks a local cold tier precisely <em>because</em> it survives a reroute.</p>
+      <table class="sheet">
+        <thead><tr><th>Layer</th><th>Job</th><th>State it owns</th><th>Reach</th><th>Where it runs</th></tr></thead>
+        <tbody>
+          <tr><td>routing plane</td><td><code>router-job</code></td><td>CH ring + per-task wait-time; <strong>relays</strong> the optional pool summary (&sect;S1)</td><td>fleet-wide</td><td>CPU-only stateless tasks</td></tr>
+          <tr><td>L1&ndash;L2 local</td><td><code>serving-{prefill,decode}-job</code></td><td>local HBM + host DRAM KV tiers (local NVMe retired, DC7); the prefill task may hold an <em>optional</em> <code>pool_filter</code> (&sect;S1)</td><td>this task only</td><td>8&times;H100 hosts</td></tr>
+          <tr style="background:#f5f3ff;"><td><strong>L3 front / L5 back (shared)</strong></td><td><strong><code>kv-store-job</code></strong></td><td><strong><code>PoolConvIndex</code> shard + KV blocks</strong> (+ an optional per-shard membership summary, &sect;S1)</td><td><strong>cross-task</strong></td><td><strong>RDMA-DRAM front over NVMe back, NO GPU</strong></td></tr>
+        </tbody>
+      </table>
+      <h4>The shape to hold in your head</h4>
+      <ul>
+        <li><strong>It is a <em>job</em>, not a tier on a task.</strong> The <code>kv-store-job</code> is its own Borg job of <code>kv_store_job_task_num &asymp; <strong>36</strong></code> tasks <span class="tag tag-d">[D &mdash; <code>max</code>(storage&nbsp;~36, QPS), scenario &sect;9b.4 post-DC7 flow sizing; was 16 pre-DC7]</span>, each a no-GPU NVMe-dense host. &ldquo;Store task&rdquo; below always means one of these.</li>
+        <li><strong>It is sharded CH-on-<code>conv_id</code>.</strong> The conversation-id space is partitioned across the store tasks by the same consistent-hashing (CH) ring discipline the serving fleet uses. Each store task <em>owns a slice</em> of <code>conv_id</code>s and holds the authoritative index + KV blocks + membership filter <em>for that slice only</em>.</li>
+        <li><strong>It is a write-back victim cache, not write-through.</strong> A conv is admitted only when it is <em>evicted</em> from <em>all</em> local tiers <em>and</em> clears a <strong>predictor-free length gate</strong> (cumulative ctx &gt; ~1.9 K; the <code>P(continue)</code> EV refinement is the &sect;S2 sidecar) &mdash; so the store holds a small admitted tail (the flow-derived <code>p<sub>admit</sub> &asymp; 7%</code> of active convs post-DC7; the old posited <code>f<sub>pool</sub> &asymp; 3%</code> fraction is <em>retired</em>, D5), not every turn. Recompute from token IDs (Recovery Point Objective, RPO&nbsp;=&nbsp;0) is always the correctness floor on any miss.</li>
+      </ul>
+
+      <div class="note-box"><strong>Three CH owners, three rings &mdash; the &ldquo;owning store task&rdquo; is NOT the decode task.</strong> A single <code>conv_id</code> has <em>three</em> independent owners, each computed by consistent hashing but on a <em>different</em> ring. <strong>Each &ldquo;ring&rdquo; is one CH ring <em>per job</em></strong> (not per task): its members are that job&rsquo;s tasks, and an individual task owns only the <em>arc</em> of <code>conv_id</code>s that hash to it &mdash; not a whole ring. All three are keyed on the same <code>conv_id</code> but have different membership (thousands of decode tasks vs ~36 store tasks), so one <code>conv_id</code> lands on a <em>different</em> task in each. The ring map itself is maintained by the Router and gossiped via the broker; whoever does lookups carries a read-only copy. Don&rsquo;t conflate them:
+        <ul style="margin:.4rem 0 .2rem">
+          <li><strong>decode-task owner</strong> = <code>CH(conv_id, decode_ring)</code> &mdash; a <code>serving-decode-job</code> task (GPU; thousands of tasks). Holds the live conversation in its local HBM/DRAM/SSD tiers and <em>sends</em> the write-back when the conv evicts.</li>
+          <li><strong>prefill-task owner</strong> = <code>CH(conv_id, prefill_ring)</code> &mdash; a <code>serving-prefill-job</code> task (GPU). Serves the next turn and <em>issues</em> the pull / recompute.</li>
+          <li><strong>store-task owner</strong> = <code>CH(conv_id, pool_ring)</code> &mdash; a <code>kv-store-job</code> task (no GPU; ~36 tasks post-DC7). Holds the pooled/evicted KV + its <code>PoolConvIndex</code> shard (+ its optional <code>shard_filter</code>, &sect;S1). <strong>This is &ldquo;the owning store task&rdquo;</strong> everywhere on this page &mdash; reached on a local miss by a <em>direct</em> <code>CH(conv_id, pool_ring)</code> probe (the main read path; the filter is an optional pre-check).</li>
+        </ul>
+        So the decode task and the store task are <em>different jobs on different hardware</em>: the decode task <code>KVWriteback</code>s its evicted KV to the store-task owner; the store-task owner is the one that <em>writes its index</em> and later serves the <code>KVPull</code>. The three owners coincide only by accident of hashing, never by design &mdash; and the prefill task holds gossiped read-only copies of <em>both</em> <code>decode_ring</code> (for the intra-request Hop) and <code>pool_ring</code> (for the cross-turn pull).</div>
+
+      <div class="note-box" id="iter5b"><strong>Iter&nbsp;5b &mdash; the <code>user_sys</code> overflow rides this <em>same</em> store (a scale event, not new infrastructure).</strong> Born at <a href="distributed_kv_cache.html#iter3b">Iter&nbsp;3b</a> the pool holds one key class: cross-turn <strong>conv K,V</strong> keyed by <code>conv_id</code> (the B12 stranded-assistant-delta job). At <a href="distributed_kv_cache.html#iter5">Iter&nbsp;5</a> prefix caching keeps each user&rsquo;s <code>user_sys</code> warm on the prefill task by reuse-recency LRU + <code>ref_count</code> &mdash; but at consumer scale the <code>user_sys</code> working set (<code>users_with_active_conv &times; T<sub>user_sys_mean</sub> &times; KV_per_tok = 3 M &times; 1 024 &times; 320 KB &asymp; 0.96 PB</code>, <a href="distributed_kv_cache.html#iter5-placement">scenario &sect;11.5</a>) far exceeds HBM, so the slice reuse-recency cannot keep resident (long-tail users + the between-turns evicted tail under churn + BLCH spill + autoscale-fresh + brand-new users) <strong>overflows onto this already-existing store</strong>. The store changes <em>only</em> by widening what it admits:
+        <ul style="margin:.4rem 0 .2rem">
+          <li><strong>A second key class, same map + same protocol.</strong> <code>user_sys</code> blobs are admitted keyed by <code>user_sys_hash</code> (a content hash of the per-user system prompt) alongside the <code>conv_id</code>-keyed conv K,V &mdash; same <code>PoolConvIndex</code> map, same CH-on-key sharding across the same store tasks, same <code>KVWriteback</code> / <code>KVPull</code> messages (&sect;6). <strong>No new message types, no new infrastructure.</strong></li>
+          <li><strong>Different admission rule for the new class.</strong> conv K,V is admitted by the predictor-free length gate (&sect;1); <code>user_sys</code> is admitted by <strong>top-<code>N_pool</code> LFU</strong> (a per-user prompt is worth keeping iff it recurs) with <code>replication_factor</code> replication for the heaviest entries. Storage grows by <code>pool_storage_bytes += N_pool &times; T<sub>user_sys_mean</sub> &times; KV_per_tok &times; replication_factor</code> &mdash; <code>N_pool &Gg;</code> the HBM-resident set because pool storage is NVMe-backed, not HBM-bound. <code>N_pool</code> (hence the exact task-count growth) is <strong>settled at S6</strong> against per-task NVMe budget + the §1.3 consumer skew.</li>
+          <li><strong>The hot-path fetch is still the assistant delta, not a 320 MB <code>user_sys</code> storm.</strong> On a warm-turn local miss the prefill task pulls the <code>~400-tok</code> assistant delta (<code>~128 MB</code>, the B12 job) and <em>re-prefills</em> the <code>1 K-tok</code> <code>user_sys</code> (<code>&beta;<sub>cold</sub> &asymp; 54 ms</code>) when cheaper than a full <code>user_sys</code> pull (<a href="distributed_kv_cache.html#iter5-placement">scenario &sect;11.5</a>, Change&nbsp;6). The pool&rsquo;s <code>user_sys</code> entries serve the <em>structural-miss / cross-session-cold</em> case (a returning heavy user whose <code>user_sys</code> fell out everywhere), so they are a correctness/cost backstop, not the common pull.</li>
+        </ul>
+        Everything else on this page &mdash; the <code>PoolConvIndex</code> read path (&sect;3), the gossip chain (&sect;4), the optional §S1 summary (&sect;5), the deployment shape (&sect;7) &mdash; is unchanged; <code>user_sys_hash</code> is just another key in the same namespace.</div>
+
+      <div class="note-box" id="iter9-10"><strong>Iter&nbsp;7&ndash;10 &mdash; what the later iterations add to the store (mostly nothing; Iter&nbsp;10 promotes it from cost lever to availability fast-path).</strong> The store is a topic reference maintained across iterations; here is the exhaustive delta for the four late iterations.
+        <ul style="margin:.4rem 0 .2rem">
+          <li><strong>Iter&nbsp;7 (speculative decoding) &mdash; no store change.</strong> The draft&rarr;verify step is decode-pool-internal (<a href="scheduler.html#iter7">scheduler &sect;11d</a>); it produces the same conv K,V (the decoded output is provably identical to vanilla sampling), so write-back / pull are byte-identical.</li>
+          <li><strong>Iter&nbsp;8 (abuse prevention) &mdash; no store change.</strong> The per-user token-bucket gate is Router-side (<a href="router.html#iter8">router &sect;8e</a>); it only thins the admitted <code>Route</code> stream, which marginally <em>lowers</em> the store&rsquo;s write-back ingest. No new key class, no protocol change.</li>
+          <li><strong>Iter&nbsp;9 (context parallelism) &mdash; a long-context conv writes back as per-rank slices.</strong> A <code>1 M</code>-context CP request (<a href="distributed_kv_cache.html#iter9">scenario &sect;15</a>) is <code>320 GB</code> of KV split across <code>N_CP = 8</code> ranks (<code>~40 GB</code>/rank). On eviction each rank writes back its slice keyed by <code>(conv_id, rank)</code> &mdash; a sub-keying within the existing <code>conv_id</code> class, <em>not</em> a new namespace or message type. The predictor-free length gate (<code>&gt; ~1.9 K</code> tokens, &sect;1) admits these trivially (<code>1 M &Gg; 1.9 K</code>). Storage impact is bounded: the CP population is <code>~0.1%</code> of convs, so even at <code>320 GB</code> each the aggregate rides the same <code>N_pool</code> sizing settled at S6 (the NVMe-back tier absorbs the bulk; only the hot front competes for RDMA-DRAM). Per-rank slices let a single dead CP-rank pull <em>only</em> its <code>~40 GB</code> slice on recovery, not the whole <code>320 GB</code>.</li>
+          <li><strong>Iter&nbsp;10 (fault tolerance) &mdash; the store becomes the per-serving-task recovery <em>fast path</em>.</strong> This is the load-bearing change. When a serving task dies (<a href="distributed_kv_cache.html#iter10">scenario &sect;16</a>), the CH ring migrates its <code>conv_id</code>s to a neighbour, and a neighbour whose conv is pool-resident <strong>pulls</strong> the prior KV (<code>pull(13 K) &asymp; 166 ms</code>, linear I/O) instead of recomputing (<code>&beta;<sub>cold</sub>(13 K) &asymp; 730 ms</code>). So the store, built at Iter&nbsp;3b purely to offload cross-turn recompute <em>cost</em>, is now also the <strong>availability</strong> fast path &mdash; the <code>KVPull</code> read path of &sect;3 / &sect;5 is reused verbatim by the recovery handler (<a href="scheduler.html#iter10">scheduler &sect;11g</a> / <a href="router.html#iter10">router &sect;8g</a>). <strong>Implication for the store&rsquo;s OWN durability:</strong> the store&rsquo;s per-shard replication (the <code>replication_factor</code> already carried for heavy <code>user_sys</code> entries, Iter&nbsp;5b) is what keeps that fast path available across a <em>store-task</em> death &mdash; distinct from the per-serving-task FT this iteration adds. A store-task loss is <em>not</em> a correctness event: the affected convs simply lose the pull fast path and fall back to <code>&beta;<sub>cold</sub></code> recompute (RPO&nbsp;=&nbsp;0, the floor that has held since Iter&nbsp;3b). The store stays a <em>cache</em>, never a source of truth; whether conv K,V (not just <code>user_sys</code>) gets a replica is an S6 lever driven by the measured failure-tail RTO.</li>
+        </ul>
+        Net: <strong>no new data structure, no new message type</strong> on the store for Iter&nbsp;7&ndash;10; Iter&nbsp;9 adds a <code>(conv_id, rank)</code> sub-key, and Iter&nbsp;10 re-uses the existing pull path as the availability fast path and raises the store&rsquo;s own replication to a first-class S6 sizing question.</div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="notation">2. Notation &mdash; the data structures the store holds (typed)</h2>
+      <p>Every identifier this page uses downstream &mdash; in the lookup path, the gossip emitter, the protocol catalog &mdash; is declared here with <strong>WHAT</strong> it stores, <strong>USED&nbsp;FOR</strong> (which decision consumes it), and <strong>UPDATED&nbsp;WHEN</strong> (cadence + trigger + writer). Inherited constants cite the scenario page rather than re-deriving.</p>
+
+      <h3 id="notation-constants">2.1 &nbsp;Constants (inherited &mdash; cited, not re-derived)</h3>
+      <div class="code-box"><span class="cm"># Bandwidth + size constants — all from the scenario page / K2 / K20; do not restate.</span>
+KV_PER_TOK_BYTES        = <span class="lt">320_000</span>      <span class="cm"># 320 KB/tok @ Llama-3-70B / GQA-8 / BF16 (K2 D31; scenario §4.2)</span>
+RDMA_BW                 = <span class="lt">25e9</span>         <span class="cm"># bytes/s — one NDR400 InfiniBand (IB) flow (K20)</span>
+NVME_BW                 = <span class="lt">7e9</span>          <span class="cm"># bytes/s — single NVMe via GPUDirect Storage (GDS)</span>
+FRONT_BW_PER_TASK       = <span class="lt">100e9</span>        <span class="cm"># ~4 × 25 GB/s NDR400 paths per store task (scenario §9b.4)</span>
+PER_STORE_TASK_NVME     = <span class="lt">60e12</span>        <span class="cm"># 60 TB usable per store task (8 × 7.68 TB NVMe-dense)</span>
+
+<span class="cm"># Working-set + sizing constants (scenario §9b.4, POST-DC7 flow sizing):</span>
+N_ACTIVE                = <span class="lt">3_000_000</span>    <span class="cm"># concurrent sessions (scenario §1.3)</span>
+<span class="cm"># f_pool as a POSITED fraction is RETIRED (D5). Pool sizing is the OUTCOME of the demotion flow:</span>
+P_ADMIT                 = <span class="lt">0.068</span>        <span class="cm"># DERIVED per-turn pool-admit prob = [P(gap>15min)5.6% + P(reroute)2%] × P(len-gate)0.9</span>
+                                     <span class="cm"># flagged inter-turn-gap model (α=0.7), scenario §9b.4 — NOT a posited fraction</span>
+POOLED_CONVS            = P_ADMIT * N_ACTIVE  <span class="cm"># ≈ 204_000 convs (returning-tail working set; Little's law)  [D]</span>
+KV_STORE_JOB_TASK_NUM   = <span class="lt">36</span>           <span class="cm"># max(storage-sized ~36, QPS-sized)  [D — §9b.4 post-DC7; was 16 pre-DC7]</span>
+
+<span class="cm"># OPTIONAL §S1 membership-summary constants (Cuckoo variant; an EXACT set is preferred — scenario §S1):</span>
+CUCKOO_BYTES_PER_KEY    = <span class="lt">1.6</span>          <span class="cm"># ~12-bit fingerprint @ ~95% DENSE pack — operate below this; see §5.6</span>
+CUCKOO_FINGERPRINT_BITS = <span class="lt">12</span>           <span class="cm"># f — sets the false-positive rate; see §5</span>
+CUCKOO_BUCKET_SIZE      = <span class="lt">4</span>            <span class="cm"># b — fingerprints per bucket (standard Cuckoo)</span>
+
+<span class="cm"># Cadence + threshold constants:</span>
+T_GOSSIP_MS             = <span class="lt">100</span>          <span class="cm"># filter-delta + wait-time gossip cadence (scenario §6.5 / Iter 1b)</span>
+POOL_ADMIT_CTX_TOKENS   = <span class="lt">1_870</span>        <span class="cm"># recompute-vs-pull crossover (DESIGN_CHOICE_CHANGE §4a)</span></div>
+
+      <h3 id="notation-types">2.2 &nbsp;Type declarations (Pythonic)</h3>
+      <div class="code-box"><span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass, field
+<span class="kw">from</span> enum <span class="kw">import</span> Enum
+
+Fingerprint = <span class="kw">int</span>          <span class="cm"># a CUCKOO_FINGERPRINT_BITS-wide hash of a conv_id (12 bits)</span>
+
+<span class="kw">class</span> <span class="fn">Tier</span>(Enum):
+    FRONT = <span class="lt">1</span>              <span class="cm"># RDMA/DRAM hot front (~25 GB/s/path) — beats recompute at the median</span>
+    BACK  = <span class="lt">2</span>              <span class="cm"># NVMe back (~7 GB/s single / ~25 GB/s 4-SSD stripe) — durable, outlives the task</span>
+
+<span class="cm"># ---- The authoritative location map. PoolConvIndex = dict[key -> PoolConvEntry].</span>
+<span class="cm"># ---- This IS a map. One SHARD of it lives on each store task (the keys CH-assigns here).</span>
+<span class="cm"># ---- KEY NAMESPACE: conv_id (cross-turn conv K,V, Iter 3b) | user_sys_hash (user_sys overflow, Iter 5b).</span>
+<span class="cm"># ----   Both ride the SAME map/sharding/protocol; only the admission rule differs (length gate vs top-N_pool LFU).</span>
+<span class="kw">@dataclass</span>
+<span class="kw">class</span> <span class="fn">PoolConvEntry</span>:                  <span class="cm"># the VALUE side of the map</span>
+    key: <span class="kw">str</span>                            <span class="cm"># conv_id (conv K,V) OR user_sys_hash (Iter 5b overflow)</span>
+    conv_id: <span class="kw">str</span>                        <span class="cm"># == key for conv K,V; the owning conv for a user_sys blob</span>
+    owning_pool_task_id: <span class="kw">str</span>          <span class="cm"># == CH(conv_id); stored for rebalance bookkeeping + sanity checks</span>
+    block_ids: <span class="kw">list</span>[<span class="kw">int</span>]              <span class="cm"># this conv's KV blocks in THIS store task's block pool (16-tok paged blocks)</span>
+    tier: Tier                          <span class="cm"># FRONT | BACK — which physical tier currently backs the blocks</span>
+    n_tokens: <span class="kw">int</span>                      <span class="cm"># cumulative context length (for the pull-bytes estimate)</span>
+    last_touch_ts: <span class="kw">float</span>              <span class="cm"># LRU clock on the DRAM front (drives front→back demotion)</span>
+
+<span class="cm"># ---- OPTIONAL §S1 membership summary (burst-insurance ONLY — the main read path is a direct CH probe).</span>
+<span class="cm"># ----   Prefer an EXACT conv_id set; the Cuckoo variant below is shown for its delete-support depth.</span>
+<span class="cm"># ----   Two roles when enabled: (a) AUTHORITATIVE per-shard filter (store task); (b) UNION replica (prefill task).</span>
+<span class="kw">@dataclass</span>
+<span class="kw">class</span> <span class="fn">CuckooFilter</span>:
+    buckets: <span class="kw">list</span>[<span class="kw">list</span>[Fingerprint]]   <span class="cm"># each bucket holds up to CUCKOO_BUCKET_SIZE fingerprints</span>
+    f_bits: <span class="kw">int</span> = CUCKOO_FINGERPRINT_BITS
+    <span class="cm"># maybe_contains(x): True ⇒ "probably present" (FPR ≈ 0.1–1%); False ⇒ DEFINITELY absent</span>
+    <span class="cm"># insert(x) / delete(x): both O(1) amortized, touch ≤2 candidate buckets — delete is the</span>
+    <span class="cm"># reason this is Cuckoo and not Bloom (a victim cache evicts constantly; §5).</span>
+
+<span class="cm"># ---- The gossip unit: what a store task emits every T_GOSSIP_MS (the delta since last tick).</span>
+<span class="kw">@dataclass</span>
+<span class="kw">class</span> <span class="fn">PoolFilterDelta</span>:
+    shard_id: <span class="kw">str</span>                     <span class="cm"># which store task / CH shard this delta is for</span>
+    inserts: <span class="kw">list</span>[Fingerprint]        <span class="cm"># conv_ids admitted since last tick</span>
+    deletes: <span class="kw">list</span>[Fingerprint]        <span class="cm"># conv_ids evicted / re-keyed since last tick</span>
+    version: <span class="kw">int</span>                      <span class="cm"># monotonic per shard; lets a stale consumer detect a gap</span>
+
+<span class="cm"># ---- Held on each STORE task (one slice of the pool):</span>
+pool_index:  <span class="kw">dict</span>[<span class="kw">str</span>, PoolConvEntry] = {}    <span class="cm"># this task's PoolConvIndex shard (the map)</span>
+shard_filter: CuckooFilter            <span class="cm"># authoritative membership of THIS shard (~10 KB; see §5 sizing)</span>
+block_pool:  <span class="kw">dict</span>[<span class="kw">int</span>, bytes]    = {}    <span class="cm"># block_id -> KV bytes, on FRONT (DRAM) or BACK (NVMe)</span>
+
+<span class="cm"># ---- Held on each PREFILL task (the consumer of the gossip):</span>
+pool_ring: CHRing                     <span class="cm"># gossiped read-only copy of the kv-store-job's OWN CH ring (~36 tasks post-DC7).</span>
+                                      <span class="cm"># owner = pool_ring.lookup(conv_id) → the store-task owner. Distinct ring from</span>
+                                      <span class="cm"># decode_ring / prefill_ring — see §1 "three CH owners, three rings".</span>
+pool_filter: CuckooFilter | None = None  <span class="cm"># OPTIONAL §S1 union summary (None on the main line); the §5 pre-probe when enabled</span>
+pool_filter_version: <span class="kw">dict</span>[<span class="kw">str</span>, <span class="kw">int</span>] = {}   <span class="cm"># shard_id -> last applied version (gap detection)</span></div>
+
+      <h3 id="notation-cadence">2.3 &nbsp;Cadence ledger &mdash; one row per identifier</h3>
+      <table class="sheet">
+        <thead><tr><th>Identifier</th><th>Lives on</th><th>WHAT</th><th>USED FOR</th><th>UPDATED WHEN (trigger &middot; writer)</th></tr></thead>
+        <tbody>
+          <tr class="var-row"><td>pool_index</td><td>store task</td><td>the <code>PoolConvIndex</code> shard (<em>this IS a map</em>): <code>conv_id &rarr; PoolConvEntry</code></td><td>resolve a present conv to exact <code>block_ids[]</code> + tier in one read</td><td><strong>synchronous</strong> on admit (insert) / evict (delete) / rebalance (re-key) &middot; the owning store task</td></tr>
+          <tr class="var-row"><td>block_pool</td><td>store task</td><td>the actual KV bytes, <code>block_id &rarr; bytes</code>, on FRONT or BACK</td><td>serve a <code>KVPull</code>; spill cold blocks to NVMe</td><td>on <code>KVWriteback</code> (write) / front-LRU demote / cold re-pull promote &middot; store task</td></tr>
+          <tr class="var-row"><td>shard_filter</td><td>store task</td><td>authoritative Cuckoo membership of this shard (~10&nbsp;KB)</td><td>source of the <code>PoolFilterDelta</code> it gossips</td><td>insert on admit / delete on evict (same trigger as <code>pool_index</code>) &middot; store task</td></tr>
+          <tr class="var-row"><td>pool_filter</td><td>prefill task</td><td>OPTIONAL §S1 union summary across all shards (~326&nbsp;KB if enabled)</td><td>the local probe that gates every <code>KVPull</code> (&sect;5)</td><td>eventually-consistent (~1&nbsp;s) on each <code>PoolFilterUpdate</code> apply &middot; prefill task</td></tr>
+          <tr class="var-row"><td>pool_filter_version</td><td>prefill task</td><td><code>shard_id &rarr; last applied version</code></td><td>detect a missed delta &rarr; request a full-blob refresh</td><td>on every applied <code>PoolFilterUpdate</code> &middot; prefill task</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="notation-bounds">2.4 &nbsp;Every bound states its cliff</h3>
+      <ul>
+        <li><strong><code>CUCKOO_FINGERPRINT_BITS = 12</code> (false-positive rate, FPR).</strong> <code>FPR &asymp; 2b / 2<sup>f</sup> = 8 / 4096 &asymp; 0.2%</code> at <code>b = 4</code>. <em>Cliff below</em>: shrink <code>f</code> and FPR climbs &rarr; more wasted round-trips to confirm-absent (each a pull then recompute). <em>Cliff above</em>: grow <code>f</code> and the per-key cost rises above ~1.6&nbsp;B, bloating the replica on <em>every</em> prefill task for diminishing FPR gain. 12 bits sits at the knee.</li>
+        <li><strong>Cuckoo load factor <code>&alpha;</code> (insert-failure cliff).</strong> A lookup touches 2 buckets at <em>any</em> <code>&alpha;</code>, but an <em>insert</em> kicks occupants along an eviction chain, and at <code>b = 4</code> the practical ceiling is <strong><code>&alpha; &asymp; 95%</code></strong> &mdash; beyond it, chains lengthen and inserts <em>fail</em>. <em>Cliff above ~95%</em>: provision table capacity with headroom (operate at <code>&alpha; &asymp; &#8531;</code>) so the churning victim-cache filter never approaches it; an insert that fails anyway degrades to a false-negative &rarr; recompute (RPO=0). Full treatment in <a href="#q3-scale">&sect;5.6</a> &mdash; the <code>1.6 B/key</code> figure below is the <em>dense-pack</em> bound (≈95%), <em>not</em> the operating point.</li>
+        <li><strong><code>T_GOSSIP_MS = 100</code> (filter staleness).</strong> The replica can lag the truth by one cadence. <em>Cliff above</em> (slower gossip): more false-positives (just-evicted convs still &ldquo;present&rdquo;) and false-negatives (just-admitted not yet visible) &mdash; both fall to recompute, so it costs latency, never correctness. <em>Cliff below</em> (faster gossip): the broker NIC saturates on fan-out. 100&nbsp;ms matches the existing wait-time tick, so it rides the same pipeline for free.</li>
+        <li><strong><code>POOL_ADMIT_CTX_TOKENS = 1_870</code> (write-back admission floor).</strong> Below it, recompute is cheaper than a pull round-trip, so admitting wastes write bandwidth. Above it, the quadratic re-prefill dominates and the pull wins decisively. Derivation: the &sect;6.5 SSD-vs-cold crossover, reused for the store.</li>
+      </ul>
+
+      <h3 id="notation-acronyms">2.5 &nbsp;Acronyms on this page</h3>
+      <table class="sheet">
+        <tbody>
+          <tr><td><strong>CH</strong></td><td>Consistent Hashing</td><td><strong>RDMA</strong></td><td>Remote Direct Memory Access</td><td><strong>FPR</strong></td><td>False-Positive Rate</td></tr>
+          <tr><td><strong>RPO</strong></td><td>Recovery Point Objective</td><td><strong>P/D</strong></td><td>Prefill / Decode (the Iter&nbsp;2 split)</td><td><strong>EOS</strong></td><td>End Of Sequence</td></tr>
+          <tr><td><strong>LRU</strong></td><td>Least Recently Used</td><td><strong>IB</strong></td><td>InfiniBand</td><td><strong>GDS</strong></td><td>GPUDirect Storage</td></tr>
+          <tr><td><strong>HBM</strong></td><td>High-Bandwidth Memory</td><td><strong>NVMe</strong></td><td>Non-Volatile Memory express</td><td><strong>EV</strong></td><td>Expected Value</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <div class="iter-head">
+        <h2 id="q1">3. Q1 &mdash; how <code>PoolConvIndex</code> is built and used</h2>
+        <p class="iter-meta"><strong>TL;DR.</strong> <code>PoolConvIndex</code> is a <em>map</em> (<code>conv_id &rarr; {owning_pool_task, block_ids[], tier}</code>) that is <strong>sharded CH-on-<code>conv_id</code></strong> across the store tasks &mdash; each store task holds the authoritative shard for its own slice. It is <strong>written synchronously by the owning store task</strong> on three triggers (admit / evict / rebalance) and <strong>read by a warm prefill task in a single RDMA</strong> &mdash; never a broadcast &mdash; because the owner is <em>computed</em> from the key, not looked up.</p>
+      </div>
+
+      <h3 id="q1-diagram">3.1 &nbsp;The build/use lifecycle (diagram first)</h3>
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1200 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PoolConvIndex build and use. On the left, three writers — all on the owning store task and all synchronous — mutate the index shard: (1) admit on a KVWriteback inserts conv_id to {blocks, tier}; (2) evict on local-LRU or invalidate deletes the conv_id; (3) rebalance on a ring change re-keys the shard slice to a new owner. In the centre, the store task owns a CH shard of the conv_id space and holds the PoolConvIndex map plus the KV block pool. On the right, a cold or rebalanced prefill task reads the index: (4) it COMPUTES the store owner as pool_ring.lookup(conv_id), the kv-store-job's own ring, with zero messages, (5) sends ONE RDMA KVPull to that single owner, (6) the store does an internal index_get to resolve block_ids and tier, and (7) returns the blocks via KVPullResp, or a KVPullMiss falls back to recompute at RPO zero.">
+        <defs>
+          <marker id="msy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="mrd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+          <marker id="mrc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker>
+        </defs>
+        <style>
+          .k1-w  { fill:#fff7ed; stroke:#c2410c; stroke-width:1.5; }
+          .k1-s  { fill:#f5f3ff; stroke:#7c3aed; stroke-width:2.2; }
+          .k1-map{ fill:#fff; stroke:#a78bfa; stroke-width:1.3; }
+          .k1-r  { fill:#eff6ff; stroke:#1e40af; stroke-width:1.8; }
+          .k1-t  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .k1-tp { font-size:13px; font-weight:700; fill:#6d28d9; }
+          .k1-s2 { font-size:11px; fill:#475569; }
+          .k1-m  { font-family:'JetBrains Mono',monospace; font-size:10.5px; fill:#0f172a; }
+          .k1-lab{ font-size:11px; font-weight:700; fill:#64748b; letter-spacing:.04em; }
+          .k1-num{ font-size:12px; font-weight:700; fill:#fff; }
+          line.sy,path.sy { stroke:#1e293b; stroke-width:1.8; fill:none; marker-end:url(#msy); }
+          line.rd,path.rd { stroke:#0d9488; stroke-width:2; stroke-dasharray:7 4; fill:none; marker-end:url(#mrd); }
+          path.rc { stroke:#b91c1c; stroke-width:1.8; stroke-dasharray:4 3; fill:none; marker-end:url(#mrc); }
+        </style>
+
+        <!-- WRITERS -->
+        <text class="k1-lab" x="24" y="92">WRITERS &mdash; owning store task, SYNCHRONOUS</text>
+        <rect class="k1-w" x="24" y="104" width="330" height="64" rx="8"/>
+        <text class="k1-t" x="40" y="126"><tspan font-weight="700">&#9312; admit</tspan> &mdash; a KVWriteback arrives</text>
+        <text class="k1-m" x="40" y="148">index_put(conv_id, block_ids, tier)</text>
+        <text class="k1-s2" x="40" y="162">+ shard_filter.insert(fp(conv_id))</text>
+
+        <rect class="k1-w" x="24" y="196" width="330" height="62" rx="8"/>
+        <text class="k1-t" x="40" y="218"><tspan font-weight="700">&#9313; evict</tspan> &mdash; local-LRU watermark / invalidate</text>
+        <text class="k1-m" x="40" y="240">index_del(conv_id)</text>
+        <text class="k1-s2" x="40" y="254">+ shard_filter.delete(fp(conv_id))</text>
+
+        <rect class="k1-w" x="24" y="286" width="330" height="62" rx="8"/>
+        <text class="k1-t" x="40" y="308"><tspan font-weight="700">&#9314; rebalance</tspan> &mdash; CH ring changes</text>
+        <text class="k1-m" x="40" y="330">re-key: hand slice to new owner</text>
+        <text class="k1-s2" x="40" y="344">(autoscale / task-add / task-loss)</text>
+
+        <!-- STORE TASK (centre) -->
+        <rect class="k1-s" x="420" y="96" width="372" height="360" rx="12"/>
+        <text class="k1-tp" x="606" y="120" text-anchor="middle">store task &mdash; owns a CH shard</text>
+        <text class="k1-s2" x="606" y="136" text-anchor="middle">of the <tspan font-family="monospace">conv_id</tspan> space (no GPU)</text>
+
+        <rect class="k1-map" x="436" y="150" width="340" height="150" rx="6"/>
+        <text class="k1-t" x="606" y="170" text-anchor="middle"><tspan font-family="monospace">PoolConvIndex</tspan> &mdash; this IS a map</text>
+        <text class="k1-m" x="448" y="190">conv_id &rarr; {owning_task, block_ids[], tier}</text>
+        <line x1="448" y1="198" x2="764" y2="198" stroke="#cbd5e1" stroke-width="1"/>
+        <text class="k1-m" x="448" y="216">conv:7af3 &rarr; { self, [b12,b13,b14], FRONT }</text>
+        <text class="k1-m" x="448" y="238">conv:91c0 &rarr; { self, [b40 &hellip; b58], BACK }</text>
+        <text class="k1-m" x="448" y="260">conv:5e22 &rarr; { self, [b03], FRONT }</text>
+        <text class="k1-s2" x="448" y="284">&#9316; index_get(conv_id) &rarr; {block_ids[], tier}</text>
+
+        <rect class="k1-map" x="436" y="312" width="340" height="58" rx="6"/>
+        <text class="k1-t" x="606" y="332" text-anchor="middle"><tspan font-family="monospace">block_pool</tspan>: block_id &rarr; KV bytes</text>
+        <text class="k1-s2" x="606" y="350" text-anchor="middle">FRONT = DRAM/RDMA &middot; BACK = NVMe (durable)</text>
+        <text class="k1-s2" x="606" y="364" text-anchor="middle">the bytes a KVPull actually streams back</text>
+
+        <text class="k1-s2" x="606" y="398" text-anchor="middle" font-style="italic">authoritative for its slice only &mdash; the other</text>
+        <text class="k1-s2" x="606" y="414" text-anchor="middle" font-style="italic">15 shards live on the other store tasks</text>
+        <text class="k1-s2" x="606" y="430" text-anchor="middle" font-style="italic">(union sizing &amp; gossip in &sect;4&ndash;&sect;5)</text>
+
+        <!-- READER -->
+        <text class="k1-lab" x="838" y="92">READER &mdash; one RDMA, never a broadcast</text>
+        <rect class="k1-r" x="838" y="104" width="338" height="300" rx="10"/>
+        <text class="k1-t" x="858" y="128">prefill task P&#946; &mdash; cold / rebalanced</text>
+        <text class="k1-s2" x="858" y="146">its local tiers lack this conv &mdash; needs prior K,V</text>
+
+        <rect class="k1-map" x="854" y="160" width="306" height="56" rx="6"/>
+        <text class="k1-m" x="868" y="182">&#9315; owner = pool_ring.lookup(conv_id)</text>
+        <text class="k1-s2" x="868" y="202">CH &mdash; 0 messages: the owner is COMPUTED,</text>
+
+        <rect class="k1-map" x="854" y="228" width="306" height="42" rx="6"/>
+        <text class="k1-m" x="868" y="252">&#9317; KVPull(conv_id) &mdash; 1 RDMA &rarr; that owner</text>
+
+        <rect class="k1-map" x="854" y="282" width="306" height="44" rx="6"/>
+        <text class="k1-m" x="868" y="306">&#9318; KVPullResp(blocks) &rarr; stage to HBM</text>
+
+        <rect class="k1-map" x="854" y="338" width="306" height="48" rx="6"/>
+        <text class="k1-m" x="868" y="360">miss &rarr; KVPullMiss &rarr; recompute</text>
+        <text class="k1-s2" x="868" y="378">(&beta;<tspan baseline-shift="sub" font-size="8">cold</tspan>, RPO=0 &mdash; always correct)</text>
+
+        <!-- writer arrows -->
+        <line class="sy" x1="354" y1="136" x2="418" y2="180"/>
+        <circle cx="392" cy="150" r="11" fill="#1e293b"/><text class="k1-num" x="392" y="154" text-anchor="middle">1</text>
+        <line class="sy" x1="354" y1="227" x2="418" y2="227"/>
+        <circle cx="392" cy="210" r="11" fill="#1e293b"/><text class="k1-num" x="392" y="214" text-anchor="middle">2</text>
+        <line class="sy" x1="354" y1="317" x2="418" y2="275"/>
+        <circle cx="392" cy="300" r="11" fill="#1e293b"/><text class="k1-num" x="392" y="304" text-anchor="middle">3</text>
+
+        <!-- reader arrows (between store x=792 and P_beta x=838) -->
+        <line class="rd" x1="852" y1="249" x2="794" y2="232"/>
+        <circle cx="818" cy="234" r="11" fill="#0d9488"/><text class="k1-num" x="818" y="238" text-anchor="middle">5</text>
+        <line class="rd" x1="792" y1="290" x2="852" y2="300"/>
+        <circle cx="818" cy="288" r="11" fill="#0d9488"/><text class="k1-num" x="818" y="292" text-anchor="middle">7</text>
+        <path class="rc" d="M 1008 386 Q 1008 430 940 430 Q 880 430 868 388"/>
+        <circle cx="940" cy="430" r="11" fill="#b91c1c"/><text class="k1-num" x="940" y="434" text-anchor="middle">R</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span style="color:#1e293b;">&#9472;&#9472;</span> <span class="b">&#9312;&#9313;&#9314;</span> <strong>Writers &rarr; index (synchronous):</strong> all three run <em>on the owning store task</em> and mutate <code>pool_index</code> + <code>shard_filter</code> together &mdash; admit inserts, evict deletes, rebalance re-keys. Synchronous so the index is never wrong about its own shard.</li>
+        <li><span style="color:#7c3aed;">&#9670;</span> <span class="b">&#9316;</span> <strong>Internal resolve:</strong> <code>index_get(conv_id)</code> turns a present <code>conv_id</code> into exact <code>block_ids[]</code> + <code>tier</code> &mdash; an in-process hashmap hit on the one owner, no second hop.</li>
+        <li><span style="color:#0d9488;">&#9476;&#9476;</span> <span class="b">&#9315;&#9317;&#9318;</span> <strong>Reader (RDMA):</strong> the prefill task <em>computes</em> the owner (&#9315;, zero messages), sends one <code>KVPull</code> (&#9317;), and stages the returned blocks (&#9318;). One known task, one round-trip.</li>
+        <li><span style="color:#b91c1c;">&#9476;&#9476;</span> <span class="b">R</span> <strong>Recompute floor:</strong> a <code>KVPullMiss</code> (lost the write-back race, or the conv was evicted) falls to <code>&beta;<sub>cold</sub></code> re-prefill &mdash; RPO=0, always correct, just slower.</li>
+      </ul>
+
+      <h3 id="q1-built">3.2 &nbsp;How it is BUILT (step by step)</h3>
+      <p>The index is <strong>not</strong> a separate service and <strong>not</strong> centralized. Each store task <em>is</em> the authority for its CH slice; the map is built incrementally by three local, synchronous mutations:</p>
+      <ol class="steps">
+        <li><strong>Admit (insert).</strong> A decode task&rsquo;s <code>KVWriteback(conv_id, block_ids[], tier_hint)</code> lands on the store task that owns <code>conv_id</code> (the decode task reached it by the same <code>CH(conv_id)</code>). The store writes the KV bytes into <code>block_pool</code>, then <code>pool_index[conv_id] = PoolConvEntry(&hellip;)</code> &mdash; and in the same critical section <code>shard_filter.insert(fp(conv_id))</code>. Index and filter move together so the shard can never say &ldquo;present&rdquo; without a resolvable entry behind it.</li>
+        <li><strong>Evict (delete).</strong> When the store task&rsquo;s own DRAM-front watermark trips (or an <code>invalidate</code> arrives &mdash; e.g. a <code>user_sys</code> version change), it demotes blocks FRONT&rarr;BACK or drops the conv entirely. A full drop does <code>pool_index.pop(conv_id)</code> + <code>shard_filter.delete(conv_id)</code>. <em>This is the line that forces Cuckoo over Bloom</em> &mdash; a victim cache deletes on every admit&rsquo;s matching future evict (&sect;5).</li>
+        <li><strong>Rebalance (re-key).</strong> On a CH ring change (autoscale, a store task added, a store task lost), the slice boundary moves. The losing owner streams the affected <code>(conv_id, blocks)</code> to the new owner, which <code>index_put</code>s them into <em>its</em> shard; the old owner <code>index_del</code>s. <code>owning_pool_task_id</code> on the entry is updated so a stale reader that lands on the old owner gets a clean &ldquo;not mine&rdquo; rather than wrong blocks.</li>
+      </ol>
+
+      <h3 id="q1-used">3.3 &nbsp;How it is USED (step by step)</h3>
+      <p>The whole point of CH-on-<code>conv_id</code> is that <em>locating</em> a conv costs <strong>zero messages</strong> &mdash; the reader does arithmetic, not a lookup-service round-trip:</p>
+      <ol class="steps">
+        <li><strong>Compute the owner (no network).</strong> A warm turn arrives on a cold/rebalanced prefill task <code>P<sub>&beta;</sub></code> that lacks the prior KV. It computes <code>owner = pool_ring.lookup(conv_id)</code> against its <em>local</em> gossiped copy of the <code>kv-store-job</code> ring (<code>pool_ring</code>, ~36 tasks &mdash; a different ring from <code>decode_ring</code>/<code>prefill_ring</code>) &mdash; an O(log&nbsp;V) bisection, no message to anyone. <em>The owning store task is whichever <code>kv-store-job</code> task this resolves to &mdash; never the decode task (&sect;1).</em></li>
+        <li><strong>One RDMA to that one owner.</strong> It sends a single <code>KVPull(conv_id, missing_block_ids)</code> to the computed owner. Not a broadcast, not a scatter-probe &mdash; the cost does <em>not</em> grow with <code>kv_store_job_task_num</code>.</li>
+        <li><strong>Owner resolves locally.</strong> The store task does <code>e = pool_index.get(conv_id)</code>. Present &rarr; it reads <code>e.block_ids</code> from <code>block_pool</code> (FRONT or BACK) and streams them back as <code>KVPullResp(blocks)</code>. Absent &rarr; <code>KVPullMiss</code>.</li>
+        <li><strong>Stage or recompute.</strong> <code>P<sub>&beta;</sub></code> stages the returned blocks into HBM with fresh <code>slot_mapping</code> entries and runs the (now-shortened) prefill; on a miss it recomputes (<code>&beta;<sub>cold</sub></code>, RPO=0).</li>
+      </ol>
+
+      <div class="note-box"><strong>Worked example.</strong> Turn&nbsp;5 of <code>conv:7af3</code> (8&nbsp;K cumulative context) re-routes to a <em>cold</em> prefill task after an autoscale. <strong>(1)</strong> <code>P<sub>&beta;</sub></code> computes <code>pool_ring.lookup("7af3") = store-task-9</code> (the <code>kv-store-job</code> ring, not the decode ring). <strong>(2)</strong> It sends <code>KVPull("7af3", [b12,b13,b14])</code> to store-task-9 only. <strong>(3)</strong> store-task-9 does <code>pool_index["7af3"]</code> &rarr; <code>{[b12,b13,b14], FRONT}</code>, reads ~2.56&nbsp;GB from its DRAM front, streams it back. <strong>(4)</strong> <code>P<sub>&beta;</sub></code> stages it (<code>~2.56 GB / 25 GB/s &asymp; 102 ms</code> <span class="tag tag-d">[D]</span>) instead of re-prefilling (<code>&beta;<sub>cold</sub>(8 K) &asymp; 407 ms</code> <span class="tag tag-d">[D]</span>) &mdash; a single round-trip to a single task, located by arithmetic.</div>
+
+      <h3 id="q1-algo">3.4 &nbsp;Algorithm &mdash; the store-side index operations</h3>
+      <div class="two-col">
+        <div>
+          <h4>Build side (on the owning store task)</h4>
+          <div class="code-box"><span class="kw">def</span> <span class="fn">index_put</span>(conv_id, block_ids, tier):  <span class="cm"># admit</span>
+    pool_index[conv_id] = PoolConvEntry(
+        conv_id, MY_TASK_ID, block_ids, tier,
+        n_tokens=_count(block_ids), last_touch_ts=now())
+    shard_filter.insert(_fp(conv_id))      <span class="cm"># filter ∥ index</span>
+    _enqueue_gossip_insert(conv_id)        <span class="cm"># §4 fan-out</span>
+
+<span class="kw">def</span> <span class="fn">index_del</span>(conv_id):                 <span class="cm"># evict / invalidate</span>
+    e = pool_index.pop(conv_id, <span class="kw">None</span>)
+    <span class="kw">if</span> e:
+        _free_blocks(e.block_ids)
+        shard_filter.delete(_fp(conv_id))
+        _enqueue_gossip_delete(conv_id)
+
+<span class="kw">def</span> <span class="fn">rebalance</span>(moved_convs, new_owner):  <span class="cm"># ring change</span>
+    <span class="kw">for</span> cid <span class="kw">in</span> moved_convs:
+        _stream_blocks(cid, new_owner)     <span class="cm"># to its shard</span>
+        index_del(cid)                     <span class="cm"># drop from mine</span></div>
+        </div>
+        <div>
+          <h4>Read side (serves a KVPull)</h4>
+          <div class="code-box"><span class="kw">def</span> <span class="fn">handle_kv_pull</span>(req: KVPull):
+    e = pool_index.get(req.conv_id)        <span class="cm"># O(1) hashmap</span>
+    <span class="kw">if</span> e <span class="kw">is</span> <span class="kw">None</span>:                        <span class="cm"># not on this shard</span>
+        <span class="kw">return</span> KVPullMiss(req.conv_id)       <span class="cm"># → caller recomputes</span>
+    want = [b <span class="kw">for</span> b <span class="kw">in</span> req.block_ids
+                  <span class="kw">if</span> b <span class="kw">in</span> e.block_ids]
+    blocks = _read(want, e.tier)           <span class="cm"># FRONT (DRAM) or BACK (NVMe)</span>
+    e.last_touch_ts = now()                <span class="cm"># LRU promote on the front</span>
+    <span class="kw">return</span> KVPullResp(req.conv_id, blocks) <span class="cm"># RDMA stream</span>
+
+<span class="cm"># The caller's owner-compute — runs on the PREFILL task,</span>
+<span class="cm"># NOT here; shown for completeness (zero messages):</span>
+<span class="cm">#   owner = pool_ring.lookup(conv_id)   # local CH bisect</span>
+<span class="cm">#   resp  = rdma_request(owner, KVPull(conv_id, missing))</span></div>
+        </div>
+      </div>
+      <p><strong>Why a single RDMA and not a broadcast.</strong> The rejected alternative was a hot-path scatter-probe (&ldquo;does anyone hold <code>conv_id</code>?&rdquo;) costing O(<code>kv_store_job_task_num</code>) messages per warm turn (<a href="distributed_kv_cache.html#iter3b-dc-index">scenario DC4</a>). CH-on-<code>conv_id</code> collapses that to arithmetic: the key <em>names</em> its owner, so location is free and the read is exactly one round-trip to one task. The only residual cost &mdash; one wasted round-trip to discover a <em>miss</em> &mdash; is what the Cuckoo filter (&sect;5) removes.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="iter-head">
+        <h2 id="q2">4. Q2 &mdash; who gossips to whom (the OPTIONAL §S1 summary topology)</h2>
+        <p class="iter-meta"><strong>This hop runs only when the optional §S1 summary is enabled</strong> (burst-insurance); the main read path is the filter-free direct CH probe (§5). <strong>TL;DR &mdash; the four-hop chain.</strong> The membership summary is <em>produced</em> on the store tasks (they own the truth) and <em>consumed</em> on the prefill tasks (they decide pull-vs-recompute). It travels: <strong><code>kv-store-job</code> task &rarr; <code>broker-job</code> (Redis Streams, sketch fan-out) &rarr; <code>router-job</code> (read-replica) &rarr; <code>serving-prefill-job</code> task (Router relays <code>PoolFilterUpdate</code>)</strong>. It rides the <em>same</em> gossip bus that already carries ring-version + per-task wait-time &mdash; no new pipeline.</p>
+      </div>
+
+      <h3 id="q2-diagram">4.1 &nbsp;The gossip topology (diagram first)</h3>
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The membership-filter gossip topology, four columns left to right. Column 1: the kv-store-job, the producers — each store task owns a CH shard and an authoritative ten-kilobyte per-shard Cuckoo filter. Column 2: the broker-job, three HA tasks running Redis Streams, the sketch fan-out hub. Column 3: the router-job, stateless tasks that are read-replicas of the broker gossip. Column 4: the serving-prefill-job, the consumers — each prefill task holds a one-hundred-forty-four-kilobyte union pool_filter. Arrow 1: each store task publishes a per-shard PoolFilterDelta to the broker every 100 milliseconds. Arrow 2: the broker fans the membership sketch out to every Router, the same read-replica bus that carries ring-version and wait-time. Arrow 3: each Router relays a PoolFilterUpdate to every prefill task on the request channel it already owns, and the prefill task merges it into its union filter. A caption explains why the chain goes through the broker and Router rather than store-to-every-prefill directly.">
+        <defs>
+          <marker id="mgs2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+        </defs>
+        <style>
+          .g2-store { fill:#f5f3ff; stroke:#7c3aed; stroke-width:2; }
+          .g2-task  { fill:#fff; stroke:#a78bfa; stroke-width:1.3; }
+          .g2-brk   { fill:#fffbeb; stroke:#b45309; stroke-width:2; }
+          .g2-rtr   { fill:#eff6ff; stroke:#1e40af; stroke-width:2; }
+          .g2-pre   { fill:#ecfeff; stroke:#0e7490; stroke-width:2; }
+          .g2-ptask { fill:#fff; stroke:#22d3ee; stroke-width:1.3; }
+          .g2-t   { font-size:13px; font-weight:700; fill:#0f172a; }
+          .g2-s   { font-size:11px; fill:#475569; }
+          .g2-m   { font-family:'JetBrains Mono',monospace; font-size:10px; fill:#0f172a; }
+          .g2-lab { font-size:11px; font-weight:700; fill:#64748b; letter-spacing:.03em; }
+          .g2-num { font-size:13px; font-weight:700; fill:#fff; }
+          .g2-al  { font-size:11px; font-weight:700; fill:#334155; }
+          path.gs,line.gs { stroke:#64748b; stroke-width:2.2; stroke-dasharray:7 4; fill:none; marker-end:url(#mgs2); }
+        </style>
+
+        <!-- Col 1: producers -->
+        <text class="g2-lab" x="24" y="66">PRODUCERS &mdash; own the membership</text>
+        <rect class="g2-store" x="24" y="78" width="250" height="320" rx="10"/>
+        <text class="g2-t" x="149" y="100" text-anchor="middle"><tspan font-family="monospace">kv-store-job</tspan></text>
+        <text class="g2-s" x="149" y="116" text-anchor="middle">~36 tasks &middot; CH-on-conv_id</text>
+        <rect class="g2-task" x="40" y="128" width="218" height="66" rx="6"/>
+        <text class="g2-t" x="52" y="148">store task 1 &mdash; shard A</text>
+        <text class="g2-m" x="52" y="168">shard_filter (Cuckoo)</text>
+        <text class="g2-s" x="52" y="184">authoritative &middot; ~10 KB</text>
+        <rect class="g2-task" x="40" y="206" width="218" height="66" rx="6"/>
+        <text class="g2-t" x="52" y="226">store task 2 &mdash; shard B</text>
+        <text class="g2-m" x="52" y="246">shard_filter (Cuckoo)</text>
+        <text class="g2-s" x="52" y="262">authoritative &middot; ~10 KB</text>
+        <text class="g2-s" x="149" y="300" text-anchor="middle" font-style="italic">&hellip; 36 shards, one filter each</text>
+        <text class="g2-s" x="149" y="322" text-anchor="middle">each filter = membership of</text>
+        <text class="g2-s" x="149" y="338" text-anchor="middle">ITS conv_ids only</text>
+        <text class="g2-m" x="149" y="362" text-anchor="middle">insert on admit</text>
+        <text class="g2-m" x="149" y="378" text-anchor="middle">delete on evict</text>
+
+        <!-- Col 2: broker -->
+        <text class="g2-lab" x="330" y="66">FAN-OUT HUB</text>
+        <rect class="g2-brk" x="330" y="190" width="190" height="120" rx="10"/>
+        <text class="g2-t" x="425" y="214" text-anchor="middle"><tspan font-family="monospace">broker-job</tspan></text>
+        <text class="g2-s" x="425" y="232" text-anchor="middle">3-task HA</text>
+        <text class="g2-s" x="425" y="250" text-anchor="middle">Redis Streams / NATS</text>
+        <text class="g2-s" x="425" y="270" text-anchor="middle" font-weight="700">&ldquo;sketch fan-out&rdquo;</text>
+        <text class="g2-s" x="425" y="288" text-anchor="middle">also carries ring +</text>
+        <text class="g2-s" x="425" y="302" text-anchor="middle">wait-time (Iter 1b)</text>
+
+        <!-- Col 3: router -->
+        <text class="g2-lab" x="600" y="66">READ-REPLICA</text>
+        <rect class="g2-rtr" x="600" y="190" width="190" height="120" rx="10"/>
+        <text class="g2-t" x="695" y="214" text-anchor="middle"><tspan font-family="monospace">router-job</tspan></text>
+        <text class="g2-s" x="695" y="232" text-anchor="middle">stateless CPU tasks</text>
+        <text class="g2-s" x="695" y="250" text-anchor="middle">subscribes to broker</text>
+        <text class="g2-s" x="695" y="270" text-anchor="middle">already has an</text>
+        <text class="g2-s" x="695" y="284" text-anchor="middle">R&rarr;S channel to every</text>
+        <text class="g2-s" x="695" y="298" text-anchor="middle">serving task (it routes)</text>
+
+        <!-- Col 4: consumers -->
+        <text class="g2-lab" x="900" y="66">CONSUMERS &mdash; probe before pull</text>
+        <rect class="g2-pre" x="900" y="78" width="276" height="320" rx="10"/>
+        <text class="g2-t" x="1038" y="100" text-anchor="middle"><tspan font-family="monospace">serving-prefill-job</tspan></text>
+        <text class="g2-s" x="1038" y="116" text-anchor="middle">every prefill task is a consumer</text>
+        <rect class="g2-ptask" x="916" y="128" width="244" height="66" rx="6"/>
+        <text class="g2-t" x="928" y="148">prefill task P&#946;&#8321;</text>
+        <text class="g2-m" x="928" y="168">pool_filter (UNION)</text>
+        <text class="g2-s" x="928" y="184">all 36 shards &middot; ~326 KB</text>
+        <rect class="g2-ptask" x="916" y="206" width="244" height="66" rx="6"/>
+        <text class="g2-t" x="928" y="226">prefill task P&#946;&#8322;</text>
+        <text class="g2-m" x="928" y="246">pool_filter (UNION)</text>
+        <text class="g2-s" x="928" y="262">all 36 shards &middot; ~326 KB</text>
+        <text class="g2-s" x="1038" y="300" text-anchor="middle" font-style="italic">&hellip; every prefill task holds</text>
+        <text class="g2-s" x="1038" y="316" text-anchor="middle">the SAME union replica</text>
+        <text class="g2-m" x="1038" y="340" text-anchor="middle">merge delta &rarr; pool_filter</text>
+        <text class="g2-m" x="1038" y="356" text-anchor="middle">probe locally (&sect;5)</text>
+        <text class="g2-s" x="1038" y="378" text-anchor="middle">no broker subscription</text>
+
+        <!-- arrows -->
+        <line class="gs" x1="274" y1="250" x2="328" y2="250"/>
+        <circle cx="301" cy="250" r="13" fill="#64748b"/><text class="g2-num" x="301" y="255" text-anchor="middle">1</text>
+        <text class="g2-al" x="301" y="226" text-anchor="middle">PoolFilterDelta</text>
+        <text class="g2-s" x="301" y="284" text-anchor="middle">every 100 ms</text>
+
+        <line class="gs" x1="520" y1="250" x2="598" y2="250"/>
+        <circle cx="559" cy="250" r="13" fill="#64748b"/><text class="g2-num" x="559" y="255" text-anchor="middle">2</text>
+        <text class="g2-al" x="559" y="226" text-anchor="middle">fan-out</text>
+        <text class="g2-s" x="559" y="284" text-anchor="middle">to every Router</text>
+
+        <line class="gs" x1="790" y1="250" x2="898" y2="250"/>
+        <circle cx="844" cy="250" r="13" fill="#64748b"/><text class="g2-num" x="844" y="255" text-anchor="middle">3</text>
+        <text class="g2-al" x="844" y="226" text-anchor="middle">PoolFilterUpdate</text>
+        <text class="g2-s" x="844" y="284" text-anchor="middle">relay on R&rarr;S</text>
+
+        <!-- caption -->
+        <rect x="24" y="428" width="1152" height="116" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text class="g2-t" x="40" y="450">Why through the broker + Router, not store &rarr; every prefill directly</text>
+        <text class="g2-s" x="40" y="472"><tspan font-weight="700" fill="#b91c1c">&#10007;</tspan> store &rarr; every prefill (direct): an N&times;M mesh &mdash; 36 store tasks &times; ~thousands of prefill tasks = an all-to-all gossip storm that grows with BOTH fleets.</text>
+        <text class="g2-s" x="40" y="492"><tspan font-weight="700" fill="#b91c1c">&#10007;</tspan> broker &rarr; prefill (direct): would make every serving task a broker subscriber. In this design only Routers subscribe to the broker (the read-replica pattern); serving tasks talk to the Router.</text>
+        <text class="g2-s" x="40" y="512"><tspan font-weight="700" fill="#15803d">&#10003;</tspan> store &rarr; broker &rarr; Router &rarr; prefill: the broker is the EXISTING fan-out hub; the Router ALREADY pushes to every serving task (it routes requests there), so PoolFilterUpdate</text>
+        <text class="g2-s" x="40" y="528">&nbsp;&nbsp;&nbsp;piggybacks on a channel that already exists. Each hop is async (dashed): a stale replica only ever causes a recompute, never a wrong answer (&sect;5).</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9312;</span> <strong>Store task &rarr; broker:</strong> each store task emits a <code>PoolFilterDelta(shard_id, inserts[], deletes[], version)</code> &mdash; the fingerprints admitted/evicted since the last tick &mdash; to the broker every <code>T<sub>gossip</sub> = 100 ms</code> (or on a large delta). The store tasks are the <em>only</em> writers of membership truth.</li>
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9313;</span> <strong>Broker &rarr; Router:</strong> the broker fans the membership sketch out to every Router on the <em>same</em> read-replica stream that already delivers ring-version + wait-time (<a href="distributed_kv_cache.html#iter1b">scenario Iter&nbsp;1b</a>). Adding the filter is a new <em>topic</em>, not a new pipeline.</li>
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9314;</span> <strong>Router &rarr; prefill task:</strong> each Router relays <code>PoolFilterUpdate(blob)</code> to the prefill tasks on the channel it already uses to send <code>Route</code> decisions; the prefill task merges the delta into its union <code>pool_filter</code> and bumps <code>pool_filter_version</code>.</li>
+      </ul>
+
+      <h3 id="q2-chain">4.2 &nbsp;The chain, hop by hop</h3>
+      <ol class="steps">
+        <li><strong>Produce (store task).</strong> The authoritative membership of a shard <em>is</em> the keyset of its <code>pool_index</code>. Every <code>index_put</code>/<code>index_del</code> mirrors into <code>shard_filter</code> and enqueues an insert/delete fingerprint. A timer flushes the accumulated <code>PoolFilterDelta</code> to the broker every 100&nbsp;ms.</li>
+        <li><strong>Fan out (broker).</strong> The <code>broker-job</code> (3-task HA Redis Streams) is the cluster&rsquo;s gossip bus &mdash; it already does &ldquo;sketch fan-out&rdquo; for the wait-time signal. It republishes each shard&rsquo;s delta to all Router subscribers. Choosing Redis Streams over Kafka: Kafka&rsquo;s per-topic overhead is too heavy for ~100&nbsp;K low-rate gossip msg/s, and Redis Streams is in-memory and already in the observability stack.</li>
+        <li><strong>Relay (Router).</strong> Routers are the broker&rsquo;s read-replicas. A Router does <em>not</em> consume the filter for routing (routing is by CH + wait-time); it merely <strong>relays</strong> <code>PoolFilterUpdate</code> downstream to the serving tasks &mdash; the one direction (R&rarr;S) it already owns because it sends every <code>Route</code> there.</li>
+        <li><strong>Apply (prefill task).</strong> The prefill task applies each shard&rsquo;s insert/delete deltas into its <em>single</em> local <code>pool_filter</code> &mdash; a Cuckoo filter covering <em>all</em> shards&rsquo; keys (note: you can&rsquo;t bit-wise-OR-merge Cuckoo tables the way you can Bloom filters, so &ldquo;union&rdquo; here means one filter <em>fed the merged delta stream</em>, not a combined table) &mdash; and records the per-shard <code>version</code>. A version gap (a missed delta) triggers a full-blob refresh. This filter is what &sect;5 probes before every pull.</li>
+      </ol>
+
+      <div class="ref-box"><strong>Wire-bandwidth sanity (why the broker NIC, not 1&nbsp;Gbps).</strong> The per-shard delta blob is small, but the broker <em>fans it out</em> to every Router: <code>broker_outbound = broker_inbound &times; router_task_num</code>. With the filter blob (~10&nbsp;KB/shard) riding the 100&nbsp;ms push alongside wait-time, this is why the <code>broker-job</code> is specced with a <strong>25&nbsp;Gbps NIC</strong>, not 1&nbsp;Gbps (<a href="distributed_kv_cache.html#iter1b">scenario Iter&nbsp;1b</a> broker sizing). The full fan-out derivation lives on <a href="router.html">router.html</a> / the broker sizing; here it just explains why the hub exists.</div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <div class="iter-head">
+        <h2 id="q3">5. Q3 &mdash; the membership summary (OPTIONAL &sect;S1 sidecar)</h2>
+        <p class="iter-meta"><strong>TL;DR.</strong> The summary is an <em>approximate</em> &ldquo;is this <code>conv_id</code> in the pool?&rdquo; pre-check. It is <strong>OPTIONAL</strong>: the <em>main</em> read path on a local miss is a <strong>direct <code>CH(conv_id, pool_ring)</code> probe to the owner</strong> (computed, one RDMA) &mdash; affordable on its own (&sect;5.5). The summary is <strong>burst-insurance</strong> for correlated mass-miss events (rolling deploy / autoscale / fabric blip), and if added an <strong>exact <code>conv_id</code> set is preferred</strong> over the Cuckoo filter (no FPR, no load-factor cliff; &sect;S1). This section builds out the Cuckoo variant for depth; a wrong answer can only ever cause a <em>recompute</em>, never wrong KV.</p>
+      </div>
+      <div class="warn-box"><strong>This whole section is the &sect;S1 sidecar.</strong> It reverses the earlier &ldquo;filter required / Cuckoo CHOSEN&rdquo; framing (<code>DESIGN_CHOICE_CHANGE.md</code> §S1). Read &ldquo;gates every pull&rdquo; below as &ldquo;<em>pre-checks</em> every pull <em>when enabled</em>&rdquo;; the unconditional path is the direct CH probe. The Cuckoo-vs-Bloom analysis (&sect;5.2, &sect;5.6) is the <em>which-summary-if-any</em> sub-choice &mdash; and &sect;S1 prefers the exact set unless its ~7&times; memory bites at consumer scale.</div>
+
+      <h3 id="q3-diagram">5.1 &nbsp;The lookup path it gates (diagram first)</h3>
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The lookup decision flow gated by the Cuckoo filter. A warm turn on a cold prefill task first probes its LOCAL union pool_filter, in process, zero network, touching only two candidate buckets. If the filter says absent — definitely not in the pool, the common case at about 97 percent of warm turns — the task recomputes at beta-cold, RPO zero, and the pool is never touched. If the filter says present-maybe, the task computes the owner by consistent hashing with zero messages, sends one RDMA KVPull, the owner does an index_get and returns the blocks on a hit which are staged to HBM, or returns a miss on a false positive or a lost write-back race, which also falls back to recompute. A bottom inset notes the false-positive rate is about 0.1 to 1 percent and that both failure modes are safe because recompute is always the floor.">
+        <defs>
+          <marker id="q3sy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="q3rd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+          <marker id="q3rc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker>
+        </defs>
+        <style>
+          .q3-a   { fill:#eff6ff; stroke:#1e40af; stroke-width:1.8; }
+          .q3-b   { fill:#f5f3ff; stroke:#7c3aed; stroke-width:2.4; }
+          .q3-abs { fill:#fef2f2; stroke:#b91c1c; stroke-width:1.8; }
+          .q3-prs { fill:#ecfdf5; stroke:#047857; stroke-width:1.8; }
+          .q3-t   { font-size:13px; font-weight:700; fill:#0f172a; }
+          .q3-s   { font-size:11px; fill:#475569; }
+          .q3-m   { font-family:'JetBrains Mono',monospace; font-size:10.5px; fill:#0f172a; }
+          .q3-num { font-size:12px; font-weight:700; fill:#fff; }
+          .q3-al  { font-size:11px; font-weight:700; fill:#334155; }
+          path.sy,line.sy { stroke:#1e293b; stroke-width:1.8; fill:none; marker-end:url(#q3sy); }
+          path.rd,line.rd { stroke:#0d9488; stroke-width:2; stroke-dasharray:7 4; fill:none; marker-end:url(#q3rd); }
+          path.rc,line.rc { stroke:#b91c1c; stroke-width:1.8; stroke-dasharray:4 3; fill:none; marker-end:url(#q3rc); }
+        </style>
+
+        <!-- C: absent / D: recompute (top row) -->
+        <rect class="q3-abs" x="560" y="60" width="280" height="80" rx="9"/>
+        <text class="q3-t" x="700" y="84" text-anchor="middle">filter says ABSENT</text>
+        <text class="q3-s" x="700" y="104" text-anchor="middle">False &rArr; DEFINITELY not in the pool</text>
+        <text class="q3-s" x="700" y="122" text-anchor="middle" font-weight="700">the common case &mdash; ~97% of warm turns</text>
+
+        <rect class="q3-abs" x="884" y="60" width="288" height="80" rx="9"/>
+        <text class="q3-t" x="1028" y="84" text-anchor="middle">recompute (&beta;<tspan baseline-shift="sub" font-size="8">cold</tspan>)</text>
+        <text class="q3-s" x="1028" y="104" text-anchor="middle">RPO=0 &mdash; always correct</text>
+        <text class="q3-s" x="1028" y="122" text-anchor="middle">pool never touched &middot; 0 network</text>
+
+        <!-- A: entry -->
+        <rect class="q3-a" x="24" y="232" width="232" height="92" rx="9"/>
+        <text class="q3-t" x="140" y="258" text-anchor="middle">warm turn on cold P&#946;</text>
+        <text class="q3-s" x="140" y="278" text-anchor="middle">needs prior conv K,V</text>
+        <text class="q3-s" x="140" y="296" text-anchor="middle">(e.g. the ~400-tok asst</text>
+        <text class="q3-s" x="140" y="312" text-anchor="middle">delta it never computed)</text>
+
+        <!-- B: probe (hub) -->
+        <rect class="q3-b" x="304" y="220" width="238" height="116" rx="10"/>
+        <text class="q3-t" x="423" y="244" text-anchor="middle">probe LOCAL pool_filter</text>
+        <text class="q3-s" x="423" y="264" text-anchor="middle">~326 KB &middot; in-process &middot; 0 network</text>
+        <text class="q3-m" x="423" y="286" text-anchor="middle">maybe_contains(conv_id)</text>
+        <text class="q3-s" x="423" y="306" text-anchor="middle">2 candidate buckets, O(1)</text>
+        <text class="q3-s" x="423" y="324" text-anchor="middle" font-style="italic">no broadcast, no probe to the pool</text>
+
+        <!-- E: present / F: pull (lower row) -->
+        <rect class="q3-prs" x="560" y="388" width="280" height="86" rx="9"/>
+        <text class="q3-t" x="700" y="412" text-anchor="middle">filter says PRESENT (maybe)</text>
+        <text class="q3-m" x="700" y="434" text-anchor="middle">owner = pool_ring.lookup(conv_id)</text>
+        <text class="q3-s" x="700" y="454" text-anchor="middle">CH &mdash; 0 messages (&sect;3)</text>
+
+        <rect class="q3-prs" x="884" y="372" width="288" height="118" rx="9"/>
+        <text class="q3-t" x="1028" y="396" text-anchor="middle">1 RDMA KVPull &rarr; owner</text>
+        <text class="q3-m" x="1028" y="416" text-anchor="middle">owner: index_get &rarr; blocks</text>
+        <text class="q3-s" x="1028" y="438" text-anchor="middle"><tspan font-weight="700" fill="#047857">hit</tspan> &rarr; KVPullResp &rarr; stage to HBM</text>
+        <text class="q3-s" x="1028" y="458" text-anchor="middle"><tspan font-weight="700" fill="#b91c1c">miss</tspan> (false-pos / lost race)</text>
+        <text class="q3-s" x="1028" y="474" text-anchor="middle">&rarr; recompute</text>
+
+        <!-- arrows -->
+        <line class="sy" x1="256" y1="278" x2="302" y2="278"/>
+        <circle cx="279" cy="278" r="11" fill="#1e293b"/><text class="q3-num" x="279" y="282" text-anchor="middle">1</text>
+
+        <path class="sy" d="M 460 220 Q 470 170 560 130"/>
+        <circle cx="494" cy="168" r="11" fill="#1e293b"/><text class="q3-num" x="494" y="172" text-anchor="middle">2</text>
+        <text class="q3-al" x="430" y="150">False</text>
+
+        <line class="rc" x1="840" y1="100" x2="882" y2="100"/>
+        <circle cx="861" cy="100" r="11" fill="#b91c1c"/><text class="q3-num" x="861" y="104" text-anchor="middle">3</text>
+
+        <path class="sy" d="M 460 336 Q 470 380 560 412"/>
+        <circle cx="494" cy="388" r="11" fill="#1e293b"/><text class="q3-num" x="494" y="392" text-anchor="middle">4</text>
+        <text class="q3-al" x="424" y="372">True</text>
+
+        <line class="rd" x1="840" y1="430" x2="882" y2="430"/>
+        <circle cx="861" cy="430" r="11" fill="#0d9488"/><text class="q3-num" x="861" y="434" text-anchor="middle">5</text>
+
+        <path class="rc" d="M 1028 372 L 1028 142"/>
+        <circle cx="1028" cy="250" r="11" fill="#b91c1c"/><text class="q3-num" x="1028" y="254" text-anchor="middle">6</text>
+        <text class="q3-al" x="1042" y="250">miss &rarr; recompute</text>
+
+        <!-- inset -->
+        <rect x="24" y="498" width="1148" height="54" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text class="q3-s" x="40" y="520"><tspan font-weight="700">FPR &asymp; 2b / 2^f = 8 / 4096 &asymp; 0.2%</tspan> (f = 12-bit fingerprint, b = 4). Both failure modes are SAFE: a false-positive (just-evicted still &ldquo;present&rdquo;) wastes one round-trip then recomputes;</text>
+        <text class="q3-s" x="40" y="538">a false-negative (just-admitted not yet gossiped) skips the pull and recomputes. Neither returns wrong KV &mdash; recompute (RPO=0) is always the floor, so APPROXIMATE is acceptable.</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span style="color:#1e293b;">&#9472;&#9472;</span> <span class="b">&#9312;</span> <strong>Probe (local):</strong> the prefill task checks its union <code>pool_filter</code> in-process &mdash; two candidate-bucket reads, no network. This is the whole optimization.</li>
+        <li><span style="color:#1e293b;">&#9472;&#9472;</span> <span class="b">&#9313;</span> <strong>False &rArr; absent:</strong> a Cuckoo &ldquo;not present&rdquo; is <em>exact</em> &mdash; the conv is definitely not in the pool, so skip it entirely.</li>
+        <li><span style="color:#b91c1c;">&#9476;&#9476;</span> <span class="b">&#9314;&#9317;</span> <strong>Recompute leg:</strong> absent (&#9314;) or a confirmed miss (&#9317;) both fall to <code>&beta;<sub>cold</sub></code> re-prefill, RPO=0.</li>
+        <li><span style="color:#1e293b;">&#9472;&#9472;</span> <span class="b">&#9315;</span> <strong>True &rArr; maybe present:</strong> a Cuckoo &ldquo;present&rdquo; is <em>approximate</em> &mdash; proceed to CH-locate the owner.</li>
+        <li><span style="color:#0d9488;">&#9476;&#9476;</span> <span class="b">&#9316;</span> <strong>Pull (RDMA):</strong> one round-trip to the computed owner, which resolves blocks via <code>index_get</code> (&sect;3) and streams them back; a hit stages to HBM.</li>
+      </ul>
+
+      <h3 id="q3-what">5.2 &nbsp;What a Cuckoo filter <em>is</em> (from zero)</h3>
+      <ul>
+        <li><strong>The job.</strong> A <em>membership</em> structure: answer &ldquo;is key <code>x</code> in the set?&rdquo; in a few bytes per key, far smaller than storing the keys. It may answer &ldquo;present&rdquo; for an absent key (a <em>false positive</em>, at rate FPR), but <strong>never</strong> &ldquo;absent&rdquo; for a present key &mdash; so a &ldquo;not present&rdquo; is exact and a &ldquo;present&rdquo; is &ldquo;probably.&rdquo;</li>
+        <li><strong>How Cuckoo stores it.</strong> Instead of a Bloom filter&rsquo;s <code>k</code> scattered bits, a Cuckoo filter stores a short <strong>fingerprint</strong> (here <code>f = 12</code> bits) of each key in a <em>cuckoo hash table</em>. <em>The key here is the <code>conv_id</code></em> &mdash; the filter answers exactly one question, &ldquo;is this conversation&rsquo;s KV in the pool?&rdquo;, so it stores <code>fp(conv_id)</code> and a lookup is <code>maybe_contains(conv_id)</code> (see BUILD &sect;5.3 and the probe in &sect;5.5). Each key maps to two candidate buckets (hence &ldquo;cuckoo&rdquo; &mdash; on a collision, kick an occupant to its alternate bucket). A lookup reads only those <strong>2 buckets</strong> &mdash; cache-friendly versus Bloom&rsquo;s <code>k</code> random probes.</li>
+        <li><strong>Why Cuckoo here and not Bloom (the one reason).</strong> A victim cache <em>evicts constantly</em> &mdash; every admit has a matching future evict. A plain Bloom filter <strong>cannot delete</strong> (clearing bits corrupts other keys), so its FPR would rot toward 1 (everything reads &ldquo;present&rdquo;) as the pool churns. Cuckoo <strong>deletes natively</strong> (remove the fingerprint from its bucket). Counting Bloom can delete too but costs ~4&times; the space &mdash; and this filter is replicated to <em>every</em> prefill task, so footprint matters. Cuckoo wins on delete-support &times; space. <em>This is the only probabilistic filter in the whole design</em> (<a href="distributed_kv_cache.html#iter3b-dc-index">scenario DC4</a>).</li>
+        <li><strong>The tuning knob.</strong> <code>FPR &asymp; 2b / 2<sup>f</sup></code> (<code>b</code> = bucket size). Wider fingerprint <code>f</code> &rarr; lower FPR &rarr; more bytes/key. At <code>f = 12, b = 4</code>: <code>FPR &asymp; 8/4096 &asymp; 0.2%</code> at <strong>~1.6 B/key</strong> &mdash; the <em>dense-pack</em> density (≈95% load factor); production provisions headroom below that cliff (<a href="#q3-scale">&sect;5.6</a>).</li>
+      </ul>
+
+      <h3 id="q3-build">5.3 &nbsp;How it is BUILT (step by step)</h3>
+      <ol class="steps">
+        <li><strong>Per-shard, on the store task.</strong> Each store task owns one <code>shard_filter</code> covering exactly <em>its</em> <code>conv_id</code>s. There is no central filter &mdash; the membership truth is distributed the same way the index is.</li>
+        <li><strong>Insert on admit.</strong> Inside <code>index_put</code> (&sect;3.4), the store does <code>shard_filter.insert(fp(conv_id))</code> in the same critical section as the index write &mdash; the filter never lags its own shard&rsquo;s truth.</li>
+        <li><strong>Delete on evict.</strong> Inside <code>index_del</code>, <code>shard_filter.delete(fp(conv_id))</code>. Native delete is the property that keeps the FPR flat as the victim cache churns.</li>
+        <li><strong>Emit a delta.</strong> A 100&nbsp;ms timer flushes the accumulated inserts/deletes as a <code>PoolFilterDelta</code> onto the gossip bus (&sect;4). Downstream, each prefill task applies all shards&rsquo; insert/delete deltas into its <em>single</em> local <code>pool_filter</code> (one Cuckoo filter covering every shard&rsquo;s keys &mdash; fed the merged delta stream, not a bit-wise OR of tables).</li>
+      </ol>
+
+      <h3 id="q3-size">5.4 &nbsp;Sizing the OPTIONAL summary (Cuckoo variant) &mdash; ~9&nbsp;KB per shard, ~326&nbsp;KB union</h3>
+      <p><em>(These size the &sect;S1 Cuckoo variant <strong>if</strong> it is deployed; the main read path carries no summary. An exact <code>conv_id</code> set is preferred &mdash; ~7&times; this memory, still trivial.)</em> The two figures that look inconsistent at first glance are the <em>per-shard</em> filter (the gossip unit) and the <em>union</em> replica (what each prefill task would hold). They reconcile exactly:</p>
+      <div class="formula-box">per-shard keys   = POOLED_CONVS / KV_STORE_JOB_TASK_NUM = 204 000 / 36       &asymp; <strong>5 667 convs/shard</strong>   <span class="tag tag-d">[D]</span>
+shard_filter     = 5 667 &times; CUCKOO_BYTES_PER_KEY    = 5 667 &times; 1.6 B          &asymp; <strong>~9 KB</strong>             <span class="tag tag-d">[D &mdash; the gossip blob, §4 hop 1]</span>
+
+union pool_filter = POOLED_CONVS &times; CUCKOO_BYTES_PER_KEY = 204 000 &times; 1.6 B    &asymp; <strong>~326 KB</strong>           <span class="tag tag-d">[D &mdash; resident on EVERY prefill task, if enabled]</span>
+consumer-scale    = (after user_sys overflow, a later scale event) &times; 1.6 B           &asymp; <strong>low MB</strong>      <span class="tag tag-d">[D &mdash; scenario §9b.3]</span></div>
+      <ul>
+        <li><strong>~9&nbsp;KB = one shard&rsquo;s filter</strong> &mdash; the unit a store task gossips. (The impl plan&rsquo;s &ldquo;~10&nbsp;KB blob&rdquo; is this per-shard figure.)</li>
+        <li><strong>~326&nbsp;KB = the union</strong> &mdash; 36 &times; ~9&nbsp;KB, the replica resident on every prefill task. Trivially task-resident; even the consumer-scale union is a rounding error against an 80&nbsp;GB-HBM host. <em>(An exact set would be ~7&times; this &mdash; still trivial, and the &sect;S1-preferred choice.)</em></li>
+        <li><strong>Why a filter and not the full index.</strong> Replicating the authoritative <code>PoolConvIndex</code> (KBs/conv, mutating every admit/evict) fleet-wide would be ~GBs per prefill task and perpetually stale. The filter is the 1-bit-per-key summary &mdash; small enough to replicate, approximate enough to gossip lazily, and backstopped by recompute.</li>
+      </ul>
+
+      <h3 id="q3-algo">5.5 &nbsp;Algorithm &mdash; the prefill-side probe + pull</h3>
+      <div class="code-box"><span class="cm"># Runs on the PREFILL task. MAIN PATH = the direct CH probe; recompute (RPO=0) is the floor.</span>
+<span class="cm"># The §S1 summary (pool_filter) is OPTIONAL — when enabled it short-circuits absent keys before the RTT.</span>
+<span class="kw">async def</span> <span class="fn">pull_or_recompute</span>(conv_id: <span class="kw">str</span>, missing_block_ids: <span class="kw">list</span>[<span class="kw">int</span>]):
+    <span class="cm"># (0, OPTIONAL §S1) if a summary is enabled and says EXACTLY-absent, skip the pool (saves one RTT in a burst):</span>
+    <span class="kw">if</span> pool_filter <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> pool_filter.maybe_contains(conv_id):
+        <span class="kw">return</span> _recompute_prefill(conv_id, missing_block_ids)   <span class="cm"># β_cold, RPO=0</span>
+
+    <span class="cm"># (1) MAIN PATH: CH-locate the one owner (0 messages), one RDMA probe-and-pull.</span>
+    owner = pool_ring.lookup(conv_id)
+    resp  = <span class="kw">await</span> _rdma_request(owner, KVPull(conv_id, missing_block_ids))
+
+    <span class="cm"># (2) absent (never admitted / evicted) OR lost the write-back race → recompute. Still correct.</span>
+    <span class="kw">if</span> <span class="kw">isinstance</span>(resp, KVPullMiss):
+        <span class="kw">return</span> _recompute_prefill(conv_id, missing_block_ids)
+    <span class="cm"># (3, p99) if the pull blows its TTFT budget under fabric contention → abandon → recompute (α-tail, §6.5).</span>
+    _stage_into_hbm(resp.blocks)                                <span class="cm"># fresh slot_mapping, then run the shortened prefill</span></div>
+      <ul>
+        <li><strong>The direct probe carries the steady state</strong> (&sect;5.5 budget: &le; <code>&lambda;<sub>peak</sub>/kv_store_job_task_num &asymp; 0.03&ndash;0.06%</code> CPU/store-task). The absent case costs one wasted RDMA RTT (~&micro;s) ahead of a hundreds-of-ms recompute &mdash; noise.</li>
+        <li><strong>What the OPTIONAL §S1 summary adds, when enabled (burst-insurance).</strong> <em>Per-request latency</em> &mdash; a confirmed-absent skips the RTT. <em>Pool-side QPS</em> &mdash; the store sees only summary-positive pulls, shrinking its query load by <code>1 / positive_fraction</code> during a correlated mass-miss storm. On the main line (no summary) the direct probe carries it.</li>
+        <li><strong>Why approximate is safe (the asymmetry).</strong> The index must be <em>exact</em> (it returns the actual blocks); the filter may be <em>stale</em> by a gossip interval because its only outputs are &ldquo;skip the pull&rdquo; or &ldquo;try the pull,&rdquo; and the wrong choice costs at most one round-trip + a recompute. The filter is a pure cost optimizer on the miss path, not a correctness component.</li>
+      </ul>
+
+      <h3 id="q3-scale">5.6 &nbsp;Does Cuckoo hold up at this traffic? (eviction chains + the ~95% load-factor cliff)</h3>
+      <p><strong>The concern is real.</strong> A Cuckoo insert places a fingerprint in one of two candidate buckets; if both are full it <em>kicks</em> an occupant to <em>its</em> alternate bucket and repeats &mdash; an <strong>eviction chain</strong>. As the table approaches its practical ceiling (<code>b = 4</code> buckets &rarr; <strong>~95% load factor</strong>), those chains lengthen and an insert can ultimately <strong>fail</strong> (no slot after <code>MaxKicks</code>). So &ldquo;just pack it to 1.6 B/key&rdquo; &mdash; which <em>is</em> the ~95% density &mdash; would park the filter exactly on that cliff. Four reasons it still holds, given one sizing fix:</p>
+      <ol class="steps">
+        <li><strong>The hot path is cliff-immune.</strong> A <em>lookup</em> reads exactly <strong>2 candidate buckets</strong>, O(1), <em>independent of load factor</em> &mdash; it never kicks. The probe-before-pull (the only filter op at request rate, ~4 K/s) does not degrade no matter how full the table is. The cliff touches <em>inserts</em> only.</li>
+        <li><strong>Inserts are off the hot path.</strong> Inserts/deletes run on the <em>gossip-apply</em> side at the churn rate (admits + evicts), not the request rate, and not on the decode tick or the prefill critical path. An occasional long kick chain adds microseconds to a background coroutine &mdash; invisible to TTFT/TPOT.</li>
+        <li><strong>Provision headroom &mdash; don&rsquo;t run at 95%.</strong> <code>~1.6 B/key</code> is the <em>dense-pack</em> bound, not the operating point. Size the <em>table capacity</em> for ~&#8531; load factor (≈1.5&times; the slots) so steady-state occupancy sits far below the cliff &rarr; inserts stay amortized-O(1), insert-failure ≈ never. The cost: the union grows <code>~144 KB &rarr; ~210 KB</code> per prefill task <span class="tag tag-d">[D &mdash; 90 K &times; 1.6 B / 0.66]</span> &mdash; still a rounding error against 80 GB HBM. A <strong>bounded working set</strong> (~90 K convs, delete-on-evict) keeps occupancy from drifting upward, and a background <strong>resize</strong> (rebuild at 2&times; capacity) is the backstop if a shard ever spikes past headroom.</li>
+        <li><strong>Even the cliff degrades to recompute.</strong> If an insert <em>does</em> fail (table over capacity), that conv is simply <em>absent</em> from the filter &rarr; a false negative &rarr; the prefill recomputes instead of pulling &mdash; <em>still correct</em> (RPO=0). The worst case is &ldquo;lose the pull optimization for some convs,&rdquo; never wrong KV and never an outage. Detection: an insert-failure / load-factor metric per shard pages before it matters.</li>
+      </ol>
+      <div class="warn-box"><strong>Honest caveat &mdash; the cliff is also an argument for <em>not</em> using a probabilistic filter at all.</strong> Because the working set is small, an <em>exact</em> hash set of <code>conv_id</code>s (<code>90 K &times; ~12 B &asymp; ~1 MB</code>; <code>~32 MB</code> at consumer scale) sidesteps the eviction-chain / load-factor cliff entirely &mdash; no FPR, no kicks, trivial delete. Cuckoo&rsquo;s only edge is <strong>memory</strong> (~7&times; smaller at consumer scale: ~4.3 MB vs ~32 MB), which is itself noise against HBM. So if the load-factor failure mode is judged not worth the operational weight (it is the <em>only</em> probabilistic component in the design), the cheap escape hatch is to swap the Cuckoo filter for an exact membership set &mdash; same protocol, same gossip, no cliff. That is a <a href="distributed_kv_cache.html#iter3b-dc-index">DC4</a> reopener, tracked for review rather than changed here.</div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="protocol">6. Protocol message catalog</h2>
+      <p>Five message types touch the store. The data plane (<code>KVWriteback</code> / <code>KVPull</code>) is RDMA over NDR400 IB; the control plane (the filter gossip) rides the broker. All are <strong>off the per-token decode tick</strong> and off the prefill hot path (awaited on coroutines). The store-side handlers for the data-plane messages are in <a href="#q1-algo">&sect;3.4</a>; the caller side is in <a href="scheduler.html#iter3b-algo">scheduler.html &sect;10b.3</a>.</p>
+      <table class="sheet">
+        <thead><tr><th>Message</th><th>Direction</th><th>Trigger</th><th>Payload</th><th>Plane / transport</th></tr></thead>
+        <tbody>
+          <tr><td><code>KVWriteback(conv_id, block_ids[], tier_hint)</code></td><td>decode task &rarr; store</td><td>EOS / local-tier evict <em>and</em> admission gate passes</td><td>the turn&rsquo;s KV blocks (incl. the asst delta) &mdash; up to ~128&nbsp;MB/turn</td><td>data &middot; RDMA (async, off-tick)</td></tr>
+          <tr><td><code>KVWritebackAck(conv_id)</code></td><td>store &rarr; decode task</td><td>blocks durable in <code>block_pool</code> + indexed</td><td>ack only</td><td>data &middot; RDMA</td></tr>
+          <tr><td><code>KVPull(conv_id, block_ids[])</code></td><td>prefill task &rarr; store</td><td>warm turn, <em>after</em> a <code>pool_filter</code> positive (&sect;5)</td><td>the requested block ids</td><td>data &middot; RDMA</td></tr>
+          <tr><td><code>KVPullResp(blocks[]) / KVPullMiss</code></td><td>store &rarr; prefill task</td><td><code>index_get</code> hit (stream) / shard miss (recompute)</td><td>KV blocks (median ~2.56&nbsp;GB @ 8&nbsp;K) / miss flag</td><td>data &middot; RDMA</td></tr>
+          <tr><td><code>PoolFilterDelta(shard_id, inserts[], deletes[], version)</code></td><td>store &rarr; broker</td><td>every <code>T<sub>gossip</sub> = 100 ms</code> (or large delta)</td><td>~10&nbsp;KB/shard fingerprints</td><td>control &middot; broker (Redis Streams)</td></tr>
+          <tr><td><code>PoolFilterUpdate(blob)</code></td><td>broker &rarr; Router &rarr; prefill task</td><td>fan-out + relay of the above</td><td>merged delta / full blob on a version gap</td><td>control &middot; broker &rarr; R&rarr;S relay</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Why RDMA for the data plane, not the Iter&nbsp;2 gRPC stream.</strong> The intra-request prefill&rarr;decode <em>Hop</em> is a point-to-point stream (one producer, one consumer). The store is a <em>pool-wide</em> fan-in/fan-out (many tasks &harr; many tasks); RDMA one-sided reads/writes avoid the N&sup2; connection cost of a gRPC mesh and keep the transfer off the remote CPU (<a href="distributed_kv_cache.html#iter2-dc-transfer-path">scenario Iter&nbsp;2 DC2</a>).</p>
+      <p><strong>Iter&nbsp;5b adds no message type.</strong> The <code>user_sys</code> overflow (<a href="#iter5b">&sect;1</a>) rides these <em>same five</em> messages with <code>user_sys_hash</code> in the key field of <code>KVWriteback</code> / <code>KVPull</code> (and its fingerprint in the <code>PoolFilterDelta</code> if the optional §S1 summary is enabled). The consumer-scale overflow is a wider admitted <em>set</em>, not a wider protocol.</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="topology">7. Physical deployment topology (Borg-style)</h2>
+      <p>The <code>kv-store-job</code> is its own job of NVMe-dense, <strong>GPU-less</strong> tasks &mdash; the cheapest hardware in the fleet, which is the whole point: it trades a rounding-error of dollars for a prefill-FLOPs offload.</p>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1100 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One kv-store-job task, Borg-style. A single bare-metal host with no GPU: two EPYC or Xeon CPU sockets that run the PoolConvIndex shard hashmap and the Cuckoo shard filter; one terabyte of DDR5 that holds the DRAM hot front of KV blocks; eight times 7.68-terabyte NVMe drives, about 60 terabytes usable, that hold the NVMe back of cold long-conversation KV; and eight NDR400 InfiniBand ports at about 25 gigabytes per second RDMA each, roughly 100 gigabytes per second of front bandwidth. A side note gives the placement math: 0.94 petabytes of pooled working set divided by 60 terabytes per task is about 16 tasks, storage-bound.">
+        <style>
+          .tp-host { fill:#f5f3ff; stroke:#7c3aed; stroke-width:2.4; }
+          .tp-c    { fill:#fff; stroke:#475569; stroke-width:1.4; }
+          .tp-cpu  { fill:#eef2ff; stroke:#4338ca; stroke-width:1.6; }
+          .tp-dram { fill:#ecfeff; stroke:#0e7490; stroke-width:1.6; }
+          .tp-nvme { fill:#fff7ed; stroke:#c2410c; stroke-width:1.6; }
+          .tp-nic  { fill:#ecfdf5; stroke:#047857; stroke-width:1.6; }
+          .tp-t    { font-size:13px; font-weight:700; fill:#0f172a; }
+          .tp-s    { font-size:11px; fill:#475569; }
+          .tp-m    { font-family:'JetBrains Mono',monospace; font-size:10.5px; fill:#0f172a; }
+          .tp-no   { font-size:12px; font-weight:700; fill:#b91c1c; }
+        </style>
+        <rect class="tp-host" x="24" y="40" width="680" height="296" rx="12"/>
+        <text class="tp-t" x="364" y="66" text-anchor="middle">one <tspan font-family="monospace">kv-store-job</tspan> task &mdash; bare-metal host, NO GPU</text>
+
+        <rect class="tp-cpu" x="44" y="84" width="312" height="80" rx="8"/>
+        <text class="tp-t" x="200" y="106" text-anchor="middle">2&times; EPYC 9554 / Xeon 8480+</text>
+        <text class="tp-s" x="200" y="126" text-anchor="middle">runs the index + filter (CPU-side)</text>
+        <text class="tp-m" x="200" y="146" text-anchor="middle">pool_index{} &middot; shard_filter</text>
+
+        <rect class="tp-dram" x="44" y="180" width="312" height="76" rx="8"/>
+        <text class="tp-t" x="200" y="202" text-anchor="middle">1 TB DDR5 ECC</text>
+        <text class="tp-s" x="200" y="222" text-anchor="middle">FRONT tier &mdash; hot KV blocks</text>
+        <text class="tp-m" x="200" y="242" text-anchor="middle">block_pool (FRONT)</text>
+
+        <rect class="tp-nvme" x="372" y="84" width="312" height="76" rx="8"/>
+        <text class="tp-t" x="528" y="106" text-anchor="middle">8&times; 7.68 TB NVMe &asymp; 60 TB</text>
+        <text class="tp-s" x="528" y="126" text-anchor="middle">BACK tier &mdash; durable cold KV</text>
+        <text class="tp-m" x="528" y="146" text-anchor="middle">block_pool (BACK) &middot; GDS</text>
+
+        <rect class="tp-nic" x="372" y="180" width="312" height="76" rx="8"/>
+        <text class="tp-t" x="528" y="202" text-anchor="middle">8&times; NDR400 InfiniBand</text>
+        <text class="tp-s" x="528" y="222" text-anchor="middle">~25 GB/s RDMA each &middot; ~100 GB/s front</text>
+        <text class="tp-m" x="528" y="242" text-anchor="middle">serves KVPull / KVWriteback</text>
+
+        <text class="tp-no" x="364" y="296" text-anchor="middle">&#10007; no GPU &middot; &#10007; no NVLink &mdash; this is storage, not compute</text>
+        <text class="tp-s" x="364" y="318" text-anchor="middle">~$4 K/mo/task &times; 36 &asymp; ~$144 K/mo &asymp; ~7 ppm of the serving fleet $</text>
+
+        <!-- placement math -->
+        <rect class="tp-c" x="728" y="84" width="348" height="172" rx="10"/>
+        <text class="tp-t" x="902" y="108" text-anchor="middle">placement: storage-bound (post-DC7 flow)</text>
+        <text class="tp-m" x="744" y="134">W_pool = p_admit &times; N_active &times; size</text>
+        <text class="tp-m" x="744" y="152">  = 0.068&times;3M&times;10.4 GB &asymp; 204 K convs &asymp; 2.1 PB</text>
+        <text class="tp-m" x="744" y="176">storage = 2.1 PB / 60 TB &asymp; 36</text>
+        <text class="tp-m" x="744" y="194">qps     = 512 GB/s / 100 GB/s &asymp; 6</text>
+        <text class="tp-m" x="744" y="218">tasks = max(36, 6) = 36</text>
+        <text class="tp-s" x="744" y="240">(flagged α=0.7 model; +more at user_sys overflow)</text>
+      </svg>
+      </div>
+
+      <h3 id="topology-spec">7.1 &nbsp;Per-task hardware + placement justification</h3>
+      <table class="sheet">
+        <thead><tr><th>Job</th><th>Task count</th><th>Per-task hardware</th><th>Placement constraint (the number that sets the count)</th></tr></thead>
+        <tbody>
+          <tr><td><code>kv-store-job</code></td><td><code>~36</code> <span class="tag tag-d">[D]</span></td><td>2&times; EPYC/Xeon, 1&nbsp;TB DDR5, 8&times;7.68&nbsp;TB NVMe (~60&nbsp;TB), 8&times; NDR400 IB, <strong>no GPU</strong>. RDMA-DRAM front over NVMe back; CXL is a scale-up alt transport for the L3 front.</td><td><strong>storage-bound</strong>: <code>W<sub>pool</sub> / per_task_NVMe = 2.1 PB / 60 TB &asymp; 36</code> (post-DC7 flow sizing, was 16) &gt; QPS-bound <code>&asymp; 6</code></td></tr>
+          <tr><td><code>broker-job</code></td><td><code>3</code> (HA)</td><td>~16 vCPU, 64&nbsp;GB, <strong>25&nbsp;Gbps NIC</strong>, Redis Streams</td><td>fixed HA quorum; NIC sized by gossip fan-out (&sect;4)</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li><strong>Why no GPU.</strong> The store does index lookups + RDMA block transfers &mdash; CPU + NIC + NVMe work, zero matmuls. Putting it on GPU hosts would waste the fleet&rsquo;s most expensive resource on storage.</li>
+        <li><strong>Why storage-bound, not QPS-bound.</strong> Most warm turns hit <em>locally</em> (sticky CH-on-<code>conv_id</code>); only the rebalance / spill / autoscale-fresh fraction pulls from the pool, so pull QPS is modest (~4&nbsp;K/s &rarr; ~512&nbsp;GB/s &rarr; ~6 tasks). The <code>~2.1&nbsp;PB</code> returning-tail working set is what forces <code>~36</code> (post-DC7 flow sizing). The <code>max(36, 6)</code> lands storage-bound.</li>
+        <li><strong>Iter&nbsp;5b grows the count, not the shape (<a href="#iter5b">&sect;1</a>).</strong> The <code>user_sys</code> overflow adds <code>N_pool &times; T<sub>user_sys_mean</sub> &times; KV_per_tok &times; replication_factor</code> of NVMe-backed storage on top of the <code>~2.1&nbsp;PB</code> conv-K,V working set &mdash; same hardware shape, more NVMe-dense tasks. Still storage-bound (the overflow is bytes, not QPS &mdash; <code>user_sys</code> pulls are the structural-miss minority). <code>N_pool</code>, hence the exact added task count, is <strong>settled at S6</strong> against per-task NVMe budget; the page&rsquo;s <code>~36</code> is the Iter&nbsp;3b cross-turn figure <em>before</em> that overflow lands.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="failures">8. Failure modes</h2>
+      <p>Every failure degrades cost or latency, <strong>never correctness</strong> &mdash; recompute from token IDs (RPO=0) is the floor on every path.</p>
+      <table class="sheet">
+        <thead><tr><th>Failure</th><th>Blast radius</th><th>Detection</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Store-task death</strong> &mdash; a shard&rsquo;s convs go absent on pull</td><td>that shard&rsquo;s convs recompute for one turn until the ring re-homes them; <strong>from Iter&nbsp;10</strong> this also degrades the per-serving-task FT <em>fast path</em> (the rebalanced target falls from <code>pull(N)&nbsp;~166 ms</code> to <code>&beta;<sub>cold</sub>&nbsp;730 ms</code> for those convs)</td><td>heartbeat gap; <code>KVPullMiss</code> spike; filter version stalls</td><td>recompute floor (RPO=0, correctness intact); durable NVMe back + per-shard <code>replication_factor</code> of the hottest convs bound the loss; CH re-homes the slice. The store&rsquo;s <em>own</em> replication (distinct from per-task FT) is the lever that keeps the Iter&nbsp;10 fast path available &mdash; an S6 sizing question (<a href="#iter9-10">&sect;1</a>)</td></tr>
+          <tr><td><strong>Write-back loses the race</strong> &mdash; next turn arrives before the async write-back lands</td><td>one turn recomputes (~600-tok warm floor)</td><td>pull-miss rate on warm turns</td><td>prioritize high-<code>P(continue)</code> convs in the write-back queue; the intra-request Hop already delivered <em>this</em> turn regardless</td></tr>
+          <tr><td><strong>Hot-key pull storm</strong> &mdash; a returning 256&nbsp;K whale (~82&nbsp;GB) saturates one pull path (~3.3&nbsp;s)</td><td>one store task&rsquo;s NIC; tail latency for co-located convs</td><td>per-task pull-BW saturation</td><td>4-SSD stripe + front replication of the hottest convs; CH spreads whales across the ~36 tasks so no one task owns them all</td></tr>
+          <tr><td><strong>Stale union filter</strong> &mdash; gossip lag / a missed delta</td><td>a few extra recomputes (false-neg) or wasted round-trips (false-pos)</td><td><code>pool_filter_version</code> gap per shard</td><td>version-gap triggers a full-blob refresh; staleness is bounded to ~1 gossip interval and is correctness-neutral (&sect;5)</td></tr>
+          <tr><td><strong>Rebalance in flight</strong> &mdash; a pull lands on the old owner mid-move</td><td>one round-trip returns &ldquo;not mine&rdquo;</td><td><code>owning_pool_task_id</code> mismatch on the entry</td><td>caller re-computes the owner against the bumped ring version and retries once; else recompute</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="crosslinks">9. Cross-links</h2>
+      <ul>
+        <li><strong>Out:</strong> <a href="distributed_kv_cache.html#iter3b">distributed_kv_cache.html &sect;9b</a> (why the store exists: B12, the write-back-vs-write-through / <code>conv_id</code>-vs-content-addressing / Cuckoo-vs-Bloom design choices, and the number chain that sizes it) &mdash; especially <a href="distributed_kv_cache.html#iter3b-dc-index">&sect;9b.3 DC4</a> (the lookup-path enumeration this page implements); <a href="distributed_kv_cache.html#iter5-placement">&sect;11.5</a> (the Iter&nbsp;5b <code>user_sys</code> overflow &mdash; the 0.96&nbsp;PB working set + why the hot-path pull is the assistant delta); <a href="scheduler.html#iter3b">scheduler.html &sect;10b</a> (the caller side: decode-task <code>maybe_writeback</code> + admission gate, prefill-task <code>pull_or_recompute</code>) and <a href="scheduler.html#iter5b">&sect;11b.5</a> (the <code>user_sys</code> overflow caller side); <a href="router.html#iter5b">router.html &sect;8b.3</a> (the gossip relay + why the overflow is Router-side a no-op); <a href="distributed_kv_cache.html#iter9">scenario &sect;15</a> (Iter&nbsp;9 CP &mdash; the <code>(conv_id, rank)</code> per-rank slice write-back) and <a href="distributed_kv_cache.html#iter10">&sect;16</a> (Iter&nbsp;10 FT &mdash; the pull-as-recovery fast path that promotes the store from cost lever to availability path); <a href="scheduler.html#iter10">scheduler.html &sect;11g</a> + <a href="router.html#iter10">router.html &sect;8g</a> (the FT callers that reuse the <code>KVPull</code> path); <a href="../../knowledge/K2_kv-cache.html">K2</a> (KV-per-token + paging); <a href="../../knowledge/K20_interconnect-and-collectives.html">K20</a> (RDMA / NDR400 IB); <a href="../../knowledge/K22_fault-tolerance-multi-gpu-inference.html">K22</a> (recompute-as-fallback the store fast-paths at Iter&nbsp;10).</li>
+        <li><strong>In:</strong> <a href="distributed_kv_cache.html#iter3b">scenario &sect;9b</a> links the <code>PoolConvIndex</code> + Cuckoo-filter component treatment here for the build/use/gossip mechanics; <a href="scheduler.html#protocol-store">scheduler.html &sect;12.4</a> links the store side of the <code>KVWriteback</code>/<code>KVPull</code> protocol here; <a href="scheduler.html#iter5b">scheduler.html &sect;11b.5</a> + <a href="router.html#iter5b">router.html &sect;8b.3</a> link the Iter&nbsp;5b <code>user_sys</code> overflow sizing here (<a href="#iter5b">&sect;1</a>).</li>
+        <li><strong>Algorithm + structure names inlined:</strong> <code>PoolConvIndex</code> (sharded CH-on-<code>conv_id</code> location map); the direct <code>CH(conv_id, pool_ring)</code> probe (main read path); the <em>optional §S1</em> membership summary (exact set preferred; Cuckoo variant per Fan et&nbsp;al., CoNEXT&nbsp;2014 &mdash; fingerprint + 2-bucket lookup + native delete) and its four-hop gossip chain (store &rarr; broker &rarr; Router &rarr; prefill, when enabled); predictor-free length-gated write-back victim cache; Mooncake / LMCache-style RDMA-front / NVMe-back pooled KV store.</li>
+      </ul>
+    </div>
+  </section>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

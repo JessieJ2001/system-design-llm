@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elasticsearch / OpenSearch — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-search.html">Search Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Elasticsearch / OpenSearch</h1>
+    <p class="hero-subtitle">Distributed search and analytics engine built on top of Apache Lucene. Inverted index for full-text, BM25 ranking, kNN (HNSW) for vectors, rich aggregations, near-real-time indexing. Indexed shards distributed across nodes; primary + replica per shard. OpenSearch is the Apache 2.0 fork after the Elastic license change.</p>
+    <p class="hero-meta">inverted index &bull; Lucene segments &bull; BM25 + kNN &bull; aggregations</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <ul>
+      <li><strong>Document &rarr; analyzers</strong> (tokenize, lowercase, stem) &rarr; <strong>terms</strong>.</li>
+      <li><strong>Inverted index</strong>: term &rarr; sorted list of document IDs (postings list) + positions / frequencies.</li>
+      <li>Each <strong>Lucene segment</strong> is an immutable mini-index. New writes &rarr; in-memory buffer &rarr; new segment.</li>
+      <li><strong>Refresh</strong> (default 1s) makes new segments queryable &mdash; not flushed to disk yet.</li>
+      <li><strong>Flush</strong> persists segments + clears translog (the WAL).</li>
+      <li><strong>Merge</strong> background combines small segments into bigger ones.</li>
+      <li><strong>Shard</strong> = a Lucene index. Primary + replicas. Index is N shards.</li>
+      <li><strong>Cluster state</strong> in master-eligible nodes; data nodes hold shards.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Index (write)</h3>
+      <pre class="line-numbers"><code class="language-text">1. Coord receives bulk request
+2. Routes to primary shards (by routing key, default = doc id)
+3. Primary indexes locally + appends to translog
+4. Replicates to replica shards (sync; in-sync set)
+5. Acks coordinator after replicas
+6. Periodically: refresh &rarr; new searchable segment
+7. Periodically: flush &rarr; segments fsynced; translog cleared
+8. Background: merge segments</code></pre>
+    </div>
+    <div>
+      <h3>Search (read)</h3>
+      <pre class="line-numbers"><code class="language-text">1. Coord parses query (DSL or KQL)
+2. Phase 1: query each shard for top-K doc IDs + scores
+   (round-robin replicas; adaptive replica selection)
+3. Coord merges &rarr; global top-K
+4. Phase 2: fetch full _source for those K
+5. Return
+
+Aggregations: shard-level reduce + final reduce on coord</code></pre>
+    </div>
+    <div>
+      <h3>Vector kNN</h3>
+      <pre class="line-numbers"><code class="language-text">HNSW graph index per segment
+Search top-K nearest by cosine / L2 / dot product
+Filter pushdown for hybrid (term filter + kNN)
+Reciprocal Rank Fusion combines BM25 + kNN scores</code></pre>
+    </div>
+    <div>
+      <h3>Cluster coordination</h3>
+      <pre class="line-numbers"><code class="language-text">Master-eligible nodes elect a master
+Master owns cluster state (mapping, shard placement)
+Data nodes hold shards
+Coord/ingest nodes can be dedicated for routing</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li>Per-shard primary + replica; sync replication.</li>
+      <li>Near-real-time: 1-second refresh interval default; reads see writes ~1s later (configurable).</li>
+      <li>Translog for durability; <code>index.translog.durability: request</code> for sync fsync per request.</li>
+      <li>Shard re-allocation on node loss; cluster health green / yellow / red.</li>
+      <li>Versioned docs allow optimistic concurrency.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li>Index split into N primary shards (chosen at index creation; cannot increase later without reindex). Replicas can change.</li>
+      <li>Routing: <code>doc_id mod num_primary_shards</code>; or custom routing key for colocation.</li>
+      <li>For time-series: rollover indices by date (ILM) instead of one giant index.</li>
+      <li>Search a "data stream" or alias spans many indices; queries fan out.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>Indexed search: O(log N) per term + O(K) merging postings.</li>
+      <li>Document insert: O(small) buffered + amortized merge cost.</li>
+      <li>kNN HNSW: O(log N) per query (approximate).</li>
+      <li>Aggregations: O(N) per shard; coord reduces.</li>
+      <li>Deep pagination: O(from + size) &mdash; expensive past 10000.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>Indexing: 50k+ docs/sec/node depending on doc size and analyzers.</li>
+      <li>Query QPS: ~10k/shard for simple match; less for aggregations.</li>
+      <li>Latency P99: 10&ndash;50 ms for simple queries; aggregations vary.</li>
+      <li>Heap: max 32 GB (compressed pointers); use multiple nodes per box past that.</li>
+      <li>Storage: hot tier limited by RAM/disk ratio; UltraWarm/cold to S3 cuts cost.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use ES/OS when&hellip;</h3>
+      <ul>
+        <li>Full-text search at scale.</li>
+        <li>Log search (ELK / OS-Log).</li>
+        <li>Faceted ecommerce search.</li>
+        <li>Hybrid (BM25 + vector) retrieval.</li>
+        <li>Rich aggregations on indexed data.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use as&hellip;</h3>
+      <ul>
+        <li>Primary store of record &mdash; not transactional, refresh interval = stale, lossy on crash without proper translog.</li>
+        <li>OLTP DB.</li>
+        <li>Analytics warehouse for huge ad-hoc joins (use BQ / Snowflake / ClickHouse).</li>
+        <li>Tiny scale where Postgres tsvector would do.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li>Mapping explosion (dynamic field types) &rarr; cluster state ballooning.</li>
+      <li>Refresh interval = visibility lag; cannot read your own write &lt; 1s without forced refresh.</li>
+      <li>Deep pagination (<code>from + size</code> &gt; 10000) errors by default; use <code>search_after</code>.</li>
+      <li>Merge throttle when ingest is heavy.</li>
+      <li>Heap pressure &rarr; circuit breakers; dropped requests.</li>
+      <li>Hot shard from skewed routing.</li>
+      <li>Index per tenant explodes shard count; consolidate.</li>
+      <li>Reindexing for mapping change is expensive on huge indices.</li>
+      <li>Stop words / stemmer mismatch causes "why doesn't my exact-match query work?"</li>
+      <li>Aggregation memory overhead bigger than indexing.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>AWS: OpenSearch Service (Amazon's fork).</li>
+      <li>GCP: (no native; use ES on GCE or Vertex Search).</li>
+      <li>Azure: AI Search (different shape; managed cognitive search).</li>
+      <li>Multi-cloud: Elastic Cloud, Bonsai, Aiven.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Single-node (dev)</td><td>Simplest</td><td>One process</td></tr>
+        <tr><td>3-node cluster</td><td>Production min</td><td>Master-eligible + data on each</td></tr>
+        <tr><td>Dedicated masters + data + ingest + coord</td><td>Role separation</td><td>Different node types per role</td></tr>
+        <tr><td>Hot / warm / cold tiers</td><td>Cost-optimized retention</td><td>ILM moves indices across tiers; cheaper storage for old</td></tr>
+        <tr><td>Frozen / UltraWarm tier</td><td>Cheap searchable old data</td><td>Indices stored on S3 with limited mem</td></tr>
+        <tr><td>Cross-cluster replication (CCR)</td><td>Geo / DR</td><td>Follower indices in another cluster</td></tr>
+        <tr><td>Cross-cluster search (CCS)</td><td>Federated query</td><td>Search across clusters from one entry point</td></tr>
+        <tr><td>Searchable snapshots</td><td>Cold data on S3 still searchable</td><td>Snapshot + restore with shard cache</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Site search / ecommerce facets.</li>
+      <li>Log + observability stack (ELK / OSL).</li>
+      <li>SIEM / security analytics.</li>
+      <li>Real-time analytics (low-cardinality dimensions).</li>
+      <li>Vector / hybrid retrieval for RAG.</li>
+      <li>Geo search.</li>
+      <li>App search APIs.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li>JVM heap (max 32 GB with compressed oops).</li>
+      <li>Refresh interval (1s default; raise for ingest-heavy logs).</li>
+      <li>Merge policy + throttle.</li>
+      <li>Shard count + size (target 20&ndash;50 GB / shard).</li>
+      <li>Replica count.</li>
+      <li>Field data circuit breakers.</li>
+      <li>Indexing back-pressure (queue, threadpool).</li>
+      <li>ILM rollover policy.</li>
+      <li>Index templates (dynamic_mapping: strict).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>Hot tier RAM &gt;= ~half of hot index size for best perf.</li>
+      <li>Shard size: 20&ndash;50 GB target; not too small, not too big.</li>
+      <li>Shard count per node: a few hundred max.</li>
+      <li>Replica count: 1 typical; raise for HA / read scale.</li>
+      <li>Disk: ~2&times; data size for merge headroom.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Master loss: re-election &asymp; seconds; cluster red briefly.</li>
+      <li>Data node loss: replicas promoted; rebalance.</li>
+      <li>Heap pressure: GC pauses; circuit breakers trip.</li>
+      <li>Hot shard: ingestion / query slowed.</li>
+      <li>Disk watermark: shards moved off; index goes read-only at high watermark.</li>
+      <li>Mapping conflict: rejected docs.</li>
+      <li>Translog corruption: from disk failure; replicas help.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>Snapshot to S3 / GCS / Azure Blob via repository plugin.</li>
+      <li>SLM (Snapshot Lifecycle Management) automates schedules.</li>
+      <li>Restore creates new indices; alias swap to cut over.</li>
+      <li>Cross-cluster replication for live DR.</li>
+      <li>Searchable snapshots: data lives on S3, queryable via cache.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Rolling upgrade across minor versions.</li>
+      <li>Major upgrades: deprecation log + reindex if mapping changes.</li>
+      <li>ES &rarr; OS: wire-compat through 7.10; later versions diverge. Snapshot + restore is the path.</li>
+      <li>Migrate from Solr: reindex via custom script.</li>
+      <li>From Postgres tsvector: build new ES index via CDC or batch.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>RBAC: roles + privileges.</li>
+      <li>TLS for transport + HTTP.</li>
+      <li>Native realm + LDAP / SAML / OIDC (Enterprise / OpenSearch security plugin).</li>
+      <li>Field-level / document-level security.</li>
+      <li>Encryption at rest: rely on disk encryption.</li>
+      <li>Audit logging.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Index per tenant: simple but explodes shard count.</li>
+      <li>Filtered alias per tenant on shared index: scales tenants.</li>
+      <li>Document-level security via term-level filter.</li>
+      <li>Quotas: per-role index/cluster privilege; no native rate-limit.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>JVM heap %.</li>
+      <li>GC pauses.</li>
+      <li>Query rate vs index rate.</li>
+      <li>Refresh time.</li>
+      <li>Merge throttle.</li>
+      <li>Segment count per shard.</li>
+      <li>Search / bulk queue depths.</li>
+      <li>Pending tasks.</li>
+      <li>Cluster health (green/yellow/red).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>ES as primary store.</li>
+      <li>Deep pagination via from+size.</li>
+      <li>Mapping explosion (no <code>dynamic: strict</code>).</li>
+      <li>Tiny shards (millions of shards = cluster state bloat).</li>
+      <li>Single huge index for time-series instead of rollover.</li>
+      <li>Aggregations without indexes / on high-cardinality fields.</li>
+      <li>Unbounded scrolls.</li>
+      <li>Heap &gt; 32 GB (loses compressed oops).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>RAM-heavy nodes &times; replicas.</li>
+      <li>UltraWarm / Frozen tier saves 80%+ for old data.</li>
+      <li>Egress + inter-AZ traffic.</li>
+      <li>Snapshots to S3 cheap; restore cost in CPU + time.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>Elasticsearch</th><th>OpenSearch</th><th>Solr</th><th>Algolia</th></tr></thead>
+      <tbody>
+        <tr><td>License</td><td>SSPL / Elastic License v2</td><td>Apache 2.0</td><td>Apache 2.0</td><td>SaaS</td></tr>
+        <tr><td>Engine</td><td>Lucene</td><td>Lucene</td><td>Lucene</td><td>Custom</td></tr>
+        <tr><td>Cloud</td><td>Elastic Cloud</td><td>OpenSearch Service</td><td>(self-host)</td><td>SaaS only</td></tr>
+        <tr><td>Pick when</td><td>You're invested in Elastic ecosystem</td><td>Apache 2.0 needed; AWS-native</td><td>Existing Solr investment</td><td>Site search, low ops</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy</td><td>Replicas + adaptive replica selection</td><td>Add replicas</td><td>CCR for cross-cluster</td></tr>
+        <tr><td>Write-heavy</td><td>Many primaries; bulk indexing</td><td>Pre-create primaries; raise refresh interval</td><td>More nodes; ingest-only nodes</td></tr>
+        <tr><td>Hot shard</td><td>One shard pegged</td><td>Custom routing for distribution</td><td>Reindex with more shards</td></tr>
+        <tr><td>Bursty</td><td>Throttle at queues</td><td>Tune indexing queue + refresh</td><td>Auto-scale nodes</td></tr>
+        <tr><td>Long-retention logs</td><td>ILM + tiers</td><td>Hot &rarr; warm &rarr; cold &rarr; frozen on S3</td><td>Searchable snapshots</td></tr>
+        <tr><td>Many tenants</td><td>Index per tenant explodes</td><td>Filtered alias on shared index</td><td>Cross-cluster federation</td></tr>
+        <tr><td>Vector / hybrid</td><td>kNN + RRF</td><td>Use kNN with metadata filter</td><td>Dedicated vector DB at scale</td></tr>
+        <tr><td>Aggregations</td><td>Native aggs</td><td>Pre-aggregate via transforms</td><td>CDC into ClickHouse / OLAP</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>Lucene index format docs.</li>
+      <li>"Elasticsearch: The Definitive Guide" (Gormley / Tong) &mdash; older but classic.</li>
+      <li>elastic.co + opensearch.org blogs.</li>
+      <li>Production: GitHub code search; Wikipedia search; Walmart; Slack.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-search.html">Search comparison</a></li>
+    <li><a href="comparison-observability.html">Observability comparison</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

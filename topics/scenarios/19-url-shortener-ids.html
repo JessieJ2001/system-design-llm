@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>URL Shortener ID Generation — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>URL Shortener: Collision-Free ID Generation at Scale</h1>
+      <p class="hero-subtitle">Generate 100 million unique 7-character short URLs per day across 5 data centers &mdash; without coordination on every write and without collisions, ever.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are designing the ID generation layer for a URL shortener service like bit.ly or tinyurl. Every time a user submits a long URL, the system must generate a unique 7-character short code (e.g., <code>https://short.ly/aB3kQ9z</code>). The short code must be globally unique across all data centers, generated instantly, and never collide with any previously generated code.</p>
+
+      <div class="full-width">
+        <h3>Concrete Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Parameter</th><th>Value</th><th>Derivation</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>New URLs per day</td><td>100 million</td><td>Given</td></tr>
+              <tr><td>Short URL length</td><td>7 characters</td><td>Given</td></tr>
+              <tr><td>Character set</td><td>Base62 (a-z, A-Z, 0-9)</td><td>62 characters</td></tr>
+              <tr><td>Total possible short URLs</td><td>62<sup>7</sup> = 3.52 trillion</td><td>Calculated</td></tr>
+              <tr><td>Data centers</td><td>5 (globally distributed)</td><td>Given</td></tr>
+              <tr><td>Read:write ratio</td><td>100:1</td><td>Given</td></tr>
+              <tr><td>Write latency SLA</td><td>&lt; 50 ms</td><td>Given</td></tr>
+              <tr><td>Read latency SLA</td><td>&lt; 10 ms</td><td>Given</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+<pre class="line-numbers"><code class="language-text">Write throughput:
+  100M URLs/day ÷ 86,400 sec/day ≈ 1,157 writes/sec average
+  Peak (3× average): ~3,500 writes/sec
+
+Read throughput:
+  100× writes = 115,700 reads/sec average
+  Peak: ~350,000 reads/sec
+
+ID space exhaustion:
+  62^7 = 3,521,614,606,208 ≈ 3.52 trillion possible codes
+  100M/day × 365 days/year = 36.5 billion/year
+  3.52 trillion ÷ 36.5 billion = 96.4 years until exhaustion
+  → More than enough capacity.
+
+Storage (over 5 years):
+  Total records: 100M/day × 365 × 5 = 182.5 billion
+  Per record: 7B (short code) + 100B (avg long URL) + 50B (metadata) ≈ 160B
+  Total: 182.5B × 160B = 29.2 TB
+  With replication factor 3: ~88 TB across all data centers.
+
+Per data center:
+  88 TB ÷ 5 DCs = 17.6 TB per DC
+  → Fits on a modest database cluster.</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Random Generation with Collision Check</h2>
+      <p>The simplest approach: for each new URL, generate a random 7-character base62 string. Check if it already exists in the database. If it does, generate another. Repeat until unique.</p>
+
+<pre class="line-numbers"><code class="language-python">import random
+import string
+
+BASE62 = string.ascii_letters + string.digits  # a-z, A-Z, 0-9
+
+def generate_short_url(long_url, db):
+    while True:
+        # Generate random 7-character code
+        code = ''.join(random.choices(BASE62, k=7))
+
+        # Check for collision
+        if not db.exists(code):
+            db.insert(code, long_url)
+            return code
+        # Collision! Try again.
+        # How often does this happen? Let's calculate...</code></pre>
+
+      <div>
+        <h3>The Birthday Paradox Kills This Approach</h3>
+        <p>The <strong>birthday paradox</strong> is a counterintuitive result from probability theory: in a group of just 23 people, there is a 50% chance that two share a birthday (out of 365 possible days). The same principle applies to hash collisions. The collision probability is far higher than the naive 1/S estimate because any pair of generated codes can collide, not just the new code with one specific existing code.</p>
+
+<pre class="line-numbers"><code class="language-text">Birthday paradox formula:
+  P(collision) ≈ 1 - e^(-N² / 2S)
+
+  N = number of generated codes so far
+  S = size of the code space = 62^7 = 3.52 trillion
+
+Let's calculate collision probability at different scales:
+
+After 1 day (100M codes):
+  N = 10^8
+  P ≈ 1 - e^(-(10^8)² / (2 × 3.52 × 10^12))
+  P ≈ 1 - e^(-10^16 / 7.04 × 10^12)
+  P ≈ 1 - e^(-1,420)
+  P ≈ 1.0  (effectively 100% — collision is CERTAIN)
+
+Wait — a collision is certain after just ONE DAY?
+
+Let's verify with smaller numbers. After 1 hour (~4.2M codes):
+  N = 4.2 × 10^6
+  P ≈ 1 - e^(-(4.2 × 10^6)² / (2 × 3.52 × 10^12))
+  P ≈ 1 - e^(-17.64 × 10^12 / 7.04 × 10^12)
+  P ≈ 1 - e^(-2.5)
+  P ≈ 1 - 0.082
+  P ≈ 91.8%
+
+After just 1 HOUR, there is a 92% chance of at least one collision.
+
+After 10 minutes (~700K codes):
+  N = 7 × 10^5
+  P ≈ 1 - e^(-(7 × 10^5)² / (2 × 3.52 × 10^12))
+  P ≈ 1 - e^(-4.9 × 10^11 / 7.04 × 10^12)
+  P ≈ 1 - e^(-0.0696)
+  P ≈ 6.7%
+
+Even after 10 minutes, there's a 7% chance of collision.</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The birthday paradox in action:</strong> With 3.52 trillion possible codes, you might expect collisions to be rare. But at 100M codes per day, collisions become <em>certain</em> within hours. The reason: you are not checking one code against one other code &mdash; you are checking each new code against ALL previous codes. The number of <em>pairs</em> grows as N<sup>2</sup>, which vastly outpaces the linear growth of N.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+
+      <div>
+        <h3>Collisions Cause Retries, Retries Cause Latency</h3>
+<pre class="line-numbers"><code class="language-text">After 1 billion codes (10 days of operation):
+  Collision probability per generation attempt:
+    P(single collision) = N / S = 10^9 / 3.52 × 10^12 = 0.000284 = 0.028%
+
+  That seems low, but at 1,157 writes/sec:
+    Expected collisions per second: 1,157 × 0.000284 = 0.33
+    Expected collisions per hour: ~1,183
+
+  Each collision requires:
+    1. Generate random code
+    2. Database lookup (does this code exist?)  → 2-5 ms
+    3. Collision! Generate another code.
+    4. Another database lookup                  → 2-5 ms
+    5. Maybe another collision...
+
+  Average retries per write ≈ 1 / (1 - P) ≈ 1.000284 (barely over 1)
+  But worst case: multiple retries → tail latency spikes.
+
+After 100 billion codes (2.7 years):
+  P(single collision) = 10^11 / 3.52 × 10^12 = 2.84%
+  Expected retries per write: 1 / (1 - 0.0284) = 1.029
+  ~3% of writes need at least one retry.
+  At 1,157 writes/sec: ~34 retries/sec, each adding 2-5 ms latency.</code></pre>
+      </div>
+
+      <div>
+        <h3>The Real Problem: Database Lookups on Every Write</h3>
+        <p>Even without collisions, the collision <em>check</em> requires a database read before every write. At 3,500 writes/sec (peak), that is 3,500 extra database reads just for uniqueness verification. This halves the effective write throughput and adds latency to every single write.</p>
+
+      </div>
+
+      <div>
+        <h3>Multi-DC Coordination is Impossible at This Speed</h3>
+        <p>With 5 data centers, two DCs could simultaneously generate the same random code. To prevent this, you would need a distributed lock or consensus protocol for every write. Cross-DC latency is 50&ndash;200 ms. A distributed lock adds this latency to every write, blowing past the 50 ms SLA.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Counter with Pre-Allocated Ranges                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Counter-Based IDs with Pre-Allocated Ranges</h2>
+      <p>Instead of random generation, use a <strong>monotonically increasing counter</strong>. Counter value 1 becomes short code <code>0000001</code>, value 62 becomes <code>0000010</code>, and so on. No collisions ever &mdash; each number maps to exactly one base62 string.</p>
+
+      <div>
+        <h3>Base62 Encoding</h3>
+<pre class="line-numbers"><code class="language-python">BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def encode_base62(num):
+    """Convert an integer to a 7-character base62 string."""
+    if num == 0:
+        return BASE62[0] * 7
+
+    chars = []
+    while num > 0:
+        chars.append(BASE62[num % 62])
+        num //= 62
+
+    # Pad to 7 characters
+    while len(chars) < 7:
+        chars.append(BASE62[0])
+
+    return ''.join(reversed(chars))
+
+# Examples:
+# encode_base62(0)       → "0000000"
+# encode_base62(1)       → "0000001"
+# encode_base62(61)      → "000000Z"
+# encode_base62(62)      → "0000010"
+# encode_base62(3521614606207) → "ZZZZZZZ" (max 7-char value)</code></pre>
+      </div>
+
+      <div>
+        <h3>The Coordination Problem</h3>
+        <p>A single global counter works perfectly on one machine. But we have 5 data centers, each with multiple application servers. If every write must contact a single global counter to get the next number, that counter becomes:</p>
+        <ul>
+          <li><strong>A bottleneck</strong> &mdash; 3,500 writes/sec all hitting one service.</li>
+          <li><strong>A single point of failure</strong> &mdash; counter down = no new URLs.</li>
+          <li><strong>A latency source</strong> &mdash; cross-DC round trip to the counter adds 50&ndash;200 ms.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Solution: Pre-Allocated Ranges</h3>
+        <p>Instead of handing out one number at a time, hand out <em>ranges</em> of numbers. Each application server gets a block of 1 million sequential IDs. It uses them locally (no network calls) until the block is exhausted, then requests a new block.</p>
+
+<pre class="line-numbers"><code class="language-text">Central Range Service (one instance, backed by a durable counter in a DB):
+
+  State: next_available = 0  (starts at zero)
+
+  allocate_range(size=1_000_000):
+    start = next_available
+    next_available += size
+    return (start, start + size - 1)
+    # Persisted in DB to survive restarts.
+
+How it plays out:
+
+  App Server A requests range → gets [0, 999,999]
+  App Server B requests range → gets [1,000,000, 1,999,999]
+  App Server C requests range → gets [2,000,000, 2,999,999]
+  ...
+
+  App Server A processes writes:
+    Write 1: counter = 0       → encode_base62(0) = "0000000"
+    Write 2: counter = 1       → encode_base62(1) = "0000001"
+    Write 3: counter = 2       → encode_base62(2) = "0000002"
+    ...
+    Write 1,000,000: counter = 999,999 → encode_base62(999999) = "0004C91"
+    Range exhausted → request new range from Central Service.
+
+How often does each server contact the Central Service?
+  At 1,157 writes/sec across all servers.
+  Say 20 app servers total (4 per DC).
+  Each handles ~58 writes/sec.
+  Range of 1M IDs lasts: 1,000,000 / 58 = 17,241 seconds ≈ 4.8 hours.
+
+  Central Service contacted: 20 servers / 4.8 hours = ~4 requests/hour.
+  This is trivially low. The Central Service could be down for HOURS
+  and existing ranges would keep working.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>No coordination on the write path.</strong> Each application server generates IDs from its local range with zero network calls. The Central Range Service is contacted once every 4.8 hours per server. Even if it is down for an entire day, each server has enough IDs to keep operating.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Multi-DC Range Allocation                        -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Multi-DC Range Allocation</h2>
+      <p>With 5 data centers, we want each DC to operate independently for writes. The Central Range Service gives each DC a large block, and each DC&rsquo;s internal coordinator sub-divides it among its app servers.</p>
+
+      <div>
+        <h3>Two-Level Range Allocation</h3>
+<pre class="line-numbers"><code class="language-text">Level 1: Central Service → Data Centers
+  Each DC gets a block of 100 million IDs.
+
+  DC 1 (US-East):   [0,          99,999,999]
+  DC 2 (US-West):   [100,000,000, 199,999,999]
+  DC 3 (EU):        [200,000,000, 299,999,999]
+  DC 4 (Asia):      [300,000,000, 399,999,999]
+  DC 5 (Australia): [400,000,000, 499,999,999]
+
+  How long does 100M IDs last per DC?
+    100M URLs/day ÷ 5 DCs = 20M/day per DC
+    100M ÷ 20M/day = 5 days of capacity per block.
+
+Level 2: DC Coordinator → App Servers
+  Within each DC, a local coordinator sub-divides the DC's block.
+
+  DC 1 has 4 app servers:
+    Server 1A: [0,         24,999,999]   (25M IDs)
+    Server 1B: [25,000,000, 49,999,999]
+    Server 1C: [50,000,000, 74,999,999]
+    Server 1D: [75,000,000, 99,999,999]
+
+  Each server's 25M IDs last:
+    25M ÷ (20M/day ÷ 4 servers) = 25M ÷ 5M/day = 5 days.
+
+Exhaustion timeline for the ENTIRE ID space:
+  3.52 trillion ÷ 100M/day = 35,200 days = 96.4 years.
+
+  Number of 100M-block allocations before exhaustion:
+    3.52 trillion ÷ 100M = 35,200 allocations.
+    At 5 DCs requesting every 5 days: 1 request/day from all DCs.
+    35,200 allocations ÷ 1/day = 96.4 years. Consistent. ✓</code></pre>
+      </div>
+
+      <div>
+        <h3>Handling DC Coordinator Failure</h3>
+<pre class="line-numbers"><code class="language-text">If the DC coordinator is down:
+  - App servers continue using their existing sub-ranges.
+  - At 5 days of capacity per sub-range, there is no urgency.
+  - The coordinator can be restarted or failed over within hours.
+
+If the Central Range Service is down:
+  - DCs continue using their existing 100M blocks.
+  - At 5 days per block, there is time to recover.
+  - The Central Service's state is just one number (next_available).
+  - Stored in a replicated database (e.g., etcd, ZooKeeper).
+  - Recovery: read the counter from the replica, resume allocation.
+
+Wasted IDs on server crash:
+  If Server 1A crashes with 20M unused IDs in its range,
+  those IDs are "lost" (never used). Is this a problem?
+
+  20M wasted ÷ 3.52 trillion total = 0.000006%.
+  Even if servers crash daily, losing 20M IDs each time:
+    20M × 365 × 100 years = 730 billion wasted.
+    Still only 20% of the 3.52T space. Plenty of room.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Preventing Predictable URLs                      -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Making Sequential IDs Look Random</h2>
+      <p>Counter-based IDs have a security issue: they are <strong>predictable</strong>. If a user sees <code>short.ly/0004C91</code>, they can guess that <code>short.ly/0004C90</code> and <code>short.ly/0004C92</code> also exist. An attacker could enumerate all URLs by incrementing the counter. This reveals private URLs and total volume information.</p>
+
+      <div>
+        <h3>Solution: Format-Preserving Encryption (FPE)</h3>
+        <p>Apply a <strong>bijective permutation</strong> to the counter before base62 encoding. A bijection (one-to-one mapping) means every counter value maps to exactly one output, and every output maps back to exactly one counter value. No collisions possible by construction.</p>
+
+<pre class="line-numbers"><code class="language-text">How format-preserving encryption works conceptually:
+
+  Think of it as a "shuffle" of all numbers from 0 to 3.52 trillion.
+
+  Without FPE:
+    Counter:  0    1    2    3    4    5    6    7   ...
+    Code:     000  001  002  003  004  005  006  007 ...
+    (sequential → predictable)
+
+  With FPE (using a secret key K):
+    Counter:  0    1    2    3    4    5    6    7   ...
+    FPE(K):   2.8T 47M  981B 12   3.1T 555M 78B  1.2T ...
+    Code:     xQ9z aB3k mN7p 000c zZZa h8Kj bC2m pR5v ...
+    (looks random, but is actually deterministic and reversible)
+
+  Properties:
+    - Deterministic: same counter always gives same output.
+    - Reversible: given the output + key K, recover the counter.
+    - Bijective: no two counters map to the same output. Zero collisions.
+    - Pseudorandom: without key K, output looks random.</code></pre>
+      </div>
+
+      <div>
+<pre class="line-numbers"><code class="language-python">from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# Simplified FPE using Feistel network on the counter value
+# (production systems use FF1 or FF3-1 from NIST SP 800-38G)
+
+SECRET_KEY = b'your-32-byte-secret-key-here!!'  # Keep secret!
+
+def feistel_permute(counter, rounds=6):
+    """
+    Simple Feistel network that permutes a counter value
+    within the range [0, 62^7) without collisions.
+    """
+    # Split counter into two halves
+    modulus = 62 ** 4  # ~14.7 million (half of 7-digit base62)
+    left = counter // modulus
+    right = counter % modulus
+
+    for i in range(rounds):
+        # Round function: hash the right half with the round number
+        f = hash_round(right, i, SECRET_KEY) % modulus
+        left, right = right, (left + f) % modulus
+
+    return left * modulus + right
+
+def generate_short_url(counter):
+    """Counter → FPE → Base62 → short URL."""
+    permuted = feistel_permute(counter)
+    return encode_base62(permuted)
+
+# Result:
+# generate_short_url(0)  → "kR3mQ7x"  (looks random)
+# generate_short_url(1)  → "aB9pL2w"  (looks random)
+# generate_short_url(2)  → "zN5vT8c"  (looks random)
+# But all are deterministic and collision-free!</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Why this works:</strong> A Feistel network is a bijection by construction. No matter what the round function produces, the overall mapping is always one-to-one. This is the same principle that makes DES and other block ciphers invertible. We are effectively using a block cipher with a block size of 7 base62 digits instead of the usual 64 or 128 bits.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 780 420" style="width:100%;max-width:780px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+
+          <!-- Central Range Service -->
+          <rect x="140" y="10" width="500" height="70" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="390" y="35" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="14">Central Range Service</text>
+          <text x="390" y="55" text-anchor="middle" fill="#64748b" font-size="11">etcd / ZooKeeper &bull; State: next_available counter &bull; Allocates 100M-ID blocks</text>
+
+          <!-- Arrows from Central to DCs -->
+          <line x1="230" y1="80" x2="100" y2="130" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+          <line x1="310" y1="80" x2="260" y2="130" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+          <line x1="390" y1="80" x2="420" y2="130" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+          <line x1="470" y1="80" x2="570" y2="130" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+          <line x1="550" y1="80" x2="720" y2="130" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+
+          <!-- DC 1 -->
+          <rect x="30" y="130" width="140" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="100" y="152" text-anchor="middle" font-weight="600" fill="#334155">DC 1 (US-East)</text>
+          <text x="100" y="172" text-anchor="middle" fill="#64748b" font-size="11">Coordinator</text>
+
+          <!-- DC 2 -->
+          <rect x="190" y="130" width="140" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="260" y="152" text-anchor="middle" font-weight="600" fill="#334155">DC 2 (US-West)</text>
+          <text x="260" y="172" text-anchor="middle" fill="#64748b" font-size="11">Coordinator</text>
+
+          <!-- DC 3 -->
+          <rect x="350" y="130" width="140" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="420" y="152" text-anchor="middle" font-weight="600" fill="#334155">DC 3 (EU)</text>
+          <text x="420" y="172" text-anchor="middle" fill="#64748b" font-size="11">Coordinator</text>
+
+          <!-- DC 4 -->
+          <rect x="510" y="130" width="120" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="570" y="152" text-anchor="middle" font-weight="600" fill="#334155">DC 4 (Asia)</text>
+          <text x="570" y="172" text-anchor="middle" fill="#64748b" font-size="11">Coordinator</text>
+
+          <!-- DC 5 -->
+          <rect x="650" y="130" width="120" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="710" y="152" text-anchor="middle" font-weight="600" fill="#334155">DC 5 (AU)</text>
+          <text x="710" y="172" text-anchor="middle" fill="#64748b" font-size="11">Coordinator</text>
+
+          <!-- Arrows from DC 1 to App Servers -->
+          <line x1="65" y1="185" x2="45" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="85" y1="185" x2="85" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="105" y1="185" x2="125" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="135" y1="185" x2="165" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+
+          <!-- DC 1 App Servers -->
+          <rect x="20" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="45" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 1A</text>
+          <rect x="80" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="105" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 1B</text>
+          <rect x="140" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="165" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 1C</text>
+
+          <!-- Arrows from DC 2 to App Servers -->
+          <line x1="225" y1="185" x2="225" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="260" y1="185" x2="275" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+          <line x1="295" y1="185" x2="325" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arrowGray)"/>
+
+          <!-- DC 2 App Servers -->
+          <rect x="200" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="225" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 2A</text>
+          <rect x="260" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="285" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 2B</text>
+          <rect x="320" y="220" width="50" height="38" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="345" y="243" text-anchor="middle" fill="#1e40af" font-size="10">App 2C</text>
+
+          <!-- Label for local counters -->
+          <text x="100" y="280" text-anchor="middle" fill="#64748b" font-size="10">Local counters</text>
+          <text x="285" y="280" text-anchor="middle" fill="#64748b" font-size="10">Local counters</text>
+
+          <!-- Annotations -->
+          <rect x="30" y="310" width="340" height="100" rx="8" fill="#fff" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4"/>
+          <text x="50" y="332" fill="#334155" font-size="11" font-weight="600">Key properties:</text>
+          <text x="50" y="352" fill="#64748b" font-size="11">- Central Service contacted ~4 req/hour (trivial)</text>
+          <text x="50" y="370" fill="#64748b" font-size="11">- DC Coordinators contacted every ~5 days</text>
+          <text x="50" y="388" fill="#64748b" font-size="11">- App Servers generate IDs with zero network calls</text>
+          <text x="50" y="406" fill="#16a34a" font-size="11" font-weight="600">- Write path: purely local, ~5 ms total</text>
+
+          <!-- "..." between DC groups -->
+          <text x="475" y="255" text-anchor="middle" fill="#64748b" font-size="16">...</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Write Path (Creating a Short URL)</h3>
+<pre class="line-numbers"><code class="language-text">1. App server receives request: shorten("https://example.com/long/path")
+
+2. App server increments its LOCAL counter: counter = 47,382,951
+   (No network call. No database lookup. No coordination.)
+
+3. Apply FPE: feistel_permute(47382951) → 2,891,004,573
+
+4. Encode to base62: encode_base62(2891004573) → "kR3mQ7x"
+
+5. Write to database: INSERT (code="kR3mQ7x", url="https://...")
+   (No uniqueness check needed — the counter guarantees uniqueness.)
+
+6. Return to user: "https://short.ly/kR3mQ7x"
+
+Total write latency:
+  Counter increment:  ~0 ms (in-memory)
+  FPE computation:    ~0.01 ms (CPU-only)
+  Base62 encoding:    ~0 ms
+  Database write:     ~5 ms (SSD-backed, local DC)
+  Total:              ~5 ms  ✓  (well under 50 ms SLA)</code></pre>
+      </div>
+
+      <div>
+        <h3>Read Path (Redirecting a Short URL)</h3>
+<pre class="line-numbers"><code class="language-text">1. User visits: https://short.ly/kR3mQ7x
+
+2. Look up "kR3mQ7x" in cache (Redis/Memcached).
+   → Cache hit (90%+ of the time): return long URL. Done.
+   → Cache miss: query database.
+
+3. Database: SELECT url FROM urls WHERE code = "kR3mQ7x"
+   → Return long URL. Cache it for future reads.
+
+4. HTTP 301 redirect to the long URL.
+
+Read latency:
+  Cache hit:  ~1 ms   ✓
+  Cache miss: ~5 ms   ✓  (both under 10 ms SLA)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Approach Comparison</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Approach</th><th>Collisions?</th><th>DB Check on Write?</th><th>Multi-DC?</th><th>Predictable?</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Random generation</td>
+                <td>Yes (certain within hours)</td>
+                <td>Yes (every write)</td>
+                <td>Needs distributed lock</td>
+                <td>No</td>
+              </tr>
+              <tr>
+                <td>Global counter</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Counter is bottleneck</td>
+                <td>Yes (sequential)</td>
+              </tr>
+              <tr>
+                <td>Pre-allocated ranges</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes (ranges per DC)</td>
+                <td>Yes (sequential within range)</td>
+              </tr>
+              <tr>
+                <td><strong>Ranges + FPE (final)</strong></td>
+                <td><strong>No</strong></td>
+                <td><strong>No</strong></td>
+                <td><strong>Yes</strong></td>
+                <td><strong>No (looks random)</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Handling Edge Cases</h3>
+<pre class="line-numbers"><code class="language-text">Custom short URLs (user picks their own code):
+  - Store in a separate "custom codes" table.
+  - Before assigning a counter-generated code, check it doesn't
+    collide with any custom code. (Rare — custom codes are uncommon
+    and the space is 3.52 trillion.)
+
+Analytics (click counting):
+  - Append click events to a Kafka topic: (code, timestamp, IP, user-agent).
+  - Consume into a time-series database for per-URL analytics.
+  - Decoupled from the redirect path — no latency added.
+
+Expiration:
+  - Add expires_at column. Default: never.
+  - Background job deletes expired entries.
+  - Counter values are NOT recycled (too complex, not needed with 96-year space).
+
+Rate limiting:
+  - Per-user write limit: 1,000 URLs/day (prevents abuse).
+  - Per-IP read limit: 10,000 reads/minute (prevents scraping).</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul class="full-width">
+        <li><strong>Never use random generation for high-volume unique IDs.</strong> The birthday paradox makes collisions certain far sooner than intuition suggests. With 3.52 trillion possible codes and 100M generated per day, collisions begin within hours.</li>
+        <li><strong>Pre-allocated ranges eliminate coordination on the write path.</strong> Each server gets a block of 1 million IDs. It generates IDs locally with zero network calls. The range service is contacted once every 4.8 hours &mdash; if it is down for days, the system keeps running.</li>
+        <li><strong>Format-preserving encryption hides sequential patterns.</strong> Apply a bijective permutation (Feistel network) to the counter before base62 encoding. The output looks random but is deterministic and collision-free by construction. This prevents URL enumeration attacks.</li>
+        <li><strong>Two-level range allocation enables multi-DC operation.</strong> Central service allocates large blocks to DCs. DC coordinators sub-divide for app servers. No cross-DC communication on the write path.</li>
+        <li><strong>Back-of-envelope math prevented a bad design.</strong> The birthday paradox calculation immediately disqualified random generation. The ID space exhaustion calculation (96 years) confirmed that counter-based generation is viable. Always do the math first.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>How hash functions distribute data across nodes &mdash; relevant for sharding the URL database.</p>
+        </a>
+        <a href="../database-sharding.html" class="card topic-card">
+          <h3>Database Sharding</h3>
+          <p>Partitioning 182 billion URL records across multiple database servers.</p>
+        </a>
+        <a href="../bloom-filters.html" class="card topic-card">
+          <h3>Bloom Filters</h3>
+          <p>Probabilistic data structures that could speed up existence checks (if you were using random generation).</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

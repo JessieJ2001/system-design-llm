@@ -1,0 +1,2140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed KV Cache for a Multimodal, Tool-Using, Branching Claude-Code-Style Assistant &mdash; Staff+ NALSD Walkthrough (Image / PDF / Video + Tool Execution + Conversation Forks)</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.86rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .gate-box { background:#fef2f2; border-left:4px solid #dc2626; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* Number-source tags (rendered as inline chips, greppable). */
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+      font-weight:700; padding:.05rem .35rem; border-radius:4px; margin-left:.25rem;
+      vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-fa { color:#b45309; background:#fef3c7; border:1px solid #fcd34d; }
+    .tag-k  { color:#6b21a8; background:#f3e8ff; border:1px solid #d8b4fe; }
+    /* Marker chips for "new" / "changed-from-parent" content. */
+    .mk { display:inline-block; font-size:.72rem; font-weight:700; padding:.05rem .4rem;
+      border-radius:4px; margin-right:.3rem; vertical-align:baseline; }
+    .mk-new { color:#9a3412; background:#ffedd5; border:1px solid #fdba74; }
+    .mk-chg { color:#1e40af; background:#dbeafe; border:1px solid #93c5fd; }
+    /* B-row spine */
+    table.bspine td:first-child { font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; }
+    /* Iteration header */
+    .iter-head { background:linear-gradient(90deg,#eff6ff,#f8fafc); border-left:6px solid #2563eb;
+      border-radius:8px; padding:.6rem 1rem; margin:1.5rem 0 .6rem; }
+    .iter-head h2 { margin:0; }
+    .iter-head .iter-meta { font-size:.85rem; color:#475569; margin-top:.25rem; }
+    /* Two-column layout (side-by-side comparisons) */
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    /* Design-choice block */
+    .dc { background:#fff; border:1px solid var(--color-border); border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; }
+    .dc h4 { margin:0 0 .25rem; color:#1e3a8a; }
+    .dc .dc-prob { font-weight:700; color:#7c2d12; }
+    .dc .dc-sols { font-weight:700; color:#0c4a6e; }
+    .dc .dc-why { font-weight:700; color:#14532d; }
+    .dc .dc-why.lead { margin-bottom:.15rem; }
+    .dc ul { margin:.2rem 0 .35rem 1rem; padding:0; }
+    .dc ul.why-list { margin:.1rem 0 .35rem 1rem; }
+    .dc ul.why-list > li { font-weight:400; color:#14532d; margin:.15rem 0; }
+    .dc ul.why-list > li > strong { color:#14532d; }
+    .dc .pick { background:#dcfce7; padding:.05rem .3rem; border-radius:3px; }
+    .dc .reject { color:#991b1b; }
+    /* SLO impact table */
+    table.slo th { background:#dbeafe; }
+    table.slo .arrow-down { color:#15803d; font-weight:700; }
+    table.slo .arrow-up { color:#b91c1c; font-weight:700; }
+    table.slo .arrow-flat { color:#6b7280; font-weight:700; }
+    /* Step lists */
+    ol.steps { margin:.3rem 0 .6rem 1.2rem; padding:0; }
+    ol.steps > li { margin:.3rem 0; }
+    /* Notation box */
+    .notation-box { background:#f8fafc; border:1px solid var(--color-border); border-radius:8px;
+      padding:.4rem 1rem .7rem; margin:.8rem 0; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    /* Section anchors get a subtle scroll-margin so sidebar jumps don't hide behind nav. */
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <!-- ===================================================== -->
+  <!-- Navigation                                              -->
+  <!-- ===================================================== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">Text sibling</a></li>
+        <li><a href="distributed_kv_cache_image.html">Image sibling</a></li>
+        <li><a href="distributed_kv_cache_image_tool.html">Tool sibling</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===================================================== -->
+  <!-- Hero                                                   -->
+  <!-- ===================================================== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Distributed KV Cache for a <em>Multimodal, Tool-Using, Branching</em> Claude-Code-Style Assistant</h1>
+      <p class="hero-subtitle">A staff+ <strong>NALSD</strong> (<em>Non-Abstract Large System Design</em>) walkthrough &mdash; same fleet, same
+        <strong>SLOs</strong> (<em>Service-Level Objectives</em>), same 8&times;H100 hardware as the
+        <a href="distributed_kv_cache.html">text page</a>, <strong>plus image / PDF / video attachments</strong> (inherited from the
+        <a href="distributed_kv_cache_image.html">image page</a>), <strong>plus tool execution &mdash; the agentic loop</strong> (inherited from the
+        <a href="distributed_kv_cache_image_tool.html">tool page</a>), <strong>and one new functional change: a conversation is no longer a line &mdash; it
+        is a tree. The client can <em>fork</em> a conversation at any point and continue it multiple ways (regenerate, edit-and-resubmit, A/B compare,
+        best-of-N).</strong></p>
+      <p class="hero-subtitle">A fork is, to the serving system, <strong>just a second conversation that happens to share a prefix with the first.</strong>
+        Because the parents&rsquo; prefix cache is <strong>content-addressed</strong> (<code>block_hash = hash(parent_hash &Vert; block_tokens)</code>,
+        <a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>) and content-hashing is <strong>path-independent</strong>, two branches that share the
+        first <em>k</em> tokens produce <strong>byte-identical block hashes</strong> for that prefix &mdash; so <strong>APC</strong> (<em>Automatic Prefix
+        Caching</em>) <strong>already deduplicates them</strong>, with no new cache and no awareness that a &ldquo;fork&rdquo; happened. So the
+        <strong>entire distributed-KV-cache design of all three parent pages still holds</strong> &mdash; it just now has to absorb <strong>the tree</strong>:
+        one conversation is no longer a line of turns but a <strong>branching DAG</strong> where sibling continuations share an ancestor prefix. That forces
+        exactly <strong>four new things</strong>: (1) a <strong>ref-count lifetime across the tree</strong> &mdash; the shared ancestor is pinned while
+        &ge;1 branch is live, GC&rsquo;d only when the last branch is gone; (2) <strong>copy-on-write of the single diverging block</strong> &mdash; full
+        shared blocks are immutable and shared by reference, only the partial fork-point block is copied; (3) <strong>co-location + parallel-branch
+        batching</strong> &mdash; all siblings land on the same task and N siblings decode in one batch reading the prefix once; and (4) <strong>a new
+        abuse axis</strong> &mdash; fan-out is combinatorial (breadth<sup>depth</sup>), so a tree&rsquo;s compute/HBM can explode without a per-request
+        limiter ever seeing it.</p>
+      <p class="hero-meta">
+        Cites <a href="../../knowledge/K2_kv-cache.html">K2 KV cache</a> (D5 / D31 / prefix caching / PagedAttention CoW) &middot;
+        <a href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4 scheduling</a> &middot;
+        <a href="../../knowledge/K19_reasoning-model-serving.html">K19 reasoning / Tree-of-Thoughts</a> &middot;
+        <a href="../../knowledge/K13_speculative-decoding.html">K13 speculative decode</a> &middot;
+        <a href="../../knowledge/K12_multimodal-and-image-offload.html">K12 multimodal</a> &middot;
+        delta of <a href="distributed_kv_cache.html">text</a> + <a href="distributed_kv_cache_image.html">image</a> +
+        <a href="distributed_kv_cache_image_tool.html">tool</a> &middot;
+        ~18 min (delta only)
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Scope: how to read this delta page                      -->
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="scope">What this page is &mdash; and how to read it</h2>
+      <p><strong>TL;DR.</strong> This is the <strong>branching sibling</strong> of the
+        <a href="distributed_kv_cache.html">text</a>, <a href="distributed_kv_cache_image.html">image</a>, and
+        <a href="distributed_kv_cache_image_tool.html">tool</a> scenario pages. It is a <strong>delta on all three</strong>: same scenario, same SLOs, same
+        8&times;H100 hardware, same fleet, same iterations Iter&nbsp;0&nbsp;&rarr;&nbsp;10, the image deltas Iter&nbsp;M0&ndash;M3, and the tool deltas
+        Iter&nbsp;T0&ndash;T3 &mdash; <em>one</em> new functional change: <strong>a conversation can fork into a tree.</strong> Everything not marked below is
+        <strong>inherited verbatim</strong> from the three parents. A reader who knows the tool page reads only the marked spans.</p>
+      <ul>
+        <li><span class="mk mk-new">NEW</span> a section / iteration / entity that does not exist on any parent.</li>
+        <li><span class="mk mk-chg">&Delta;</span> an inherited section that <em>changes</em> under forking (the parents are otherwise intact).</li>
+        <li><strong>Fork</strong> = creating a <em>sibling continuation</em> of a conversation from an earlier point. <strong>CoW</strong> = Copy-on-Write.
+          <strong>DAG</strong> = Directed Acyclic Graph (the shape a forked conversation takes). Defined from zero in <a href="#b">&sect;B</a>.</li>
+      </ul>
+      <p><strong>Where the new content lands.</strong> This page adds one knowledge section &mdash;
+        <a href="#b">&sect;B &ldquo;How branching / multi-turn forks work &mdash; the conversation is a tree&rdquo;</a> (the from-zero explainer, the branching
+        analogue of the image page&rsquo;s <a href="distributed_kv_cache_image.html#m">&sect;M</a> and the tool page&rsquo;s
+        <a href="distributed_kv_cache_image_tool.html#t">&sect;T</a>) &mdash; placed right after the scenario (<a href="#s0">S0</a>) because every later
+        delta references it, plus four branch iterations (<a href="#iter">Iter&nbsp;B0&ndash;B3</a>) slotted into the existing
+        Iter&nbsp;0&rarr;10 / M0&ndash;M3 / T0&ndash;T3 ribbon, then the S6/S7 and cross-link deltas. It does <strong>not</strong> restate &sect;M (image) or
+        &sect;T (tool) &mdash; those live on their pages; this page links to them.</p>
+      <div class="warn-box"><strong>Number-source discipline (inherited &mdash; one-line pointer).</strong>
+        Same chips as the parents:
+        <span class="tag tag-g">G</span> given &middot;
+        <span class="tag tag-fa">G-FA</span> flagged assumption (would confirm in interview) &middot;
+        <span class="tag tag-k">G&nbsp;&mdash;&nbsp;K{N}&nbsp;D{m}</span> owned by a knowledge page (cite, don&rsquo;t restate) &middot;
+        <span class="tag tag-d">D</span> derived &mdash; <em>formula + substituted values printed inline</em>.
+        Every new fork / tree number is declared <strong>once</strong> in <a href="#s0-workload">&sect;1.3</a> and cited downstream. The parent constants
+        reused throughout: <code>&lambda;<sub>peak</sub> = 100&nbsp;K&nbsp;req/s</code> and <code>KV_per_tok = 320&nbsp;KB</code>
+        (<a href="../../knowledge/K2_kv-cache.html#d31">K2&nbsp;D31</a>).
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S0 delta - Scenario & Requirements                      -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s0">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S0 &nbsp;Scenario &amp; Requirements (delta)</h2>
+      <p><strong>TL;DR.</strong> One functional change &mdash; a conversation can fork into a tree of sibling continuations &mdash; reshapes four things:
+        the <strong>non-goals</strong> (&sect;1.1, the tree&rsquo;s structure stays client-side, no server tree object), the <strong>NFR budget</strong>
+        (&sect;1.2, two new fan-out caps; TTFT now has a <em>sibling</em> binding case), the <strong>workload distribution</strong> (&sect;1.3, the single
+        source of truth for every new number), and the <strong>bottleneck spine</strong> (&sect;1.5, six new rows BB1&ndash;BB6). Everything else in the
+        parents&rsquo; S0 is inherited verbatim.</p>
+
+      <h3 id="s0-functional">1.1 &nbsp;Functional shape &amp; non-goals (delta)</h3>
+      <h4>Added to the functional shape</h4>
+      <ul>
+        <li>A conversation may be <strong>forked</strong>: the client may continue an existing conversation <strong>from any prior node</strong>, producing
+          <strong>sibling branches</strong> that share an ancestor prefix. Forks express <strong>regenerate, edit-and-resubmit, A/B compare, and
+          best-of-N</strong> (<a href="#b2">&sect;B.2</a>). Multiple branches may be <strong>live simultaneously</strong> (A/B compare).</li>
+        <li><strong>Forking is client-driven + implicit</strong> (<a href="#b3">&sect;B.3</a> / <a href="#b6">&sect;B.6</a> (a)): the client re-POSTs a
+          sibling keyed by the same <code>conv_id</code> + a <code>branch_id</code>; the fleet shares the prefix via the existing content-hash APC.</li>
+      </ul>
+      <h4>Added to non-goals (new)</h4>
+      <ul>
+        <li><strong>A server-side conversation-tree object / heavyweight <code>fork()</code> RPC</strong> (<a href="#b6">&sect;B.6</a> (b)) &mdash; the fleet
+          holds no authoritative tree; the client owns tree structure. (The fleet <em>does</em> keep lightweight KV ref-count/pin metadata &mdash; the
+          line drawn in <a href="#b6">&sect;B.6</a>.)</li>
+        <li><strong>Branch <em>selection / evaluation</em> policy</strong> &mdash; which branch to keep, how to score best-of-N, when to prune &mdash; is
+          product/UX or model behavior, not serving.</li>
+        <li><strong>Cross-conversation (cross-<code>conv_id</code>) merge / graph editing</strong> &mdash; branches live under one root
+          <code>conv_id</code>; arbitrary DAG merges across conversations are out of scope.</li>
+      </ul>
+      <div class="note-box"><strong>An inherited non-goal that <em>stays</em> a non-goal.</strong> Multi-agent / sub-agent fan-out (tool page &sect;1.1) is
+        <strong>still</strong> out of scope &mdash; branching is <strong>one conversation&rsquo;s tree of continuations</strong>, not many agents. Stated so
+        the two fan-outs aren&rsquo;t conflated: a fork shares a prefix and decodes siblings; a sub-agent is a separate conversation with its own context.</div>
+
+      <h3 id="s0-nfr">1.2 &nbsp;Non-functional requirements (delta)</h3>
+      <table class="sheet">
+        <thead><tr><th>Dimension</th><th>Parent</th><th>Delta under forking</th><th>Tag</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99 <span class="tag tag-fa" title="Time To First Token">TTFT</span></td><td class="n">&le; 400 ms</td>
+            <td><strong>Target unchanged; new binding case = the <em>sibling</em> request.</strong> A branch that lands on a task already holding the warm
+              shared prefix pays TTFT = prefill of <strong>only the divergent tail</strong> (a cache hit on the trunk). A branch that lands cold (prefix
+              evicted between siblings, or routed off-task) pays a <strong>full shared-trunk re-prefill</strong> &rarr; the case
+              <a href="#iter-b1">Iter&nbsp;B1</a>&rsquo;s pin + <a href="#iter-b2">Iter&nbsp;B2</a>&rsquo;s co-location protect against.</td>
+            <td class="n"><span class="tag tag-g">G</span></td></tr>
+          <tr><td>TPOT p99 (<em>Time Per Output Token</em>)</td><td class="n">&le; 30 ms</td>
+            <td><strong>Unchanged</strong> &mdash; each branch decodes independently; parallel-branch batching (<a href="#iter-b2">B2</a>) shares prefix
+              <em>memory</em>, not the per-token compute.</td><td class="n"><span class="tag tag-g">G</span></td></tr>
+          <tr><td><strong>Live branches / conversation</strong> <span class="mk mk-new">NEW</span></td><td class="n">&mdash;</td>
+            <td><code>max_live_branches</code> cap (e.g. &le; 16) &mdash; bounds concurrent fan-out per conv (<a href="#iter-b3">Iter&nbsp;B3</a>, BB5).</td>
+            <td class="n"><span class="tag tag-fa">G-FA</span></td></tr>
+          <tr><td><strong>Tree nodes / conversation</strong> <span class="mk mk-new">NEW</span></td><td class="n">&mdash;</td>
+            <td><code>max_tree_nodes</code> cap (e.g. &le; 1 000) &mdash; bounds total branch+depth accumulation (<a href="#iter-b3">Iter&nbsp;B3</a>).</td>
+            <td class="n"><span class="tag tag-fa">G-FA</span></td></tr>
+          <tr><td>Max context</td><td class="n">1 M tokens</td>
+            <td><strong>Unchanged, and it is <em>per root&rarr;head path</em>, not per tree.</strong> Each decoding sequence is one path; the 1 M cap binds the
+              path, not the aggregate tree. A heavily-forked tree&rsquo;s <em>aggregate</em> KV can far exceed 1 M-tok-worth while no single path does &rarr;
+              drives the hot-conversation / tree-footprint sizing (<a href="#iter-b2">B2</a>/<a href="#iter-b1">B1</a>), <strong>not</strong> the
+              context-parallelism (CP) threshold.</td><td class="n"><span class="tag tag-g">G</span>/<span class="tag tag-d">D</span></td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s0-workload">1.3 &nbsp;Workload composition (delta) &mdash; single source of truth</h3>
+      <div class="note-box"><strong>Discipline.</strong> Every new fork / tree number is declared <strong>once, here</strong>, and cited downstream. Inputs
+        are <span class="tag tag-fa">G-FA</span> (would confirm in interview); derived rows print their formula + substitution inline
+        (<span class="tag tag-d">D</span>). Per <em>variable-usage cadence</em>, each row gives WHAT / used-for / updated-when / by-whom. Reused parent
+        constants: <code>&lambda;<sub>peak</sub> = 100&nbsp;K&nbsp;req/s</code>, <code>KV_per_tok = 320&nbsp;KB</code>
+        (<a href="../../knowledge/K2_kv-cache.html#d31">K2&nbsp;D31</a>).</div>
+
+      <h4>Fork shape &mdash; the amplification + sharing drivers</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>What / used-for / updated-when / by-whom</th></tr></thead>
+        <tbody>
+          <tr><td class="c">f_fork</td><td class="n">0.15</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>fraction of conversations that fork &ge;1 time (regenerate dominates); <strong>written by</strong> product telemetry; <strong>used for</strong>
+              sizing tree-KV footprint + the sibling-batch rate.</td></tr>
+          <tr><td class="c">fanout_mean</td><td class="n">2.0</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>mean live branches per fork (regenerate&rarr;2, A/B&rarr;2, best-of-N larger); <strong>used for</strong> decode-amplification + co-location
+              load.</td></tr>
+          <tr><td class="c">fanout_p99</td><td class="n">8</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>best-of-N / heavy-exploration tail; p99 = the <code>max_live_branches</code> region.</td></tr>
+          <tr><td class="c">p_fork_late</td><td class="n">0.7</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>fraction of forks near the conversation tail (regenerate / last-turn) &rarr; high prefix share.</td></tr>
+          <tr><td class="c">shared_prefix_frac</td><td class="n">0.85</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>mean fraction of a branch&rsquo;s context shared with siblings (high because forks are late); <strong>drives</strong> the prefill-saved-by-
+              sharing win.</td></tr>
+          <tr><td class="c">branch_lifetime (best-of-N)</td><td class="n">~seconds</td><td><span class="tag tag-fa">G-FA</span></td>
+            <td>the N&minus;1 best-of-N branches are discarded almost immediately &rarr; short-lived <code>ref_count</code>; vs A/B-compare branches that
+              live the session.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Derived tree-amplified workload (replaces parent means in tree-bearing formulas)</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>Derivation / source</th></tr></thead>
+        <tbody>
+          <tr><td class="c">forks_per_conv_mean</td><td class="n">~0.3</td><td><span class="tag tag-d">D</span></td>
+            <td>mean fork events per conversation = <code>f_fork &times; E[forks &vert; forked]</code> = <code>0.15 &times; 2 = 0.3</code> (a forked conv
+              forks ~twice on average).</td></tr>
+          <tr><td class="c">decode_amp</td><td class="n">~1.15</td><td><span class="tag tag-d">D</span></td>
+            <td>mean decode-work multiplier per conv: <code>1 + f_fork&middot;(fanout_mean &minus; 1) = 1 + 0.15&middot;(2.0&minus;1) = 1.15</code>.
+              <strong>Fan-out multiplies decode, not the shared prefill.</strong></td></tr>
+          <tr><td class="c">prefill_share_saving</td><td class="n">~0.85</td><td><span class="tag tag-d">D</span></td>
+            <td>shared-prefix prefill <strong>avoided</strong> vs re-prefilling per branch:
+              <code>shared_prefix_frac&middot;(fanout_mean &minus; 1) = 0.85&middot;1 = 0.85</code> of a trunk per fork &mdash; the headline sharing
+              win.</td></tr>
+          <tr><td class="c">tree_kv_footprint</td><td class="n">&Sigma; (symbolic)</td><td><span class="tag tag-d">D</span></td>
+            <td>one conv&rsquo;s total KV = <code>shared_prefix_kv + &Sigma;<sub>branches</sub> branch_unique_kv</code>; <strong>sublinear in fan-out</strong>
+              (shared trunk counted once) &mdash; the <a href="#iter-b1">B1</a>/<a href="#iter-b2">B2</a> hot-conv driver.</td></tr>
+          <tr><td class="c">sibling_batch_rate</td><td class="n">~15 k / s</td><td><span class="tag tag-d">D</span></td>
+            <td>rate of same-prefix sibling requests fleet-wide &rarr; the co-location + shared-prefix-batch opportunity (<a href="#iter-b2">B2</a>):
+              <code>&lambda;<sub>peak</sub>&middot;f_fork&middot;(fanout_mean&minus;1) = 100k&middot;0.15&middot;1 = 15k/s</code>.</td></tr>
+          <tr><td class="c"><strong>n_branches_concurrent</strong></td><td class="n"><strong>~300 k</strong></td><td><span class="tag tag-d">D</span></td>
+            <td><strong>Little&rsquo;s-law population of live sibling branches fleet-wide</strong> (the <a href="#iter-b2">B2</a> parallel-branch-batch sizing +
+              the ref-count-<code>&gt;1</code> population):
+              <code>&lambda;<sub>peak</sub>&middot;f_fork&middot;fanout_mean&middot;E[branch_overlap_time]</code>. With
+              <code>E[branch_overlap_time] &asymp; 10 s</code> <span class="tag tag-fa">G-FA</span> (how long siblings co-exist before pruning):
+              <code>100k&middot;0.15&middot;2.0&middot;10 = 300k</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s0-flagged">1.4 &nbsp;Flagged assumptions (delta)</h3>
+      <ul>
+        <li>Forking is <strong>client-driven + implicit</strong> (<a href="#b6">&sect;B.6</a> (a)); no server tree object.</li>
+        <li><code>f_fork = 0.15</code>; <code>fanout</code> mean 2.0 / p99 8; <code>p_fork_late = 0.7</code>; <code>shared_prefix_frac = 0.85</code>.</li>
+        <li><code>max_live_branches &asymp; 16</code>; <code>max_tree_nodes &asymp; 1 000</code>; <code>E[branch_overlap_time] &asymp; 10 s</code>.</li>
+        <li>Branch sharing is <strong>intra-tenant</strong> (a user forks their own conversation) &rarr; <strong>no privacy gate</strong> &mdash; the safest
+          sharing class on the page (<a href="#b4">&sect;B.4</a>).</li>
+        <li>The 1 M context cap binds <strong>per root&rarr;head path</strong>, not per aggregate tree (&sect;1.2).</li>
+      </ul>
+
+      <h3 id="s0-spine">1.5 &nbsp;Bottleneck spine (delta) &mdash; new rows BB1&ndash;BB6</h3>
+      <p>Inherited B1&ndash;B12 (text), BM1&ndash;BM6 (image), and BT1&ndash;BT7 (tool) are <strong>unchanged</strong> (branch tokens are regular tokens
+        &rarr; the same KV machinery, <a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>). Add:</p>
+      <table class="sheet bspine">
+        <thead><tr><th>ID</th><th>Bottleneck</th><th>Solved by</th></tr></thead>
+        <tbody>
+          <tr><td>BB1</td><td>A shared ancestor prefix is referenced by <strong>multiple live branches</strong>; naive lifetime would evict it when
+            <em>one</em> branch ends, forcing the others to cold re-prefill the whole trunk.</td>
+            <td><a href="#iter-b1">Iter&nbsp;B1</a> (ref-count = live-branch count; pin while &ge;1 branch live; GC at last)</td></tr>
+          <tr><td>BB2</td><td>At the fork point the <strong>partial (not-yet-full) block</strong> is appended-to differently by each branch &rarr; a single
+            physical block can&rsquo;t serve both.</td>
+            <td><a href="#iter-b1">Iter&nbsp;B1</a> (copy-on-write <strong>only</strong> the partial fork-point block; full blocks shared read-only &mdash;
+              the vLLM fork primitive)</td></tr>
+          <tr><td>BB3</td><td>Sibling branches routed to <strong>different tasks</strong> each cold-prefill the shared trunk &rarr; the sharing win is lost;
+            fan-out &times; full-trunk prefill.</td>
+            <td><a href="#iter-b2">Iter&nbsp;B2</a> (CH-on-<code>conv_id</code> co-locates all siblings on the task holding the warm prefix)</td></tr>
+          <tr><td>BB4</td><td>N live siblings decoded as N independent requests waste HBM (N copies of the prefix) and batch slots.</td>
+            <td><a href="#iter-b2">Iter&nbsp;B2</a> (parallel-branch batching &mdash; N branch queries read the <strong>one</strong> shared prefix block set;
+              K4)</td></tr>
+          <tr><td>BB5</td><td><strong>Fan-out is combinatorial</strong> (breadth<sup>depth</sup>) &rarr; one conversation&rsquo;s tree compute/HBM can
+            explode, invisible to a per-request limiter.</td>
+            <td><a href="#iter-b3">Iter&nbsp;B3</a> / Iter&nbsp;8 delta (<code>max_live_branches</code> + <code>max_tree_nodes</code> + fan-out-amplified
+              token-bucket charge)</td></tr>
+          <tr><td>BB6</td><td>A forked conversation can become a <strong>hot conversation</strong> &mdash; <code>tree_kv_footprint</code> exceeds one
+            task&rsquo;s HBM-for-KV &rarr; can&rsquo;t keep all siblings co-located.</td>
+            <td><a href="#iter-b2">Iter&nbsp;B2</a> (spread-vs-share crossover: overflow branches to a sibling task, shared trunk pulled from the
+              Iter&nbsp;3b pool)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- §B - How branching / multi-turn forks work             -->
+  <!-- ===================================================== -->
+  <section class="section" id="b">
+    <div class="container">
+      <h2><span class="mk mk-new">NEW</span> &sect;B &nbsp;How branching / multi-turn forks work &mdash; the conversation is a tree (from zero)</h2>
+
+      <div class="note-box"><strong>Why this section exists.</strong> Same contract as the image page&rsquo;s
+        <a href="distributed_kv_cache_image.html#m">&sect;M</a> and the tool page&rsquo;s <a href="distributed_kv_cache_image_tool.html#t">&sect;T</a>: the
+        reader knows LLM text + vision + agentic-tool serving cold but <strong>nothing</strong> about forked / tree-structured conversations. So this section
+        defines from zero, walks one concrete forked conversation node-by-node, and gives the tree a diagram (not a wall of prose). It is
+        <strong>knowledge, not a design iteration</strong> &mdash; no &ldquo;what breaks&rdquo; / SLO table. Acronyms expanded on first use:
+        <strong>fork</strong> (creating a sibling continuation of a conversation from an earlier point), <strong>CoW</strong> (<em>Copy-on-Write</em> &mdash;
+        share a block by reference until one writer diverges, then copy only the diverging block), <strong>DAG</strong> (<em>Directed Acyclic Graph</em>
+        &mdash; the shape a forked conversation takes), <strong>best-of-N</strong> (sampling N continuations from one prefix and keeping the best),
+        <strong>ToT</strong> (<em>Tree-of-Thoughts</em> &mdash; the reasoning analogue, <a href="#b1">&sect;B.1</a>).</div>
+
+      <!-- ---------- B.1 the load-bearing fact ---------- -->
+      <h3 id="b1">B.1 &nbsp;The one load-bearing fact (state it first)</h3>
+      <div class="ref-box">
+        <p style="margin-top:0"><strong>A fork is two sequences that share a content-hashed prefix &mdash; and the prefix cache already shares it.</strong>
+          When the client takes a conversation up to node <em>k</em> and continues it two different ways, the two resulting sequences are
+          <strong>identical for tokens <code>1..k</code></strong> and diverge afterward. The parents&rsquo; block hash is
+          <code>hash(parent_block_hash &Vert; this_block_tokens)</code> (<a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>) &mdash; a
+          <strong>pure function of the token path so far</strong>, independent of which &ldquo;branch&rdquo; produced it. So the shared prefix&rsquo;s blocks
+          hash <strong>identically</strong> in both branches &rarr; the existing APC <strong>deduplicates them with zero new machinery.</strong> The KV is
+          computed once and read by both.</p>
+        <p><strong>Consequence, stated up front (so the rest of &sect;B pays off):</strong> &ldquo;cache the KV shared by two branches&rdquo; is just
+          &ldquo;cache KV with <code>ref_count &gt; 1</code>&rdquo; &mdash; already solved by the parents (cross-conversation prefix sharing).
+          <strong>The genuinely new thing is the <em>tree</em>, not the sharing.</strong> A conversation is no longer one growing line; it is a
+          <strong>DAG of nodes</strong> where siblings share an ancestor. That changes four things the parents assumed about a <em>linear</em> conversation:
+          who keeps the shared ancestor alive (<strong>ref-count lifetime</strong>, <a href="#iter-b1">B1</a>), how the <em>one</em> not-yet-full block at
+          the fork point is handled (<strong>CoW</strong>, <a href="#iter-b1">B1</a>), where the siblings run
+          (<strong>co-location + batching</strong>, <a href="#iter-b2">B2</a>), and how much compute one conversation can demand
+          (<strong>fan-out abuse</strong>, <a href="#iter-b3">B3</a>).</p>
+        <p style="margin-bottom:0"><strong>This is K19&rsquo;s Tree-of-Thoughts, externalized &mdash; and K2/K4&rsquo;s parallel sampling, made
+          user-visible.</strong> A reasoning model exploring branches internally (ToT, beam search) and a serving engine sampling best-of-N from one prompt
+          are <strong>the same KV-sharing shape</strong> the engine already implements (vLLM CoW fork, SGLang RadixAttention). User-visible forking
+          (regenerate, edit-resubmit, A/B compare) is that primitive <strong>promoted to a product feature across turns</strong>. The serving consequence is
+          identical; only the <em>trigger</em> (a client request) and the <em>time-scale</em> (turns, not tokens) are new.</p>
+      </div>
+
+      <!-- ---------- B.2 why a client forks ---------- -->
+      <h3 id="b2">B.2 &nbsp;Why a client forks &mdash; the four concrete shapes (the worked examples)</h3>
+      <p>State these once; every branch iteration traces to one. All are <strong>client-driven</strong> (<a href="#b3">&sect;B.3</a>).</p>
+      <table class="sheet">
+        <thead><tr><th>Shape</th><th>What the user does</th><th>Fork point &amp; share</th><th>Fan-out / lifetime</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Regenerate</strong></td><td>dislikes the last answer, asks for another</td>
+            <td>fork at the <strong>last user turn</strong>; shared = everything minus the rejected answer &rarr; <code>shared_prefix_frac &asymp; 1</code></td>
+            <td>fan-out 2; the cheapest, most common fork</td></tr>
+          <tr><td><strong>Edit-and-resubmit</strong></td><td>edits an earlier message, re-runs from there</td>
+            <td>fork at the <strong>edited turn</strong>; before = shared, after = discarded + re-decoded &rarr;
+              <code>shared_prefix_frac = edit_position / context_len</code></td>
+            <td>fan-out 2; supersedes the old tail</td></tr>
+          <tr><td><strong>A/B compare</strong></td><td>&ldquo;try approach A <em>and</em> approach B&rdquo;</td>
+            <td>two+ <strong>live</strong> siblings from one fork point, both retained, shown side-by-side</td>
+            <td>fan-out &ge; 2, <strong>both alive simultaneously</strong> &mdash; the ref-count-<code>&gt;1</code>-from-within-one-conv case</td></tr>
+          <tr><td><strong>Best-of-N / parallel sampling</strong></td><td>sample N continuations, keep the best (often automated, e.g. agent
+            self-consistency)</td>
+            <td>degenerate fork: <strong>same prefix, N immediate siblings</strong></td>
+            <td>highest fan-out, <strong>N&minus;1 discarded</strong> &rarr; shortest-lived branches</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ---------- B.3 walked node-by-node + D-B1 ---------- -->
+      <h3 id="b3">B.3 &nbsp;The forked conversation, walked node-by-node (worked example + diagram D-B1)</h3>
+      <p><strong>Anchor scenario</strong> (continues the tool page&rsquo;s Claude-Code task; concrete dims flagged <span class="tag tag-fa">G-FA</span>):
+        <em>&ldquo;Fix the failing test in <code>auth.py</code>.&rdquo;</em> The agent runs <code>read_file</code> &rarr; <code>run_tests</code> (the tool
+        loop, <a href="distributed_kv_cache_image_tool.html#t">&sect;T</a>). After seeing the failure log at node <code>n4</code>, the user
+        <strong>forks</strong> to compare two fixes: <strong>branch A</strong> &ldquo;add the missing <code>await</code>&rdquo;, <strong>branch B</strong>
+        &ldquo;wrap in a retry&rdquo;. Then the user <strong>regenerates</strong> branch A&rsquo;s final explanation (a second fork at A&rsquo;s last turn).</p>
+      <table class="sheet">
+        <thead><tr><th>Node</th><th>Path</th><th>Tokens</th><th>KV state</th></tr></thead>
+        <tbody>
+          <tr><td class="c">n0</td><td class="c">[hidden_sys &Vert; tool_defs &Vert; user_sys &Vert; user_msg]</td><td>shared root</td>
+            <td>computed once; <code>ref_count</code> = (# live branch heads below)</td></tr>
+          <tr><td class="c">n1..n4</td><td><code>read_file</code> call/result &rarr; <code>run_tests</code> call / <strong>failure-log result</strong></td>
+            <td>shared trunk</td><td><code>ref_count = 3</code> (A, B, and A&prime;) &mdash; <strong>all live branches&rsquo; paths include it</strong></td></tr>
+          <tr><td class="c">n5_A</td><td>branch A: <code>edit_file(await)</code> &rarr; <code>run_tests</code> &rarr; &ldquo;PASS&rdquo;</td>
+            <td>A-unique suffix</td><td><code>ref_count = 2</code> (A and A&prime;) up to A&rsquo;s regenerate point</td></tr>
+          <tr><td class="c">n5_B</td><td>branch B: <code>edit_file(retry)</code> &rarr; <code>run_tests</code> &rarr; &ldquo;PASS&rdquo;</td>
+            <td>B-unique suffix</td><td><code>ref_count = 1</code> (only B)</td></tr>
+          <tr><td class="c">n6_A / n6_A&prime;</td><td>A&rsquo;s two regenerated final answers</td><td>each unique</td>
+            <td>the <strong>fork-point partial block</strong> is <strong>copy-on-written</strong> (<a href="#b4">&sect;B.4</a>)</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Read the rows.</strong> The root + trunk (<code>n0..n4</code>) is <strong>stored once</strong> and read by <strong>all three</strong> live
+        branch heads &mdash; that is the whole win, and it is <strong>free</strong> from the content-hash chain. Only the unique suffixes
+        (<code>n5_A</code>, <code>n5_B</code>, <code>n6_A</code>, <code>n6_A&prime;</code>) cost distinct KV. <strong>Fan-out multiplies decode, not the
+        shared prefill.</strong></p>
+
+      <p><strong>Diagram D-B1 &mdash; the conversation tree, shared vs unique KV.</strong> Green = the shared-prefix KV stored <em>once</em> and read by every
+        branch; blue = branch-unique suffix KV (one <code>ref_count</code> each); the amber marker = the single partial fork-point block that is
+        copy-on-written; the faded node = an abandoned branch whose <code>ref_count</code> falls to 0 and is reclaimed.</p>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1120 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A conversation tree: a shared root-and-trunk prefix (n0 through n4) stored once with ref_count 3, forking into branch A and branch B unique suffixes, and branch A forking again into two regenerated answers where only the partial fork-point block is copy-on-written.">
+        <defs>
+          <marker id="bh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+          <marker id="bg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#15803d"/>
+          </marker>
+        </defs>
+        <style>
+          .bsh  { fill:#ecfdf5; stroke:#059669; stroke-width:1.8; rx:8; }
+          .buq  { fill:#eff6ff; stroke:#2563eb; stroke-width:1.6; rx:8; }
+          .bcow { fill:#fffbeb; stroke:#d97706; stroke-width:1.8; rx:8; }
+          .bfade{ fill:#f8fafc; stroke:#94a3b8; stroke-width:1.4; stroke-dasharray:5 3; rx:8; }
+          .tt   { font-size:13px; font-weight:700; fill:#0f172a; }
+          .ts   { font-size:11px; fill:#475569; }
+          .tg   { font-size:11px; font-weight:700; fill:#15803d; }
+          .mono { font-family:'JetBrains Mono',monospace; }
+          .lbl  { font-size:11px; font-weight:700; fill:#334155; }
+          line.f, path.f { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#bh); }
+          line.g, path.g { stroke:#15803d; stroke-width:1.9; fill:none; marker-end:url(#bg); }
+        </style>
+
+        <!-- shared trunk box -->
+        <rect class="bsh" x="30" y="120" width="430" height="150"/>
+        <text class="tg mono" x="50" y="146">SHARED PREFIX KV &mdash; stored ONCE</text>
+        <text class="tt mono" x="50" y="172">n0  [hidden_sys &#8214; tool_defs &#8214; user_sys &#8214; user_msg]</text>
+        <text class="ts mono" x="50" y="194">n1..n4  read_file &rarr; run_tests &rarr; failure log</text>
+        <text class="tg mono" x="50" y="230" font-weight="700">ref_count = 3</text>
+        <text class="ts" x="50" y="250">(A, B, A&prime; &mdash; every live branch&rsquo;s path includes it)</text>
+
+        <!-- fork edges to A and B -->
+        <text class="lbl" x="468" y="150">FORK</text>
+        <text class="ts" x="468" y="166">(client re-POSTs sibling)</text>
+        <path class="g" d="M460,170 C510,120 540,90 600,80"/>
+        <path class="g" d="M460,220 C510,250 540,270 600,278"/>
+
+        <!-- branch A suffix -->
+        <rect class="buq" x="600" y="48" width="220" height="72"/>
+        <text class="tt mono" x="616" y="74">n5_A  edit_file(await)</text>
+        <text class="ts mono" x="616" y="94">&rarr; run_tests &rarr; PASS</text>
+        <text class="ts mono" x="616" y="112">ref_count = 2 (A, A&prime;)</text>
+
+        <!-- branch B suffix (will be abandoned: faded) -->
+        <rect class="bfade" x="600" y="248" width="220" height="72"/>
+        <text class="tt mono" x="616" y="274" fill="#64748b">n5_B  edit_file(retry)</text>
+        <text class="ts mono" x="616" y="294">&rarr; run_tests &rarr; PASS</text>
+        <text class="ts mono" x="616" y="312">ref_count = 1 &rarr; (abandoned)</text>
+
+        <!-- second fork at A: CoW partial block -->
+        <text class="lbl" x="828" y="40">FORK (regenerate)</text>
+        <rect class="bcow" x="828" y="56" width="58" height="56"/>
+        <text class="ts mono" x="833" y="80" fill="#b45309">CoW</text>
+        <text class="ts mono" x="831" y="96" fill="#b45309">partial</text>
+        <path class="f" d="M820,84 L828,84"/>
+        <path class="f" d="M886,72 C910,60 916,46 940,42"/>
+        <path class="f" d="M886,96 C910,108 916,122 940,128"/>
+
+        <!-- n6_A and n6_A' -->
+        <rect class="buq" x="940" y="14" width="160" height="52"/>
+        <text class="tt mono" x="954" y="38">n6_A</text>
+        <text class="ts mono" x="954" y="56">final answer v1</text>
+        <rect class="buq" x="940" y="100" width="160" height="52"/>
+        <text class="tt mono" x="954" y="124">n6_A&prime;</text>
+        <text class="ts mono" x="954" y="142">final answer v2</text>
+
+        <!-- annotation -->
+        <text class="tg" x="30" y="300" font-weight="700">Shared prefill paid ONCE &mdash; fan-out multiplies only the blue suffixes.</text>
+      </svg>
+      </div>
+      <ul class="legend" style="columns:2;-webkit-columns:2;list-style:none;padding:0;font-size:.85rem;">
+        <li><span style="color:#059669;font-weight:700;">&#9632; green</span> &mdash; shared-prefix KV, one physical copy, <code>ref_count</code> = live-branch count</li>
+        <li><span style="color:#2563eb;font-weight:700;">&#9632; blue</span> &mdash; branch-unique suffix KV, <code>ref_count = 1</code> each</li>
+        <li><span style="color:#d97706;font-weight:700;">&#9632; amber</span> &mdash; CoW: the single partial fork-point block, copied so two branches append differently</li>
+        <li><span style="color:#94a3b8;font-weight:700;">&#9632; faded</span> &mdash; abandoned branch (user drops B) &rarr; <code>ref_count = 0</code> &rarr; normal eviction</li>
+      </ul>
+
+      <!-- ---------- B.4 the cache-key consequence ---------- -->
+      <h3 id="b4">B.4 &nbsp;The cache-key consequence &mdash; the chain becomes a tree (radix), and content-hashing makes it free</h3>
+      <ul>
+        <li><strong>The parents&rsquo; block-hash <em>chain</em></strong> (<code>hidden_sys &rarr; tool_defs &rarr; user_sys &rarr; history&hellip;</code>) was a
+          <strong>line</strong> because a linear conversation has one path. With forks the same hashing rule produces a <strong>tree</strong>: a shared prefix
+          with multiple divergent tails &mdash; i.e. a <strong>radix tree of KV prefixes</strong> (the structure <strong>SGLang RadixAttention</strong>
+          maintains natively; vLLM reaches the same end via hash-keyed blocks + CoW).</li>
+        <li><strong>The key fact: nothing about the <em>key</em> changes.</strong> <code>block_hash = hash(parent_hash &Vert; tokens)</code> is
+          path-independent, so the shared prefix&rsquo;s blocks collide (intentionally) across branches &rarr; APC dedups them. The data structure the
+          <em>engine</em> keeps is a tree/radix; the <strong>cache key model is unchanged</strong>. This is why branching is &ldquo;free&rdquo; at the cache
+          layer and the delta is all about <strong>lifetime, placement, and fan-out</strong>.</li>
+        <li><strong>Privacy / sharing scope (contrast the tool-def and image cases).</strong> Branch sharing is <strong>intra-conversation</strong>, hence
+          <strong>intra-tenant by construction</strong> &rarr; <strong>no privacy gate, no cross-user exposure</strong> (unlike the image cross-user dedup,
+          which <em>was</em> gated; unlike tool-defs, which are cross-user-shareable-but-public). It is the <em>safest</em> form of sharing on the whole page:
+          a user sharing a prefix only with their own sibling branches. (If two <em>different</em> users&rsquo; branches happen to share a public prefix
+          &mdash; <code>hidden_sys &Vert; tool_defs</code> &mdash; that reuse is already governed by the parents&rsquo; cross-user rules; the
+          <em>branch-specific</em> tail is always private.)</li>
+      </ul>
+
+      <!-- ---------- B.5 how forks compose ---------- -->
+      <h3 id="b5">B.5 &nbsp;How forks compose with the inherited features (the bridges &mdash; state once)</h3>
+      <div class="two-col">
+        <div>
+          <h4>Bridge to tools (the subtle one)</h4>
+          <p style="margin:.2rem 0"><em>Where</em> a fork diverges depends on the <strong>tool determinism boundary</strong>
+            (tool page <a href="distributed_kv_cache_image_tool.html#t5">&sect;T.5</a> / Iter&nbsp;T2):</p>
+          <ul style="margin:.2rem 0 .2rem 1rem">
+            <li><strong>Fork <em>after</em> a tool result</strong> (already fixed in the parent, e.g. the failure log at <code>n4</code>): both branches
+              <strong>share the result&rsquo;s KV</strong> &rarr; full prefix share to the fork point. The common case (you fork <em>because</em> you saw the
+              result).</li>
+            <li><strong>Fork <em>before</em> a non-deterministic tool call</strong> (e.g. two branches each independently <code>web_search</code>): the client
+              <strong>re-executes the tool</strong> in each branch &rarr; different results &rarr; the branches genuinely <strong>diverge at the
+              result</strong>, not at the fork point. The content-hash chain handles this automatically (different result tokens &rarr; different
+              <code>block_hash</code>es &rarr; no false share).</li>
+          </ul>
+          <p style="margin:.2rem 0"><strong>So branching and the determinism boundary compose cleanly:</strong> shared up to the first <em>divergent</em>
+            token, private after &mdash; exactly the rule already stated for tools.</p>
+        </div>
+        <div>
+          <h4>Bridges to images &amp; the loop (compounding wins)</h4>
+          <ul style="margin:.2rem 0 .2rem 1rem">
+            <li><strong>Images.</strong> A fork <em>after</em> an image attachment shares the <strong>image-embedding KV</strong> (content-addressed
+              embedding cache, image page Iter&nbsp;M2) across <strong>all</strong> branches. The expensive <strong>encode is paid once</strong> regardless
+              of fan-out &rarr; forking is <em>especially</em> cheap for vision-heavy conversations (the most expensive shared prefix is shared the most).</li>
+            <li><strong>The loop continuity win.</strong> The tool page turned the loop from quadratic to linear via prefix reuse; branching reuses the
+              <strong>same</strong> mechanism, so a fork <em>after</em> a deep loop inherits the entire cached loop context for free &mdash; fork cost = only
+              the divergent suffix, even if the shared trunk is a 50-turn agentic history.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- ---------- B.6 who owns the tree (DC) ---------- -->
+      <h3 id="b6">B.6 &nbsp;Design choice &mdash; who owns the tree (the one with a serving consequence)</h3>
+      <div class="dc">
+        <p class="dc-prob">Problem.&nbsp; A conversation is now a tree. Where do the tree&rsquo;s structure + shared-KV lifetime live?</p>
+        <p class="dc-sols">Alternatives (enumerated):</p>
+        <ul>
+          <li><strong>(a) Client-driven, implicit forking</strong> &mdash; <span class="pick">picked (main line)</span>. The client holds the tree; to fork,
+            it <strong>re-POSTs a sibling conversation</strong> (the shared prefix + a new tail) keyed by the same <code>conv_id</code> (with a
+            <code>branch_id</code> sub-key, <a href="#s1-entities">&sect;2.1</a>). The serving fleet treats each branch like any other turn; <strong>all</strong>
+            sharing is the existing content-hash APC, <strong>all</strong> cross-branch continuity is the existing conv-keyed pool + prefix cache.
+            <em>Optional tail-only fast path:</em> a client <em>may</em> send <code>parent_node_id</code> + only the divergent tail (a bandwidth opt-in) and
+            fall back to a full re-POST on a <code>409</code> cache miss &mdash; this stays within (a) because full-resend remains the correctness floor
+            (<a href="#s2">&sect;3</a>).</li>
+          <li><strong>(b) Server-tracked conversation tree + explicit <code>fork()</code> RPC</strong> &mdash;
+            <span class="reject">rejected for this page</span>. The fleet holds the tree server-side as an addressable object; the client calls
+            <code>POST /conversations/{id}/fork {from_node}</code> and sends <strong>only the divergent continuation</strong> per branch. A <strong>real,
+            attractive alternative</strong> (it is what a stateful &ldquo;responses/threads&rdquo; API does), so its wins are named <em>before</em> rejection:
+            <ul style="margin:.2rem 0 .2rem 1rem;font-weight:400;color:#334155;">
+              <li><strong>Bandwidth</strong> &mdash; the client stops re-uploading the shared prefix once <em>per branch</em> (at high fan-out + a near-1 M
+                shared trunk + image parts, that is fan-out &times; MB re-uploaded and re-parsed).</li>
+              <li><strong>Guaranteed (not opportunistic) prefix retention</strong> &mdash; implicit forking <em>hopes</em> the shared prefix survives in cache
+                between sibling requests; a TTL expiry / pressure-evict between branch A and branch B = a <strong>cold re-prefill of the whole shared
+                trunk</strong> for B. A server tree lets the fleet <strong>pin</strong> the fork-point deliberately (and this pin is <em>more</em> valuable
+                than in the tool plan &mdash; the share factor is fan-out, not 1).</li>
+              <li><strong>Cheaper CoW in place</strong> &mdash; the server can fork blocks by <strong>bumping <code>ref_count</code></strong> instead of the
+                client re-hashing + the engine re-matching the prefix.</li>
+              <li><strong>Authoritative tree structure</strong> &mdash; natural home for &ldquo;show me the branch tree,&rdquo; branch GC policy, and fan-out
+                metering (<a href="#iter-b3">B3</a>).</li>
+            </ul></li>
+        </ul>
+        <p class="dc-why lead">Why (a) wins anyway &mdash; the winning constraint:</p>
+        <ul class="why-list">
+          <li>All of (b)&rsquo;s wins are <strong>content-ownership / pinning value, not new KV-<em>sharing</em> value.</strong> On a <em>KV-cache</em> page the
+            content-hash chain <em>already</em> shares the prefix, so a server tree adds a per-conv stateful subsystem (the tree object + the
+            <a href="#s1-jobs">&sect;2.2</a> A/B/C/D state-mgmt spectrum + replication + FT) for <strong>zero sharing gain</strong>.</li>
+          <li>The one genuinely-KV win it is credited with &mdash; <em>guaranteed retention</em> &mdash; is the <strong>orthogonal pinning axis</strong> below,
+            reachable while staying client-driven.</li>
+          <li>Its remaining (non-KV) <strong>bandwidth</strong> win is recovered opt-in by the <a href="#s2">&sect;3</a> tail-only fast path
+            (<code>parent_node_id</code>, best-effort, <code>409</code>-fallback) &mdash; so even that needs no server tree.</li>
+        </ul>
+      </div>
+      <div class="note-box"><strong>Orthogonal axis &mdash; KV <em>pinning</em> &ne; server-tracked tree</strong> (the load-bearing distinction, same as the
+        tool page&rsquo;s T6). The retention win attributed to (b) is a <strong>separate axis</strong> reachable under client-driven (a):
+        <strong>explicit prompt-cache <code>cache_control</code> markers</strong> pin the fork-point prefix while the client still re-sends content.
+        <strong>Two distinct layers (don&rsquo;t conflate):</strong> <code>cache_control</code> is an <strong>API-level</strong> caching tier (explicit
+        breakpoints, TTL-managed, may persist to a separate KV store) &mdash; <em>not</em> the same thing as the <strong>engine-level</strong> automatic
+        APC + CoW (block-internal, ref-counted, LRU). They coexist: <code>cache_control</code> is the client&rsquo;s lever to <em>pin</em> a prefix the engine
+        would otherwise let age out under LRU.
+        <ul style="margin:.4rem 0 .2rem 1rem">
+          <li><strong>Axis A &mdash; who holds the tree <em>content</em>:</strong> client re-POSTs siblings (a) &harr; server holds the tree (b).</li>
+          <li><strong>Axis B &mdash; is the shared prefix <em>retained</em>:</strong> opportunistic LRU/TTL &harr; <strong>pinned</strong>
+            (client-requestable under either A or B).</li>
+          <li><strong>This page&rsquo;s pick:</strong> <strong>(a) on Axis A</strong> + <strong>explicit pin/retain on Axis B at the fork point</strong>
+            (<a href="#iter-b1">B1</a>&rsquo;s ref-count + the parent&rsquo;s prefix-pinning) &mdash; i.e. take the <em>pinning</em> benefit (which fan-out
+            makes <em>more</em> valuable) <strong>without</strong> the server tree. (b)&rsquo;s only residual value beyond pinning is the bandwidth offload,
+            which this page does not need.</li>
+        </ul>
+      </div>
+      <div class="warn-box"><strong>Honest tension to surface.</strong> (a) is &ldquo;client holds the tree,&rdquo; but the fleet still keeps
+        <strong>lightweight server-side KV metadata</strong> &mdash; <code>branch_id</code> + per-block <code>ref_count</code> + the fork-point pin
+        (<a href="#s1-entities">&sect;2.1</a>) &mdash; because <a href="#iter-b1">B1</a>&rsquo;s lifetime management needs it. The real line drawn is
+        <strong>server-tracked KV ref-count/pin metadata (kept) vs server-authoritative tree <em>content</em> (rejected)</strong>, identical to the tool
+        page&rsquo;s &ldquo;KV-residency metadata kept, conversation content rejected.&rdquo;</div>
+
+      <!-- ---------- B.7 serving consequences ---------- -->
+      <h3 id="b7">B.7 &nbsp;The serving consequences that drive the entire delta (the bridge to the iterations)</h3>
+      <p>State these once; every iteration delta below traces to one.</p>
+      <ol class="steps">
+        <li><strong>Ref-count lifetime across the tree.</strong> The shared ancestor must be <strong>pinned while &ge;1 branch is live</strong> and GC&rsquo;d
+          only when the last branch dies; an abandoned branch&rsquo;s unique suffix must be reclaimed. &rarr; <strong><a href="#iter-b1">Iter&nbsp;B1</a></strong>,
+          on the Iter&nbsp;3 PagedAttention ref-count + Iter&nbsp;5 chain + Iter&nbsp;1a coldness gate.</li>
+        <li><strong>Copy-on-write of the fork-point block.</strong> Full shared blocks are immutable + shared by reference; only the <strong>partial
+          (not-yet-full) fork-point block</strong> must be copied so two branches can append different tokens. &rarr;
+          <strong><a href="#iter-b1">Iter&nbsp;B1</a></strong>.</li>
+        <li><strong>Sibling co-location + parallel-branch batching.</strong> All branches should land on the <strong>same task</strong> (else each
+          cold-prefills the shared trunk); N siblings can decode <strong>in one batch reading the prefix once</strong>. &rarr;
+          <strong><a href="#iter-b2">Iter&nbsp;B2</a></strong>, on Iter&nbsp;1b routing + Iter&nbsp;6 continuous batching.</li>
+        <li><strong>Fan-out abuse.</strong> A tree is <strong>combinatorial</strong> (breadth<sup>depth</sup>); one conversation&rsquo;s compute/HBM can
+          explode, invisible to a per-<em>request</em> limiter. &rarr; <strong>Iter&nbsp;8 delta + <a href="#iter-b3">Iter&nbsp;B3</a></strong>
+          (tree-shape quota).</li>
+      </ol>
+
+      <div class="notation-box"><strong>&sect;B notation recap</strong> (symbols this section newly introduces; full typing in the implementation
+        notation later).
+        <ul style="columns:2;-webkit-columns:2;margin:.3rem 0 0 1rem;font-size:.86rem;">
+          <li><code>branch_id</code> &mdash; routing / ref-count sub-key under <code>conv_id</code>; <em>set by</em> client per sibling.</li>
+          <li><code>parent_node_id</code> &mdash; the node a branch continues from; a <em>hint</em> for fork-point targeting.</li>
+          <li><code>ref_count</code> &mdash; live readers of a block; now also incremented by intra-conv siblings (mechanism unchanged).</li>
+          <li><code>cow_partial</code> &mdash; bit on the single partial fork-point block (the only block ever copied).</li>
+          <li><code>fanout</code> &mdash; live branches per fork; <code>shared_prefix_frac</code> &mdash; share fraction; both declared in
+            <a href="#s0-workload">&sect;1.3</a>.</li>
+          <li><code>cache_control</code> &mdash; API-level pin marker (Axis B), distinct from engine APC.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S1 delta - Entities + Borg topology                     -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s1">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S1 &nbsp;Entities + Borg topology (delta)</h2>
+      <p><strong>TL;DR.</strong> Three new <em>logical</em> entities (the tree node, the branch, the pinned fork-point) and four edits to inherited entities
+        &mdash; but <strong>no new field that isn&rsquo;t a sub-key or a bit</strong>, and <strong>no new Borg job</strong> (the tree lives on the client,
+        exactly the tool page&rsquo;s result). The existing jobs gain tree-awareness; the only stateful new thing is <em>metadata on KV blocks already in the
+        pool</em>.</p>
+
+      <h3 id="s1-entities">2.1 &nbsp;New core entities <span class="mk mk-new">NEW</span></h3>
+      <table class="sheet">
+        <thead><tr><th>Entity</th><th>Min shape</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td><strong>ConvNode</strong> (logical, client-held)</td>
+            <td class="c">node_id, parent_node_id, conv_id, turn_idx, content_ref</td>
+            <td>a node in the conversation tree; <strong>the client owns the tree</strong> (<a href="#b6">&sect;B.6</a> (a)); the fleet sees nodes only as the
+              token paths it is asked to serve</td></tr>
+          <tr><td><strong>Branch</strong> (logical, in the KV layer)</td>
+            <td class="c">branch_id, conv_id, head_node_id, status &isin; {live, abandoned}</td>
+            <td>a live continuation; <code>branch_id</code> is the routing / ref-count sub-key under <code>conv_id</code> &mdash; <strong>not a new
+              store</strong></td></tr>
+          <tr><td><strong>ForkPoint</strong></td>
+            <td class="c">conv_id, fork_node_id, shared_prefix_block_hashes[], pin_until</td>
+            <td>the pinned shared-prefix span; <code>pin_until</code> keeps the trunk resident across the fan-out (<a href="#b6">&sect;B.6</a> Axis B)</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Edits to inherited entities</h4>
+      <table class="sheet">
+        <thead><tr><th>Entity</th><th>Change</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Conversation</strong></td><td>gains <code>is_tree, n_live_branches, fork_node_ids[]</code> (so the scheduler / router know a conv
+            has fanned out &mdash; the <a href="#iter-b1">B1</a>/<a href="#iter-b2">B2</a> signal)</td></tr>
+          <tr><td><strong>KV Block</strong></td><td><code>ref_count</code> semantics <strong>extended</strong>: a block&rsquo;s <code>ref_count</code> is now
+            also incremented by <strong>intra-conversation sibling branches</strong>, not only cross-conversation prefix matches. <strong>No new field</strong>
+            &mdash; the <em>source</em> of <code>ref_count &gt; 1</code> is new, the mechanism is the parent&rsquo;s. Gains a <code>cow_partial</code> bit on
+            the single partial fork-point block (the only block ever copied; <a href="#b4">&sect;B.4</a>)</td></tr>
+          <tr><td><strong>Request</strong></td><td>carries <code>conv_id</code> <strong>+ <code>branch_id</code></strong> + the <code>parent_node_id</code> it
+            continues from (a hint, so the router can target the task holding the fork-point prefix; the prefix match itself is still by content hash)</td></tr>
+          <tr><td><strong>Pool Conv Index</strong> (text S1 / image Iter&nbsp;M2 / tool &sect;2.1)</td><td>the content-addressed <code>block_hash</code> key
+            space now also serves <strong>branch-shared trunks</strong>: a shared prefix pulled from the pool is read by all branches that need it;
+            <code>ref_count</code> spans pool blocks too</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s1-jobs">2.2 &nbsp;Jobs &mdash; Borg topology delta: <strong>no new job</strong></h3>
+      <div class="note-box"><strong>Decision (client-side scope, <a href="#b3">&sect;B.3</a> / <a href="#b6">&sect;B.6</a>).</strong> Forking is client-driven
+        and the tree lives on the client, so <strong>the branch delta adds no new Borg job</strong> &mdash; the same deliberate result as the tool page (and
+        the contrast with the image page&rsquo;s <code>vision-encoder-job</code> + <code>blob-store-job</code>). The serving fleet&rsquo;s existing jobs gain
+        tree-awareness.</div>
+      <table class="sheet">
+        <thead><tr><th>Job</th><th>Branch-delta change</th><th>Introduced at</th></tr></thead>
+        <tbody>
+          <tr><td class="c">router-job</td><td>Routes every branch by <strong>CH-on-<code>conv_id</code></strong> (already sticky &rarr; all siblings co-locate
+            <strong>for free</strong>); adds a <code>parent_node_id</code> / fork-point lookup so a new branch is dispatched to the task already holding the
+            shared-prefix blocks, and a <strong>hot-conv overflow</strong> decision (BB6, <a href="#iter-b2">Iter&nbsp;B2</a>).</td>
+            <td class="c">Iter&nbsp;B2 (&Delta;)</td></tr>
+          <tr><td class="c">serving-prefill-job</td><td>Prefills <strong>only the divergent tail</strong> of a branch (the shared trunk is a cache hit); a
+            cold / spread branch re-prefills the trunk (the case <a href="#iter-b1">B1</a>/<a href="#iter-b2">B2</a> minimize).</td>
+            <td class="c">Iter&nbsp;B1/B2 (&Delta;)</td></tr>
+          <tr><td class="c">serving-decode-job (scheduler)</td><td><strong>Parallel-branch batching</strong> &mdash; admits N live siblings as N slots reading
+            the <strong>one</strong> shared prefix block set (K4); ref-count-aware eviction (don&rsquo;t drop a trunk with live branches).</td>
+            <td class="c">Iter&nbsp;B2 (&Delta;)</td></tr>
+          <tr><td class="c">kv-store-job (pool)</td><td>Gains the <strong>branch-shared-trunk</strong> residency class (a hot conv&rsquo;s shared prefix parked
+            here, pulled by branches that overflow off-task) + the <strong>fork-point pin</strong> (<code>pin_until</code>). Same backend, no new job.</td>
+            <td class="c">Iter&nbsp;B1/B2 (&Delta;)</td></tr>
+        </tbody>
+      </table>
+      <div class="warn-box"><strong>State-management spectrum</strong> (per Borg-style topology discipline). The tree structure is <strong>client-held</strong>
+        &rarr; there is <strong>no new server store</strong> &rarr; the 4-option spectrum (A read-replicas / B sharded / C quorum / D CRDT) <strong>does not
+        apply to a new store</strong>. The stateful part is the <strong>shared-trunk KV + <code>ref_count</code> metadata</strong>, which inherits the parent
+        pool&rsquo;s choice (<strong>B: sharded, CH-on-<code>conv_id</code></strong> &mdash; and CH-on-<code>conv_id</code> is exactly what keeps a conv&rsquo;s
+        whole tree on one shard). Stated explicitly so the absence is a decision, not an omission.</div>
+
+      <h3 id="s1-routing">2.3 &nbsp;Routing-model delta</h3>
+      <p>Parent (text + image + tool): a client-driven <strong>cycle</strong> keyed by <code>conv_id</code>. Forking turns the cycle into a
+        <strong>client-driven tree fan-out</strong> &mdash; multiple sibling requests under one <code>conv_id</code>:</p>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1120 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Routing model: root turns hash by conv_id to a prefill task that becomes a warm cache; forked branches A and B re-POST under the same conv_id and consistent-hash to the same task, prefilling only their tails; if the tree exceeds task HBM, an overflow branch is spread to a sibling task that pulls the shared trunk from the pool.">
+        <defs>
+          <marker id="rh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+          <marker id="rg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#15803d"/>
+          </marker>
+          <marker id="ro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+          </marker>
+        </defs>
+        <style>
+          .rbx { fill:#fff; stroke:#334155; stroke-width:1.5; rx:8; }
+          .rrt { fill:#eef2ff; stroke:#4338ca; stroke-width:1.6; rx:8; }
+          .rtk { fill:#ecfdf5; stroke:#059669; stroke-width:1.8; rx:8; }
+          .rpl { fill:#f1f5f9; stroke:#475569; stroke-width:1.6; rx:8; }
+          .rt  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .rs  { font-size:11px; fill:#475569; }
+          .mono{ font-family:'JetBrains Mono',monospace; }
+          .rlbl{ font-size:11px; font-weight:700; fill:#334155; }
+          line.rf, path.rf { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#rh); }
+          line.rgn, path.rgn { stroke:#15803d; stroke-width:1.9; fill:none; marker-end:url(#rg); }
+          line.rov, path.rov { stroke:#94a3b8; stroke-width:1.6; fill:none; stroke-dasharray:6 4; marker-end:url(#ro); }
+        </style>
+
+        <!-- client -->
+        <rect class="rbx" x="20" y="150" width="120" height="56"/>
+        <text class="rt" x="44" y="174">CLIENT</text>
+        <text class="rs" x="34" y="192">holds the tree</text>
+
+        <!-- router -->
+        <rect class="rrt" x="200" y="150" width="150" height="56"/>
+        <text class="rt" x="230" y="174">Router</text>
+        <text class="rs mono" x="216" y="192">CH(conv_id)</text>
+
+        <!-- task A (warm) -->
+        <rect class="rtk" x="470" y="110" width="240" height="64"/>
+        <text class="rt" x="490" y="134">prefill/decode TASK</text>
+        <text class="rs mono" x="490" y="154">holds WARM shared trunk KV</text>
+        <text class="rs" x="490" y="168">root + branch A + branch B</text>
+
+        <!-- overflow task -->
+        <rect class="rbx" x="470" y="250" width="240" height="60"/>
+        <text class="rt" x="490" y="274">SIBLING TASK (overflow)</text>
+        <text class="rs" x="490" y="292">pulls shared trunk from pool</text>
+
+        <!-- pool -->
+        <rect class="rpl" x="820" y="250" width="260" height="60"/>
+        <text class="rt" x="840" y="274">Iter 3b POOL (kv-store-job)</text>
+        <text class="rs" x="840" y="292">branch-shared-trunk residency</text>
+
+        <!-- edges -->
+        <path class="rf" d="M140,178 L200,178"/>
+        <text class="rlbl" x="150" y="140">root + branches</text>
+        <path class="rgn" d="M350,170 C410,150 430,140 470,138"/>
+        <text class="rlbl" x="356" y="120" fill="#15803d">(1) all siblings &rarr; SAME task</text>
+        <text class="rs" x="356" y="218">branch A tail: prefill only A &middot; branch B tail: prefill only B (trunk = warm hit)</text>
+
+        <!-- overflow edge -->
+        <path class="rov" d="M590,174 L590,250"/>
+        <text class="rlbl" x="600" y="220">(2) if tree_kv &gt; task HBM</text>
+        <path class="rov" d="M710,280 L820,280"/>
+        <text class="rs" x="724" y="246">pull trunk once, not fan-out &times; re-prefill</text>
+      </svg>
+      </div>
+      <ul class="legend" style="columns:2;-webkit-columns:2;list-style:none;padding:0;font-size:.85rem;">
+        <li><span style="color:#15803d;font-weight:700;">&#10122;</span> <strong>sibling co-location</strong> &mdash; CH-on-<code>conv_id</code> already lands every branch on the task holding the warm trunk (the loop&rsquo;s gift, reused)</li>
+        <li><span style="color:#94a3b8;font-weight:700;">&#10123;</span> <strong>hot-conv overflow</strong> (BB6) &mdash; when <code>tree_kv_footprint</code> &gt; the task&rsquo;s KV budget, spread excess branches to a sibling task; serve the shared trunk from the pool</li>
+      </ul>
+      <div class="note-box"><strong>Production note &mdash; name the real mechanism.</strong> Real prefix-cache-aware routers (SGLang router, llm-d, AIBrix,
+        Mooncake conductor) co-locate by <strong>longest-prefix-match on the actual tokens</strong>, not by <code>conv_id</code> &mdash; which is strictly
+        stronger (it catches <em>cross</em>-conversation prefix sharing too, and targets the exact task holding the matching blocks). CH-on-<code>conv_id</code>
+        is the <strong>coarser proxy</strong> this fleet inherits; for siblings the two coincide (all branches share the conv&rsquo;s prefix), so the proxy is
+        adequate here &mdash; but the mechanism production actually uses is <strong>prefix-affinity routing</strong>. The router also adds
+        <strong>fork-point targeting</strong>: <code>parent_node_id</code> confirms the target task holds the shared-prefix blocks before dispatch.</div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S2 delta - API / Interface Contracts                    -->
+  <!-- ===================================================== -->
+  <section class="section" id="s2">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S2 &nbsp;API / Interface Contracts (delta)</h2>
+      <p><strong>TL;DR.</strong> A fork needs <strong>no special call</strong> &mdash; a <code>messages</code> POST with a new <code>branch_id</code> (and the
+        full shared prefix re-sent) <em>is</em> the fork (&sect;B.6 (a)). Two read/observability endpoints and one optimization hint are added; the only
+        non-trivial contract is the <strong>tail-only fast path</strong> (<code>parent_node_id</code>) and its <strong>honest <code>409</code> fallback</strong>.</p>
+      <table class="sheet">
+        <thead><tr><th>Method + Path</th><th>Request</th><th>Response</th><th>SLO</th></tr></thead>
+        <tbody>
+          <tr><td class="c">POST /v1/conversations/{id}/messages <span class="mk mk-chg">&Delta;</span></td>
+            <td>gains <strong><code>branch_id</code></strong> (required) + <strong><code>parent_node_id</code></strong> (<em>optional</em> tail-only fast
+              path; absent &rArr; client re-sends full shared prefix, pure (a)); same <code>content[]</code> (text / image / tool_result parts)</td>
+            <td>SSE unchanged; terminal event gains <code>branch_id</code> echo</td>
+            <td>TTFT p99 &le; 400 ms <strong>per branch</strong> (divergent-tail prefill on a warm trunk)</td></tr>
+          <tr><td class="c">GET /v1/conversations/{id}/tree <span class="mk mk-new">NEW</span></td><td>&mdash;</td>
+            <td><code>{nodes[], branches[{branch_id, head_node_id, status}], n_live_branches}</code> (read-only <strong>view</strong> of metadata the fleet
+              holds; the <strong>content</strong> tree is the client&rsquo;s)</td>
+            <td>p99 &le; 50 ms (debug / observability)</td></tr>
+          <tr><td class="c">POST /v1/conversations/{id}/branches/{bid}/abandon <span class="mk mk-new">NEW</span></td><td>&mdash;</td>
+            <td><code>{released_blocks}</code> &mdash; explicit hint to <strong>decrement <code>ref_count</code></strong> on a branch&rsquo;s unique suffix
+              early (a best-of-N optimization so discarded branches free KV immediately instead of waiting for TTL)</td>
+            <td>p99 &le; 50 ms</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li><strong>Implicit-fork default.</strong> No special call: a <code>messages</code> POST with a new <code>branch_id</code> <strong>and the full
+          shared prefix re-sent</strong> <em>is</em> the fork; the shared prefix dedups by content hash (&sect;B.6 (a)). <code>abandon</code> is a pure
+          <em>optimization hint</em>, not required for correctness (TTL reclaims abandoned branches anyway).</li>
+        <li><strong>Tail-only fast path (an explicit slice of (b), named honestly).</strong> <code>parent_node_id</code> is <strong>not</strong> part of the
+          pure-stateless path &mdash; it lets the client send <strong>only the divergent tail</strong> and trust the server still holds the shared prefix
+          (the same shape as OpenAI&rsquo;s <code>previous_response_id</code> / Responses-API <code>store=true</code>). It is a <strong>performance opt-in
+          layered on (a)</strong>: on a prefix-cache hit it saves the re-upload; on a miss the server returns <strong><code>409</code></strong> and the client
+          <strong>falls back to re-POSTing the full prefix</strong> (pure (a)). The page runs (a) as the correctness floor; the <code>409</code> is not a
+          stateless-API contradiction.</li>
+        <li><strong>Optional pin.</strong> <code>cache_control</code> markers on the shared-prefix span pin the fork point (<code>pin_until</code>) across the
+          fan-out (&sect;B.6 Axis B) &mdash; the client&rsquo;s lever to guarantee, not hope for, trunk retention.</li>
+        <li><strong>Error model.</strong> <code>409</code> is raised <strong>only</strong> on the <code>parent_node_id</code> tail-only fast path when the trunk
+          was evicted past TTL &rarr; client re-sends the full prefix. The pure-stateless full-resend path <strong>never <code>409</code>s</strong> (a cache
+          miss is a slower full prefill, not an error). <code>max_live_branches</code> / <code>max_tree_nodes</code> exceeded is a <strong><code>429</code></strong>
+          (fan-out budget, Iter B3), <strong>not</strong> a server error. <strong>Idempotency:</strong> a re-POSTed identical branch (client retry) is a
+          <code>conv_id</code>+<code>branch_id</code>-keyed no-op replay (reuses the parent&rsquo;s idempotency window).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S3 delta - Back-of-Envelope                             -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s3">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S3 &nbsp;Back-of-Envelope (new ratios only)</h2>
+      <p>Cite <a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>/<a href="../../knowledge/K2_kv-cache.html#d31">D31</a> for KV; K2 (CoW) for
+        forking; <a href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4</a> for batching. New rows only (per derivation standards, formula +
+        substitution inline; <code>KV_per_tok = 320&nbsp;KB</code>, K2&nbsp;D31):</p>
+      <table class="sheet">
+        <thead><tr><th>Quantity</th><th>Formula + substitution</th><th>Tag</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Fan-out: shared-prefill saving</strong></td>
+            <td>naive per-fork prefill <code>= fanout&middot;T_shared</code>; with sharing <code>= T_shared + &Sigma; branch_tails</code> &rarr; saving
+              <code>= shared_prefix_frac&middot;(fanout&minus;1)&middot;T_shared</code>; at fan-out 8: <code>0.85&middot;7 = 5.95&times; T_shared</code></td>
+            <td><span class="tag tag-d">D</span></td>
+            <td><strong>the headline sharing number</strong> &mdash; content-hash dedup makes the shared trunk cost <strong>once</strong>, not fan-out times
+              (BB1/BB3)</td></tr>
+          <tr><td><strong>Tree KV footprint (sublinear)</strong></td>
+            <td><code>tree_kv = T_shared&middot;KV_per_tok + &Sigma; T_branch_unique&middot;KV_per_tok</code>; at <code>shared_prefix_frac = 0.85</code>, fan-out
+              8: <code>0.85 + 8&middot;0.15 = 2.05&times;</code> a single path, <strong>not 8&times;</strong></td>
+            <td><span class="tag tag-d">D</span></td><td>the BB6 hot-conv driver &mdash; aggregate tree KV grows far slower than fan-out</td></tr>
+          <tr><td><strong>CoW cost per fork</strong></td>
+            <td>exactly <strong>one</strong> partial block copied <code>= 1 &times; block_size &times; KV_per_tok</code>; at 16&ndash;32 tok:
+              <code>16&middot;320KB = 5.1 MB</code> &hellip; <code>32&middot;320KB = 10.2 MB</code></td>
+            <td><span class="tag tag-d">D</span></td>
+            <td>the <em>only</em> copy a fork ever pays; full shared blocks are immutable + ref-counted (zero copy) &mdash; the K2-CoW fact</td></tr>
+          <tr><td><strong>Decode amplification</strong></td>
+            <td><code>decode_amp = 1 + f_fork&middot;(fanout_mean&minus;1) = 1 + 0.15&middot;1 = 1.15</code></td>
+            <td><span class="tag tag-d">D</span></td>
+            <td>fan-out multiplies <strong>decode</strong> (each branch its own query stream), not the shared prefill &mdash; the asymmetry that makes forks
+              cheap on prefill, costly on decode</td></tr>
+          <tr><td><strong>Parallel-branch batch memory win</strong></td>
+            <td>N siblings batched: prefix KV resident <strong>1&times;</strong> (read by N queries) vs <strong>N&times;</strong> if unbatched</td>
+            <td><span class="tag tag-d">D&nbsp;&mdash;&nbsp;K4</span></td>
+            <td><strong>capacity</strong> win unconditional (1&times; storage &rarr; larger <code>B_decode</code>); the <strong>read-bandwidth</strong> win
+              (prefix read 1&times;, not N&times;) needs a <strong>cascade-attention kernel</strong> (FlashInfer / flash-attn) &mdash; decode is
+              bandwidth-bound, so name the kernel</td></tr>
+          <tr><td><strong>Ref-count-<code>&gt;1</code> population</strong></td>
+            <td><code>n_branches_concurrent &asymp; 300k</code> (&sect;1.3) blocks held alive by <em>intra-conv</em> sharing</td>
+            <td><span class="tag tag-d">D</span></td>
+            <td>the new eviction-pressure source; the coldness gate (<code>ref_count == 0</code>) is unchanged &mdash; only the <em>source</em> of
+              <code>ref_count &gt; 1</code> is new</td></tr>
+          <tr><td><strong>Hot-conv overflow threshold</strong></td>
+            <td>spread branches when <code>tree_kv_footprint &gt; &rho;_kv &middot; HBM_task</code></td>
+            <td><span class="tag tag-d">D</span></td>
+            <td>BB6 crossover: keep co-located (share trunk, hot) below; spread + pull trunk from pool (one extra <code>&alpha; + &beta;&middot;n</code> trunk
+              pull) above &mdash; modeled <code>&alpha; + &beta;&middot;n</code>, not <code>n/BW</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iteration deltas                                        -->
+  <!-- ===================================================== -->
+  <section class="section" id="iter">
+    <div class="container">
+      <h2>Iteration deltas &mdash; where the tree slots in</h2>
+      <p><strong>How to read.</strong> <strong>Part A</strong> = short deltas to inherited iterations (the parent iteration is unchanged except as noted).
+        <strong>Part B</strong> = the new branch iterations (full treatment), each placed at its dependency point in the existing
+        Iter&nbsp;0&rarr;10 / M0&ndash;M3 / T0&ndash;T3 ribbon. They are presented in <strong>ribbon order</strong> (B0, B1, B2; B3 folds into Iter&nbsp;8) so
+        each builds only on what came before. Everything below traces to a <a href="#s0-spine">BB1&ndash;BB6</a> row.</p>
+
+      <h3 id="iter-ribbon">The ribbon &mdash; new branch iterations in teal, slotted at their dependency points</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iteration ribbon: branch iterations B0 after T0, B1 after Iter 5 and T2, B2 after Iter 6 and T1, and B3 folded into Iter 8, slotted into the parent text plus image plus tool sequence.">
+        <defs>
+          <marker id="rbb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+        </defs>
+        <style>
+          .pib { fill:#f1f5f9; stroke:#94a3b8; stroke-width:1.2; rx:6; }
+          .nib { fill:#ccfbf1; stroke:#0d9488; stroke-width:1.7; rx:6; }
+          .tib { fill:#fef3c7; stroke:#d97706; stroke-width:1.3; rx:6; }
+          .ilb { font-size:11px; font-weight:700; fill:#0f172a; }
+          .isb { font-size:9px; fill:#475569; }
+          line.rb { stroke:#64748b; stroke-width:1.4; fill:none; marker-end:url(#rbb); }
+        </style>
+        <text class="isb" x="20" y="22" font-weight="700">Each branch iteration is introduced at the point its enabling prior exists &mdash; never earlier.</text>
+        <!-- row 1 -->
+        <rect class="pib" x="20"  y="40" width="86" height="40"/><text class="ilb" x="63"  y="58" text-anchor="middle">T0</text><text class="isb" x="63"  y="72" text-anchor="middle">loop shape</text>
+        <rect class="nib" x="126" y="36" width="100" height="48"/><text class="ilb" x="176" y="56" text-anchor="middle">Iter B0</text><text class="isb" x="176" y="70" text-anchor="middle">fork orchestr.</text>
+        <rect class="pib" x="246" y="40" width="86" height="40"/><text class="ilb" x="289" y="58" text-anchor="middle">Iter 3 / 3b</text><text class="isb" x="289" y="72" text-anchor="middle">PagedAttn+pool</text>
+        <rect class="pib" x="352" y="40" width="86" height="40"/><text class="ilb" x="395" y="58" text-anchor="middle">Iter 5 &Delta;</text><text class="isb" x="395" y="72" text-anchor="middle">prefix$ &rarr;tree</text>
+        <rect class="pib" x="458" y="40" width="86" height="40"/><text class="ilb" x="501" y="58" text-anchor="middle">T2</text><text class="isb" x="501" y="72" text-anchor="middle">tool-def$</text>
+        <rect class="nib" x="564" y="36" width="100" height="48"/><text class="ilb" x="614" y="56" text-anchor="middle">Iter B1</text><text class="isb" x="614" y="70" text-anchor="middle">CoW+ref-count</text>
+        <line class="rb" x1="106" y1="60" x2="126" y2="60"/>
+        <line class="rb" x1="226" y1="60" x2="246" y2="60"/>
+        <line class="rb" x1="332" y1="60" x2="352" y2="60"/>
+        <line class="rb" x1="438" y1="60" x2="458" y2="60"/>
+        <line class="rb" x1="544" y1="60" x2="564" y2="60"/>
+        <path class="rb" d="M664,60 C700,60 700,120 540,120 C200,120 80,120 35,150" stroke-dasharray="4 3"/>
+        <!-- row 2 -->
+        <rect class="pib" x="20"  y="156" width="86" height="40"/><text class="ilb" x="63"  y="174" text-anchor="middle">Iter 6 &Delta;</text><text class="isb" x="63"  y="188" text-anchor="middle">cont.batch</text>
+        <rect class="pib" x="126" y="156" width="86" height="40"/><text class="ilb" x="169" y="174" text-anchor="middle">T1</text><text class="isb" x="169" y="188" text-anchor="middle">residency</text>
+        <rect class="nib" x="232" y="152" width="100" height="48"/><text class="ilb" x="282" y="172" text-anchor="middle">Iter B2</text><text class="isb" x="282" y="186" text-anchor="middle">co-loc+batch</text>
+        <rect class="pib" x="352" y="156" width="86" height="40"/><text class="ilb" x="395" y="174" text-anchor="middle">Iter 7 / T3</text><text class="isb" x="395" y="188" text-anchor="middle">spec+FSM</text>
+        <rect class="tib" x="458" y="154" width="120" height="44"/><text class="ilb" x="518" y="172" text-anchor="middle">Iter 8 &Delta; +B3</text><text class="isb" x="518" y="186" text-anchor="middle">fan-out quota</text>
+        <rect class="pib" x="604" y="156" width="86" height="40"/><text class="ilb" x="647" y="174" text-anchor="middle">9&Delta; / 10&Delta;</text><text class="isb" x="647" y="188" text-anchor="middle">CP / FT</text>
+        <line class="rb" x1="106" y1="176" x2="126" y2="176"/>
+        <line class="rb" x1="212" y1="176" x2="232" y2="176"/>
+        <line class="rb" x1="332" y1="176" x2="352" y2="176"/>
+        <line class="rb" x1="438" y1="176" x2="458" y2="176"/>
+        <line class="rb" x1="578" y1="176" x2="604" y2="176"/>
+        <!-- legend -->
+        <text class="isb" x="20" y="232" font-weight="700">Legend:</text>
+        <rect class="pib" x="78" y="222" width="16" height="12"/><text class="isb" x="98" y="232">inherited (text/image/tool)</text>
+        <rect class="nib" x="268" y="222" width="16" height="12"/><text class="isb" x="288" y="232">new branch iteration</text>
+        <rect class="tib" x="438" y="222" width="16" height="12"/><text class="isb" x="458" y="232">inherited Iter 8 + folded B3</text>
+      </svg>
+      </div>
+      <ul>
+        <li><strong>Iter B0</strong> after Iter T0 &mdash; needs the client-driven loop shape (a fork generalizes &ldquo;re-enter the path&rdquo; to &ldquo;re-enter
+          from an <em>earlier</em> node&rdquo;); establishes the tree shape + <code>branch_id</code> + sibling contract <strong>before</strong> any sharing
+          optimization.</li>
+        <li><strong>Iter B1</strong> after Iter 5 (and T2) &mdash; reuses Iter 5&rsquo;s content-hash chain (the dedup that makes sharing free) + Iter 3&rsquo;s
+          PagedAttention ref-count/CoW; this is where the chain becomes a tree.</li>
+        <li><strong>Iter B2</strong> after Iter 6 (and T1) &mdash; parallel-branch batching <em>is</em> a continuous-batching admission policy; needs Iter 6&rsquo;s
+          scheduler + Iter 1b routing + the Iter 3b pool to overflow into.</li>
+        <li><strong>Iter B3</strong> folded into Iter 8 &mdash; fan-out quota is the abuse axis; composes with the loop quota (tool Iter 8) and image quota.</li>
+      </ul>
+
+      <h3 id="part-a">Part A &mdash; deltas to inherited iterations (text + image + tool)</h3>
+      <table class="sheet">
+        <thead><tr><th>Iter</th><th>Delta (everything else inherited verbatim)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Iter 0</strong> (naive)</td><td>One added &ldquo;what breaks&rdquo; row: with no cache a <code>fanout = 8</code> best-of-N
+            re-prefills the <strong>entire shared trunk 8&times;</strong> &rarr; fan-out &times; full-context prefill, <strong>on top of</strong> the loop&rsquo;s
+            O(n&sup2;). The cost shock compounds with branching. No design change.</td></tr>
+          <tr><td><strong>Iter 1a</strong> (cache + tiering) <span class="mk mk-chg">&Delta;</span></td><td>Branch blocks are <strong>regular blocks</strong>
+            (<a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>) &rarr; same HBM/DRAM tiering. New pressure (BB1): <code>ref_count</code> is now bumped
+            by <strong>intra-conversation siblings</strong>; the coldness gate (<code>last_access old &and; ref_count==0 &and; session_idle</code>) is
+            <strong>unchanged</strong> &mdash; but a shared-trunk block now stays <code>ref_count &gt; 0</code> as long as <strong>any</strong> branch is live,
+            so it survives until the <strong>last</strong> sibling ends (BB1), while an <strong>abandoned</strong> branch&rsquo;s unique suffix drops to
+            <code>ref_count == 0</code> and ages out normally. The mechanism is the parent&rsquo;s; the <em>source</em> of <code>ref_count &gt; 1</code> is
+            new.</td></tr>
+          <tr><td><strong>Iter 1b</strong> (Router / stickiness)</td><td>CH-on-<code>conv_id</code> already lands <strong>every sibling on the same
+            task</strong> (the tree&rsquo;s biggest gift &mdash; co-location for free; BB3). Delta: autoscale-down must not drain a task holding a conv with
+            <strong>live branches</strong> &rarr; add <code>n_live_branches</code> to the drain-safety check (alongside the tool plan&rsquo;s
+            <code>parked_concurrent</code>).</td></tr>
+          <tr><td><strong>Iter 3</strong> (PagedAttention)</td><td><strong>This is where forking lives natively.</strong> PagedAttention&rsquo;s ref-counted
+            blocks + <strong>copy-on-write</strong> <em>are</em> the fork primitive (vLLM parallel sampling / beam search). Full shared blocks are immutable
+            &rarr; shared by reference at zero copy; <strong>only the partial fork-point block is CoW-copied</strong> (BB2). Branching is that engine primitive
+            <strong>promoted to a user-visible feature</strong> &mdash; not new machinery, just a new trigger.</td></tr>
+          <tr><td><strong>Iter 3b</strong> (cross-task pool) <span class="mk mk-chg">&Delta;</span></td><td><strong>New residency class: branch-shared
+            trunks.</strong> A hot conv whose <code>tree_kv_footprint</code> exceeds one task (BB6) parks its <strong>shared trunk</strong> in the pool;
+            overflowed branches <strong>pull the trunk</strong> (read-only, <code>ref_count</code>-shared across pullers) rather than re-prefill it. The
+            fork-point <code>pin_until</code> is a <strong>retention pin</strong> (don&rsquo;t evict a trunk with live branches), distinct from the LRU tail and
+            from the tool plan&rsquo;s parked-conv pin.</td></tr>
+          <tr><td><strong>Iter 4</strong> (chunked / varlen prefill)</td><td>A fork is <strong>mostly a cache hit</strong> (no new prefill spike for late
+            forks). The exception is <strong>edit-and-resubmit</strong> (&sect;B.2 #2): editing an early turn invalidates the prefix <strong>from the edit
+            point</strong> &rarr; a <strong>partial re-prefill</strong> of the post-edit tail &rarr; chunked prefill handles it exactly as a long tool result.
+            Earlier-edit &rArr; bigger re-prefill &rArr; smaller share (<code>shared_prefix_frac</code> is the lever).</td></tr>
+          <tr><td><strong>Iter 5</strong> (prefix caching) <span class="mk mk-chg">&Delta;</span></td><td><strong>The block-hash chain becomes a block-hash
+            <em>tree</em> (radix).</strong> No key change: <code>block_hash = hash(parent_hash &Vert; tokens)</code> is <strong>path-independent</strong>, so
+            sibling branches&rsquo; shared-prefix blocks <strong>collide intentionally</strong> &rarr; APC dedups them with zero new mechanism (&sect;B.4). The
+            engine&rsquo;s structure is a <strong>radix tree of prefixes</strong> (SGLang RadixAttention; vLLM via hash-keyed blocks + CoW). Branch sharing is
+            <strong>intra-tenant</strong> &rarr; <strong>no privacy gate</strong> (the safest sharing class). The full treatment is <a href="#iter-b1">Iter
+            B1</a>.</td></tr>
+          <tr><td><strong>Iter 6</strong> (continuous batching) <span class="mk mk-chg">&Delta;</span></td><td><strong>Parallel-branch batching:</strong> N live
+            siblings admitted as N decode slots whose attention reads the <strong>one</strong> shared prefix block set
+            (<a href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4</a>) &rarr; prefix KV resident <strong>1&times;</strong>, not N&times; (BB4,
+            <a href="#s3">&sect;4</a>). <code>B_decode</code> math unchanged; effective slot demand rises by <strong>fan-out</strong> for forked convs (each
+            branch is a slot). Best-of-N is the textbook case (the engine already does this for parallel sampling). Full treatment in <a href="#iter-b2">Iter
+            B2</a>.</td></tr>
+          <tr><td><strong>Iter 7</strong> (speculative decoding)</td><td>Sibling branches share a prefix &rarr; can <strong>share the draft model&rsquo;s prefix
+            pass</strong> (draft once for the shared part, branch the draft tails). Best-of-N is itself a same-prefix fan-out the draft/verify path already
+            handles. Minor compounding win; no new mechanism.</td></tr>
+          <tr><td><strong>Iter 8</strong> (abuse) <span class="mk mk-chg">&Delta;</span></td><td><strong>BB5 &mdash; fan-out is the new abuse axis (this is
+            Iter B3, folded here).</strong> See the expanded note below.</td></tr>
+          <tr><td><strong>Iter 9</strong> (context parallelism) <span class="mk mk-chg">&Delta;</span></td><td><strong>CP fires per root&rarr;head <em>path</em>,
+            not per <em>tree</em></strong> &mdash; each decoding sequence is one path; the 256 GB / &asymp; 800 k-tok threshold binds the <strong>path</strong>,
+            unchanged. A heavily-forked tree&rsquo;s <em>aggregate</em> KV can exceed the threshold while <strong>no single path</strong> does &rarr; that is a
+            <strong>hot-conv</strong> problem (<a href="#iter-b2">Iter B2</a>/BB6), <strong>not</strong> a CP trigger. If one branch&rsquo;s own path (deep loop
+            + huge results) crosses the threshold, the tool plan&rsquo;s accumulated-context CP fires for that branch alone; <strong>sibling branches share the
+            CP&rsquo;d shards read-only</strong> (only the divergent suffix needs its own CP layout). Rare.</td></tr>
+          <tr><td><strong>Iter 10</strong> (fault tolerance) <span class="mk mk-chg">&Delta;</span></td><td>A task dying with a live tree loses the shared
+            trunk + branch suffixes &rarr; recover from the <strong>client&rsquo;s transcript</strong>: the client holds the <strong>whole tree</strong> and
+            re-POSTs each branch&rsquo;s path anyway &rarr; <strong>re-prefill-as-fallback</strong>, the same RPO=0 story as all parents. <strong>The client is
+            the durability root for the tree</strong> &mdash; a clean consequence of the &sect;B.6 (a) client-held-tree choice.</td></tr>
+          <tr><td><strong>Tool iters T0&ndash;T3</strong> (compose note)</td><td>Forking composes with the loop via the <strong>determinism boundary</strong>
+            (&sect;B.5, diagram <a href="#iter-b0">D-B5</a>): fork-<strong>after</strong> a tool result shares the result KV; fork-<strong>before</strong> a
+            non-deterministic tool call &rarr; the client re-executes the tool per branch &rarr; branches diverge at the (different) result, handled
+            automatically by the content-hash chain. A best-of-N fork over a tool-calling step = N independent loop continuations (each consumes loop budget,
+            Iter 8).</td></tr>
+          <tr><td><strong>Image iters M0&ndash;M3</strong> (compose note)</td><td>A fork <strong>after</strong> an image attachment shares the
+            <strong>image-embedding KV</strong> (content-addressed, Iter M2) across <strong>all</strong> branches &rarr; <strong>encode paid once regardless of
+            fan-out</strong> (&sect;B.5). The most expensive shared prefix (vision) is shared the most &rarr; forking is <em>especially</em> cheap for
+            vision-heavy conversations.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Iter 8 delta, expanded &mdash; fan-out abuse + tree-shape quota (Iter B3, D-B4)</h4>
+      <div id="iter-b3" class="iter-head" style="border-left-color:#0d9488;background:linear-gradient(90deg,#f0fdfa,#f8fafc)">
+        <h2 style="font-size:1.2rem"><span class="mk mk-new">Iter B3</span> Fan-out abuse + tree-shape quota (folded into Iter 8)</h2>
+        <div class="iter-meta">Bottleneck <strong>BB5</strong> &middot; reuses the parent token-bucket <em>mechanism</em> verbatim &mdash; only the
+          <strong>cost function</strong> changes &middot; cites Iter 8 + the tool plan&rsquo;s loop quota</div>
+      </div>
+      <ol class="steps">
+        <li><strong>Problem (BB5).</strong> Fan-out is <strong>combinatorial</strong> &mdash; breadth<sup>depth</sup>. A per-<em>request</em> limiter sees each
+          branch as &ldquo;1 request&rdquo; and never sees that one conversation has spawned a 1 000-node tree. A runaway client (UI bug, or adversary) can
+          explode compute/HBM under one <code>conv_id</code>.</li>
+        <li><strong>Solutions enumerated.</strong> (a) cap <strong>live branches</strong> (<code>max_live_branches</code>); (b) cap <strong>total tree
+          nodes</strong> (<code>max_tree_nodes</code>); (c) <strong>fan-out-amplified token-bucket charge</strong> &mdash; debit the conv its <em>aggregate
+          live-tree decode cost</em> (<code>&Sigma; live branches: decode tokens</code>), not <code>1 req</code> per branch; (d) <strong>all three (defense in
+          depth) &mdash; picked</strong>.</li>
+        <li><strong>Why the caps <em>and</em> the charge.</strong> Caps alone let a conv sit just under <code>max_tree_nodes</code> forever
+          (cheap-but-persistent); the charge alone lets a burst spike before the bucket drains. Both &rarr; bounded worst case + fair steady state.</li>
+        <li><strong>Composition.</strong> The cost function <strong>composes</strong> with the tool plan&rsquo;s loop charge (a branch that also loops debits
+          <code>&Sigma; turns &times;</code> its branch weight) and the image plan&rsquo;s token/byte charge (a branch that uploads images debits those bytes).
+          One token-bucket, three additive cost terms.</li>
+      </ol>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Fan-out abuse quota: a combinatorial tree of branches debits a per-tenant token bucket the aggregate live-tree decode cost, not one unit per branch; max_live_branches and max_tree_nodes caps shed new branches with a 429 while protecting live ones.">
+        <defs>
+          <marker id="qbh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+        </defs>
+        <style>
+          .qbx { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .qbb { fill:#fef2f2; stroke:#dc2626; stroke-width:1.4; rx:8; }
+          .qbg { fill:#ccfbf1; stroke:#0d9488; stroke-width:1.5; rx:8; }
+          .qt  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .qs  { font-size:11px; fill:#475569; }
+          .qn  { font-size:13px; font-weight:700; fill:#1d4ed8; }
+          line.qf { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#qbh); }
+        </style>
+        <!-- combinatorial tree -->
+        <circle cx="60" cy="125" r="9" fill="#0d9488"/>
+        <circle cx="120" cy="80" r="8" fill="#0d9488"/><circle cx="120" cy="170" r="8" fill="#0d9488"/>
+        <circle cx="180" cy="55" r="7" fill="#5eead4"/><circle cx="180" cy="105" r="7" fill="#5eead4"/>
+        <circle cx="180" cy="145" r="7" fill="#5eead4"/><circle cx="180" cy="195" r="7" fill="#5eead4"/>
+        <line x1="69" y1="125" x2="112" y2="84" stroke="#0d9488" stroke-width="1.4"/>
+        <line x1="69" y1="125" x2="112" y2="166" stroke="#0d9488" stroke-width="1.4"/>
+        <line x1="128" y1="80" x2="173" y2="57" stroke="#5eead4" stroke-width="1.2"/>
+        <line x1="128" y1="80" x2="173" y2="103" stroke="#5eead4" stroke-width="1.2"/>
+        <line x1="128" y1="170" x2="173" y2="147" stroke="#5eead4" stroke-width="1.2"/>
+        <line x1="128" y1="170" x2="173" y2="193" stroke="#5eead4" stroke-width="1.2"/>
+        <text class="qs" x="40" y="225" font-weight="700">tree = breadth^depth</text>
+        <rect class="qbg" x="270" y="70" width="220" height="110"/><text class="qt" x="380" y="100" text-anchor="middle">Per-tenant token bucket</text><text class="qs" x="380" y="122" text-anchor="middle">debit = &Sigma; live-tree decode</text><text class="qs" x="380" y="140" text-anchor="middle">(NOT 1 / branch)</text><text class="qs" x="380" y="162" text-anchor="middle">+ loop + image terms</text>
+        <rect class="qbx" x="560" y="40" width="220" height="60"/><text class="qt" x="670" y="66" text-anchor="middle">budget remains</text><text class="qs" x="670" y="84" text-anchor="middle">&rarr; admit next branch</text>
+        <rect class="qbb" x="560" y="150" width="220" height="60"/><text class="qt" x="670" y="176" text-anchor="middle">drained / cap hit</text><text class="qs" x="670" y="194" text-anchor="middle">429: shed NEW branches</text>
+        <rect class="qbb" x="850" y="95" width="290" height="60"/><text class="qt" x="995" y="121" text-anchor="middle">max_live_branches=16 / nodes=1000</text><text class="qs" x="995" y="139" text-anchor="middle">protect live branches; shed new only</text>
+        <line class="qf" x1="195" y1="125" x2="270" y2="125"/><text class="qn" x="232" y="115" text-anchor="middle">&#9312;</text>
+        <line class="qf" x1="490" y1="110" x2="560" y2="78"/><text class="qn" x="525" y="82" text-anchor="middle">&#9313;</text>
+        <line class="qf" x1="490" y1="150" x2="560" y2="178"/><text class="qn" x="525" y="176" text-anchor="middle">&#9314;</text>
+        <line class="qf" x1="780" y1="180" x2="850" y2="135"/><text class="qn" x="815" y="150" text-anchor="middle">&#9315;</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Debit by aggregate tree work</strong> &mdash; each branch debits the bucket the conv&rsquo;s running live-tree decode total, not <code>1 req</code>.</li>
+        <li><span class="b">&#9313;</span> <strong>Budget remains</strong> &mdash; admit the next branch.</li>
+        <li><span class="b">&#9314;</span> <strong>Drained</strong> &mdash; a combinatorial tree drains its own bucket (a per-request limiter never sees fan-out, BB5) &rarr; <code>429</code> on <em>new</em> branches.</li>
+        <li><span class="b">&#9315;</span> <strong>Hard caps</strong> &mdash; <code>max_live_branches = 16</code>, <code>max_tree_nodes = 1000</code> <span class="tag tag-fa">G-FA</span>; shed new branches, <strong>protect live ones</strong>.</li>
+      </ul>
+      <p><strong>What breaks.</strong> (1) Legitimate best-of-N (high but bounded fan-out) tripping the cap &rarr; set <code>max_live_branches</code> above the
+        product&rsquo;s best-of-N (e.g. 16 &ge; typical N=8) + the <code>abandon</code> hint frees discarded branches fast; (2) the amplified charge starving a
+        genuine A/B-compare user &rarr; the charge is <strong>per-tenant fair-share</strong> (the parent&rsquo;s WFQ), not a hard per-conv wall.
+        <strong>SLO impact:</strong> fairness <span class="arrow-down">&uarr;&uarr;</span> (a forking conv can&rsquo;t monopolize a task); $/mo bounded;
+        TTFT/TPOT <span class="arrow-flat">&rarr;</span> for well-behaved convs (the cap only bites abuse).</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter B0 - Fork orchestration                            -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="iter-b0">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter B0 &mdash; Fork orchestration (the tree shape, client-driven, implicit)</h2>
+        <div class="iter-meta">Sets up <strong>BB1 / BB3</strong> &middot; placed after Iter T0 &middot; <strong>no new job</strong> &middot; cites
+          <a href="../../knowledge/K19_reasoning-model-serving.html">K19</a> (Tree-of-Thoughts) + <a href="../../knowledge/K2_kv-cache.html">K2</a> (the dedup
+          that makes it free) &middot; diagrams <a href="#b3">D-B1</a> (the tree) + D-B5 (fork-vs-tool boundary)</div>
+      </div>
+
+      <h3>B0.1 &nbsp;Why introduce this now (after Iter T0)</h3>
+      <ul>
+        <li><strong>Enabling prior:</strong> the client-driven loop (Iter T0) established &ldquo;the client re-enters the path per turn, continuity = the KV
+          cache.&rdquo; A fork <strong>generalizes</strong> that: re-enter the path <strong>from an earlier node</strong>, producing a sibling.</li>
+        <li><strong>Constraint that flipped:</strong> the parents (incl. the tool loop) assumed a conversation is a <strong>line</strong> &mdash; one growing
+          path, one head. With forks it is a <strong>tree</strong> &mdash; many heads sharing ancestors &rarr; the page must define <strong>how a fork is
+          expressed</strong> and <strong>what carries the shared KV</strong> before any optimization.</li>
+        <li><strong>Why not a server-tracked conversation tree?</strong> &rarr; &sect;B.6 (b): a per-conv stateful tree object + the affinity/replication/FT it
+          drags in, for <strong>zero KV-sharing benefit</strong> &mdash; the content-hash chain <em>already</em> shares the prefix, and its <em>retention</em>
+          win is the orthogonal pinning axis reachable client-driven. Client-held tree + implicit fork reuses the parents&rsquo; stickiness + APC
+          wholesale.</li>
+      </ul>
+
+      <h3>B0.2 &nbsp;Architecture &mdash; fork composes with tools across the determinism boundary (D-B5)</h3>
+      <p>A fork&rsquo;s divergence point is set by the <strong>tool determinism boundary</strong> (&sect;B.5). Fork-<strong>after</strong> a tool result shares
+        the result&rsquo;s KV (full share to the fork point); fork-<strong>before</strong> a non-deterministic call &rarr; the client re-runs the tool per
+        branch &rarr; <strong>different results</strong> &rarr; the branches diverge <em>at the result</em>, handled automatically by the content-hash chain
+        (different result tokens &rarr; different <code>block_hash</code>es &rarr; no false share).</p>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Fork composes with tools: on the left, forking after a fixed tool result lets both branches share the result KV up to the fork point; on the right, forking before a non-deterministic tool call makes each branch re-run the tool, producing different results so the branches diverge at the result, deduped correctly by content hash.">
+        <defs>
+          <marker id="b5h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+        </defs>
+        <style>
+          .b5sh { fill:#ecfdf5; stroke:#059669; stroke-width:1.7; rx:8; }
+          .b5uq { fill:#eff6ff; stroke:#2563eb; stroke-width:1.5; rx:8; }
+          .b5df { fill:#fef2f2; stroke:#dc2626; stroke-width:1.5; rx:8; }
+          .b5t { font-size:12px; font-weight:700; fill:#0f172a; }
+          .b5s { font-size:10.5px; fill:#475569; }
+          .b5h { font-size:12.5px; font-weight:700; fill:#334155; }
+          line.b5f { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#b5h); }
+        </style>
+        <line x1="590" y1="20" x2="590" y2="285" stroke="#cbd5e1" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <!-- LEFT: fork AFTER a result -->
+        <text class="b5h" x="40" y="36">Fork AFTER a (fixed) tool result &mdash; shared</text>
+        <rect class="b5sh" x="40" y="60" width="230" height="60"/><text class="b5t" x="60" y="84">trunk + run_tests RESULT</text><text class="b5s" x="60" y="104">result is fixed in the parent (n4)</text>
+        <rect class="b5uq" x="330" y="46" width="190" height="46"/><text class="b5t" x="350" y="66">branch A: await fix</text><text class="b5s" x="350" y="84">shares result KV</text>
+        <rect class="b5uq" x="330" y="120" width="190" height="46"/><text class="b5t" x="350" y="140">branch B: retry fix</text><text class="b5s" x="350" y="158">shares result KV</text>
+        <line class="b5f" x1="270" y1="80" x2="330" y2="68"/><line class="b5f" x1="270" y1="100" x2="330" y2="142"/>
+        <text class="b5s" x="40" y="200" font-weight="700" fill="#059669">&rarr; full prefix share to the fork point (the common case)</text>
+        <!-- RIGHT: fork BEFORE a non-deterministic call -->
+        <text class="b5h" x="620" y="36">Fork BEFORE a non-deterministic call &mdash; diverges</text>
+        <rect class="b5sh" x="620" y="60" width="210" height="60"/><text class="b5t" x="640" y="84">trunk (pre-call)</text><text class="b5s" x="640" y="104">shared up to the call</text>
+        <rect class="b5df" x="890" y="46" width="240" height="46"/><text class="b5t" x="910" y="66">A: web_search &rarr; result&#8321;</text><text class="b5s" x="910" y="84">client re-runs &rarr; tokens differ</text>
+        <rect class="b5df" x="890" y="120" width="240" height="46"/><text class="b5t" x="910" y="140">B: web_search &rarr; result&#8322;</text><text class="b5s" x="910" y="158">client re-runs &rarr; tokens differ</text>
+        <line class="b5f" x1="830" y1="80" x2="890" y2="68"/><line class="b5f" x1="830" y1="100" x2="890" y2="142"/>
+        <text class="b5s" x="620" y="200" font-weight="700" fill="#dc2626">&rarr; diverge AT the result; different block_hash &rarr; no false share</text>
+        <text class="b5s" x="620" y="224">the determinism boundary = the divergence boundary (auto via content hash)</text>
+      </svg>
+      </div>
+
+      <h3>B0.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Fork expression</h4>
+        <ul>
+          <li><span class="pick">(a) client-driven implicit fork &mdash; CHOSEN</span>: re-POST a sibling with a new <code>branch_id</code> +
+            <code>parent_node_id</code>; APC dedups the shared prefix (&sect;B.6 (a)).</li>
+          <li><span class="reject">(b) explicit server <code>fork()</code> RPC + server-tracked tree</span> &mdash; per-conv server state (the &sect;1.1
+            non-goal&rsquo;s home); its pinning benefit is a separate axis we take without it (&sect;B.6 (b)).</li>
+          <li><span class="reject">(c) a new &ldquo;branch-orchestrator&rdquo; job</span> &mdash; a new control plane for no KV gain.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>The content-hash dedup is <em>already</em> path-independent &rarr; siblings share for free, with zero new server state and no new
+          job. Implicit forking reuses the parents&rsquo; stickiness + APC wholesale.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Sharing mechanism</h4>
+        <ul>
+          <li><span class="pick">(a) the existing content-hash APC chain &mdash; CHOSEN</span>: path-independent hashing &rarr; siblings collide on the shared
+            prefix &rarr; free dedup (&sect;B.4).</li>
+          <li><span class="reject">(b) a server &ldquo;branch store&rdquo; that explicitly copies the prefix per branch</span> &mdash; duplicates KV the content
+            hash already shares.</li>
+        </ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Tree ownership / durability</h4>
+        <ul class="why-list"><li>The <strong>client holds the tree</strong> (durability root, Iter 10); the fleet keeps only <strong><code>ref_count</code> +
+          <code>branch_id</code> + fork-point pin</strong> metadata (&sect;B.6 honest tension).</li></ul>
+      </div>
+
+      <h3>B0.4 &nbsp;Number chain</h3>
+      <div class="formula-box">per user fork action, fleet work = ONE divergent-tail prefill + fan-out decode streams (NOT fan-out full re-prefills):
+  prefill per branch = (1 &minus; shared_prefix_frac) of a path = (1 &minus; 0.85) = 0.15 path   [D]
+  shared trunk drops out of the per-fork wait (cache hit)
+  decode_amp        = 1 + f_fork&middot;(fanout_mean &minus; 1) = 1 + 0.15&middot;1 = 1.15   [D]
+  prefill_share_saving = shared_prefix_frac&middot;(fanout_mean &minus; 1) = 0.85   trunk/fork   [D]
+no new task count (no new job). Symbolic; settled at S6.</div>
+
+      <h3>B0.5 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>Fork from an evicted trunk</strong> (TTL/pressure) &rarr; <code>409</code> / cold trunk re-prefill &rarr; mitigate with the fork-point pin
+          (<a href="#iter-b1">B1</a>).</li>
+        <li><strong>Stale <code>parent_node_id</code></strong> (tree desync) &rarr; <code>conv_id</code>+<code>branch_id</code>+<code>turn_idx</code> mismatch
+          &rarr; re-prefill from the client&rsquo;s transcript (RPO=0).</li>
+        <li><strong>Unbounded forking</strong> (a UI bug spamming regenerate) &rarr; fan-out abuse (<a href="#iter-b3">Iter 8 / B3</a>).</li>
+      </ul>
+
+      <h3>B0.6 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99</td><td><span class="arrow-flat">&rarr;</span> unchanged target, <strong>new binding case</strong>: a warm trunk &rArr; only the tail
+            prefills (per branch).</td></tr>
+          <tr><td>$/mo</td><td>prefill <span class="arrow-down">&darr;</span> (trunk shared) but decode <span class="arrow-up">&uarr;</span> by
+            <code>decode_amp</code> before B2&rsquo;s batch win.</td></tr>
+          <tr><td>Max context</td><td><span class="arrow-flat">&rarr;</span> per-path (Iter 9), not per-tree.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter B1 - CoW + ref-count lifetime (flagship)           -->
+  <!-- ===================================================== -->
+  <section class="section" id="iter-b1">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter B1 &mdash; Copy-on-write prefix sharing + ref-count lifetime across the tree
+          <span style="font-weight:400;font-size:.9rem;color:#475569">(the flagship)</span></h2>
+        <div class="iter-meta">Bottleneck <strong>BB1 + BB2</strong> &middot; placed after Iter 5 / T2 &middot; <strong>no new job</strong> &middot; cites
+          <a href="../../knowledge/K2_kv-cache.html#d5">K2 D5</a> (path-independent key) + K2 (APC / PagedAttention CoW) + <strong>GAP: tree-structured KV /
+          RadixAttention</strong> &middot; diagram D-B2</div>
+      </div>
+
+      <h3>B1.1 &nbsp;Why introduce this now (after Iter 5 / T2)</h3>
+      <ul>
+        <li><strong>Enabling priors:</strong> Iter 5 built the <strong>content-hash block chain + APC</strong> (the dedup that makes sibling sharing free);
+          Iter 3 built <strong>PagedAttention&rsquo;s ref-counted blocks + CoW</strong> (the fork primitive); Iter 3b built the pool to overflow into. B1 turns
+          the chain into a <strong>tree</strong> and manages its lifetime.</li>
+        <li><strong>Constraint that flipped:</strong> the parents&rsquo; <code>ref_count</code> only ever exceeded 1 via <strong>cross-conversation</strong>
+          prefix matches. Forking makes <code>ref_count &gt; 1</code> arise <strong>within one conversation</strong> (live siblings), and introduces the
+          <strong>partial fork-point block</strong> problem (two branches appending different tokens to the same not-yet-full block).</li>
+        <li><strong>Why not copy the whole shared prefix per branch?</strong> &rarr; it throws away the entire sharing win (fan-out &times; trunk KV) and re-pays
+          fan-out &times; trunk prefill &mdash; at <code>shared_prefix_frac = 0.85</code>, fan-out 8, that is ~7&times; wasted HBM + prefill per fork.</li>
+        <li><strong>Why not refuse to evict any shared trunk ever?</strong> &rarr; a popular root would pin HBM forever; the trunk must be reclaimable
+          <strong>once the last branch dies</strong> &rarr; ref-count, not pinning-forever.</li>
+      </ul>
+
+      <h3>B1.2 &nbsp;Architecture &mdash; the CoW + ref-count state machine (D-B2)</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CoW and ref-count state machine: a fork increments ref_count along the shared path and copy-on-writes only the partial fork-point block; a branch ending decrements ref_count along its unique suffix; when ref_count reaches zero the coldness gate GCs the block; a fork-point pin_until holds the trunk across the fan-out.">
+        <defs>
+          <marker id="b2h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="b2r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/></marker>
+        </defs>
+        <style>
+          .b2x { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .b2g { fill:#ecfdf5; stroke:#059669; stroke-width:1.6; rx:8; }
+          .b2c { fill:#fffbeb; stroke:#d97706; stroke-width:1.6; rx:8; }
+          .b2k { fill:#fef2f2; stroke:#dc2626; stroke-width:1.5; rx:8; }
+          .b2t { font-size:12.5px; font-weight:700; fill:#0f172a; }
+          .b2s { font-size:10.5px; fill:#334155; }
+          .b2n { font-size:13px; font-weight:700; fill:#1d4ed8; }
+          line.b2f { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#b2h); }
+          line.b2gc, path.b2gc { stroke:#dc2626; stroke-width:1.7; fill:none; marker-end:url(#b2r); }
+        </style>
+        <rect class="b2g" x="30" y="130" width="170" height="76"/><text class="b2t" x="115" y="158" text-anchor="middle">SHARED TRUNK block</text><text class="b2s" x="115" y="178" text-anchor="middle">immutable, ref-counted</text><text class="b2s" x="115" y="194" text-anchor="middle">ref_count = live heads</text>
+        <rect class="b2x" x="250" y="40" width="200" height="70"/><text class="b2t" x="350" y="66" text-anchor="middle">FORK (client re-POST)</text><text class="b2s" x="350" y="86" text-anchor="middle">++ref_count on shared path</text><text class="b2s" x="350" y="102" text-anchor="middle">CoW the PARTIAL block</text>
+        <rect class="b2c" x="500" y="40" width="190" height="70"/><text class="b2t" x="595" y="66" text-anchor="middle">CoW partial block</text><text class="b2s" x="595" y="86" text-anchor="middle">the ONLY block copied</text><text class="b2s" x="595" y="102" text-anchor="middle">(&le; 1 block / fork)</text>
+        <rect class="b2x" x="250" y="225" width="200" height="70"/><text class="b2t" x="350" y="251" text-anchor="middle">BRANCH ends / abandon</text><text class="b2s" x="350" y="271" text-anchor="middle">&minus;&minus;ref_count on unique suffix</text><text class="b2s" x="350" y="287" text-anchor="middle">(abandon hint = early)</text>
+        <rect class="b2k" x="500" y="225" width="200" height="70"/><text class="b2t" x="600" y="251" text-anchor="middle">ref_count == 0 &rarr; GC</text><text class="b2s" x="600" y="271" text-anchor="middle">UNCHANGED coldness gate</text><text class="b2s" x="600" y="287" text-anchor="middle">(Iter 1a)</text>
+        <rect class="b2g" x="760" y="130" width="200" height="76"/><text class="b2t" x="860" y="156" text-anchor="middle">fork-point pin_until</text><text class="b2s" x="860" y="176" text-anchor="middle">hold trunk across fan-out</text><text class="b2s" x="860" y="192" text-anchor="middle">single TTL, biased SHORT</text>
+        <rect class="b2x" x="1000" y="130" width="150" height="76"/><text class="b2t" x="1075" y="160" text-anchor="middle">last branch</text><text class="b2t" x="1075" y="178" text-anchor="middle">dies &rarr; trunk GC</text>
+        <!-- edges -->
+        <line class="b2f" x1="200" y1="150" x2="250" y2="85"/><text class="b2n" x="215" y="110" text-anchor="middle">&#9312;</text>
+        <line class="b2f" x1="450" y1="75" x2="500" y2="75"/><text class="b2n" x="475" y="64" text-anchor="middle">&#9313;</text>
+        <line class="b2f" x1="200" y1="186" x2="250" y2="255"/><text class="b2n" x="215" y="232" text-anchor="middle">&#9314;</text>
+        <line class="b2gc" x1="450" y1="260" x2="500" y2="260"/><text class="b2n" x="475" y="249" text-anchor="middle">&#9315;</text>
+        <line class="b2f" x1="200" y1="168" x2="760" y2="168" stroke-dasharray="5 4"/><text class="b2n" x="480" y="158" text-anchor="middle">&#9316;</text>
+        <line class="b2gc" x1="960" y1="168" x2="1000" y2="168"/><text class="b2n" x="980" y="158" text-anchor="middle">&#9317;</text>
+        <text class="b2s" x="30" y="320" font-weight="700" fill="#dc2626">Red = GC path (ref_count == 0). Dashed = retention pin holding the trunk live across siblings.</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Fork</strong> &mdash; increment <code>ref_count</code> along the shared path (fork-point block + ancestors).</li>
+        <li><span class="b">&#9313;</span> <strong>CoW</strong> &mdash; copy <em>only</em> the partial fork-point block (&le; 1 block/fork); full blocks shared read-only.</li>
+        <li><span class="b">&#9314;</span> <strong>Branch ends</strong> &mdash; decrement <code>ref_count</code> along its <em>unique</em> suffix (the <code>abandon</code> hint does this early).</li>
+        <li><span class="b">&#9315;</span> <strong>GC</strong> &mdash; <code>ref_count == 0</code> hits the <strong>unchanged</strong> coldness gate (Iter 1a).</li>
+        <li><span class="b">&#9316;</span> <strong>Pin</strong> &mdash; <code>pin_until</code> holds the trunk across the fan-out (single TTL, biased short &mdash; the client re-POSTs on a late fork, RPO=0).</li>
+        <li><span class="b">&#9317;</span> <strong>Last branch dies</strong> &mdash; trunk <code>ref_count</code> hits 0 &rarr; reclaimed normally.</li>
+      </ul>
+
+      <h3>B1.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Shared-block handling: share read-only + CoW only the partial block</h4>
+        <p class="dc-prob">Problem: two branches diverge at a not-yet-full block &mdash; how to let both append without corrupting each other?</p>
+        <ul>
+          <li><span class="reject">(a) copy the prefix per branch</span> &mdash; kills the win (fan-out &times; trunk KV + prefill).</li>
+          <li><span class="pick">(b) share full blocks read-only by reference (ref-counted) + copy-on-write <em>only</em> the partial fork-point block &mdash;
+            CHOSEN</span> &mdash; full content-hashed blocks are immutable, so two branches read the same physical block safely; the one not-yet-full block at
+            the fork point is the <strong>only</strong> thing copied. It is the vLLM parallel-sampling/beam-search primitive; <strong>one block copied per
+            fork</strong> (<a href="#s3">&sect;4</a>), the rest shared.</li>
+        </ul>
+        <p class="dc-why lead">Concrete tech &mdash; <strong>vLLM</strong> (hash-block + CoW) vs <strong>SGLang RadixAttention</strong> (native radix tree):</p>
+        <div class="two-col">
+          <div>
+            <h4>vLLM &mdash; hash-keyed blocks + CoW</h4>
+            <ul style="margin:.2rem 0 .2rem 1rem">
+              <li><code>block_hash = hash(parent_hash &Vert; tokens)</code> over <strong>full</strong> blocks (e.g. <code>page_size = 16</code>).</li>
+              <li>Fork = bump <code>ref_count</code> + CoW the one partial block.</li>
+              <li><strong>Flat, global, shardable key</strong> &rarr; CH-shard across the cross-task pool, gossip, dedup fleet-wide (the whole
+                <code>kv-store-job</code> / PoolConvIndex design). O(1), paging-native.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>SGLang RadixAttention &mdash; radix tree of prefixes</h4>
+            <ul style="margin:.2rem 0 .2rem 1rem">
+              <li>A radix tree shares branches <strong>natively</strong> (no separate fork call); <code>token_to_kv_pool</code> at <code>page_size = 1</code>.</li>
+              <li>Can split a node at the <strong>exact divergence token</strong> &rarr; the CoW copy + partial re-prefill disappears.</li>
+              <li><strong>Centralized in-memory structure</strong> &mdash; awkward to distribute; needs split/merge maintenance; loses the contiguous
+                16-token kernel gather.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="dc-why lead" style="margin-top:.5rem">The four radix-vs-block-hash benefits, judged honestly &mdash; only #1 is a real capability gap:</p>
+        <ul class="why-list">
+          <li><strong>#1 Token-granular (sub-block) sharing &mdash; the real lever is <code>page_size</code>, not the tree alone.</strong> Block-hash leaves a
+            <strong>partial trailing block</strong> unshared at a non-aligned fork &rarr; the one CoW + up-to-<code>block_size&minus;1</code> re-prefilled
+            tokens. The physical unit on HBM is the <strong>page</strong> (alloc unit <em>and</em> kernel-gather run); a radix tree is an <em>index</em> whose
+            leaves are still whole pages, so the exact-token win is <strong>contingent on shrinking the page</strong>: at <code>page_size = 16</code> the child
+            still CoW-copies the mid-page (the tree buys nothing); at <code>page_size = 1</code> (SGLang) the divergence token gets a fresh slot &rarr; no CoW,
+            but page-table count grows ~<code>block_size</code>&times; and the kernel loses coalescing; <code>page_size = 2&ndash;4</code> bounds the residual
+            loss to <code>page_size&minus;1</code> tokens. <strong>Net:</strong> a local, small-<code>page_size</code> option &mdash; the distributed pool stays
+            <code>page_size = 16</code>.</li>
+          <li><strong>#2 Structure-aware eviction &mdash; NOT a gap; a cheap block-hash upgrade matches it.</strong> Flat <code>ref_count</code> is
+            <em>already correct</em>: <code>ref_count</code> is <strong>monotone up the chain</strong>, so <code>ref_count(block) = 0</code> &rArr; all
+            descendants are 0 &rArr; no live children &mdash; the &ldquo;never evict an internal node with a live child&rdquo; invariant falls out of the
+            <code>ref_count == 0</code> gate alone. Even the eviction <em>ordering</em> is recoverable from scalars: among <code>ref_count = 0</code>
+            candidates, the faithful policy is the triple <code>(ref_count==0 gate &rarr; last_access recency &rarr; min_position depth tiebreak)</code>, which
+            reproduces SGLang&rsquo;s &ldquo;coldest leaf.&rdquo; <em>(Runnable side-by-side: <a href="prefix_cache_impl.html">prefix_cache_impl.html</a>.)</em></li>
+          <li><strong>#3 One longest-prefix-match traversal &mdash; near-wash, and metadata is trivial.</strong> Per-block lookup is O(1), so matching a
+            P-token prefix is ~<code>P/block_size</code> probes, comparable to the radix walk. A block-hash entry is ~100 B guarding a ~5 MB block (16 tok
+            &times; <code>KV_per_tok = 320 KB</code>) &rarr; metadata is <strong>~0.002%</strong> of the KV (<code>hidden_sys</code>&rsquo;s ~500 entries
+            &asymp; 50 KB vs ~2.5 GB). The uniform-fixed-block invariant (logical block == physical page) is load-bearing for the paged allocator + kernel
+            gather + per-page eviction + chunked-prefill page-by-page commit &mdash; not worth trading for a coarse mega-entry to save 0.002%.</li>
+          <li><strong>#4 Native many-way branching.</strong> Best-of-N / beam / ToT / user forks <em>are</em> trees; inserting a sibling = adding a child edge
+            at the divergence node &mdash; the structure mirrors the request topology.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li><strong>Picked vLLM-style</strong> (hash-block + CoW) to stay consistent with the parents&rsquo; content-hash APC <em>and</em> the
+          shardable pool; <strong>adopt a RadixAttention-style local tree</strong> per-task where sub-block/partial sharing dominates &mdash; which branching,
+          with its arbitrary fork points, is exactly the workload that justifies. They live at different layers: <strong>block-hash for the
+          distributed/shardable pool, a radix tree as the local per-task prefix structure.</strong></li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Ref-count lifetime (BB1) &mdash; and why <em>no watermark pair</em> is needed</h4>
+        <ul class="why-list">
+          <li><code>ref_count(block)</code> = number of <strong>live branch heads</strong> whose path includes it. <strong>Fork</strong> &rarr; increment along
+            the shared path; <strong>branch ends/abandoned</strong> &rarr; decrement along its <strong>unique suffix</strong>; <strong>GC</strong> when
+            <code>ref_count == 0</code> (the <strong>unchanged</strong> coldness gate, Iter 1a). The shared trunk survives until the <strong>last</strong>
+            sibling dies.</li>
+          <li><strong>No watermark <em>pair</em> needed here</strong> (contrast the tool plan&rsquo;s keep-warm band): ref-count is an <strong>exact liveness
+            signal</strong>, not a thrash-prone threshold. The only retention <em>tuning</em> is the fork-point <strong>pin TTL</strong>
+            (<code>pin_until</code>): how long to hold a trunk after the last <em>known</em> branch ends, in case the client forks again &mdash; a single TTL,
+            biased <strong>short</strong> because the client re-POSTs the trunk anyway on a late fork (RPO=0).</li>
+        </ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Block alignment of the fork point</h4>
+        <ul>
+          <li><span class="reject">(a) fork at arbitrary token offset</span> &rarr; always a partial block to CoW.</li>
+          <li><span class="pick">(b) prefer block-aligned fork points &mdash; CHOSEN as an optimization</span> &rarr; the fork lands on a block boundary
+            &rarr; both branches start fresh blocks, <strong>zero copy</strong>; fall back to (a)&rsquo;s single-block CoW otherwise.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Cheap, and makes the common late-fork (regenerate) <strong>fully zero-copy</strong>.</li></ul>
+      </div>
+
+      <h3>B1.4 &nbsp;Wait-time formula delta</h3>
+      <div class="formula-box">a branch's prefill wait = chunked_prefill(divergent_tail) + (0 if trunk warm/ref-counted else trunk_pull(&alpha; + &beta;&middot;KV_bytes from pool))
+the shared trunk contributes 0 to the second branch onward (cache hit), folded into the parent's &beta;(r) tier machinery as the already-resident case.</div>
+
+      <h3>B1.5 &nbsp;Number chain</h3>
+      <div class="formula-box">tree_kv_footprint = T_shared + &Sigma; branch_tails   &rarr; sublinear in fan-out
+   at shared_prefix_frac = 0.85, fan-out 8:  0.85 + 8&middot;0.15 = 2.05&times; a single path (NOT 8&times;)   [D]
+CoW cost          = 1 partial block / fork = 16&ndash;32 tok &times; KV_per_tok = 5.1&ndash;10.2 MB   [D]
+ref_count>1 pop   = n_branches_concurrent &asymp; 300k blocks held alive by intra-conv sharing   [D, &sect;1.3]
+prefill collapse  = fan-out &times; trunk  &rarr;  1 &times; trunk   (the headline branch win)   [D]</div>
+
+      <h3>B1.6 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>Long-lived A/B branch keeps a huge trunk pinned</strong> (<code>ref_count</code> never hits 0) &rarr; correctly retained, but a
+          <em>zombie</em> branch (client never closes it) leaks &rarr; the <code>pin_until</code> / session-idle TTL reclaims it (trunk is RPO=0 re-buildable
+          from transcript).</li>
+        <li><strong>Fork from a partially-evicted block</strong> (tail gone, head kept) &rarr; re-prefill the missing tail only (chunked, Iter 4).</li>
+        <li><strong>Ref-count race under concurrent fork+abandon</strong> &rarr; the parent pool&rsquo;s existing atomic <code>ref_count</code> ops
+          (Cuckoo/PoolConvIndex) handle it &mdash; no new concurrency primitive.</li>
+      </ul>
+
+      <h3>B1.7 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99 (sibling branches)</td><td><span class="arrow-down">&darr;&darr;</span> trunk = cache hit, only the tail prefills.</td></tr>
+          <tr><td>HBM pressure</td><td><span class="arrow-down">&darr;&darr;</span> one trunk for N branches, not N &rarr; enables higher effective
+            <code>B_decode</code>.</td></tr>
+          <tr><td>$/mo</td><td><span class="arrow-down">&darr;&darr;</span> the fan-out prefill collapses from fan-out &times; trunk to 1 &times; trunk &mdash;
+            the headline branch win.</td></tr>
+          <tr><td>TPOT / correctness</td><td><span class="arrow-flat">&rarr;</span> TPOT unchanged; CoW guarantees branches never corrupt each other&rsquo;s
+            KV.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter B2 - Co-location + parallel-branch batching        -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="iter-b2">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter B2 &mdash; Sibling co-location + parallel-branch batching (+ hot-conv overflow)</h2>
+        <div class="iter-meta">Bottleneck <strong>BB3 + BB4 + BB6</strong> &middot; placed after Iter 6 / T1 &middot; <strong>no new job</strong> &middot;
+          cites <a href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4</a> + Iter 1b (routing) + Iter 3b (pool) &middot; diagram D-B3</div>
+      </div>
+
+      <h3>B2.1 &nbsp;Why introduce this now (after Iter 6 / T1)</h3>
+      <ul>
+        <li><strong>Enabling priors:</strong> Iter 6 gave the continuous-batching decode scheduler; Iter 1b gave CH-on-<code>conv_id</code> stickiness; Iter 3b
+          gave the pool; <a href="#iter-b1">B1</a> gave the ref-counted shared trunk. B2 places the branches and batches them.</li>
+        <li><strong>Constraint that flipped:</strong> siblings must (a) <strong>land on the task holding the warm trunk</strong> (else BB3: each cold-prefills
+          it) and (b) be <strong>batched to share the prefix block set</strong> (else BB4: N copies of the prefix waste HBM). And a heavily-forked conv can
+          exceed one task (BB6).</li>
+        <li><strong>Why not just let the load balancer spread branches?</strong> &rarr; spreading siblings across tasks <strong>destroys the sharing</strong>
+          &mdash; each task cold-prefills the whole trunk &rarr; fan-out &times; trunk prefill, the exact waste B1 eliminated.</li>
+      </ul>
+
+      <h3>B2.2 &nbsp;Architecture &mdash; N branch slots read one shared prefix block set (D-B3)</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Parallel-branch batching: N sibling decode slots on one task all attention-read the single shared prefix block set, so the prefix KV is resident once not N times; when the tree exceeds the task HBM budget, an overflow branch is spread to a sibling task that pulls the shared trunk read-only from the Iter 3b pool.">
+        <defs>
+          <marker id="b3h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="b3o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>
+        </defs>
+        <style>
+          .b3sh { fill:#ecfdf5; stroke:#059669; stroke-width:1.9; rx:8; }
+          .b3sl { fill:#eff6ff; stroke:#2563eb; stroke-width:1.5; rx:8; }
+          .b3pl { fill:#f1f5f9; stroke:#475569; stroke-width:1.6; rx:8; }
+          .b3t { font-size:12.5px; font-weight:700; fill:#0f172a; }
+          .b3s { font-size:10.5px; fill:#475569; }
+          line.b3f { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#b3h); }
+          line.b3ov, path.b3ov { stroke:#94a3b8; stroke-width:1.6; stroke-dasharray:6 4; fill:none; marker-end:url(#b3o); }
+        </style>
+        <!-- shared prefix block set -->
+        <rect class="b3sh" x="40" y="120" width="210" height="90"/><text class="b3t" x="145" y="150" text-anchor="middle">SHARED PREFIX</text><text class="b3t" x="145" y="170" text-anchor="middle">block set (1&times; HBM)</text><text class="b3s" x="145" y="190" text-anchor="middle">resident ONCE, read by all</text>
+        <!-- N decode slots -->
+        <rect class="b3sl" x="340" y="40" width="180" height="44"/><text class="b3t" x="430" y="62" text-anchor="middle">branch A slot</text><text class="b3s" x="430" y="78" text-anchor="middle">query stream A</text>
+        <rect class="b3sl" x="340" y="100" width="180" height="44"/><text class="b3t" x="430" y="122" text-anchor="middle">branch B slot</text><text class="b3s" x="430" y="138" text-anchor="middle">query stream B</text>
+        <rect class="b3sl" x="340" y="160" width="180" height="44"/><text class="b3t" x="430" y="182" text-anchor="middle">branch C slot</text><text class="b3s" x="430" y="198" text-anchor="middle">query stream C</text>
+        <text class="b3s" x="340" y="232" font-weight="700">N slots, 1&times; prefix &mdash; capacity win unconditional;</text>
+        <text class="b3s" x="340" y="248">read-bandwidth win needs a cascade-attention kernel (FlashInfer / flash-attn)</text>
+        <line class="b3f" x1="250" y1="150" x2="340" y2="62"/>
+        <line class="b3f" x1="250" y1="165" x2="340" y2="122"/>
+        <line class="b3f" x1="250" y1="180" x2="340" y2="182"/>
+        <!-- overflow path -->
+        <rect class="b3pl" x="620" y="120" width="220" height="60"/><text class="b3t" x="730" y="146" text-anchor="middle">SIBLING TASK (overflow)</text><text class="b3s" x="730" y="166" text-anchor="middle">tree_kv &gt; &rho;_kv&middot;HBM_task</text>
+        <rect class="b3pl" x="920" y="120" width="230" height="60"/><text class="b3t" x="1035" y="146" text-anchor="middle">Iter 3b POOL</text><text class="b3s" x="1035" y="166" text-anchor="middle">trunk pulled read-only (&alpha;+&beta;n)</text>
+        <path class="b3ov" d="M520,150 C560,150 580,150 620,150"/><text class="b3s" x="535" y="112">overflow branch</text>
+        <path class="b3ov" d="M840,150 L920,150"/><text class="b3s" x="848" y="112">one trunk pull</text>
+        <text class="b3s" x="620" y="210" font-weight="700">spread &rArr; pay ONE trunk pull, not fan-out &times; full re-prefill</text>
+      </svg>
+      </div>
+
+      <h3>B2.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Sibling placement</h4>
+        <ul>
+          <li><span class="pick">(a) prefix-affinity routing &rarr; all siblings on one task &mdash; CHOSEN</span>: production prefix-cache-aware routers
+            (SGLang router, llm-d, AIBrix, Mooncake conductor) route by longest-prefix-match on the tokens; this fleet&rsquo;s inherited
+            <strong>CH-on-<code>conv_id</code></strong> is the coarser proxy that coincides for siblings (they all share the conv&rsquo;s prefix) &rarr; every
+            branch lands on the one warm trunk + one physical prefix block set <strong>for free</strong>.</li>
+          <li><span class="reject">(b) spread for load balance</span> &mdash; as the default, loses sharing.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Co-location <em>is</em> the sharing precondition; prefix-affinity is the mechanism, conv-id stickiness the adequate proxy.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Parallel-branch batching (BB4) &mdash; capacity vs bandwidth</h4>
+        <p class="dc-sols">N live siblings admitted as N decode slots whose attention reads the <em>one</em> shared prefix block set (K4) &mdash; prefix KV
+          resident <strong>1&times;</strong>, read by N query streams. <strong>Two distinct cases, don&rsquo;t conflate:</strong></p>
+        <ul class="why-list">
+          <li><strong>Best-of-N issued as one <code>n=N</code> request</strong> &rarr; the engine co-batches the N samples <strong>by construction</strong>
+            (vLLM/SGLang parallel sampling) &mdash; guaranteed, the textbook case.</li>
+          <li><strong>A/B-compare siblings arriving as <em>separate</em> HTTP requests</strong> &rarr; <strong>no special &ldquo;branch batch&rdquo;
+            admission</strong>; the continuous batcher co-batches them only <strong>opportunistically</strong> when concurrent + co-located. Real but
+            best-effort.</li>
+          <li><strong>Capacity vs bandwidth.</strong> Storing the prefix <strong>1&times;</strong> is a <strong>capacity</strong> win (lets
+            <code>B_decode</code> grow). By default each branch still <em>reads</em> the shared KV independently &rarr; <strong>N&times; read
+            bandwidth</strong>; since decode is bandwidth-bound, the read-side win needs a <strong>shared-prefix (cascade) attention kernel</strong> (FlashInfer
+            cascade inference / flash-attn) that reads the prefix <strong>once</strong> for all N queries.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Decode is memory-bound &rarr; sharing the prefix block set across siblings is a large HBM-capacity win unconditionally, and a
+          bandwidth win with the cascade kernel.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Hot-conv overflow (BB6) &mdash; the spread-vs-share crossover</h4>
+        <ul class="why-list">
+          <li>When one conv&rsquo;s <code>tree_kv_footprint &gt; &rho;_kv &middot; HBM_task</code> (one task can&rsquo;t hold the whole tree), <strong>spread
+            excess branches to a sibling task</strong> and serve the <strong>shared trunk from the Iter 3b pool</strong> (overflowed branches pull it
+            read-only, <code>ref_count</code>-shared).</li>
+          <li><strong>Crossover:</strong> keep co-located below the threshold (share trunk, pay hot-task risk); spread above (pay <strong>one</strong> trunk pull
+            <code>&alpha; + &beta;&middot;KV_bytes</code> per overflow task, <strong>not</strong> fan-out &times; full re-prefill). Modeled
+            <code>&alpha; + &beta;&middot;n</code>, not <code>n/BW</code>. <strong>No watermark pair needed</strong> &mdash; this is a capacity threshold (does
+            the tree fit?), not a thrash-prone oscillating signal.</li>
+        </ul>
+      </div>
+
+      <h3>B2.4 &nbsp;Wait-time formula delta</h3>
+      <div class="formula-box">parallel-branch batch occupies N slots but 1&times; prefix KV:
+  slot-demand(forked conv)   = fan-out   (each branch is a slot)
+  KV-memory-demand(forked conv) = divergent suffixes only   (trunk shared 1&times;)
+&rarr; fold into Iter 6's B_decode admission: forked convs are SLOT-bound, not memory-bound (the asymmetry).</div>
+
+      <h3>B2.5 &nbsp;Number chain</h3>
+      <div class="formula-box">sibling_batch_rate = &lambda;_peak&middot;f_fork&middot;(fanout_mean &minus; 1) = 100k&middot;0.15&middot;1 = 15k/s   [D, &sect;1.3]
+overflow fires when tree_kv_footprint &gt; &rho;_kv &middot; HBM_task   (BB6 crossover, &sect;4)
+parallel-branch batch: prefix resident 1&times; vs N&times;  &rarr;  HBM saved = (N&minus;1)&times; prefix KV   [D]</div>
+
+      <h3>B2.6 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>A single conv fans out past one task&rsquo;s slots</strong> (not just KV) &rarr; spread branches across tasks (DC3) + the fan-out cap
+          (<a href="#iter-b3">Iter 8/B3</a>) bounds it.</li>
+        <li><strong>Co-location makes a forked conv a hot task</strong> (all its branches&rsquo; decode on one GPU) &rarr; the overflow path (DC3) sheds branch
+          <em>slots</em> to siblings while keeping the trunk in the pool.</li>
+        <li><strong>Overflow trunk-pull storm</strong> if many convs spread at once &rarr; the <code>&rho;_fabric</code>-derated pull + headroom (inherited from
+          the tool plan&rsquo;s resume-storm mitigation).</li>
+      </ul>
+
+      <h3>B2.7 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99</td><td><span class="arrow-down">&darr;&darr;</span> siblings hit the warm co-located trunk.</td></tr>
+          <tr><td>HBM pressure</td><td><span class="arrow-down">&darr;&darr;</span> 1&times; prefix for N branches.</td></tr>
+          <tr><td>Throughput / $/mo</td><td>throughput <span class="arrow-down">&uarr;</span> (parallel-branch batch packs siblings); $/mo
+            <span class="arrow-down">&darr;</span> (fewer tasks, no redundant trunk copies).</td></tr>
+          <tr><td>TPOT / fairness</td><td><span class="arrow-flat">&rarr;</span> batched branches swap in before rejoining; a hot forked conv is bounded by
+            Iter 8/B3.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S6 delta - Final design                                 -->
+  <!-- ===================================================== -->
+  <section class="section" id="s6">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S6 &nbsp;Final design &mdash; the whole settled fleet</h2>
+      <p>The final fleet is the <a href="distributed_kv_cache_image_tool.html#s6">tool page&rsquo;s fleet</a> (itself = parent text fleet + the multimodal
+        stack + the tool deltas) with <strong>no new job</strong> &mdash; the deliberate structural contrast with the image plan (which added
+        <code>vision-encoder-job</code> + <code>blob-store-job</code>) and the consistency with the tool plan. The existing jobs gain tree-awareness; the
+        <code>kv-store-job</code> gains one <em>residency class</em> (not a new key space).</p>
+
+      <h3 id="s6-arch">6.1 &nbsp;Final fleet architecture &mdash; the whole settled fleet in one picture (D-B6)</h3>
+      <p>This is the <a href="distributed_kv_cache_image_tool.html#s6-arch">tool page&rsquo;s final fleet</a> with every branch addition folded in &mdash;
+        <strong>not</strong> a delta sketch but the entire fleet. The inherited boxes keep their colors (router blue, broker pink, prefill green, decode purple,
+        kv-store orange, the <span style="color:#ea580c;font-weight:700;">amber</span> multimodal stack, the <span style="color:#0891b2;font-weight:700;">cyan</span>
+        tool rows); the <strong>branch deltas are <span style="color:#0d9488;font-weight:700;">teal</span></strong>. The headline structural fact is again
+        <strong>no new job</strong> &mdash; forking is the <strong>client&rsquo;s</strong> (the client now holds the whole <em>tree</em>), drawn outside the
+        dashed <em>fleet boundary</em>, and a fork closes through the <em>existing</em> ingress / egress. Every branch delta is a <em>teal row inside an existing
+        box</em> + a <strong>residency class</strong> on key space 1 of the <code>kv-store-job</code>.</p>
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1360 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Final branching fleet architecture. The client sits outside a dashed serving-fleet boundary because forking is the client's: it holds the whole conversation tree and re-POSTs sibling branches keyed by conv_id plus branch_id, and is the durability root for the tree. Inside the boundary the fleet is structurally the tool page's fleet with no new job. The router-job holds the two consistent-hash rings on conv_id (which co-locate every sibling for free), an admit gate now carrying loop AND fan-out quotas, a CP fork that fires per root-to-head path not per tree, image content-hash and tool toolset-hash affinity, and a NEW teal row for sibling co-location plus fork-point targeting plus hot-conv overflow. The broker adds n_live_branches to the drain-safety check. The cp_ring forks per path; fan-out is not a CP trigger and siblings share CP'd shards read-only. The amber blob store and encode pool serve images, and a fork after an image shares the embedding KV so encode is paid once regardless of fan-out. The serving-prefill-job prefills only the divergent tail of a branch because the shared trunk is a cache hit, copy-on-writes only the partial fork-point block, and the prefix chain is now a block-hash tree (radix). The serving-decode-job adds parallel-branch batching where N sibling slots read one shared prefix block set, ref-count-aware eviction, and a cascade attention kernel for the read-bandwidth win. The kv-store-job key space 1 conv_id to KV gains a teal branch-shared-trunk residency class with ref_count across siblings and a fork-point pin_until, alongside the inherited parked-conversation class; key space 2 is the image embedding cache and key space 3 the tool-def prefix.">
+        <defs>
+          <marker id="bf-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="bf-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/></marker>
+          <marker id="bf-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+          <marker id="bf-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker>
+          <marker id="bf-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+          <marker id="bf-c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0891b2"/></marker>
+          <marker id="bf-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+        </defs>
+        <style>
+          .fb6 { fill:none; stroke:#0d9488; stroke-width:1.8; stroke-dasharray:9 5; rx:14; }
+          .blb6{ fill:#fef3c7; stroke:#d97706; stroke-width:1.6; rx:8; }
+          .brt6{ fill:#eff6ff; stroke:#1e40af; stroke-width:2; rx:8; }
+          .bbr6{ fill:#fce7f3; stroke:#be185d; stroke-width:2; rx:8; }
+          .bsp6{ fill:#ecfdf5; stroke:#047857; stroke-width:2; rx:8; }
+          .bsd6{ fill:#ede9fe; stroke:#6d28d9; stroke-width:2; rx:8; }
+          .bks6{ fill:#fff7ed; stroke:#c2410c; stroke-width:2; rx:8; }
+          .bcp6{ fill:#f0fdfa; stroke:#0d9488; stroke-width:1.6; stroke-dasharray:6 4; rx:8; }
+          .bmm6{ fill:#fff7ed; stroke:#ea580c; stroke-width:2; rx:8; }
+          .bcl6{ fill:#f0fdfa; stroke:#0d9488; stroke-width:2; rx:8; }
+          .bi6 { fill:#fff; stroke:#1e40af; stroke-width:1.1; rx:6; }
+          .bia6{ fill:#fff7ed; stroke:#ea580c; stroke-width:1.3; rx:6; }
+          .btl6{ fill:#ecfeff; stroke:#0891b2; stroke-width:1.5; rx:6; }
+          .bbn6{ fill:#ccfbf1; stroke:#0d9488; stroke-width:1.6; rx:6; }
+          .bm6 { fill:#f1f5f9; stroke:#475569; stroke-width:1.1; rx:6; }
+          .bp6 { fill:#fff; stroke:#047857; stroke-width:1.1; rx:6; }
+          .bd6 { fill:#fff; stroke:#6d28d9; stroke-width:1.1; rx:6; }
+          .bk16{ fill:#fff; stroke:#c2410c; stroke-width:1.2; rx:6; }
+          .bk26{ fill:#ffedd5; stroke:#ea580c; stroke-width:1.4; rx:6; }
+          .bk36{ fill:#ecfeff; stroke:#0891b2; stroke-width:1.6; rx:6; }
+          .t6  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s6  { font-size:10.5px; fill:#475569; }
+          .tl6 { font-size:10.5px; font-weight:700; fill:#0e7490; }
+          .am6 { font-size:10.5px; font-weight:700; fill:#c2410c; }
+          .br6 { font-size:10.5px; font-weight:700; fill:#0f766e; }
+          .em6 { font-size:10.5px; font-weight:700; fill:#b91c1c; }
+          .num6{ font-size:11px; font-weight:700; fill:#fff; }
+          line.sy6, path.sy6 { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#bf-d); }
+          line.mm6, path.mm6 { stroke:#ea580c; stroke-width:2; fill:none; marker-end:url(#bf-a); }
+          path.mmd6{ stroke:#ea580c; stroke-width:1.8; stroke-dasharray:5 3; fill:none; marker-end:url(#bf-a); marker-start:url(#bf-a); }
+          line.kv6, path.kv6 { stroke:#059669; stroke-width:2.4; fill:none; marker-end:url(#bf-g); }
+          line.pl6, path.pl6 { stroke:#7c3aed; stroke-width:2.4; fill:none; marker-end:url(#bf-p); marker-start:url(#bf-p); }
+          path.as6 { stroke:#64748b; stroke-width:1.5; stroke-dasharray:6 4; fill:none; marker-end:url(#bf-s); }
+          path.fk6 { stroke:#0d9488; stroke-width:1.8; stroke-dasharray:2 3; fill:none; marker-end:url(#bf-t); }
+          line.tc6, path.tc6 { stroke:#0891b2; stroke-width:2.2; fill:none; marker-end:url(#bf-c); marker-start:url(#bf-c); }
+          line.bn6, path.bn6 { stroke:#0d9488; stroke-width:2.2; fill:none; marker-end:url(#bf-t); marker-start:url(#bf-t); }
+        </style>
+
+        <!-- fleet boundary -->
+        <rect class="fb6" x="264" y="28" width="1086" height="716"/>
+        <text class="br6" x="274" y="44">SERVING FLEET (this page) &mdash; forking is the client&rsquo;s; KV lifecycle is ours</text>
+
+        <!-- Client (left, holds the TREE) -->
+        <rect class="bcl6" x="12" y="150" width="132" height="312"/>
+        <text class="t6"  x="78" y="174" text-anchor="middle">Clients</text>
+        <text class="s6"  x="78" y="190" text-anchor="middle">HTTP &middot; SSE &middot; upload</text>
+        <line x1="22" y1="200" x2="134" y2="200" stroke="#5eead4" stroke-width="1"/>
+        <text class="tl6" x="78" y="218" text-anchor="middle">TOOL EXEC (off-fleet)</text>
+        <text class="s6"  x="78" y="234" text-anchor="middle">ms &rarr; minutes</text>
+        <text class="tl6" x="78" y="252" text-anchor="middle">&#8635; re-POSTs conv + result</text>
+        <line x1="22" y1="262" x2="134" y2="262" stroke="#5eead4" stroke-width="1"/>
+        <text class="br6" x="78" y="282" text-anchor="middle">HOLDS THE TREE</text>
+        <text class="s6"  x="78" y="298" text-anchor="middle">re-POSTs sibling branch</text>
+        <text class="s6"  x="78" y="314" text-anchor="middle">(conv_id + branch_id)</text>
+        <text class="br6" x="78" y="334" text-anchor="middle">&#8635; fork = regenerate /</text>
+        <text class="s6"  x="78" y="350" text-anchor="middle">edit / A&middot;B / best-of-N</text>
+        <text class="br6" x="78" y="372" text-anchor="middle">durability root for</text>
+        <text class="br6" x="78" y="388" text-anchor="middle">the WHOLE tree</text>
+        <text class="s6"  x="78" y="408" text-anchor="middle">(&sect;B.6 a)</text>
+
+        <!-- L4 -->
+        <rect class="blb6" x="160" y="196" width="88" height="58"/>
+        <text class="t6" x="204" y="220" text-anchor="middle">L4 LB</text>
+        <text class="s6" x="204" y="236" text-anchor="middle">VIP &middot; TLS</text>
+
+        <!-- router-job -->
+        <rect class="brt6" x="276" y="56" width="214" height="338"/>
+        <text class="t6" x="383" y="73" text-anchor="middle">router-job (3 tasks, HA)</text>
+        <rect class="bi6"  x="286" y="80"  width="194" height="38"/>
+        <text class="s6" x="383" y="96"  text-anchor="middle"><tspan font-weight="700">Iter 1b/2</tspan> &mdash; two CH rings (conv_id)</text>
+        <text class="s6" x="383" y="110" text-anchor="middle">co-locate every sibling FOR FREE</text>
+        <rect class="btl6" x="286" y="122" width="194" height="38"/>
+        <text class="tl6" x="383" y="138" text-anchor="middle">Iter 8 &Delta; &mdash; admit + LOOP + FAN-OUT</text>
+        <text class="s6"  x="383" y="152" text-anchor="middle">tree-cost bucket + caps (B3)</text>
+        <rect class="bi6"  x="286" y="164" width="194" height="38"/>
+        <text class="s6"  x="383" y="180" text-anchor="middle"><tspan font-weight="700">Iter 9 &Delta;</tspan> &mdash; CP fork per PATH</text>
+        <text class="s6"  x="383" y="194" text-anchor="middle">root&rarr;head path, NOT per tree</text>
+        <rect class="bia6" x="286" y="206" width="194" height="34"/>
+        <text class="am6" x="383" y="221" text-anchor="middle">Iter M0/M2 &mdash; content_hash</text>
+        <text class="s6"  x="383" y="234" text-anchor="middle">image embed hit / miss</text>
+        <rect class="btl6" x="286" y="244" width="194" height="34"/>
+        <text class="tl6" x="383" y="259" text-anchor="middle">Iter T0/T2 &mdash; toolset_hash</text>
+        <text class="s6"  x="383" y="272" text-anchor="middle">affinity + resume</text>
+        <rect class="bbn6" x="286" y="282" width="194" height="46"/>
+        <text class="br6" x="383" y="298" text-anchor="middle">Iter B0/B2 &mdash; sibling co-loc</text>
+        <text class="s6"  x="383" y="312" text-anchor="middle">+ fork-point target (parent_node_id)</text>
+        <text class="br6" x="383" y="325" text-anchor="middle">+ hot-conv OVERFLOW (BB6)</text>
+        <rect class="bi6"  x="286" y="332" width="194" height="38"/>
+        <text class="s6" x="383" y="348" text-anchor="middle"><tspan font-weight="700">Iter 1a&rarr;7</tspan> &mdash; wait-time</text>
+        <text class="s6" x="383" y="362" text-anchor="middle"><tspan font-family="monospace">approx_wait</tspan> &middot; autoscale</text>
+
+        <!-- broker -->
+        <rect class="bbr6" x="276" y="408" width="214" height="70"/>
+        <text class="t6" x="383" y="427" text-anchor="middle">broker-job (3 tasks, HA)</text>
+        <text class="s6" x="383" y="445" text-anchor="middle"><tspan font-weight="700">Iter 1b</tspan> &mdash; gossip ring epochs</text>
+        <text class="br6" x="383" y="463" text-anchor="middle">+ n_live_branches drain-safety</text>
+
+        <!-- cp_ring -->
+        <rect class="bcp6" x="276" y="492" width="214" height="118"/>
+        <text class="t6" x="383" y="512" text-anchor="middle"><tspan font-family="monospace">cp_ring</tspan> (Iter 9 &Delta;)</text>
+        <text class="s6" x="383" y="530" text-anchor="middle">on-demand 8-rank fork</text>
+        <text class="s6" x="383" y="546" text-anchor="middle">Ring Attention &middot; ctx &gt; 256 GB</text>
+        <text class="br6" x="383" y="566" text-anchor="middle">per root&rarr;head PATH &mdash;</text>
+        <text class="br6" x="383" y="581" text-anchor="middle">fan-out is NOT a CP trigger;</text>
+        <text class="s6" x="383" y="598" text-anchor="middle">siblings share CP&rsquo;d shards RO</text>
+
+        <!-- blob + preprocess (image, inherited) -->
+        <rect class="bmm6" x="508" y="56" width="182" height="92"/>
+        <text class="t6"  x="599" y="73"  text-anchor="middle">blob + preprocess</text>
+        <text class="am6" x="599" y="89"  text-anchor="middle">(image, inherited)</text>
+        <text class="s6"  x="599" y="105" text-anchor="middle">presigned &rarr; object store</text>
+        <text class="s6"  x="599" y="121" text-anchor="middle">hot-blob CDN &middot; NVDEC</text>
+        <text class="s6"  x="599" y="137" text-anchor="middle">&rarr; frames / pages</text>
+
+        <!-- encode pool (image + tool inherited) + branch share note -->
+        <rect class="bmm6" x="508" y="168" width="182" height="226"/>
+        <text class="t6"  x="599" y="186" text-anchor="middle">ENCODE pool</text>
+        <text class="am6" x="599" y="202" text-anchor="middle">vision-encoder-job (M1)</text>
+        <text class="em6" x="599" y="218" text-anchor="middle">compute-bound &middot; NO KV</text>
+        <text class="s6"  x="599" y="234" text-anchor="middle">L40S &middot; ragged batch (M3)</text>
+        <text class="s6"  x="599" y="250" text-anchor="middle">&asymp; 21 MB/img &rarr; prefill</text>
+        <rect class="btl6" x="518" y="262" width="162" height="48"/>
+        <text class="tl6" x="599" y="278" text-anchor="middle">TOOL &Delta; &mdash; tool-returns-image</text>
+        <text class="s6"  x="599" y="294" text-anchor="middle">results route here</text>
+        <rect class="bbn6" x="518" y="318" width="162" height="64"/>
+        <text class="br6" x="599" y="334" text-anchor="middle">BRANCH &mdash; fork after an</text>
+        <text class="s6"  x="599" y="349" text-anchor="middle">image shares embed KV (M2)</text>
+        <text class="br6" x="599" y="365" text-anchor="middle">encode paid ONCE</text>
+        <text class="s6"  x="599" y="378" text-anchor="middle">regardless of fan-out</text>
+
+        <!-- serving-prefill-job -->
+        <rect class="bsp6" x="708" y="56" width="300" height="338"/>
+        <text class="t6" x="858" y="74" text-anchor="middle">serving-prefill-job</text>
+        <text class="s6" x="858" y="89" text-anchor="middle">TP=8 H100 &middot; MFU 40% &middot; B=1</text>
+        <rect class="bp6" x="720" y="98" width="276" height="44"/>
+        <text class="t6" x="858" y="116" text-anchor="middle">prefill task &mdash; sticky <tspan font-family="monospace">conv_id</tspan></text>
+        <text class="s6" x="858" y="132" text-anchor="middle">computes K,V for the new tail</text>
+        <rect class="bm6" x="720" y="154" width="276" height="232"/>
+        <text class="t6" x="858" y="172" text-anchor="middle">folds in (final form)</text>
+        <text class="s6"  x="858" y="190" text-anchor="middle"><tspan font-weight="700">Iter 4</tspan> &mdash; chunked-varlen prefill</text>
+        <text class="s6"  x="858" y="206" text-anchor="middle"><tspan font-weight="700">Iter 5/T2</tspan> &mdash; prefix cache; chain:</text>
+        <text class="tl6" x="858" y="220" text-anchor="middle">&nbsp;hidden&middot;tool_defs&middot;user&middot;result</text>
+        <text class="br6" x="858" y="238" text-anchor="middle">now a block-hash TREE (radix)</text>
+        <text class="br6" x="858" y="256" text-anchor="middle">Iter B1 &mdash; prefill DIVERGENT</text>
+        <text class="br6" x="858" y="270" text-anchor="middle">TAIL only (trunk = cache hit)</text>
+        <text class="br6" x="858" y="286" text-anchor="middle">+ CoW the partial fork block</text>
+        <text class="s6"  x="858" y="304" text-anchor="middle"><tspan font-weight="700">Iter 1a/3b</tspan> &mdash; tiers + write-back</text>
+        <text class="s6"  x="858" y="320" text-anchor="middle">every tok &rarr; 320 KB (K2 D31)</text>
+        <text class="br6" x="858" y="340" text-anchor="middle">trunk shared 1&times; across siblings;</text>
+        <text class="br6" x="858" y="354" text-anchor="middle">overflow pulls trunk from pool</text>
+        <text class="s6"  x="858" y="372" text-anchor="middle">(&alpha; + &beta;&middot;n, not fan-out &times; re-prefill)</text>
+
+        <!-- serving-decode-job -->
+        <rect class="bsd6" x="1026" y="56" width="310" height="338"/>
+        <text class="t6" x="1181" y="74" text-anchor="middle">serving-decode-job</text>
+        <text class="s6" x="1181" y="89" text-anchor="middle">TP=8 H100 &middot; B<tspan baseline-shift="sub" font-size="9px">decode</tspan> &asymp; 106</text>
+        <rect class="bd6" x="1038" y="98" width="286" height="44"/>
+        <text class="t6" x="1181" y="116" text-anchor="middle">decode task &mdash; sticky <tspan font-family="monospace">conv_id</tspan></text>
+        <text class="s6" x="1181" y="132" text-anchor="middle">rolling continuous-batch tick</text>
+        <rect class="bm6" x="1038" y="154" width="286" height="232"/>
+        <text class="t6"  x="1181" y="172" text-anchor="middle">folds in (final form)</text>
+        <text class="tl6" x="1181" y="190" text-anchor="middle">Iter 6 &Delta; &mdash; batch + PAUSE/RESUME</text>
+        <text class="tl6" x="1181" y="206" text-anchor="middle">Iter T1 &mdash; keep-warm vs PARK</text>
+        <text class="br6" x="1181" y="224" text-anchor="middle">Iter B2 &mdash; PARALLEL-BRANCH batch:</text>
+        <text class="br6" x="1181" y="238" text-anchor="middle">N sibling slots &rarr; 1&times; prefix set</text>
+        <text class="br6" x="1181" y="254" text-anchor="middle">+ ref-count-aware eviction</text>
+        <text class="s6"  x="1181" y="270" text-anchor="middle">+ cascade kernel &rarr; 1&times; prefix READ</text>
+        <text class="tl6" x="1181" y="288" text-anchor="middle">Iter T3 &mdash; FSM tool-call decode</text>
+        <text class="s6"  x="1181" y="304" text-anchor="middle"><tspan font-weight="700">Iter 7</tspan> &mdash; speculative ~2&times;</text>
+        <text class="tl6" x="1181" y="322" text-anchor="middle">Iter 10 &Delta; &mdash; replay-from-transcript</text>
+        <text class="br6" x="1181" y="338" text-anchor="middle">FT &mdash; client = TREE durability root</text>
+        <text class="s6"  x="1181" y="356" text-anchor="middle">(re-POSTs each branch path, RPO 0)</text>
+
+        <!-- kv-store-job, key spaces 1/2/3 + branch residency class in ks1 -->
+        <rect class="bks6" x="508" y="498" width="828" height="236"/>
+        <text class="t6" x="922" y="518" text-anchor="middle">kv-store-job &mdash; Mooncake RDMA-front / NVMe-back (Iter 3b) &middot; I/O-sized, no GPU &middot; B: sharded, CH-on-conv_id</text>
+        <!-- ks2 (image) -->
+        <rect class="bk26" x="522" y="532" width="182" height="190"/>
+        <text class="am6" x="613" y="552" text-anchor="middle" font-size="12px">Key space 2 (M2)</text>
+        <text class="s6" x="613" y="572" text-anchor="middle"><tspan font-family="monospace">content_hash</tspan> &rarr;</text>
+        <text class="s6" x="613" y="588" text-anchor="middle"><tspan font-family="monospace">VisionEmbedding</tspan></text>
+        <text class="s6" x="613" y="608" text-anchor="middle">content-addressed</text>
+        <text class="s6" x="613" y="626" text-anchor="middle">private vs shared</text>
+        <text class="s6" x="613" y="644" text-anchor="middle">RPO 0 from blob</text>
+        <!-- ks1 (parent + park + BRANCH residency class) -->
+        <rect class="bk16" x="714" y="532" width="312" height="190"/>
+        <text class="t6" x="870" y="552" text-anchor="middle" font-size="12px">Key space 1 &mdash; <tspan font-family="monospace">conv_id</tspan> &rarr; K,V</text>
+        <text class="s6" x="870" y="570" text-anchor="middle">write-back victim &middot; gate &gt; 1.9k tok &middot; RPO 0</text>
+        <text class="tl6" x="870" y="590" text-anchor="middle">+ PARKED-CONV class (T1)</text>
+        <rect class="bbn6" x="724" y="600" width="292" height="112"/>
+        <text class="br6" x="870" y="618" text-anchor="middle">+ BRANCH-SHARED-TRUNK class (B1/B2)</text>
+        <text class="s6"  x="870" y="636" text-anchor="middle">a residency class, NOT a new key space</text>
+        <text class="s6"  x="870" y="654" text-anchor="middle">hot-conv shared trunk parked here,</text>
+        <text class="s6"  x="870" y="670" text-anchor="middle">pulled read-only by overflow branches</text>
+        <text class="br6" x="870" y="690" text-anchor="middle"><tspan font-family="monospace">ref_count</tspan> across siblings &middot;</text>
+        <text class="br6" x="870" y="705" text-anchor="middle">fork-point <tspan font-family="monospace">pin_until</tspan></text>
+        <!-- ks3 (tool-def) -->
+        <rect class="bk36" x="1036" y="532" width="290" height="190"/>
+        <text class="tl6" x="1181" y="552" text-anchor="middle" font-size="12px">Key space 3 (T2)</text>
+        <text class="s6" x="1181" y="572" text-anchor="middle"><tspan font-family="monospace">toolset_hash</tspan> &rarr; tool-def KV</text>
+        <text class="tl6" x="1181" y="590" text-anchor="middle">cross-user, NO privacy gate</text>
+        <text class="s6" x="1181" y="608" text-anchor="middle">schemas = shared infra</text>
+        <text class="s6" x="1181" y="626" text-anchor="middle"><tspan font-family="monospace">n_toolsets</tspan> &asymp; 10 &rarr; 25.6 GB</text>
+        <text class="s6" x="1181" y="644" text-anchor="middle">(few medium shared prefixes)</text>
+
+        <!-- ===== arrows ===== -->
+        <line class="sy6" x1="144" y1="225" x2="160" y2="225"/>
+        <circle cx="152" cy="210" r="9" fill="#1d4ed8"/><text class="num6" x="152" y="214" text-anchor="middle">1</text>
+        <line class="sy6" x1="248" y1="225" x2="276" y2="225"/>
+        <circle cx="262" cy="210" r="9" fill="#1d4ed8"/><text class="num6" x="262" y="214" text-anchor="middle">2</text>
+        <line class="mm6" x1="490" y1="102" x2="508" y2="102"/>
+        <circle cx="499" cy="88" r="9" fill="#ea580c"/><text class="num6" x="499" y="92" text-anchor="middle">3</text>
+        <line class="mm6" x1="599" y1="148" x2="599" y2="168"/>
+        <circle cx="620" cy="158" r="9" fill="#ea580c"/><text class="num6" x="620" y="162" text-anchor="middle">4</text>
+        <line class="mm6" x1="690" y1="240" x2="708" y2="240"/>
+        <circle cx="699" cy="226" r="9" fill="#ea580c"/><text class="num6" x="699" y="230" text-anchor="middle">5</text>
+        <path class="mmd6" d="M599,394 L613,532"/>
+        <circle cx="606" cy="463" r="9" fill="#ea580c"/><text class="num6" x="606" y="467" text-anchor="middle">6</text>
+        <line class="sy6" x1="490" y1="158" x2="708" y2="158"/>
+        <circle cx="540" cy="158" r="9" fill="#1d4ed8"/><text class="num6" x="540" y="162" text-anchor="middle">7</text>
+        <line class="kv6" x1="1008" y1="120" x2="1026" y2="120"/>
+        <circle cx="1017" cy="106" r="9" fill="#059669"/><text class="num6" x="1017" y="110" text-anchor="middle">8</text>
+        <path class="sy6" d="M 1181 56 L 1181 14 L 78 14 L 78 150"/>
+        <circle cx="628" cy="14" r="9" fill="#1d4ed8"/><text class="num6" x="628" y="18" text-anchor="middle">9</text>
+        <line class="pl6" x1="820" y1="394" x2="820" y2="532"/>
+        <circle cx="820" cy="463" r="9" fill="#7c3aed"/><text class="num6" x="820" y="467" text-anchor="middle">10</text>
+        <path class="pl6" d="M1120,394 L940,532"/>
+        <circle cx="1030" cy="455" r="9" fill="#7c3aed"/><text class="num6" x="1030" y="459" text-anchor="middle">11</text>
+        <path class="as6" d="M 708 360 C 640 408 560 430 490 436"/>
+        <circle cx="600" cy="420" r="9" fill="#64748b"/><text class="num6" x="600" y="424" text-anchor="middle">12</text>
+        <path class="as6" d="M 383 408 L 383 394"/>
+        <circle cx="407" cy="401" r="9" fill="#64748b"/><text class="num6" x="407" y="405" text-anchor="middle">13</text>
+        <path class="fk6" d="M 276 188 L 258 188 L 258 540 L 276 540"/>
+        <circle cx="258" cy="360" r="9" fill="#0d9488"/><text class="num6" x="258" y="364" text-anchor="middle">14</text>
+        <line class="tc6" x1="996" y1="360" x2="1130" y2="532"/>
+        <circle cx="1063" cy="446" r="9" fill="#0891b2"/><text class="num6" x="1063" y="450" text-anchor="middle">15</text>
+        <path class="bn6" d="M 880 600 C 880 470 760 430 720 372"/>
+        <circle cx="812" cy="500" r="9" fill="#0d9488"/><text class="num6" x="812" y="504" text-anchor="middle">16</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;&#9313;</span> <strong>Clients &rarr; L4 &rarr; router-job</strong> &mdash; HTTP opens an SSE stream; a fork is just a re-POST of a sibling branch (<code>conv_id</code> + <code>branch_id</code>) on this same ingress.</li>
+        <li><span style="color:#ea580c;">&#9472;&#9472;</span> <span class="b">&#9314;&#9315;&#9316;&#9317;</span> <strong>image path (inherited)</strong> &mdash; blob &rarr; encode &rarr; prefill, and the content-addressed embedding cache (key space 2); a fork after an image re-uses this embedding KV (encode paid once).</li>
+        <li><span class="b">&#9318;</span> <strong>Router &rarr; prefill</strong> &mdash; CH-on-<code>conv_id</code> after the admit + loop + <strong>fan-out</strong> quota gate; the same hash co-locates every sibling on the warm-trunk task <em>for free</em>.</li>
+        <li><span style="color:#059669;">&#9472;&#9472;</span> <span class="b">&#9319;</span> <strong>Prefill &rarr; decode</strong> &mdash; K,V handoff (320 KB/tok). A branch prefills only its <strong>divergent tail</strong>; the trunk is a cache hit.</li>
+        <li><span class="b">&#9320;</span> <strong>Decode &rarr; Clients (egress)</strong> &mdash; SSE tokens; the client then forks/continues and re-POSTs via &#9312; (the loop + the tree close through the existing ingress/egress).</li>
+        <li><span style="color:#7c3aed;">&#9472;&#9472;</span> <span class="b">&#9321;&#9322;</span> <strong>Serving pools &harr; key space 1</strong> &mdash; write-back / pull conv K,V; also carries the parked-conv park/restore and the <strong>branch-shared-trunk</strong> residency.</li>
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9323;&#9324;</span> <strong>Pools &rarr; broker &rarr; Router</strong> &mdash; async gossip of <code>approx_wait</code> + ring epochs; the broker now also gates drain on <code>n_live_branches</code>.</li>
+        <li><span style="color:#0d9488;">&#8943;&#8943;</span> <span class="b">&#9325;</span> <strong>Router &rarr; <code>cp_ring</code></strong> &mdash; CP forks <strong>per root&rarr;head path</strong> (fan-out is not a CP trigger).</li>
+        <li><span style="color:#0891b2;">&#9472;&#9472;</span> <span class="b">&#9326;</span> <strong>Prefill &harr; key space 3</strong> &mdash; the cross-user tool-def prefix (inherited).</li>
+        <li><span style="color:#0d9488;">&#9472;&#9472;</span> <span class="b">&#9327;</span> <strong>Branch-shared-trunk &harr; prefill (NEW)</strong> &mdash; on hot-conv overflow, a sibling task pulls the shared trunk read-only from the pool (one <code>&alpha; + &beta;&middot;n</code> pull, not fan-out &times; re-prefill).</li>
+      </ul>
+      <p><strong>Read the diagram.</strong> The whole fleet is still the parents&rsquo; &mdash; <strong>no new job line</strong>. Every branch delta is either a
+        <span style="color:#0d9488;font-weight:700;">teal row inside an existing box</span> (Router sibling-co-location + fan-out quota + per-path CP;
+        prefill&rsquo;s divergent-tail-only + CoW + radix chain; decode&rsquo;s parallel-branch batch + ref-count-aware eviction + cascade read) or the
+        <strong>branch-shared-trunk residency class</strong> on key space 1 of the <code>kv-store-job</code>. The one genuinely new <em>actor</em> is the same
+        one the tool page drew outside the boundary &mdash; the <strong>client</strong> &mdash; which now holds the entire conversation <em>tree</em> and is its
+        durability root. A fork is more <em>traffic on the same fleet</em>, not more fleet.</p>
+
+      <h3 id="s6-adds">6.2 &nbsp;What S6 adds over the tool final design</h3>
+      <ul>
+        <li><strong>The conversation tree</strong> &mdash; shared trunk drawn <em>once</em> + branch suffixes, <code>ref_count</code> annotated, client
+          (holding the tree) outside the fleet boundary.</li>
+        <li><strong>The CoW marker</strong> on the fork-point partial block (the only block copied) + the prefix chain becoming a <strong>radix tree</strong>.</li>
+        <li><strong>The parallel-branch batch</strong> &mdash; N decode slots &rarr; one shared prefix block set (1&times; HBM; cascade kernel for the read).</li>
+        <li><strong>The branch-shared-trunk residency class</strong> on <code>kv-store-job</code> key space 1 (a hot conv&rsquo;s shared prefix parked here,
+          pulled by overflow branches) &mdash; a <em>residency class</em>, <strong>not</strong> a new key space.</li>
+        <li><strong>The fan-out quota</strong> (<code>max_live_branches</code> / <code>max_tree_nodes</code> + amplified token-bucket charge) on the abuse
+          limiter.</li>
+      </ul>
+
+      <h3 id="s6-stack">6.3 &nbsp;Optimization stack &mdash; branch rows</h3>
+      <table class="sheet">
+        <thead><tr><th>Optimization</th><th>Win</th><th>Iter</th></tr></thead>
+        <tbody>
+          <tr><td>Shared-trunk prefill collapse (content-hash dedup)</td><td>fan-out &times; trunk prefill &rarr; <strong>1&times;</strong>; at fan-out 8,
+            <code>0.85&middot;7 = 5.95&times; T_shared</code> saved/fork <span class="tag tag-d">D</span></td><td>B1 / 5</td></tr>
+          <tr><td>Copy-on-write (one block/fork)</td><td>only the partial fork-point block copied (5.1&ndash;10.2 MB); full blocks shared read-only
+            <span class="tag tag-d">D</span></td><td>B1 / 3</td></tr>
+          <tr><td>Parallel-branch batch (1&times; prefix for N branches)</td><td>prefix resident 1&times; vs N&times; &rarr; HBM saved
+            <code>(N&minus;1)&times;</code> prefix KV; tree_kv <code>2.05&times;</code> a path, not 8&times; <span class="tag tag-d">D</span></td><td>B2 / 6</td></tr>
+          <tr><td>Fan-out quota (caps + amplified charge)</td><td>combinatorial explosion (breadth<sup>depth</sup>) bounded; fairness preserved
+            <span class="tag tag-d">D</span></td><td>B3 / 8</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s6-degr">6.4 &nbsp;Degradation contract &mdash; branch additions</h3>
+      <ul>
+        <li><strong>Hot-conv tree exceeds task</strong> &rarr; spread branches + pull trunk from pool (one <code>&alpha; + &beta;&middot;n</code> pull, not
+          fan-out &times; re-prefill).</li>
+        <li><strong>Fan-out cap exceeded</strong> &rarr; <code>429</code>, shed <em>new</em> branches, <strong>protect live ones</strong>.</li>
+        <li><strong>Fork from an evicted trunk</strong> &rarr; <code>409</code> &rarr; client re-sends the prefix (RPO=0).</li>
+      </ul>
+
+      <h3 id="s6-fleet">6.5 &nbsp;Fleet comparison &mdash; the no-new-job result</h3>
+      <p><code>prefill_task_num</code> now reflects <strong>shared-trunk dedup</strong> (a fork is mostly a cache hit, not a new prefill);
+        <code>B_decode</code> slot demand reflects <strong>fan-out</strong> for forked convs (each branch is a slot, while KV-memory grows only by the divergent
+        suffixes). <strong>No new job line</strong> (client-held tree) &mdash; the structural contrast with the image plan&rsquo;s
+        <code>vision-encoder-job</code>, and the consistency with the tool plan. The stateful part that <em>does</em> grow is the <code>kv-store-job</code>
+        pool (branch-shared-trunk class + the fork-point pin), inheriting the parent&rsquo;s <strong>B: sharded, CH-on-<code>conv_id</code></strong>
+        state-management choice.</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S7 delta - Takeaways + diagram index + cross-links      -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s7">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S7 &nbsp;Takeaways (new lines, added to the parents&rsquo;)</h2>
+      <ol class="steps">
+        <li>A fork is just a second conversation that <strong>shares a content-hashed prefix</strong> &mdash; and because the block hash is
+          <strong>path-independent</strong> (<a href="../../knowledge/K2_kv-cache.html#d5">K2&nbsp;D5</a>), the existing prefix cache <strong>already
+          deduplicates siblings</strong> with no new cache. The delta is the <strong>tree</strong> (lifetime, placement, fan-out), not the sharing.</li>
+        <li>The chain becomes a <strong>radix tree</strong> of KV prefixes (SGLang RadixAttention; vLLM via hash-blocks + CoW). Forking is the engine&rsquo;s
+          <strong>parallel-sampling / beam-search fork primitive</strong> promoted to a <strong>user-visible feature</strong> &mdash; full shared blocks are
+          immutable and shared by reference; <strong>only the one partial fork-point block is copy-on-written</strong>.</li>
+        <li>Branching is a new <strong>source</strong> of <code>ref_count &gt; 1</code> (intra-conversation), not a new <strong>mechanism</strong> &mdash; the
+          shared trunk lives while &ge; 1 branch is live, GC&rsquo;d at the last, by the <strong>unchanged</strong> coldness gate. Unlike the tool plan&rsquo;s
+          keep-warm band, ref-count is an <strong>exact liveness signal</strong>, so no anti-thrash watermark pair is needed.</li>
+        <li>Branch sharing is <strong>intra-tenant by construction</strong> &rarr; the <strong>safest</strong> sharing class on the page: no privacy gate at all
+          (contrast tool-defs cross-user, image cross-user gated). The cache key&rsquo;s sharing scope is again a function of the content&rsquo;s reuse +
+          privacy profile.</li>
+        <li>Fan-out multiplies <strong>decode</strong>, not the <strong>shared prefill</strong> &mdash; so co-locate siblings (prefix-affinity routing;
+          CH-on-<code>conv_id</code> is the inherited proxy) and <strong>batch them to store the prefix once</strong> (1&times; HBM-capacity for N branches; the
+          matching read-bandwidth win needs a <strong>cascade-attention kernel</strong>). The win compounds with the image embedding cache (encode paid once
+          for all branches) and the loop (fork inherits the cached agentic trunk).</li>
+        <li>Fan-out is <strong>combinatorial</strong> (breadth<sup>depth</sup>) &rarr; a new abuse axis a per-request limiter can&rsquo;t see; cap live branches
+          + tree nodes <strong>and</strong> charge the token-bucket the aggregate-tree cost, composed with the loop and image quotas.</li>
+        <li>Client-held tree means <strong>no new server job</strong> and makes the <strong>client the durability root</strong> for the whole tree (it re-POSTs
+          each branch path) &mdash; the same recompute-from-tokens RPO=0 story as all parents, generalized from a line to a tree.</li>
+      </ol>
+
+      <h3 id="diagram-index">Diagram index</h3>
+      <table class="sheet">
+        <thead><tr><th>ID</th><th>Title</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td><strong>D-B1</strong></td><td>The conversation tree (shared trunk drawn once + ref-count + fork edges)</td><td><a href="#b3">&sect;B.3</a></td></tr>
+          <tr><td><strong>D-B2</strong></td><td>CoW + ref-count state machine (fork &rarr; increment + CoW partial; abandon &rarr; decrement; GC; pin)</td><td><a href="#iter-b1">Iter B1</a></td></tr>
+          <tr><td><strong>D-B3</strong></td><td>Parallel-branch batching (N slots &rarr; one shared prefix block set; hot-conv overflow)</td><td><a href="#iter-b2">Iter B2</a></td></tr>
+          <tr><td><strong>D-B4</strong></td><td>Fan-out abuse / tree-shape quota (caps + amplified token-bucket charge)</td><td><a href="#iter-b3">Iter 8 / B3</a></td></tr>
+          <tr><td><strong>D-B5</strong></td><td>Fork composes with tools (determinism boundary = divergence boundary)</td><td><a href="#iter-b0">Iter B0</a></td></tr>
+          <tr><td><strong>D-B6</strong></td><td>The whole settled fleet (text + image + tool inherited, branch deltas in teal + branch-shared-trunk class)</td><td><a href="#s6-arch">S6.1</a></td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="crosslinks">Cross-links</h3>
+      <ul>
+        <li><strong>Parents:</strong> <a href="distributed_kv_cache.html">distributed_kv_cache.html</a> (text) &middot;
+          <a href="distributed_kv_cache_image.html">distributed_kv_cache_image.html</a> (image) &middot;
+          <a href="distributed_kv_cache_image_tool.html">distributed_kv_cache_image_tool.html</a> (tool) &mdash; this page is their branching sibling.</li>
+        <li><strong>Knowledge:</strong> <a href="../../knowledge/K2_kv-cache.html">K2</a> (D5 / D31 / prefix caching / PagedAttention CoW) &middot;
+          <a href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4</a> (batching) &middot;
+          <a href="../../knowledge/K19_reasoning-model-serving.html">K19</a> (Tree-of-Thoughts / reasoning) &middot;
+          <a href="../../knowledge/K13_speculative-decoding.html">K13</a> (best-of-N / parallel sampling) &middot;
+          runnable demo <a href="prefix_cache_impl.html">prefix_cache_impl.html</a> (radix vs block-hash eviction).</li>
+        <li><strong>New-K-page flag (rule-of-three MET):</strong> <strong>tree-structured KV sharing</strong> (radix-tree prefix cache / RadixAttention / CoW
+          fork / parallel sampling / beam search) has no K-page, and it is now the <strong>second</strong> scenario-local derivation that wants one (alongside
+          the tool plan&rsquo;s <strong>constrained decoding</strong>) &rarr; <strong>rule-of-three is met</strong>. Candidate
+          <code>K23 structured-decoding-and-kv-tree-sharing</code> (or split <code>K23 structured-decoding-and-tool-use</code> +
+          <code>K24 kv-tree-sharing-radixattention</code>).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Sidebar                                                 -->
+  <!-- ===================================================== -->
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#scope">Scope &mdash; how to read</a></li>
+
+          <li><a class="sidebar-section-link" href="#s0">1. Scenario &amp; reqs (S0 delta)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-functional">&nbsp;&nbsp;Functional &amp; non-goals</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-nfr">&nbsp;&nbsp;NFR delta</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-workload">&nbsp;&nbsp;Workload SoT</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-flagged">&nbsp;&nbsp;Flagged assumptions</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-spine">&nbsp;&nbsp;Spine BB1&ndash;BB6</a></li>
+
+          <li><a class="sidebar-section-link" href="#b">&sect;B. The conversation is a tree</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b1">&nbsp;&nbsp;B.1 Load-bearing fact</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b2">&nbsp;&nbsp;B.2 Four fork shapes</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b3">&nbsp;&nbsp;B.3 Tree walked (D-B1)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b4">&nbsp;&nbsp;B.4 Chain &rarr; tree (free)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b5">&nbsp;&nbsp;B.5 Composes with tools/img</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b6">&nbsp;&nbsp;B.6 Who owns the tree (DC)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#b7">&nbsp;&nbsp;B.7 Serving consequences</a></li>
+
+          <li><a class="sidebar-section-link" href="#s1">2. Entities + Borg topology (S1)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-entities">&nbsp;&nbsp;New entities</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-jobs">&nbsp;&nbsp;Jobs (no new job)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-routing">&nbsp;&nbsp;Routing-model delta</a></li>
+
+          <li><a class="sidebar-section-link" href="#s2">3. API contracts (S2 delta)</a></li>
+          <li><a class="sidebar-section-link" href="#s3">4. BOE (S3 delta)</a></li>
+
+          <li><a class="sidebar-section-link" href="#iter">5. Iteration deltas</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter-ribbon">&nbsp;&nbsp;The ribbon</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#part-a">&nbsp;&nbsp;Part A &mdash; inherited &Delta;</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter-b3">&nbsp;&nbsp;Iter 8 + B3 &mdash; fan-out quota</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter-b0">&nbsp;&nbsp;Iter B0 &mdash; fork orchestration</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter-b1">&nbsp;&nbsp;Iter B1 &mdash; CoW + ref-count (flagship)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#iter-b2">&nbsp;&nbsp;Iter B2 &mdash; co-loc + batch</a></li>
+
+          <li><a class="sidebar-section-link" href="#s6">6. Final design (S6 delta)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s6-arch">&nbsp;&nbsp;Whole fleet (D-B6)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s6-stack">&nbsp;&nbsp;Optimization stack</a></li>
+          <li><a class="sidebar-section-link" href="#s7">7. Takeaways (S7 delta)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#diagram-index">&nbsp;&nbsp;Diagram index</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#crosslinks">&nbsp;&nbsp;Cross-links</a></li>
+        </ul>
+      </div>
+
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Cross-links</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">distributed_kv_cache.html (text)</a></li>
+          <li><a class="sidebar-section-link" href="distributed_kv_cache_image.html">distributed_kv_cache_image.html (image)</a></li>
+          <li><a class="sidebar-section-link" href="distributed_kv_cache_image_tool.html">distributed_kv_cache_image_tool.html (tool)</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K2_kv-cache.html">K2 &mdash; KV cache (D5/D31/CoW)</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K4_continuous-batching-and-scheduling.html">K4 &mdash; scheduling</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K19_reasoning-model-serving.html">K19 &mdash; reasoning / ToT</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K13_speculative-decoding.html">K13 &mdash; speculative decode</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K12_multimodal-and-image-offload.html">K12 &mdash; multimodal</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===================================================== -->
+  <!-- Footer                                                  -->
+  <!-- ===================================================== -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../../js/sidebar.js"></script>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

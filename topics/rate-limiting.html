@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rate Limiting — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Topics</a></li>
+        <li><a href="cdn.html">CDN</a></li>
+        <li><a href="api-gateway.html">API Gateway</a></li>
+        <li><a href="load-balancing.html">Load Balancing</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Rate Limiting</h1>
+      <p class="hero-subtitle">Controlling the rate of incoming requests to protect services from overload, abuse, and unfair resource consumption.</p>
+      <span class="hero-meta">25 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>Rate limiting is a technique for controlling the number of requests a client can make to a service within a given time window. When a client exceeds the allowed rate, the service rejects additional requests — typically with an HTTP 429 "Too Many Requests" status code — rather than processing them. The rejected client is told when it can retry, usually via a <code>Retry-After</code> header.</p>
+      <p>Think of rate limiting like a bouncer at a nightclub. The venue has a maximum occupancy. Once it is full, the bouncer turns people away and tells them to come back later. This prevents the venue from becoming dangerously overcrowded, ensures the people inside have a good experience, and stops any one group from monopolizing the space.</p>
+      <p><strong>Why it matters:</strong></p>
+      <ul>
+        <li><strong>Prevent abuse:</strong> Stops malicious actors from flooding your API with requests, whether for scraping, credential stuffing, or denial-of-service attacks.</li>
+        <li><strong>Ensure fairness:</strong> In a multi-tenant system, prevents one noisy tenant from consuming all the shared capacity, starving other tenants.</li>
+        <li><strong>Protect downstream services:</strong> Your API might handle 10K RPS, but the database behind it might only handle 2K. Rate limiting at the edge prevents the cascade of overload from reaching fragile backends.</li>
+        <li><strong>Cost control:</strong> In cloud environments where you pay per request or per compute-second, runaway traffic from a bug or a misconfigured client can generate enormous bills. Rate limiting puts a ceiling on this.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Token Bucket Animation</h2>
+      <div class="animation-container" id="token-bucket-animation">
+        <canvas id="tokenBucketCanvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">A token bucket fills at a fixed rate. Incoming requests consume tokens — accepted if a token is available (green), rejected with 429 if not (red). Tokens accumulate up to the bucket capacity.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>Token Bucket (Step-by-Step)</h3>
+      <p>The token bucket is the most widely used rate limiting algorithm. Here is how it works:</p>
+      <ol>
+        <li><strong>Initialize:</strong> Create a bucket with a maximum capacity (e.g., 10 tokens) and a refill rate (e.g., 5 tokens per second). Start with the bucket full.</li>
+        <li><strong>Token refill:</strong> At a fixed interval, add tokens to the bucket. If the bucket is already full, new tokens are discarded — they do not accumulate beyond capacity.</li>
+        <li><strong>Request arrives:</strong> When a request comes in, check if there is at least one token in the bucket.</li>
+        <li><strong>Accept:</strong> If a token is available, remove one token from the bucket and process the request.</li>
+        <li><strong>Reject:</strong> If the bucket is empty, reject the request immediately with HTTP 429. Set <code>Retry-After</code> and <code>X-RateLimit-Remaining: 0</code> headers.</li>
+        <li><strong>Burst handling:</strong> Because tokens accumulate, a client that has been idle can send a burst of requests up to the bucket capacity. This is a feature, not a bug — it allows legitimate burst behavior.</li>
+      </ol>
+
+      <h3>Other Algorithms</h3>
+
+      <h4>Leaky Bucket</h4>
+      <p>Requests enter a queue (the bucket) and are processed at a fixed rate, like water leaking from a hole. Unlike the token bucket, the leaky bucket enforces a strict, smooth output rate — no bursts are allowed. If the queue is full, new requests are dropped. This is ideal when you need a perfectly smooth request rate to protect a downstream service that cannot handle any burstiness at all.</p>
+
+      <h4>Leaky Bucket — Deep Dive</h4>
+      <p><strong>How it differs from the token bucket:</strong> The token bucket controls <em>input</em> — it decides whether to accept or reject each incoming request. The leaky bucket controls <em>output</em> — it accepts requests into a queue and processes them at a fixed, constant rate, smoothing out any burstiness in the input. Think of it literally: a bucket with a small hole at the bottom.</p>
+      <ul>
+        <li><strong>Water (requests) pours in</strong> at varying, unpredictable rates — sometimes a trickle, sometimes a flood.</li>
+        <li><strong>Water leaks out</strong> through the hole at a constant rate <code>R</code> (e.g., 1 request per second).</li>
+        <li>The bucket has a finite capacity <code>B</code> (the queue size). If the bucket is full and more water arrives, the excess overflows and is <strong>discarded</strong> (request dropped).</li>
+      </ul>
+      <p>This means: no matter how bursty the input, the output is always smooth. A downstream service behind a leaky bucket sees a perfectly steady stream of requests, never more than <code>R</code> per second.</p>
+
+      <p><strong>Key difference from token bucket:</strong> The token bucket says "you can send up to B at once, then R per second after that." The leaky bucket says "output is always exactly R per second, regardless of how bursty the input is." Token bucket <em>permits</em> bursts. Leaky bucket <em>absorbs</em> bursts.</p>
+
+      <p><strong>Worked example:</strong> Leak rate R = 1 request/second, bucket capacity B = 4.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Requests In</th><th>Queue Before</th><th>Leaked (processed)</th><th>Queue After</th><th>Dropped</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>T=0</td><td>3</td><td>0</td><td>1</td><td>2</td><td>0</td></tr>
+          <tr><td>T=1</td><td>0</td><td>2</td><td>1</td><td>1</td><td>0</td></tr>
+          <tr><td>T=2</td><td>4</td><td>1</td><td>1</td><td>4</td><td>0</td></tr>
+          <tr><td>T=3</td><td>3</td><td>4</td><td>1</td><td>4</td><td>2</td></tr>
+          <tr><td>T=4</td><td>0</td><td>4</td><td>1</td><td>3</td><td>0</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Reading the table:</strong> At T=0, 3 requests arrive. The bucket was empty, so all 3 enter the queue. One leaks out (is processed), leaving 2 in the queue. At T=2, 4 requests arrive and 1 is already in the queue. One leaks out, and the remaining 4 fit exactly (capacity is 4). At T=3, the bucket is full (4 items). 3 new requests arrive, 1 leaks out making room for 1, but 2 of the 3 incoming requests have no room — they are dropped. Notice that the output (the "Leaked" column) is always exactly 1, regardless of input burstiness. That is the core property of the leaky bucket.</p>
+
+      <p><strong>Queue-based implementation:</strong></p>
+<pre class="line-numbers"><code class="language-python">import time
+from collections import deque
+
+class LeakyBucket:
+    def __init__(self, rate, capacity):
+        self.rate = rate              # requests leaked per second
+        self.capacity = capacity      # max queue size
+        self.queue = deque()          # timestamps of queued requests
+        self.last_leak = time.monotonic()
+
+    def _leak(self):
+        """Remove requests that have been 'processed' since last check."""
+        now = time.monotonic()
+        elapsed = now - self.last_leak
+        leaked = int(elapsed * self.rate)
+        for _ in range(min(leaked, len(self.queue))):
+            self.queue.popleft()
+        if leaked > 0:
+            self.last_leak = now
+
+    def allow(self):
+        self._leak()
+        if len(self.queue) < self.capacity:
+            self.queue.append(time.monotonic())
+            return True    # accepted into the queue
+        return False       # bucket full — request dropped
+
+# Usage: leak rate = 1 req/s, capacity = 4
+bucket = LeakyBucket(rate=1, capacity=4)
+</code></pre>
+
+      <h4>Fixed Window Counter</h4>
+      <p>Divide time into fixed windows (e.g., each minute). Maintain a counter for each window. Increment the counter for each request; reject if the counter exceeds the limit. Simple to implement but has a boundary problem: a client can send the full limit at the end of one window and the full limit at the start of the next, doubling the effective rate across the boundary.</p>
+
+      <h4>Sliding Window Log</h4>
+      <p>Store a timestamp for every request in a sorted set. When a new request arrives, remove all timestamps older than the window, then count the remaining entries. This eliminates the boundary problem but requires storing every timestamp — memory usage scales linearly with traffic, making it expensive at high rates.</p>
+
+      <h4>Sliding Window Log — Deep Dive</h4>
+      <p><strong>The data structure:</strong> Store the timestamp of every request in a sorted set (e.g., a Redis ZSET, where the score is the timestamp). To check if a new request should be allowed:</p>
+      <ol>
+        <li><strong>Remove all timestamps older than <code>(now - window_size)</code>.</strong> These are requests that have "expired" — they happened outside the current sliding window and should no longer count.</li>
+        <li><strong>Count the remaining timestamps.</strong> This is the number of requests that happened within the current window.</li>
+        <li><strong>If count &lt; limit</strong>, allow the request and add the current timestamp to the set.</li>
+        <li><strong>If count &ge; limit</strong>, reject the request.</li>
+      </ol>
+
+      <p><strong>Why it is perfectly accurate:</strong> Unlike fixed window counters (which have a boundary problem) or sliding window counters (which use an approximation), the sliding window log tracks the exact timestamp of every request. There is no approximation — the count is always exactly the number of requests in the last <code>window_size</code> seconds.</p>
+
+      <p><strong>Memory analysis — why it does not scale for high-rate limits:</strong></p>
+      <ul>
+        <li>For a limit of 100 requests per 60 seconds, each user stores up to 100 timestamps. Each timestamp is 8 bytes. For 1M users: 1M &times; 100 &times; 8 = <strong>800 MB</strong>.</li>
+        <li>For an API gateway limiting at 10,000 requests/sec per user: 10K &times; 8 bytes &times; 1M users = <strong>80 GB</strong>.</li>
+        <li>This is why the sliding window log is practical only for low-volume, high-accuracy use cases (e.g., login attempt limiting at 5 per minute) — not for high-throughput API rate limiting.</li>
+      </ul>
+
+      <p><strong>Redis implementation:</strong></p>
+<pre class="line-numbers"><code class="language-python">import time
+import redis
+
+def sliding_window_log(redis_client, key, limit, window_secs):
+    """
+    Returns True if the request is allowed, False if rejected.
+    Uses a Redis sorted set (ZSET) where each member is a unique
+    request ID and the score is the timestamp.
+    """
+    now = time.time()
+
+    # Use a pipeline to send all commands in one round-trip
+    pipe = redis_client.pipeline()
+
+    # Step 1: Remove all entries older than the window
+    pipe.zremrangebyscore(key, 0, now - window_secs)
+
+    # Step 2: Add the current request's timestamp
+    pipe.zadd(key, {str(now): now})
+
+    # Step 3: Count how many entries remain
+    pipe.zcard(key)
+
+    # Step 4: Set a TTL so the key auto-expires
+    pipe.expire(key, window_secs)
+
+    results = pipe.execute()
+    count = results[2]  # zcard result
+
+    if count > limit:
+        # Undo the add — this request should not count
+        redis_client.zrem(key, str(now))
+        return False  # rejected
+
+    return True  # allowed
+</code></pre>
+      <p><strong>Note:</strong> This pipeline is <em>not</em> fully atomic — another request could slip in between the <code>zadd</code> and the <code>zcard</code>. For strict atomicity, wrap this logic in a Lua script (see the distributed rate limiting section below).</p>
+
+      <h4>Sliding Window Counter</h4>
+      <p>A hybrid approach. Maintain counters for the current and previous window. Weight the previous window's count by the overlap fraction. For example, if you are 30% into the current minute, the effective count is <code>current_count + previous_count * 0.7</code>. This approximation eliminates the boundary spike with minimal memory overhead — just two counters per window.</p>
+
+      <h4>Sliding Window Counter — Deep Dive</h4>
+      <p><strong>The core idea:</strong> Maintain two simple counters — one for the current fixed window and one for the previous fixed window. To estimate how many requests occurred in the last <code>window_size</code> seconds, compute a weighted combination of both counters.</p>
+
+      <p><strong>The formula:</strong></p>
+      <p><code>estimated_count = previous_window_count &times; overlap_fraction + current_window_count</code></p>
+      <p>Where: <code>overlap_fraction = 1 - (elapsed_time_in_current_window / window_size)</code></p>
+      <p>The overlap fraction represents how much of the previous window still falls within our sliding window. If we are 15 seconds into a 60-second window, 45 seconds of the previous window still overlap — so the overlap fraction is 1 - (15/60) = 0.75.</p>
+
+      <p><strong>Worked example:</strong></p>
+      <ul>
+        <li>Window size: 60 seconds. Limit: 100 requests.</li>
+        <li>Previous window (T=0 to T=60): 84 requests</li>
+        <li>Current window (T=60 to T=120): 36 requests so far</li>
+        <li>Current time: T=75 (15 seconds into the current window)</li>
+      </ul>
+      <p><strong>Calculation:</strong></p>
+      <ul>
+        <li>Overlap fraction = 1 - (15 / 60) = <strong>0.75</strong></li>
+        <li>Estimated count = 84 &times; 0.75 + 36 = 63 + 36 = <strong>99</strong></li>
+        <li>99 &lt; 100 &rarr; <strong>ALLOW</strong></li>
+      </ul>
+      <p>Another request arrives at T=76:</p>
+      <ul>
+        <li>Current window count is now 37</li>
+        <li>Overlap fraction = 1 - (16 / 60) = <strong>0.733</strong></li>
+        <li>Estimated count = 84 &times; 0.733 + 37 = 61.6 + 37 = <strong>98.6</strong> &rarr; round to 99 &rarr; <strong>ALLOW</strong></li>
+      </ul>
+
+      <p><strong>Why this is approximate:</strong> We assume requests in the previous window were <em>uniformly distributed</em> across the window. If all 84 requests arrived in the last 15 seconds of the previous window, our estimate would be too low — the true count within the sliding window would be much higher. But in practice, the error is small. According to Cloudflare's analysis, the error rate is less than 0.003% for typical traffic patterns.</p>
+
+      <p><strong>Memory advantage:</strong> Only 2 counters per key (16 bytes total) vs. the sliding window log which stores every timestamp (potentially thousands of entries). This is why Cloudflare uses sliding window counters for their global rate limiting — it scales to millions of keys with negligible memory.</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Algorithm</th><th>Memory per Key</th><th>Accuracy</th><th>Boundary Problem?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Fixed Window Counter</td><td>8 bytes (1 counter)</td><td>Exact within window</td><td>Yes — 2x burst at boundary</td></tr>
+          <tr><td>Sliding Window Log</td><td>8 bytes &times; request count</td><td>Exact</td><td>No</td></tr>
+          <tr><td>Sliding Window Counter</td><td>16 bytes (2 counters)</td><td>~99.997% accurate</td><td>No</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Rate Limiting When</h4>
+          <ul>
+            <li><strong>API protection:</strong> Any public-facing API should have rate limits. It is the first line of defense against abuse, scraping, and DDoS.</li>
+            <li><strong>Multi-tenant fairness:</strong> When multiple customers share infrastructure, rate limits prevent one tenant from monopolizing capacity.</li>
+            <li><strong>Cost control:</strong> In pay-per-use cloud architectures, rate limits cap runaway costs from bugs or misconfigured clients.</li>
+            <li><strong>DDoS mitigation:</strong> Rate limiting at the edge (CDN/API gateway) absorbs volumetric attacks before they reach your application servers.</li>
+            <li><strong>Compliance requirements:</strong> Some regulatory frameworks require demonstrable controls on data access rates.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use Rate Limiting When</h4>
+          <ul>
+            <li><strong>Internal trusted services where backpressure is better:</strong> Between your own microservices, backpressure (e.g., gRPC flow control, TCP window sizing, or queue-based buffering) is usually better than hard rejection. Rejecting internal requests means you have to build retry logic everywhere.</li>
+            <li><strong>When you need guaranteed delivery, not rejection:</strong> If every request must eventually be processed (e.g., payment processing, audit events), use a queue or backpressure instead of dropping requests.</li>
+            <li><strong>Latency-critical paths with predictable load:</strong> If traffic is well-understood and auto-scaling handles demand, rate limiting adds unnecessary overhead and latency to the hot path.</li>
+            <li><strong>Single-user tools or batch systems:</strong> If there is only one client and you control it, throttling at the client side (e.g., a semaphore or sleep loop) is simpler.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic Approaches</h3>
+      <p><strong>Token Bucket</strong> (1990s, ATM networks): Simple, allows bursts up to bucket capacity, widely implemented. Used in Linux traffic shaping (<code>tc</code>), Nginx, and most API gateways. The main limitation is that in distributed settings, each node maintains its own bucket, so the aggregate rate can exceed the intended limit by a factor of N (number of nodes).</p>
+      <p><strong>Leaky Bucket</strong>: Guarantees a perfectly smooth output rate. Used in network traffic policing (ATM and frame relay). Less common for API rate limiting because most APIs can tolerate bursts and the strict smoothing unnecessarily penalizes legitimate traffic.</p>
+
+      <h3>Modern Approaches</h3>
+
+      <h4>GCRA (Generic Cell Rate Algorithm)</h4>
+      <p>GCRA is mathematically equivalent to the token bucket but is easier to implement correctly in distributed systems. Instead of tracking token count and last refill time, GCRA tracks a single value: the TAT (Theoretical Arrival Time) — the earliest time the next request should arrive. If a request arrives before TAT, it is rejected. If it arrives after, TAT is updated to <code>max(now, TAT) + emission_interval</code>. Only one value to store, one comparison to make, and one atomic update — perfect for Redis. Used by Shopify's rate limiter and the <code>governor</code> Rust crate.</p>
+
+      <h4>GCRA — Deep Dive</h4>
+      <p><strong>The core concept:</strong> Instead of counting tokens or tracking request counts, GCRA tracks a single value: the <strong>TAT (Theoretical Arrival Time)</strong> — the earliest time the next request "should" arrive if requests were perfectly spaced. If a request arrives too early (before the system has had time to "recover"), it is rejected.</p>
+
+      <p><strong>The algorithm, step by step:</strong></p>
+      <ol>
+        <li>When a request arrives at time <code>now</code>:</li>
+        <li>Compute the <strong>emission interval</strong>: <code>emission_interval = window / limit</code>. This is the ideal spacing between requests. For 5 requests per 10 seconds: <code>10 / 5 = 2.0 seconds</code>.</li>
+        <li>Compute the new TAT: <code>new_tat = max(tat, now) + emission_interval</code>. The <code>max(tat, now)</code> handles the case where the client has been idle — if TAT is in the past, we reset to "now" so idle time is not penalized.</li>
+        <li>Check burst tolerance: if <code>new_tat - now &gt; burst_tolerance</code>, the request arrived too early and would exceed the burst limit. <strong>REJECT</strong> the request.</li>
+        <li>Otherwise, <strong>ALLOW</strong> the request and update <code>tat = new_tat</code>.</li>
+      </ol>
+      <p>Where <code>burst_tolerance = emission_interval &times; burst</code>. The burst parameter controls how many back-to-back requests are allowed.</p>
+
+      <p><strong>Worked example:</strong> limit = 5 requests per 10 seconds, burst = 2.</p>
+      <ul>
+        <li>emission_interval = 10 / 5 = <strong>2.0 seconds</strong></li>
+        <li>burst_tolerance = 2.0 &times; 2 = <strong>4.0 seconds</strong></li>
+      </ul>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Request</th><th>Time (now)</th><th>TAT before</th><th>new_tat = max(TAT,now)+2</th><th>new_tat - now</th><th>&gt; 4.0?</th><th>Decision</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>0.0</td><td>0.0</td><td>max(0, 0) + 2 = 2.0</td><td>2.0</td><td>No</td><td>ALLOW, TAT = 2.0</td></tr>
+          <tr><td>2</td><td>0.5</td><td>2.0</td><td>max(2, 0.5) + 2 = 4.0</td><td>3.5</td><td>No</td><td>ALLOW, TAT = 4.0</td></tr>
+          <tr><td>3</td><td>1.0</td><td>4.0</td><td>max(4, 1) + 2 = 6.0</td><td>5.0</td><td><strong>YES</strong></td><td><strong>REJECT</strong></td></tr>
+          <tr><td>4</td><td>3.0</td><td>4.0</td><td>max(4, 3) + 2 = 6.0</td><td>3.0</td><td>No</td><td>ALLOW, TAT = 6.0</td></tr>
+          <tr><td>5</td><td>5.0</td><td>6.0</td><td>max(6, 5) + 2 = 8.0</td><td>3.0</td><td>No</td><td>ALLOW, TAT = 8.0</td></tr>
+        </tbody>
+      </table></div>
+
+      <p><strong>Reading the table:</strong> Request 1 arrives at T=0. TAT starts at 0, so new_tat = 0 + 2 = 2.0. The difference (2.0 - 0.0 = 2.0) is within the burst tolerance of 4.0, so it is allowed. Request 2 arrives just 0.5 seconds later. TAT is 2.0 (in the future), so new_tat = 2.0 + 2 = 4.0. The difference (4.0 - 0.5 = 3.5) is still within tolerance. But request 3 at T=1.0 pushes new_tat to 6.0, and 6.0 - 1.0 = 5.0 exceeds the burst tolerance of 4.0 — <strong>rejected</strong>. By T=3.0, enough time has passed that request 4 is allowed again.</p>
+
+      <p><strong>Why GCRA is equivalent to a token bucket:</strong> GCRA's TAT tracks the same state as a token bucket's token count — it is just inverted. When TAT is in the future, it means you have "used up" tokens. When TAT is in the past, tokens have been accumulating. The burst_tolerance maps directly to the bucket capacity.</p>
+
+      <p><strong>Why GCRA is better for distributed systems:</strong> Only <strong>one value</strong> needs to be stored — the TAT. A single Redis key with a <code>GETSET</code> (or <code>SET ... GET</code> in Redis 6.2+) is atomic. There is no need for multi-key transactions like <code>INCR</code> + <code>EXPIRE</code>, no race conditions between reading and writing two separate values, and no Lua script required for basic operation.</p>
+
+<pre class="line-numbers"><code class="language-python">import time
+
+class GCRA:
+    def __init__(self, rate, burst):
+        """
+        rate:  allowed requests per second
+        burst: max burst size (extra requests beyond the steady rate)
+        """
+        self.emission_interval = 1.0 / rate     # seconds between requests
+        self.burst_tolerance = self.emission_interval * burst
+        self.tat = 0.0  # Theoretical Arrival Time
+
+    def allow(self):
+        now = time.monotonic()
+        new_tat = max(self.tat, now) + self.emission_interval
+
+        if new_tat - now > self.burst_tolerance:
+            return False  # too early — reject
+
+        self.tat = new_tat
+        return True       # allowed
+
+# 5 requests per 10 seconds, burst of 2
+limiter = GCRA(rate=0.5, burst=2)
+</code></pre>
+
+      <h4>Adaptive / Dynamic Rate Limiting</h4>
+      <p>Instead of static limits, the rate adjusts dynamically based on system health. If CPU utilization is above 80% or p99 latency exceeds the SLO, the rate limiter tightens. If the system is healthy, limits relax. Netflix's concurrency-limits library implements this using TCP-congestion-control-inspired algorithms (Vegas, Gradient). The key insight: the optimal rate is not a fixed number you configure — it is a function of current system capacity, which changes constantly.</p>
+
+      <h4>Distributed Rate Limiting with Redis + Lua</h4>
+      <p>For distributed enforcement, the standard approach is Redis with Lua scripts for atomicity. A Lua script running inside Redis can check the current count, increment it, and set the TTL in a single atomic operation — no race conditions. The sliding window counter algorithm is commonly implemented this way. Cloudflare, Stripe, and GitHub all use variants of this pattern. The tradeoff: Redis becomes a dependency on the critical path. If Redis is down, you must decide: fail open (allow all traffic) or fail closed (reject all traffic).</p>
+
+      <h4>Distributed Rate Limiting — Deep Dive</h4>
+      <p><strong>Why local rate limiters fail:</strong> If your limit is 100 req/s and you have 10 servers, you might configure each server with a local limiter of 10 req/s. If load balancing distributes requests perfectly evenly, a client gets exactly 100 req/s total — correct. But load balancing is never perfectly even. Some servers might see 15 req/s from a client (rejected at 10) while others see only 5 req/s. The effective global limit becomes unpredictable — the client may get anywhere from 50 to 100 req/s depending on how requests are distributed. This is why you need a <em>centralized</em> counter.</p>
+
+      <p><strong>The race condition with INCR and EXPIRE:</strong></p>
+      <p>The naive Redis approach looks simple but has a critical bug:</p>
+<pre class="line-numbers"><code class="language-python"># WRONG — Race condition!
+count = redis.incr("rate:user42")    # count is now 1
+if count == 1:
+    redis.expire("rate:user42", 60)  # set TTL only on first request
+</code></pre>
+      <p><strong>The problem:</strong> If the process crashes (or the network drops) between the <code>INCR</code> and the <code>EXPIRE</code>, the key has no TTL. The counter persists forever. The user is <strong>permanently rate-limited</strong> — every subsequent request increments the counter further, and it never resets because there is no expiration. This is a real production bug that has caused outages.</p>
+
+      <p><strong>The fix — Lua script for atomicity:</strong></p>
+<pre class="line-numbers"><code class="language-python">RATE_LIMIT_SCRIPT = """
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+
+local current = redis.call('INCR', key)
+if current == 1 then
+    redis.call('EXPIRE', key, window)
+end
+
+if current > limit then
+    return 0  -- rejected
+end
+return 1  -- allowed
+"""
+
+def check_rate_limit(redis_client, user_id, limit=100, window=60):
+    """
+    Returns True if allowed, False if rate-limited.
+    The Lua script runs atomically inside Redis —
+    no other command can execute between INCR and EXPIRE.
+    """
+    key = f"rate:{user_id}"
+    result = redis_client.eval(RATE_LIMIT_SCRIPT, 1, key, limit, window)
+    return result == 1
+</code></pre>
+      <p><strong>Why this works:</strong> Lua scripts execute atomically in Redis — the Redis server is single-threaded, and while a Lua script is running, no other command can execute. This means <code>INCR</code> and <code>EXPIRE</code> happen as one indivisible operation. There is no window for a crash or race condition between them.</p>
+
+      <p><strong>Alternative approaches:</strong></p>
+      <ul>
+        <li><strong><code>SET key value EX window NX</code></strong> for the first request (sets the key with a TTL only if it does not already exist), then <code>INCR</code> for subsequent requests. This avoids the race because the TTL is set in the same command as the key creation.</li>
+        <li><strong><code>MULTI/EXEC</code> transaction block:</strong> Groups <code>INCR</code> and <code>EXPIRE</code> into a transaction. Redis guarantees both commands execute without interleaving. However, <code>MULTI/EXEC</code> does not support conditional logic (you cannot read the count and branch on it within the transaction), so Lua scripts are more flexible.</li>
+      </ul>
+
+      <h4>Client-Side Rate Limiting with Exponential Backoff</h4>
+      <p>Server-side rate limiting is the safety net; well-behaved clients should self-limit. The standard pattern is exponential backoff with jitter: after a 429 response, wait <code>base * 2^attempt + random_jitter</code> before retrying. AWS SDKs, Google API clients, and Stripe's client libraries all implement this. The jitter is critical — without it, all throttled clients retry at the same time, causing a thundering herd that re-triggers the rate limit.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Token Bucket Model Assumptions</h4>
+        <ul>
+          <li><strong>Uniform token refill:</strong> Tokens are added at a constant rate. In practice, refill is computed lazily — when a request arrives, the algorithm calculates how many tokens should have been added since the last request, rather than running a background timer.</li>
+          <li><strong>Requests consume 1 token each:</strong> All requests are treated as equal cost. This breaks when you have requests that vary wildly in cost — a simple GET vs. a complex aggregation query. Some implementations assign different token costs to different endpoints.</li>
+          <li><strong>Single point of enforcement:</strong> The algorithm assumes one authoritative counter. In a distributed system with multiple enforcement points, the same key is checked by multiple nodes, introducing race conditions and clock skew.</li>
+          <li><strong>Independent, memoryless arrivals:</strong> The algorithm does not model request patterns. It works fine for steady or random traffic but can be gamed by an adversary who carefully times requests to maximize throughput.</li>
+        </ul>
+        <h4>When Assumptions Break</h4>
+        <ul>
+          <li><strong>Distributed enforcement:</strong> With N nodes each running a local token bucket, the aggregate rate is up to N times the intended limit. Centralizing state (e.g., in Redis) fixes this but adds latency and a single point of failure.</li>
+          <li><strong>Clock skew across nodes:</strong> If nodes have different clocks, sliding window boundaries and token refill calculations diverge. NTP drift of even a few milliseconds can cause inconsistent enforcement during window transitions.</li>
+          <li><strong>Variable-cost requests:</strong> A request that triggers a 10-second database query should cost more tokens than a request served from cache. Without variable costing, rate limiting can under-protect expensive endpoints.</li>
+          <li><strong>Bursty legitimate traffic:</strong> A mobile app that batches requests (e.g., sync on app open) may legitimately send 50 requests in 1 second, then nothing for 5 minutes. A low burst capacity penalizes this pattern even though the average rate is well within limits.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>How to Pick the Rate</h3>
+      <ol>
+        <li><strong>Start from SLOs:</strong> Determine the maximum request rate your service can handle while meeting its latency SLO (e.g., p99 &lt; 100ms).</li>
+        <li><strong>Measure p99 capacity:</strong> Load test to find the throughput at which p99 latency exceeds your SLO. This is your capacity ceiling.</li>
+        <li><strong>Set at 80%:</strong> Set the global rate limit at 80% of the capacity ceiling. The 20% headroom absorbs natural variance, background tasks, and retry storms.</li>
+      </ol>
+
+      <h3>Per-User vs. Global vs. Per-Endpoint Limits</h3>
+      <ul>
+        <li><strong>Global limit:</strong> Protects the service as a whole. Set based on total capacity. Example: 8,000 RPS.</li>
+        <li><strong>Per-user/per-tenant limit:</strong> Ensures fairness. Divide global capacity by expected concurrent tenants, with headroom. Example: 100 RPS per tenant.</li>
+        <li><strong>Per-endpoint limit:</strong> Protects expensive endpoints independently. A search endpoint that hits the database might have a limit of 10 RPS per user, while a simple status endpoint allows 1,000 RPS.</li>
+      </ul>
+
+      <h3>Burst Size</h3>
+      <p>The burst size (token bucket capacity) determines how much spike you tolerate. A burst size of 1x the per-second rate allows no burst at all. A burst size of 2x allows a client to briefly double its rate if it has been idle. Rule of thumb: set burst capacity to 2-3x the per-second rate limit. Higher burst capacity is more forgiving to legitimate clients but offers less protection against sudden spikes.</p>
+
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Rate limits should never be guessed — they should be <strong>derived from your Service Level Objectives</strong>. The process is: define the SLO, measure system behavior under load, and mathematically derive the rate limit parameters that keep you within the SLO. The following examples walk through this derivation for four common scenarios.</p>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: Public API with 99.9% Availability</h4>
+        <p><strong>Target SLO:</strong> 99.9% availability (no more than 0.1% of requests rejected due to overload per month).</p>
+        <p><strong>Given:</strong> Backend capacity is 12,000 RPS at p99 &lt; 300ms. Average traffic is 4,000 RPS. Peak traffic (95th percentile daily) reaches 9,000 RPS. There are 200 API consumers.</p>
+        <p><strong>Step 1 — Capacity ceiling:</strong> 12,000 &times; 0.80 = <strong>9,600 RPS</strong> global limit (20% headroom for GC pauses, deploys, retry storms).</p>
+        <p><strong>Step 2 — Burst allowance:</strong> Peak-to-average ratio = 9,000 / 4,000 = 2.25&times;. Set token bucket burst capacity to <strong>3&times; the per-second rate</strong> to absorb legitimate spikes without rejections.</p>
+        <p><strong>Step 3 — Per-consumer limit:</strong> 9,600 / 200 = 48 RPS baseline. Round up to <strong>60 RPS per consumer</strong> (allows headroom since not all consumers peak simultaneously). Burst bucket: 60 &times; 3 = <strong>180 tokens</strong>.</p>
+        <p><strong>Step 4 — Rejection budget check:</strong> At 99.9% availability, you can reject at most 0.1% of ~10.4B monthly requests = ~10.4M rejections/month. With the 3&times; burst allowance, simulated rejection rate at peak is 0.02%, well within budget.</p>
+        <p><strong>Result:</strong> Global limit 9,600 RPS; per-consumer 60 RPS sustained / 180 burst. Projected rejection rate 0.02% &mdash; 5&times; margin on the 0.1% SLO.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: Payment Processing (p99 &lt; 200ms)</h4>
+        <p><strong>Target SLO:</strong> p99 latency &lt; 200ms for all payment API calls.</p>
+        <p><strong>Given:</strong> Each payment request takes 40ms average processing time. The payment service runs 8 worker threads. Database connection pool is 20 connections with 150ms average query time.</p>
+        <p><strong>Step 1 — Throughput ceiling from workers:</strong> 8 threads &times; (1000ms / 40ms) = <strong>200 RPS</strong> max throughput at average latency.</p>
+        <p><strong>Step 2 — Queue depth bound:</strong> At p99, you need 99% of requests to complete in &lt; 200ms. Using Little's Law: max queue depth = (200ms &minus; 40ms processing) / 40ms = <strong>4 requests queued</strong>. Beyond 4 queued requests, p99 exceeds the SLO.</p>
+        <p><strong>Step 3 — Derive token bucket parameters:</strong> Sustained rate = 200 &times; 0.80 = <strong>160 RPS</strong>. Burst capacity = queue depth bound + workers = 4 + 8 = <strong>12 tokens</strong>. This keeps the queue from growing past the latency budget.</p>
+        <p><strong>Step 4 — DB connection pool check:</strong> At 160 RPS with 150ms avg query time, concurrent DB connections = 160 &times; 0.15 = <strong>24</strong>. This exceeds the pool size of 20. Either increase the pool to 25 or reduce the rate limit to <strong>130 RPS</strong> (20 / 0.15 = 133, with margin).</p>
+        <p><strong>Result:</strong> Token bucket at 130 RPS sustained / 12 burst. DB pool increased to 25. Load-tested p99 = 172ms at 130 RPS &mdash; within the 200ms SLO.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: Real-Time Chat (p95 &lt; 100ms)</h4>
+        <p><strong>Target SLO:</strong> p95 message delivery latency &lt; 100ms.</p>
+        <p><strong>Given:</strong> Chat service handles 50,000 connected users. Average message rate is 2 messages/sec/user during active typing. Message fan-out averages 5 recipients per message. WebSocket server capacity is 500,000 messages/sec.</p>
+        <p><strong>Step 1 — Peak message volume:</strong> Assume 10% of users are actively typing at any time: 5,000 users &times; 2 msg/s = 10,000 inbound msg/s. After fan-out: 10,000 &times; 5 = <strong>50,000 outbound msg/s</strong>.</p>
+        <p><strong>Step 2 — Per-user rate limit:</strong> To prevent spam and keep latency low, cap each user at <strong>5 msg/s</strong> (sustained) with <strong>10 msg burst</strong>. This allows rapid-fire replies while bounding the total inbound rate.</p>
+        <p><strong>Step 3 — Global rate limit:</strong> At 5 msg/s per active user with 5,000 active users: 25,000 inbound msg/s &times; 5 fan-out = 125,000 outbound msg/s. This is 25% of server capacity &mdash; safe margin. Set global inbound limit to <strong>30,000 msg/s</strong> (60% of capacity / fan-out factor).</p>
+        <p><strong>Step 4 — Latency verification:</strong> At 125,000 outbound msg/s on a 500,000 msg/s capacity server, utilization is 25%. Using M/M/1 queue model: avg latency = 1 / (capacity &minus; arrival rate) = 1 / 375,000 = <strong>2.7&mu;s queueing delay</strong>. p95 dominated by network RTT (~20-40ms), well within the 100ms SLO.</p>
+        <p><strong>Result:</strong> Per-user 5 msg/s sustained / 10 burst. Global cap 30,000 inbound msg/s. Projected p95 = 40ms &mdash; 2.5&times; margin on the 100ms SLO.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: CDN Origin Protection (Cost SLO)</h4>
+        <p><strong>Target SLO:</strong> Origin infrastructure cost &lt; $5,000/month.</p>
+        <p><strong>Given:</strong> Origin server cost is $0.10 per 10,000 requests (compute + bandwidth). CDN cache hit ratio is 92%. Total edge request volume is 500M requests/month. Average origin response is 250KB.</p>
+        <p><strong>Step 1 — Current origin load:</strong> 500M &times; (1 &minus; 0.92) = <strong>40M origin requests/month</strong>. Cost = 40M / 10,000 &times; $0.10 = <strong>$400/month</strong> &mdash; well within budget.</p>
+        <p><strong>Step 2 — Budget ceiling:</strong> $5,000 / $0.10 &times; 10,000 = <strong>500M origin requests/month max</strong>. That is ~193 origin RPS sustained.</p>
+        <p><strong>Step 3 — Derive rate limit for origin shield:</strong> Set origin rate limit to <strong>150 RPS</strong> (78% of 193 RPS ceiling). This caps monthly origin requests at 150 &times; 86,400 &times; 30 = <strong>388M requests</strong>, costing ~$3,888 &mdash; within the $5,000 budget with 22% margin.</p>
+        <p><strong>Step 4 — Burst for cache misses:</strong> Cache miss storms (e.g., after a purge) can spike origin traffic 10&times;. Set burst to <strong>500 tokens</strong> to absorb a 3-second cache-miss storm without dropping requests: 500 tokens &div; 150 RPS = 3.3s of burst capacity.</p>
+        <p><strong>Result:</strong> Origin shield rate limit at 150 RPS sustained / 500 burst. Monthly cost capped at $3,888, with burst capacity for cache purge events. Alert at 120 RPS (80% of limit) to investigate cache hit ratio drops.</p>
+      </div>
+
+      <h3>Rate Limit Impact Visualization</h3>
+      <p>The graph below shows how request rate, rejection rate, and p99 latency interact at different rate limit thresholds. Hover over the chart to see exact values at each request rate.</p>
+      <div class="animation-container">
+        <canvas id="rateLimitGraph" width="700" height="350" style="cursor:crosshair"></canvas>
+        <p class="caption">Interactive: Hover to see request rate, rejection percentage, and p99 latency at each throughput level. The dashed vertical line marks the configured rate limit.</p>
+      </div>
+      <script>(function() {
+        var canvas = document.getElementById('rateLimitGraph');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var W = canvas.width, H = canvas.height;
+        var pad = { top: 40, right: 70, bottom: 50, left: 60 };
+        var plotW = W - pad.left - pad.right;
+        var plotH = H - pad.top - pad.bottom;
+
+        var rateLimit = 8000;
+        var maxRPS = 14000;
+        var maxLatency = 500;
+        var maxRejection = 100;
+
+        function requestToX(rps) { return pad.left + (rps / maxRPS) * plotW; }
+        function rejectionToY(pct) { return pad.top + plotH - (pct / maxRejection) * plotH; }
+        function latencyToY(ms) { return pad.top + plotH - (ms / maxLatency) * plotH; }
+
+        function getRejection(rps) {
+          if (rps <= rateLimit) return 0;
+          return Math.min(100, ((rps - rateLimit) / rps) * 100);
+        }
+
+        function getLatency(rps) {
+          if (rps <= rateLimit * 0.5) return 20;
+          if (rps <= rateLimit) {
+            var t = (rps - rateLimit * 0.5) / (rateLimit * 0.5);
+            return 20 + t * t * 80;
+          }
+          return 100;
+        }
+
+        function drawChart(mouseX) {
+          ctx.clearRect(0, 0, W, H);
+
+          // Background
+          ctx.fillStyle = '#1a1a2e';
+          ctx.fillRect(0, 0, W, H);
+
+          // Grid lines
+          ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+          ctx.lineWidth = 1;
+          for (var i = 0; i <= 5; i++) {
+            var y = pad.top + (plotH / 5) * i;
+            ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+          }
+          for (var j = 0; j <= 7; j++) {
+            var x = pad.left + (plotW / 7) * j;
+            ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+          }
+
+          // Axes
+          ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + plotH); ctx.lineTo(pad.left + plotW, pad.top + plotH); ctx.stroke();
+
+          // Axis labels
+          ctx.fillStyle = 'rgba(255,255,255,0.7)';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          for (var k = 0; k <= 7; k++) {
+            var rps = (maxRPS / 7) * k;
+            ctx.fillText(Math.round(rps / 1000) + 'k', pad.left + (plotW / 7) * k, pad.top + plotH + 20);
+          }
+          ctx.fillText('Request Rate (RPS)', pad.left + plotW / 2, pad.top + plotH + 40);
+
+          // Left Y axis labels (Rejection %)
+          ctx.textAlign = 'right';
+          ctx.fillStyle = '#ff6b6b';
+          for (var m = 0; m <= 5; m++) {
+            var pct = (maxRejection / 5) * m;
+            ctx.fillText(Math.round(pct) + '%', pad.left - 8, rejectionToY(pct) + 4);
+          }
+
+          // Right Y axis labels (Latency ms)
+          ctx.textAlign = 'left';
+          ctx.fillStyle = '#4ecdc4';
+          for (var n = 0; n <= 5; n++) {
+            var ms = (maxLatency / 5) * n;
+            ctx.fillText(Math.round(ms) + 'ms', pad.left + plotW + 6, latencyToY(ms) + 4);
+          }
+
+          // Rate limit vertical line
+          ctx.strokeStyle = 'rgba(255,215,0,0.6)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          var limitX = requestToX(rateLimit);
+          ctx.beginPath(); ctx.moveTo(limitX, pad.top); ctx.lineTo(limitX, pad.top + plotH); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = 'rgba(255,215,0,0.9)';
+          ctx.font = 'bold 11px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Limit: ' + (rateLimit / 1000) + 'k RPS', limitX, pad.top - 8);
+
+          // Rejection rate curve (red)
+          ctx.strokeStyle = '#ff6b6b';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          for (var r = 0; r <= maxRPS; r += 50) {
+            var px = requestToX(r);
+            var py = rejectionToY(getRejection(r));
+            if (r === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+
+          // Latency curve (teal)
+          ctx.strokeStyle = '#4ecdc4';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          for (var s = 0; s <= maxRPS; s += 50) {
+            var lx = requestToX(s);
+            var ly = latencyToY(getLatency(s));
+            if (s === 0) ctx.moveTo(lx, ly); else ctx.lineTo(lx, ly);
+          }
+          ctx.stroke();
+
+          // Accepted throughput curve (green, area fill)
+          ctx.fillStyle = 'rgba(46,204,113,0.15)';
+          ctx.beginPath();
+          ctx.moveTo(requestToX(0), pad.top + plotH);
+          for (var a = 0; a <= maxRPS; a += 50) {
+            var accepted = a <= rateLimit ? a : rateLimit;
+            var ax = requestToX(a);
+            var ay = pad.top + plotH - (accepted / maxRPS) * plotH;
+            ctx.lineTo(ax, ay);
+          }
+          ctx.lineTo(requestToX(maxRPS), pad.top + plotH);
+          ctx.closePath();
+          ctx.fill();
+
+          // Legend
+          ctx.font = '11px JetBrains Mono, monospace';
+          var legendX = pad.left + 12, legendY = pad.top + 16;
+          ctx.fillStyle = '#ff6b6b'; ctx.fillRect(legendX, legendY - 8, 14, 3); ctx.fillText('Rejection %', legendX + 20, legendY - 2);
+          ctx.fillStyle = '#4ecdc4'; ctx.fillRect(legendX, legendY + 8, 14, 3); ctx.fillText('p99 Latency', legendX + 20, legendY + 14);
+          ctx.fillStyle = 'rgba(46,204,113,0.5)'; ctx.fillRect(legendX, legendY + 24, 14, 8); ctx.fillStyle = 'rgba(46,204,113,0.9)'; ctx.fillText('Accepted', legendX + 20, legendY + 32);
+
+          // Hover tooltip
+          if (mouseX !== null && mouseX >= pad.left && mouseX <= pad.left + plotW) {
+            var hoverRPS = ((mouseX - pad.left) / plotW) * maxRPS;
+            var rej = getRejection(hoverRPS);
+            var lat = getLatency(hoverRPS);
+            var accepted = hoverRPS <= rateLimit ? hoverRPS : rateLimit;
+
+            // Vertical hover line
+            ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(mouseX, pad.top); ctx.lineTo(mouseX, pad.top + plotH); ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Tooltip box
+            var tipW = 185, tipH = 72;
+            var tipX = mouseX + 12;
+            var tipY = pad.top + 20;
+            if (tipX + tipW > W - 10) tipX = mouseX - tipW - 12;
+
+            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+            ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.roundRect(tipX, tipY, tipW, tipH, 6);
+            ctx.fill(); ctx.stroke();
+
+            ctx.font = '11px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('Rate: ' + Math.round(hoverRPS).toLocaleString() + ' RPS', tipX + 10, tipY + 18);
+            ctx.fillStyle = '#ff6b6b';
+            ctx.fillText('Rejected: ' + rej.toFixed(1) + '%', tipX + 10, tipY + 34);
+            ctx.fillStyle = '#4ecdc4';
+            ctx.fillText('p99: ' + Math.round(lat) + 'ms', tipX + 10, tipY + 50);
+            ctx.fillStyle = 'rgba(46,204,113,0.9)';
+            ctx.fillText('Accepted: ' + Math.round(accepted).toLocaleString() + ' RPS', tipX + 10, tipY + 66);
+          }
+        }
+
+        drawChart(null);
+
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = canvas.width / rect.width;
+          drawChart((e.clientX - rect.left) * scaleX);
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          drawChart(null);
+        });
+      })();</script>
+
+      <h3>Worked Example</h3>
+      <div class="callout callout-info">
+        <p><strong>Scenario:</strong> Your service handles 10,000 RPS at p99 &lt; 100ms. You have 100 tenants.</p>
+        <ul>
+          <li><strong>Global limit:</strong> 10,000 * 0.8 = <strong>8,000 RPS</strong></li>
+          <li><strong>Per-tenant limit:</strong> 8,000 / 100 = 80, rounded up to <strong>100 RPS</strong> (allows some tenants to burst while others are idle)</li>
+          <li><strong>Per-tenant burst capacity:</strong> 2 * 100 = <strong>200 tokens</strong> (allows a 2-second burst at full rate)</li>
+          <li><strong>Expensive endpoint (/search):</strong> <strong>10 RPS per tenant</strong>, burst 20</li>
+          <li><strong>Redis memory:</strong> ~100 bytes per key * 100 tenants * 5 endpoints = <strong>~50 KB</strong> (negligible)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>No Rate Limiting</h4>
+          <p>At low scale, your service can handle all traffic. You might add a simple <code>time.sleep()</code> in a script or a basic Nginx <code>limit_req</code> directive, but rate limiting is not a priority. Your biggest risk is a single misbehaving script, not systemic overload.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>In-Process Counter</h4>
+          <p>As you gain API consumers, add an in-process rate limiter (e.g., a middleware with an in-memory dictionary of counters per API key). Works if you have a single server or sticky sessions. Breaks when you add a second server — each server enforces independently, so the effective limit doubles.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>Redis INCR/EXPIRE</h4>
+          <p>Centralize counters in Redis. Use <code>INCR</code> + <code>EXPIRE</code> for fixed windows, or Lua scripts for sliding windows. All application servers query the same Redis, so limits are enforced consistently. Redis handles 100K+ ops/sec on a single node. <strong>Migration signal:</strong> you notice different servers enforcing different effective limits.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Hierarchical / Edge + Service</h4>
+          <p>At massive scale, use layered rate limiting: (1) edge-level limiting at the CDN/API gateway for DDoS and volumetric attacks, (2) service-level limiting in the application for per-endpoint protection, (3) per-tenant limiting with quotas managed in a control plane. Use Redis Cluster or cell-based Redis for scalability. Consider local token buckets with periodic sync to reduce Redis round-trips.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Rate Limit Too Aggressive — Blocking Legitimate Spikes</h3>
+      <p><strong>What happened:</strong> A company set per-user rate limits based on average traffic. During a product launch, legitimate users spiked well above average. The rate limiter rejected the launch traffic, and the company's own marketing campaign resulted in error pages for excited new users.</p>
+      <p><strong>Root cause:</strong> Rate limits were set for steady-state traffic without accounting for legitimate spikes (marketing events, viral moments, batch operations).</p>
+      <p><strong>Blast radius:</strong> All users attempting to access the service during the spike received 429 errors. Support tickets surged.</p>
+      <p><strong>Mitigation:</strong> Emergency increase of rate limits. Added a "burst" allowance to the token bucket configuration.</p>
+      <p><strong>Prevention:</strong> Use adaptive rate limiting that adjusts based on system health rather than static limits. Maintain an override mechanism for planned events. Set burst capacity to at least 3x the sustained rate.</p>
+
+      <h3>2. Race Conditions in Distributed Counters</h3>
+      <p><strong>What happened:</strong> A multi-region API used local Redis instances for rate limiting. During a traffic spike, the counter in us-east-1 showed 90/100, while eu-west-1 showed 85/100 — but the actual aggregate rate was 175 RPS, nearly 2x the intended limit. The downstream database was overwhelmed.</p>
+      <p><strong>Root cause:</strong> Each region maintained its own counter. There was no cross-region synchronization. The rate limit was effectively multiplied by the number of regions.</p>
+      <p><strong>Blast radius:</strong> Database overload caused cascading failures across all regions.</p>
+      <p><strong>Mitigation:</strong> Immediate switch to a global Redis with cross-region replication for rate limiting keys. Accepted the added latency (30-80ms) as a tradeoff for correctness.</p>
+      <p><strong>Prevention:</strong> Use a single authoritative counter (global Redis or a coordination service). Alternatively, divide the global limit across regions statically (e.g., each of 3 regions gets 1/3 of the limit) and accept the inefficiency.</p>
+
+      <h3>3. Cached 429 Responses Blocking Traffic</h3>
+      <p><strong>What happened:</strong> A CDN was configured to cache all API responses by default. When a rate-limited 429 response was generated, the CDN cached it. Subsequent requests from all users hit the cached 429 and were rejected — even though the rate limit had long since reset.</p>
+      <p><strong>Root cause:</strong> The 429 response did not include <code>Cache-Control: no-store</code> headers, and the CDN's default caching policy cached it based on URL pattern.</p>
+      <p><strong>Blast radius:</strong> Complete API outage for the affected endpoint until the cached response expired or was manually purged.</p>
+      <p><strong>Prevention:</strong> Always set <code>Cache-Control: no-store, no-cache</code> on 429 responses. Configure CDN rules to never cache 4xx responses. Add monitoring for unexpected cache hit rates on error responses.</p>
+
+      <h3>4. Clock Skew Across Nodes</h3>
+      <p><strong>What happened:</strong> In a sliding window rate limiter, two application servers had clocks drifting by 2 seconds. Requests near window boundaries were counted in different windows by different servers, creating gaps where requests were allowed past the limit and periods where legitimate requests were incorrectly rejected.</p>
+      <p><strong>Root cause:</strong> NTP synchronization was misconfigured, and the rate limiting algorithm relied on wall-clock time for window boundaries.</p>
+      <p><strong>Prevention:</strong> Use centralized time (Redis server time via <code>TIME</code> command in Lua scripts). Alternatively, use algorithms like GCRA that are less sensitive to clock differences because they track relative intervals rather than absolute timestamps.</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Description</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>rate_limit_rejections_total</code></td>
+            <td>Total 429 responses, labeled by tenant and endpoint</td>
+            <td>Rejection rate &gt; 5% for any single tenant over 5 minutes</td>
+          </tr>
+          <tr>
+            <td><code>rate_limit_utilization</code></td>
+            <td>Current usage as a percentage of the limit, per tenant</td>
+            <td>&gt; 90% sustained for 10 minutes (tenant nearing limit)</td>
+          </tr>
+          <tr>
+            <td><code>rate_limit_burst_frequency</code></td>
+            <td>How often tenants hit burst capacity</td>
+            <td>&gt; 10 bursts/hour (may indicate limit is too low)</td>
+          </tr>
+          <tr>
+            <td><code>redis_rate_limit_latency_p99</code></td>
+            <td>Latency of Redis calls for rate limit checks</td>
+            <td>&gt; 5ms p99 (rate limiting is adding significant overhead)</td>
+          </tr>
+          <tr>
+            <td><code>rate_limit_redis_errors</code></td>
+            <td>Redis errors during rate limit checks</td>
+            <td>Any errors (fail-open vs. fail-closed decision needed)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Users reporting 429 errors?</strong></p>
+        <p>&rarr; Check <code>rate_limit_rejections_total</code> by tenant and endpoint</p>
+        <p>&nbsp;&nbsp;&rarr; Is one tenant dominating? → Check if their traffic is legitimate or abusive</p>
+        <p>&nbsp;&nbsp;&rarr; Are many tenants hitting limits? → Check if global limit is too low, or if system capacity has degraded</p>
+        <p>&nbsp;&nbsp;&rarr; Are limits correct but system slow? → Check backend latency — rate limits may be masking a deeper issue</p>
+        <p><strong>Rate limiter adding latency?</strong></p>
+        <p>&rarr; Check <code>redis_rate_limit_latency_p99</code></p>
+        <p>&nbsp;&nbsp;&rarr; High Redis latency? → Check Redis CPU, memory, network. Consider local caching of rate limit decisions.</p>
+        <p>&nbsp;&nbsp;&rarr; Redis connection pool exhausted? → Increase pool size or add connection pooling (e.g., Envoy sidecar).</p>
+      </div>
+
+      <h3>Critical Configuration</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Config</th>
+            <th>Recommended Value</th>
+            <th>Why It Matters</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>Redis key TTL</code></td>
+            <td>Match your window size + small buffer (e.g., 62s for 60s windows)</td>
+            <td>Without TTL, keys accumulate forever and Redis runs out of memory. Too-short TTL causes premature key eviction and under-counting.</td>
+          </tr>
+          <tr>
+            <td><code>Lua script atomicity</code></td>
+            <td>Always use EVAL/EVALSHA, never separate GET+SET</td>
+            <td>Separate GET and SET have a race condition — two requests can read the same count, both pass, and only one increment is recorded.</td>
+          </tr>
+          <tr>
+            <td><code>X-RateLimit-Remaining</code></td>
+            <td>Include in every response (not just 429s)</td>
+            <td>Well-behaved clients use this header to self-throttle before hitting the limit. Reduces 429s and improves client experience.</td>
+          </tr>
+          <tr>
+            <td><code>Retry-After</code></td>
+            <td>Include in every 429 response</td>
+            <td>Tells the client exactly when to retry. Without it, clients guess and either retry too aggressively (making things worse) or too conservatively (hurting their throughput).</td>
+          </tr>
+          <tr>
+            <td><code>Fail-open vs. fail-closed</code></td>
+            <td>Fail-open for most APIs; fail-closed for security-critical endpoints</td>
+            <td>If Redis is down, fail-open allows all traffic (risking overload), fail-closed rejects all traffic (causing an outage). For most APIs, a brief period without rate limiting is better than a total outage.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Rate Limiting + Caching</h3>
+      <p><strong>Never cache 429 responses.</strong> This is the single most dangerous interaction. If a CDN or reverse proxy caches a 429 response, subsequent requests from all clients hit the cached 429 — even though the rate limit has reset. Always set <code>Cache-Control: no-store</code> on 429 responses. Configure your CDN to exclude 4xx/5xx responses from caching. This seems obvious, but it has caused real outages at multiple companies.</p>
+
+      <h3>Rate Limiting + Load Balancing</h3>
+      <p><strong>Where to enforce: before or after the load balancer?</strong> If you enforce after (at the application server), each server sees only a fraction of the client's traffic. A client sending 100 RPS across 10 servers appears to send only 10 RPS to each server. You must either centralize the counter (Redis) or enforce before the load balancer (at the API gateway/edge). The API gateway approach is simpler and more correct, but it means your gateway must handle the full request rate and becomes a scaling bottleneck.</p>
+
+      <h3>Rate Limiting + API Gateway</h3>
+      <p><strong>Centralized enforcement is the standard pattern.</strong> API gateways like Kong, AWS API Gateway, and Envoy have built-in rate limiting. This is where rate limiting naturally belongs — the gateway sees all traffic, can authenticate the client, and can enforce limits before requests reach backend services. The pitfall: if you have multiple API gateways (e.g., one per region), you are back to the distributed enforcement problem. Either share state across gateways or partition limits by region.</p>
+
+      <h3>Rate Limiting + Auto-Scaling</h3>
+      <p>Rate limiting and auto-scaling are complementary but can conflict. If your auto-scaler adds capacity in response to high traffic, but the rate limiter is rejecting that traffic, the auto-scaler may not see enough load to scale up — creating a deadlock where the system is under-provisioned but traffic is being rejected. Solution: scale based on incoming request rate (including rejected requests), not just processed requests.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <ul>
+          <li><strong>Redis memory for counters:</strong> Tiny. A sliding window counter requires ~100 bytes per key. Even with 1M unique clients and 10 endpoints each, that is only ~1 GB. A small Redis instance (e.g., AWS ElastiCache cache.r6g.large, ~$200/month) handles this easily with room to spare.</li>
+          <li><strong>Compute overhead:</strong> Negligible. A Redis round-trip adds 0.1-0.5ms to each request. The Lua script execution is sub-microsecond. At 10K RPS, rate limiting consumes less than 1% of a single CPU core.</li>
+          <li><strong>Network:</strong> Each rate limit check is a small Redis request (~100 bytes) and response (~50 bytes). At 10K RPS, that is ~1.5 MB/s — well within any network capacity.</li>
+          <li><strong>Dominant cost driver:</strong> The Redis instance, not the rate limiting logic itself. If you are already running Redis for caching or sessions, the marginal cost of adding rate limiting is essentially zero.</li>
+        </ul>
+        <h4>Cost of NOT Rate Limiting</h4>
+        <ul>
+          <li><strong>DDoS costs:</strong> Without rate limiting, a volumetric attack scales your cloud bill linearly. A sustained 100K RPS attack on a serverless function at $0.20 per million invocations costs $1,200/hour.</li>
+          <li><strong>Cascade failures:</strong> A single overloaded service can cascade to the entire system. The blast radius of an unprotected API is your entire infrastructure.</li>
+          <li><strong>Customer impact:</strong> Without per-tenant limits, one noisy tenant can degrade the experience for all tenants — causing churn that dwarfs any infrastructure cost.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Stripe API Rate Limiting</h3>
+      <p>Stripe enforces rate limits at 100 requests per second per API key in live mode and 25 per second in test mode. They use a token bucket algorithm and return <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>Retry-After</code> headers on every response. Stripe's approach is notable for its developer experience: clear documentation, generous burst allowance, and client libraries that automatically implement exponential backoff with jitter on 429 responses. They also offer the ability to request higher limits for specific use cases.</p>
+
+      <h3>GitHub API Limits</h3>
+      <p>GitHub's REST API allows 5,000 requests per hour for authenticated users and 60 per hour for unauthenticated requests. Their GraphQL API has a point-based system — each query has a cost based on its complexity, and users get 5,000 points per hour. This is a sophisticated form of variable-cost rate limiting: a simple query might cost 1 point, while a query that fetches 100 repositories with their issues and pull requests might cost 50 points. This prevents clients from using cheap requests to mask expensive operations.</p>
+
+      <h3>Cloudflare Rate Limiting at the Edge</h3>
+      <p>Cloudflare's rate limiting operates at the edge — in data centers distributed across 300+ cities worldwide. This means rate-limited requests never reach the origin server, saving both bandwidth and compute. Cloudflare uses a combination of fixed window and sliding window algorithms, with the ability to define rules based on URL patterns, HTTP methods, headers, and client IP. At their scale, they process millions of rate limiting decisions per second globally, using a distributed counting system that synchronizes across edge locations with eventual consistency — accepting that the effective limit may briefly exceed the configured limit by a small margin during synchronization delays.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example — Token Bucket</h2>
+      <p>A clean token bucket implementation in Python. The key insight is lazy refill: instead of a background timer adding tokens, we compute how many tokens should have been added since the last request.</p>
+<pre class="line-numbers"><code class="language-python">import time
+
+class TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate = rate          # tokens per second
+        self.capacity = capacity  # max tokens
+        self.tokens = capacity    # start full
+        self.last_refill = time.monotonic()
+
+    def _refill(self):
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        new_tokens = elapsed * self.rate
+        self.tokens = min(self.capacity, self.tokens + new_tokens)
+        self.last_refill = now
+
+    def allow(self, tokens=1):
+        self._refill()
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        return False
+
+    def retry_after(self):
+        """Seconds until a token is available."""
+        if self.tokens >= 1:
+            return 0.0
+        deficit = 1 - self.tokens
+        return deficit / self.rate
+
+# Usage
+limiter = TokenBucket(rate=10, capacity=20)  # 10 req/s, burst of 20
+
+for i in range(25):
+    if limiter.allow():
+        print(f"Request {i}: allowed")
+    else:
+        wait = limiter.retry_after()
+        print(f"Request {i}: rejected (retry after {wait:.2f}s)")</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Load Testing</h3>
+      <p>Use <strong>k6</strong> to simulate clients at varying request rates. Start below the rate limit and gradually increase. Verify that:</p>
+      <ul>
+        <li>Requests below the limit always succeed (0% rejection rate).</li>
+        <li>Requests above the limit are rejected with 429 (not 500 or timeout).</li>
+        <li>The actual rejection threshold matches the configured limit within 5%.</li>
+        <li><code>X-RateLimit-Remaining</code> headers decrement correctly.</li>
+        <li><code>Retry-After</code> values are accurate — retrying after the specified time succeeds.</li>
+      </ul>
+
+      <h3>Burst Behavior</h3>
+      <p>Test burst handling explicitly: let a client idle for 10 seconds, then send requests as fast as possible. The first N requests (up to burst capacity) should succeed. Requests beyond burst capacity should be rejected. Repeat to verify tokens refill correctly.</p>
+
+      <h3>Distributed Consistency</h3>
+      <p>Run multiple k6 instances simultaneously against the same API key, through different application servers. The total accepted requests should not significantly exceed the configured limit. A margin of 5-10% is acceptable for distributed systems; more than that indicates a synchronization problem.</p>
+
+      <h3>Chaos Testing</h3>
+      <ul>
+        <li><strong>Kill Redis:</strong> Verify the system fails open (or closed, per your policy). Measure the impact on latency and error rates.</li>
+        <li><strong>Add Redis latency (toxiproxy):</strong> Inject 50ms of latency to Redis. Verify the application still responds within its SLO. If not, consider local caching of rate limit decisions.</li>
+        <li><strong>Clock skew (Chaos Monkey):</strong> Skew the system clock on one application server by 5 seconds. Verify the rate limiter still enforces limits correctly (it should, if you are using Redis server time).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>Design a rate limiter for a multi-tenant API</summary>
+        <div class="answer">
+          <p>Start by clarifying requirements: how many tenants, what is the SLO, and whether tenants have different tiers (free vs. paid). The core design uses a centralized counter in Redis, keyed by <code>tenant_id:endpoint:window</code>. Use a sliding window counter algorithm implemented in a Lua script for atomicity.</p>
+          <p>The architecture has three layers: (1) An API gateway that authenticates the request and extracts the tenant ID. (2) A rate limiter middleware that checks Redis. (3) The application server. For different tiers, store the rate limit configuration per tenant in a database, and cache it in the gateway. Use <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>Retry-After</code> headers in every response.</p>
+          <p>The key tradeoff is where to enforce: at the gateway (simpler, sees all traffic) vs. at each service (finer-grained, per-endpoint limits). In practice, use both: coarse limits at the gateway, fine-grained limits at the service level.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How do you handle it when Redis is unavailable? (Fail-open vs. fail-closed.) How do you handle rate limiting across multiple regions?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Token bucket vs. sliding window — what are the tradeoffs?</summary>
+        <div class="answer">
+          <p><strong>Token bucket</strong> allows bursts (up to the bucket capacity), requires storing two values (token count and last refill time), and is simple to implement. It is ideal when you want to allow some burstiness — a mobile app that syncs on open, a batch job that sends 50 requests then idles.</p>
+          <p><strong>Sliding window counter</strong> provides smoother enforcement (no burst spikes), requires storing two counters (current and previous window), and has a slight approximation at window boundaries. It is better when you need a steady, predictable request rate — protecting a database that does not tolerate bursts.</p>
+          <p>In distributed systems, the sliding window counter is easier to implement correctly in Redis (two INCR operations with TTL) than the token bucket (which requires a compare-and-swap on the token count). GCRA is the best of both worlds — single-value storage, correct distributed behavior, and configurable burstiness.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> What about the fixed window boundary problem? How does the sliding window counter solve it? What is the approximation error?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How would you implement distributed rate limiting?</summary>
+        <div class="answer">
+          <p>The standard approach is Redis with Lua scripts. The Lua script atomically checks the current count, increments it, and sets the TTL — all in a single Redis command with no race conditions. For a sliding window counter, the script accesses two keys (current and previous window), computes the weighted count, and returns the decision.</p>
+          <p>The main challenge is Redis availability. Options: (1) Redis Sentinel for automatic failover (adds ~1s of unavailability during failover). (2) Redis Cluster for horizontal scaling (shards keys by client ID — no cross-shard operations needed). (3) Local fallback — if Redis is unavailable, use an in-memory token bucket with a conservative limit until Redis recovers.</p>
+          <p>For global deployments across regions, you have two options: (a) Global Redis with cross-region replication (correct but adds latency), or (b) partition the limit across regions (e.g., 3 regions each get 1/3 of the limit) and accept some inefficiency when traffic is unevenly distributed.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How do you handle the case where a Lua script takes too long? (Redis is single-threaded — a long script blocks all other operations.) What is your Redis sizing?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you handle rate limiting for WebSocket connections?</summary>
+        <div class="answer">
+          <p>WebSocket rate limiting is fundamentally different from HTTP rate limiting because a WebSocket connection is long-lived. You need to limit at two levels: (1) connection rate — how many new connections a client can open per time window, and (2) message rate — how many messages per second a client can send on an established connection.</p>
+          <p>For connection rate limiting, use the same approach as HTTP — a token bucket or sliding window at the connection handshake phase. For message rate limiting, use an in-process token bucket per connection (since messages flow through a specific server). If the client exceeds the message rate, you can either drop messages, send a rate limit notification message over the WebSocket, or close the connection.</p>
+          <p>The key design decision is whether to enforce server-side per connection (simple but requires coordination if clients reconnect to different servers) or per client ID across all connections (requires Redis, but correct if a client opens multiple connections).</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How do you handle broadcast messages vs. client-to-server messages? Should they have different limits?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design rate limiting that is fair across tenants of different sizes</summary>
+        <div class="answer">
+          <p>Static per-tenant limits are inherently unfair: giving every tenant 100 RPS penalizes large tenants who generate more revenue and underutilizes capacity when small tenants are idle. The solution is a hierarchical token bucket with weighted fair queuing.</p>
+          <p><strong>Design:</strong> (1) Assign each tenant a weight based on their tier (e.g., Enterprise = 10, Pro = 3, Free = 1). (2) Allocate a global token pool (e.g., 8,000 tokens/sec). (3) Each tenant's share is proportional to their weight relative to active tenants. If only one Enterprise tenant and one Free tenant are active, they get 10/11 and 1/11 of the capacity. (4) Unused capacity is redistributed — if the Enterprise tenant is idle, the Free tenant can use more than their base allocation.</p>
+          <p>Implementation: use Redis sorted sets to track active tenants and their weights. Compute each tenant's effective limit dynamically (e.g., every 10 seconds). Update the per-tenant token bucket rates. This is the approach used by cloud providers like AWS for API Gateway throttling with usage plans.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How do you handle the cold-start problem — a new tenant joins and suddenly all existing tenants' limits decrease? How do you prevent a malicious tenant from inflating their weight?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>A service is returning 429s but Redis shows the client is under the limit. How do you debug this?</summary>
+        <div class="answer">
+          <p>This is a classic distributed systems debugging problem. Work through the possible causes systematically:</p>
+          <p><strong>1. Check which layer is rejecting.</strong> Is it the API gateway, the application, or a downstream service? Check logs and response headers at each layer. The 429 might not be from your rate limiter at all — a third-party API or database connection pool might be returning 429.</p>
+          <p><strong>2. Check key mismatch.</strong> The rate limiter might be using a different key than what you are checking in Redis. Common mistakes: the client IP changed (NAT, proxy), the API key was regenerated, or the rate limiter is keying on a different identifier (e.g., user ID vs. API key).</p>
+          <p><strong>3. Check clock skew.</strong> If the rate limiter uses wall-clock time for window boundaries and the application server clock is ahead of Redis, requests may be counted in a different window than expected.</p>
+          <p><strong>4. Check for cached 429s.</strong> A CDN or reverse proxy might be serving a cached 429 response. Check the <code>Age</code> and <code>X-Cache</code> headers.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How would you add observability to prevent this from happening again? What rate limit headers would help the client self-diagnose?</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>Rate limiting is a safety mechanism, not a performance optimization.</strong> It protects your system from overload, abuse, and unfairness. Every public API should have it.</li>
+        <li><strong>The token bucket algorithm</strong> is the most common approach. It is simple, allows bursts, and has well-understood behavior. GCRA is a modern equivalent that is easier to implement in distributed systems.</li>
+        <li><strong>In distributed systems, centralize the counter</strong> — typically in Redis with Lua scripts for atomicity. Local counters lead to the limit being multiplied by the number of nodes.</li>
+        <li><strong>Set limits based on measured capacity, not guesses.</strong> Load test to find your p99 capacity, set the limit at 80%, and size burst capacity at 2-3x the per-second rate.</li>
+        <li><strong>Never cache 429 responses.</strong> Always set <code>Cache-Control: no-store</code> on rate-limited responses.</li>
+        <li><strong>Include rate limit headers in every response</strong> — <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Limit</code>, and <code>Retry-After</code> on 429s. Well-behaved clients use these to self-throttle.</li>
+        <li><strong>Decide your fail-open/fail-closed policy</strong> before Redis goes down. For most APIs, fail-open is better than a total outage.</li>
+        <li><strong>Use layered rate limiting at scale:</strong> edge (DDoS), gateway (per-tenant), service (per-endpoint). Each layer protects against different failure modes.</li>
+        <li><strong>Adaptive rate limiting</strong> (adjusting limits based on system health) is the modern best practice, but static limits are a perfectly good starting point.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <p>Continue exploring related topics:</p>
+      <ul>
+        <li><a href="api-gateway.html">API Gateway</a> — Where rate limiting is typically enforced in production architectures.</li>
+        <li><a href="load-balancing.html">Load Balancing</a> — How traffic distribution interacts with rate limiting enforcement.</li>
+        <li><a href="caching.html">Caching</a> — Why cached 429 responses are dangerous, and how caching reduces the need for rate limiting by absorbing read traffic.</li>
+        <li><a href="message-queues.html">Message Queues</a> — An alternative to rate limiting for managing overload: queue requests instead of rejecting them.</li>
+        <li><a href="circuit-breakers.html">Circuit Breakers</a> — A complementary pattern that protects against downstream failures, while rate limiting protects against upstream overload.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="cdn.html" class="prev">CDN</a>
+      <a href="api-gateway.html" class="next">API Gateway</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+  // ===== Token Bucket Animation =====
+  (function() {
+    const canvas = document.getElementById('tokenBucketCanvas');
+    if (!canvas) return;
+
+    // State
+    const BUCKET_CAPACITY = 8;
+    const REFILL_RATE = 1.5;       // tokens per second
+    const REQUEST_INTERVAL = 0.6;  // seconds between requests
+
+    let tokens = BUCKET_CAPACITY;
+    let tokenPositions = [];       // {x, y, opacity} for each token in bucket
+    let requests = [];             // {x, y, status, opacity, label}
+    let lastRefillTime = 0;
+    let lastRequestTime = 0;
+    let statusMessages = [];       // {text, color, y, opacity, time}
+
+    function resetState() {
+      tokens = BUCKET_CAPACITY;
+      tokenPositions = [];
+      requests = [];
+      statusMessages = [];
+      lastRefillTime = 0;
+      lastRequestTime = 0;
+    }
+
+    resetState();
+
+    function drawTokenBucket(ctx, time, w, h) {
+      const bucketX = w * 0.5;
+      const bucketY = h * 0.45;
+      const bucketW = 120;
+      const bucketH = 160;
+      const tokenRadius = 12;
+
+      // Title
+      drawLabel(ctx, w * 0.5, 20, 'Token Bucket Rate Limiter', { fontSize: 16, bold: true, color: '#1e293b' });
+
+      // --- Refill tokens ---
+      if (time - lastRefillTime > 1.0 / REFILL_RATE) {
+        if (tokens < BUCKET_CAPACITY) {
+          tokens = Math.min(BUCKET_CAPACITY, tokens + 1);
+        }
+        lastRefillTime = time;
+      }
+
+      // --- Generate requests ---
+      if (time - lastRequestTime > REQUEST_INTERVAL) {
+        const accepted = tokens >= 1;
+        if (accepted) tokens--;
+
+        requests.push({
+          startTime: time,
+          accepted: accepted,
+          phase: 'arriving',  // arriving -> checking -> result
+        });
+        lastRequestTime = time;
+      }
+
+      // --- Draw refill pipe ---
+      const pipeX = bucketX;
+      const pipeTopY = bucketY - bucketH / 2 - 50;
+      ctx.save();
+      ctx.strokeStyle = '#0891b2';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(pipeX, pipeTopY);
+      ctx.lineTo(pipeX, bucketY - bucketH / 2 + 5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      drawLabel(ctx, pipeX, pipeTopY - 15, 'Token Refill', { fontSize: 11, bold: true, color: '#0891b2' });
+      drawLabel(ctx, pipeX, pipeTopY - 2, `(${REFILL_RATE} tokens/sec)`, { fontSize: 10, color: '#64748b' });
+
+      // Animated refill dot
+      const refillProgress = ((time * REFILL_RATE) % 1);
+      if (tokens < BUCKET_CAPACITY) {
+        const dotY = pipeTopY + (bucketY - bucketH / 2 - pipeTopY) * refillProgress;
+        ctx.save();
+        ctx.fillStyle = '#0891b2';
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        ctx.arc(pipeX, dotY, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // --- Draw bucket ---
+      const bLeft = bucketX - bucketW / 2;
+      const bTop = bucketY - bucketH / 2;
+
+      // Bucket body (trapezoid)
+      ctx.save();
+      ctx.fillStyle = '#f0f9ff';
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(bLeft + 10, bTop);
+      ctx.lineTo(bLeft + bucketW - 10, bTop);
+      ctx.lineTo(bLeft + bucketW, bTop + bucketH);
+      ctx.lineTo(bLeft, bTop + bucketH);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+
+      // --- Draw tokens inside bucket ---
+      const cols = 4;
+      const rows = Math.ceil(BUCKET_CAPACITY / cols);
+      const startY = bTop + bucketH - tokenRadius - 10;
+
+      for (let i = 0; i < Math.floor(tokens); i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const tx = bLeft + 25 + col * (tokenRadius * 2 + 4);
+        const ty = startY - row * (tokenRadius * 2 + 4);
+
+        ctx.save();
+        ctx.fillStyle = '#2563eb';
+        ctx.beginPath();
+        ctx.arc(tx, ty, tokenRadius, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Shine
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.beginPath();
+        ctx.arc(tx - 3, ty - 3, tokenRadius * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Token count label
+      drawLabel(ctx, bucketX, bTop + bucketH + 15, `Tokens: ${Math.floor(tokens)} / ${BUCKET_CAPACITY}`, {
+        fontSize: 13, bold: true, color: '#1e293b'
+      });
+
+      // Capacity label
+      drawLabel(ctx, bucketX, bTop + bucketH + 32, `Capacity: ${BUCKET_CAPACITY}`, {
+        fontSize: 11, color: '#64748b'
+      });
+
+      // --- Draw requests ---
+      const requestStartX = w * 0.08;
+      const requestCheckX = bucketX - bucketW / 2 - 40;
+      const acceptedEndX = w * 0.92;
+      const rejectedEndY = h - 30;
+
+      // Labels
+      drawLabel(ctx, requestStartX, h * 0.25 - 25, 'Incoming', { fontSize: 11, bold: true, color: '#64748b' });
+      drawLabel(ctx, requestStartX, h * 0.25 - 12, 'Requests', { fontSize: 11, bold: true, color: '#64748b' });
+      drawLabel(ctx, acceptedEndX, h * 0.25 - 25, 'Accepted', { fontSize: 11, bold: true, color: '#16a34a' });
+      drawLabel(ctx, acceptedEndX, h * 0.25 - 12, '(200 OK)', { fontSize: 10, color: '#16a34a' });
+
+      // Draw arrow guides
+      ctx.save();
+      ctx.strokeStyle = '#e2e8f0';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(requestStartX + 20, h * 0.35);
+      ctx.lineTo(requestCheckX - 5, h * 0.35);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(bucketX + bucketW / 2 + 40, h * 0.35);
+      ctx.lineTo(acceptedEndX - 20, h * 0.35);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // Process and draw requests
+      const requestsToKeep = [];
+      for (const req of requests) {
+        const age = time - req.startTime;
+        const speed = 1.2;
+
+        if (age < speed) {
+          // Arriving phase - moving toward bucket
+          const progress = age / speed;
+          const x = requestStartX + 20 + (requestCheckX - requestStartX - 25) * ease.out(progress);
+          const y = h * 0.35;
+          ctx.save();
+          ctx.fillStyle = '#2563eb';
+          ctx.beginPath();
+          ctx.arc(x, y, 8, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 0.3;
+          ctx.beginPath();
+          ctx.arc(x, y, 14, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          requestsToKeep.push(req);
+        } else if (age < speed * 2.5) {
+          // Result phase
+          const resultProgress = (age - speed) / (speed * 1.5);
+          if (req.accepted) {
+            // Move right (accepted)
+            const x = requestCheckX + (acceptedEndX - 20 - requestCheckX) * ease.out(resultProgress);
+            const y = h * 0.35;
+            ctx.save();
+            ctx.fillStyle = '#16a34a';
+            ctx.beginPath();
+            ctx.arc(x, y, 8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = 0.3;
+            ctx.beginPath();
+            ctx.arc(x, y, 14, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            if (resultProgress < 0.4) {
+              drawStatusBadge(ctx, requestCheckX + 30, h * 0.35 - 25, 'ALLOWED', 'success');
+            }
+          } else {
+            // Move down and fade (rejected)
+            const x = requestCheckX;
+            const startRY = h * 0.35;
+            const y = startRY + 80 * ease.out(resultProgress);
+            const alpha = 1 - resultProgress * 0.8;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = '#dc2626';
+            ctx.beginPath();
+            ctx.arc(x, y, 8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = alpha * 0.3;
+            ctx.beginPath();
+            ctx.arc(x, y, 14, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            if (resultProgress < 0.5) {
+              drawStatusBadge(ctx, requestCheckX + 35, h * 0.35 - 25, '429 REJECTED', 'danger');
+            }
+          }
+          requestsToKeep.push(req);
+        }
+        // else: request animation is done, discard
+      }
+      requests = requestsToKeep;
+    }
+
+    const anim = createAnimation(canvas, drawTokenBucket, { height: 380 });
+    setupControls(document.getElementById('token-bucket-animation'), anim);
+
+    // Override reset to clear state
+    const originalReset = anim.reset;
+    anim.reset = function() {
+      resetState();
+      originalReset.call(anim);
+    };
+  })();
+  </script>
+
+</body>
+</html>

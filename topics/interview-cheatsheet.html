@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interview Quick Reference — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Topics</a></li>
+        <li><a href="design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Interview Quick Reference</h1>
+      <p class="hero-subtitle">Exhaustive clarification checklist + concise design tradeoff comparisons. One page to scan before any system design interview.</p>
+      <span class="hero-meta">15 min read</span>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 1: Clarifications Checklist                          -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="clarifications">
+    <div class="container">
+      <h2>Clarifications to Seek</h2>
+      <p>Before drawing a single box, pin down these dimensions. Each one eliminates entire categories of design choices.</p>
+
+      <!-- Traffic & Scale -->
+      <div>
+        <h3>Traffic &amp; Scale</h3>
+        <ul>
+          <li><strong>QPS (Queries Per Second):</strong> Average and peak? Peak-to-average ratio? (typically 3&ndash;10x)</li>
+          <li><strong>Data size:</strong> Total storage now and growth rate? Does it fit one machine?</li>
+          <li><strong>Read/write ratio:</strong> 100:1 read-heavy (caching/replicas) or 1:1 write-heavy (sharding/queues)?</li>
+          <li><strong>User count:</strong> DAU (Daily Active Users) vs total? Concurrent sessions?</li>
+          <li><strong>Object size:</strong> Average payload size? Affects bandwidth, storage tier, and caching decisions.</li>
+          <li><strong>Data growth:</strong> How much new data per day/month? When do you hit the next capacity cliff?</li>
+        </ul>
+      </div>
+
+      <!-- Latency & Performance -->
+      <div>
+        <h3>Latency &amp; Performance</h3>
+        <ul>
+          <li><strong>Latency SLO (Service Level Objective):</strong> p50 vs p99 target? &lt;50ms interactive, &lt;500ms background, &lt;5s batch.</li>
+          <li><strong>Throughput target:</strong> Sustained vs burst? How long do bursts last?</li>
+          <li><strong>Real-time requirement:</strong> Is &lt;100ms delivery needed (WebSocket / SSE &mdash; Server-Sent Events) or is polling acceptable?</li>
+          <li><strong>Latency budget breakdown:</strong> If end-to-end is 200ms across 5 services, each gets ~35ms after network overhead.</li>
+        </ul>
+      </div>
+
+      <!-- Consistency & Correctness -->
+      <div>
+        <h3>Consistency &amp; Correctness</h3>
+        <ul>
+          <li><strong>Staleness tolerance:</strong> Can reads be stale? For how long? 300ms stale likes = fine; stale bank balance = catastrophic.</li>
+          <li><strong>Business cost of staleness:</strong> Quantify in dollars &mdash; $0 for social likes, $2M/day for double-charges.</li>
+          <li><strong>Exactly-once semantics:</strong> Is duplicate processing acceptable? (notifications yes, payments no)</li>
+          <li><strong>Ordering guarantee:</strong> Global order? Per-user? Per-conversation? Per-entity?</li>
+          <li><strong>Conflict resolution:</strong> Last-write-wins? CRDTs (Conflict-free Replicated Data Types &mdash; data structures like counters and sets that automatically merge concurrent updates without coordination)? Application-level merge?</li>
+        </ul>
+      </div>
+
+      <!-- Availability & Durability -->
+      <div>
+        <h3>Availability &amp; Durability</h3>
+        <ul>
+          <li><strong>Availability target:</strong> 99.9% (8.7h/yr), 99.99% (52min/yr), 99.999% (5min/yr)? Each 9 costs ~10x.</li>
+          <li><strong>RPO (Recovery Point Objective):</strong> How much data can you lose, measured in time. RPO=0 &rarr; synchronous replication (zero loss). RPO=5min &rarr; async replication is fine. Financial: 0. Social: minutes.</li>
+          <li><strong>RTO (Recovery Time Objective):</strong> How fast must the system be back online after failure. RTO=30s &rarr; automated failover, leader election, pre-provisioned standbys. RTO=1h &rarr; manual failover, cold standby acceptable.</li>
+          <li><strong>Multi-region:</strong> Required for disaster recovery (DR)? If so: active-active (both regions serve traffic) or active-passive (standby region takes over on failure)?</li>
+          <li><strong>Failure modes:</strong> What can go wrong and how often? Shapes retry, idempotency, and replication factor.</li>
+        </ul>
+      </div>
+
+      <!-- Access Patterns -->
+      <div>
+        <h3>Access Patterns</h3>
+        <ul>
+          <li><strong>Hot spots:</strong> Uniform distribution or Zipfian/power-law? (celebrity followers, viral content, flash sales)</li>
+          <li><strong>Query patterns:</strong> Point lookups vs range scans vs full-text search vs aggregations?</li>
+          <li><strong>Temporal patterns:</strong> Time-of-day spikes? Seasonal? Predictable or sudden?</li>
+          <li><strong>Fan-out factor:</strong> One write triggers how many reads/notifications? (1 celebrity post &rarr; 10M deliveries)</li>
+          <li><strong>Access recency:</strong> Do users access recent data mostly, or uniformly across history?</li>
+        </ul>
+      </div>
+
+      <!-- Operational Context -->
+      <div>
+        <h3>Operational Context</h3>
+        <ul>
+          <li><strong>Team size:</strong> &lt;20 engineers &rarr; monolith; &gt;50 &rarr; microservices (Conway's Law).</li>
+          <li><strong>Budget:</strong> Cost ceiling? Optimize for cost vs latency vs simplicity?</li>
+          <li><strong>Existing infra:</strong> What's already in place? Cloud provider constraints?</li>
+          <li><strong>Compliance:</strong> Data residency? Encryption at rest? Audit logs? Retention period?</li>
+          <li><strong>What does "failure" look like?</strong> 503 error page vs degraded results vs queued-for-later?</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 2: Data Layer Tradeoffs                              -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="data-layer">
+    <div class="container">
+      <h2>Data Layer Tradeoffs</h2>
+
+      <!-- SQL vs NoSQL -->
+      <div>
+        <h3>SQL vs NoSQL</h3>
+        <p><strong>SQL</strong> when you need ACID (Atomicity, Consistency, Isolation, Durability) transactions, complex joins, and strong consistency (banking, e-commerce orders). <strong>NoSQL</strong> when you need horizontal write scalability (&gt;50K writes/sec &mdash; PostgreSQL's ceiling), flexible schemas, or simple key-value access at massive scale. Many systems use both: SQL for transactional core, NoSQL for read-heavy denormalized views.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Criterion</th><th>SQL</th><th>NoSQL</th></tr></thead>
+          <tbody>
+            <tr><td>Complex joins</td><td>Native (1&ndash;5ms)</td><td>No joins &mdash; must denormalize (see below)</td></tr>
+            <tr><td>ACID transactions</td><td>Native multi-record (<code>BEGIN; UPDATE A; UPDATE B; COMMIT;</code>)</td><td>Single-document atomic only. Cross-record needs workarounds: Saga (compensating actions, not truly atomic) or CRDTs (merge-friendly structures, limited to counters/sets)</td></tr>
+            <tr><td>Horizontal write scale</td><td>Sharding works but painful (see below)</td><td>Built-in (DynamoDB partitions, Cassandra vnodes)</td></tr>
+            <tr><td>Write throughput ceiling</td><td>~50K inserts/sec single node</td><td>1M+ writes/sec (Cassandra LSM &mdash; Log-Structured Merge-tree, optimized for sequential writes)</td></tr>
+            <tr><td>Schema flexibility</td><td>Rigid, migrations required</td><td>Schema-on-read, flexible</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Denormalization explained -->
+      <div>
+        <h4>What "must denormalize" means</h4>
+        <p>In SQL, data is <strong>normalized</strong>: split across tables, joined at query time. NoSQL has no joins, so you <strong>denormalize</strong> &mdash; pre-flatten data by storing redundant copies together. Example: instead of joining <code>users</code> + <code>orders</code> + <code>products</code>, store one document with all fields embedded. Reads are fast (one lookup), but writes must update every copy &mdash; miss one and data goes stale.</p>
+      </div>
+
+      <!-- SQL sharding complexity explained -->
+      <div>
+        <h4>Why SQL sharding is painful</h4>
+        <p>NoSQL databases are distributed from the start &mdash; sharding is built into the storage engine. SQL databases bolt it on, which introduces several challenges:</p>
+        <ul>
+          <li><strong>Cross-shard queries:</strong> A query touching data on multiple shards requires scatter-gather &mdash; send query to all shards, merge results. Latency = slowest shard.</li>
+          <li><strong>Cross-shard transactions:</strong> ACID doesn't span shards natively. Need 2PC (Two-Phase Commit &mdash; coordinator asks all shards to prepare, then commit; adds latency, holds locks) or Saga patterns (adds compensating logic).</li>
+          <li><strong>Shard key is permanent:</strong> The column you shard by (user_id, order_id, etc.) determines which queries are fast (local to one shard) and which are slow (scatter-gather). Changing the shard key later means migrating all data &mdash; effectively rebuilding the database.</li>
+          <li><strong>Resharding is painful:</strong> When shards outgrow capacity, you must split them. With naive <code>hash % N</code>, changing N remaps nearly every key &mdash; massive data migration. Mitigation: use virtual shards (256 logical &rarr; N physical) so resharding only moves a fraction. But this must be planned upfront; retrofitting is much harder.</li>
+          <li><strong>Operational overhead:</strong> N independent databases to monitor, back up, upgrade, and failover instead of one.</li>
+        </ul>
+      </div>
+
+      <!-- Sharding vs Replication -->
+      <div>
+        <h3>Sharding vs Replication</h3>
+        <p><strong>Replication</strong> multiplies read capacity and availability &mdash; same data on multiple nodes, survives failures. <strong>Sharding</strong> splits data across nodes for write scalability and storage capacity. Ask: "Is my bottleneck read throughput / availability (&rarr; replicate) or write throughput / data size (&rarr; shard)?" Most production systems do both: shard for write scale, replicate each shard for durability.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Dimension</th><th>Replication</th><th>Sharding</th></tr></thead>
+          <tbody>
+            <tr><td>Solves</td><td>Read throughput, availability, geo-latency</td><td>Write throughput, storage capacity</td></tr>
+            <tr><td>Data duplication</td><td>Full copy on each replica</td><td>Each shard holds a subset</td></tr>
+            <tr><td>Write path</td><td>Write amplification (every replica)</td><td>Single shard per write (by key)</td></tr>
+            <tr><td>Failure impact</td><td>Other replicas serve reads</td><td>One shard's data unavailable</td></tr>
+            <tr><td>Complexity</td><td>Consistency model (async/sync/semi-sync)</td><td>Shard key choice, cross-shard queries, resharding</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Strong vs Eventual Consistency -->
+      <div>
+        <h3>Strong vs Eventual Consistency</h3>
+        <p>Strong (linearizable) guarantees everyone sees the latest write &mdash; required when staleness has measurable business cost (double-charges, overselling). Eventual is faster and more available but allows stale reads. Middle ground: <strong>read-your-writes</strong> for shopping carts and user profiles.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Model</th><th>Latency</th><th>Availability</th><th>Use Case</th></tr></thead>
+          <tbody>
+            <tr><td>Linearizable</td><td>10&ndash;50ms (cross-region Raft)</td><td>Rejects writes during partition</td><td>Banking, inventory</td></tr>
+            <tr><td>Read-your-writes</td><td>1&ndash;10ms (sticky sessions)</td><td>High</td><td>Shopping cart, user profile</td></tr>
+            <tr><td>Eventual</td><td>&lt;1ms added</td><td>Highest (serves during partitions)</td><td>Social likes, view counts</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Replication Modes -->
+      <div>
+        <h3>Replication Modes</h3>
+        <p>The sync/async choice determines the write latency vs durability tradeoff.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Mode</th><th>Write Latency Added</th><th>Durability</th><th>When to Use</th></tr></thead>
+          <tbody>
+            <tr><td>Async</td><td>&lt;1ms</td><td>Data loss risk on failure</td><td>Content, analytics, product catalog</td></tr>
+            <tr><td>Semi-sync</td><td>1&ndash;10ms</td><td>Durable to 1 replica</td><td>Financial ledgers, RPO &lt;1s</td></tr>
+            <tr><td>Sync (Raft/Paxos)</td><td>10&ndash;50ms per region</td><td>Zero data loss</td><td>High-assurance systems</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Shard Key Selection -->
+      <div>
+        <h3>Shard Key Selection</h3>
+        <p>The shard key determines which queries are local (fast) and which require scatter-gather (slow). Pick the key that matches your dominant access pattern.</p>
+        <ul>
+          <li><strong>By user_id:</strong> Per-user queries are local. Risk: power-law users (celebrities) create hot shards.</li>
+          <li><strong>By entity_id:</strong> Uniform distribution. Risk: user-scoped queries require scatter-gather across all shards.</li>
+          <li><strong>By time:</strong> Range scans by time are fast. Risk: recent shard gets all writes (hot shard).</li>
+          <li><strong>Compound key (user + time):</strong> Per-user time-range queries are local. Best of both when access pattern fits.</li>
+        </ul>
+        <p><strong>Resharding rule:</strong> Use virtual shards (e.g., 256 logical &rarr; N physical) so resharding moves a fraction of data instead of rehashing everything. Never use <code>hash % N</code> directly.</p>
+      </div>
+
+      <!-- Consistent Hashing -->
+      <div>
+        <h3>Consistent Hashing</h3>
+        <p>Maps keys to nodes on a ring so that adding/removing a node only moves ~1/N of keys (vs <code>hash % N</code> which remaps nearly everything). Use virtual nodes (100&ndash;400 per physical node) to reduce load imbalance from ~3.6x to &lt;5%. Memory overhead is negligible (~32 bytes per vnode).</p>
+        <p><strong>Where it's used</strong> &mdash; anywhere you have N nodes that can change (scale up, crash, deploy) and want to minimize disruption:</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Use Case</th><th>Key</th><th>Node</th><th>Why Consistent Hashing</th></tr></thead>
+          <tbody>
+            <tr><td>Distributed cache</td><td>Cache key</td><td>Cache server</td><td>Node crash only invalidates ~1/N keys, not all</td></tr>
+            <tr><td>Database sharding</td><td>Shard key (user_id)</td><td>Shard</td><td>Add a shard &rarr; move ~1/N of data, not reshuffle everything</td></tr>
+            <tr><td>Load balancing (sticky)</td><td>Client IP / session ID</td><td>Backend server</td><td>Same client hits same server (session affinity), minimal disruption on scale-out</td></tr>
+            <tr><td>CDN</td><td>URL / content hash</td><td>Edge server</td><td>Content stays on same edge unless topology changes</td></tr>
+            <tr><td>DHT &mdash; Distributed Hash Table (Chord, DynamoDB)</td><td>Data key</td><td>Storage node</td><td>Peer-to-peer key routing with O(log N) hops</td></tr>
+            <tr><td>Queue partitioning (Kafka)</td><td>Partition key</td><td>Broker</td><td>Broker add only moves ~1/N partitions</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 3: Communication Patterns                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="communication">
+    <div class="container">
+      <h2>Communication Patterns</h2>
+
+      <!-- Sync vs Async -->
+      <div>
+        <h3>Sync vs Async Communication</h3>
+        <p><strong>Sync</strong> when the user is waiting for the result and it must succeed before responding (payment, inventory check). <strong>Async</strong> when the operation can happen later or the caller doesn't need the result (notifications, analytics). Rule: "Is the user staring at a spinner?" Yes &rarr; sync. No &rarr; queue it. Async decouples services: if downstream is slow/down, requests queue instead of cascading.</p>
+      </div>
+
+      <!-- Push vs Pull -->
+      <div>
+        <h3>Push vs Pull</h3>
+        <p><strong>Push</strong> gives low latency but write-amplification scales with subscriber count (one celebrity post = millions of writes). <strong>Pull</strong> is simpler but adds polling latency and wastes bandwidth when nothing changed. <strong>Hybrid</strong> is common: push for normal users (&lt;5K followers), pull for celebrities (millions). Decision variable: <code>updates/sec &times; subscribers_per_update</code>.</p>
+      </div>
+
+      <!-- WebSocket vs Polling vs SSE -->
+      <div>
+        <h3>WebSocket vs Polling vs SSE</h3>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Method</th><th>Latency</th><th>Direction</th><th>Best For</th></tr></thead>
+          <tbody>
+            <tr><td>Polling</td><td>= poll interval</td><td>Client &rarr; Server</td><td>Dashboards updating every 30s</td></tr>
+            <tr><td>Long polling</td><td>Low (held connection)</td><td>Server &rarr; Client</td><td>Infrequent updates, simple servers</td></tr>
+            <tr><td>SSE</td><td>Low, auto-reconnects</td><td>Server &rarr; Client</td><td>One-way streams: live scores, notifications</td></tr>
+            <tr><td>WebSocket</td><td>Lowest, full-duplex</td><td>Both</td><td>Chat, collaboration, gaming (~15&ndash;250KB/conn)</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Rate Limiting vs Queues -->
+      <div>
+        <h3>Rate Limiting vs Queues</h3>
+        <p><strong>Rate limiting rejects</strong> excess traffic (429) &mdash; protects services from overload, enforces tenant fairness. <strong>Queues absorb</strong> excess traffic and process it later &mdash; smooths bursts, enables async processing. Use rate limiting at the API gateway for external traffic. Use queues internally when work can be deferred. They often work together: rate limit at the edge, queue behind the limit.</p>
+      </div>
+
+      <!-- Rate Limiting Algorithms -->
+      <div>
+        <h3>Rate Limiting Algorithms</h3>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Algorithm</th><th>Burst Handling</th><th>Accuracy</th><th>When to Use</th></tr></thead>
+          <tbody>
+            <tr><td>Token bucket</td><td>Allows burst up to bucket size</td><td>Good</td><td>Most common. Burst = capacity, sustained = refill rate</td></tr>
+            <tr><td>Sliding window</td><td>Smooth, no boundary spike</td><td>Best</td><td>When fixed-window boundary burst is unacceptable</td></tr>
+            <tr><td>Fixed window</td><td>2x burst at boundary</td><td>Approximate</td><td>Simplest. Fine for non-critical use</td></tr>
+            <tr><td>Leaky bucket</td><td>None (constant drain)</td><td>Good</td><td>APIs needing constant throughput, smooth output</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p><strong>Sizing rule:</strong> Set rate limit at 80% of capacity at SLO latency. Burst = 2&ndash;3x sustained rate.</p>
+      </div>
+
+      <!-- Message Queue Patterns -->
+      <div>
+        <h3>Message Queue Patterns</h3>
+        <ul>
+          <li><strong>Utilization sweet spot:</strong> 60&ndash;70%. Above 70%, tail latency amplifies non-linearly (M/M/c queuing). At 90%, response time is ~5&ndash;10x baseline.</li>
+          <li><strong>At-least-once + idempotency = exactly-once.</strong> Use idempotency keys for payment/financial systems.</li>
+          <li><strong>Ordering:</strong> Partition by the entity that needs ordering (conversation_id for chat, not user_id). Ordering within partition is guaranteed; cross-partition is not.</li>
+          <li><strong>Dead letter queue (DLQ):</strong> Route permanently failing messages (corrupt data, missing fields) to a separate queue after N retries. Prevents infinite retry loops. Engineers inspect the DLQ manually or with alerting.</li>
+          <li><strong>Backpressure:</strong> When consumers can't keep up &mdash; slow producers (backpressure) or drop oldest data (lossy buffer). Choice depends on data importance.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 4: Infrastructure Components                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="infrastructure">
+    <div class="container">
+      <h2>Infrastructure Components</h2>
+
+      <!-- Load Balancing Algorithms -->
+      <div>
+        <h3>Load Balancing</h3>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Algorithm</th><th>Best For</th><th>Weakness</th></tr></thead>
+          <tbody>
+            <tr><td>Round-robin</td><td>Identical servers, uniform request cost</td><td>Breaks with variable-cost requests or heterogeneous servers</td></tr>
+            <tr><td>Least-connections</td><td>Variable-latency backends</td><td>Slightly more state to track</td></tr>
+            <tr><td>Weighted</td><td>Heterogeneous fleets, canary deploys</td><td>Weights must be maintained</td></tr>
+            <tr><td>Consistent hashing</td><td>Caching layers, stateful services</td><td>Hot keys still hit one node</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- L4 vs L7 -->
+      <div>
+        <h3>L4 vs L7 Load Balancing</h3>
+        <p><strong>L4 (TCP/UDP)</strong> routes by IP+port. Fast (~0.1ms overhead), stateless, handles any protocol including WebSockets. Use when you don't need to inspect content. <strong>L7 (HTTP)</strong> routes by URL path, headers, cookies. Slower (1&ndash;5ms) but enables content-based routing, A/B testing, auth at the edge. Use when different endpoints need different backends.</p>
+      </div>
+
+      <!-- Caching Strategies -->
+      <div>
+        <h3>Caching Strategies</h3>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Strategy</th><th>How It Works</th><th>Best For</th></tr></thead>
+          <tbody>
+            <tr><td>Cache-aside</td><td>App checks cache; on miss reads DB and populates</td><td>Read-heavy (95:5), infrequent updates</td></tr>
+            <tr><td>Write-through</td><td>Every write goes to cache + DB together</td><td>Reads &asymp; writes, cache freshness critical (sessions)</td></tr>
+            <tr><td>Write-behind</td><td>Write to cache, async flush to DB</td><td>Write-heavy + acceptable data loss (counters)</td></tr>
+            <tr><td>Read-through</td><td>Cache itself fetches from DB on miss</td><td>Simplifies app code; needs cache-aware infra</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p><strong>TTL (Time To Live) tradeoff:</strong> Longer TTL = higher hit rate + staler data. Product catalog: 5min fine. Payment state: &lt;1sec. Immutable assets: TTL=1yr with filename hash for cache-busting.</p>
+        <p><strong>Cache sizing:</strong> For Zipfian workloads, cache &radic;N items as lower bound. Hit rate has diminishing returns. Derive required hit rate from SLO: if cache hit = 1.5ms but miss = 45ms (DB lookup), and your p99 SLO is 20ms, then every miss (45ms) violates the SLO. Since p99 allows at most 1% of requests to exceed 20ms, at most 1% can be misses &rarr; need &ge;99% hit rate.</p>
+        <p><strong>Cache warmup</strong> &mdash; pre-populate cache before it takes traffic (avoids cold-start 100% miss rate hitting DB):</p>
+        <ul>
+          <li><strong>Startup script:</strong> On deploy/restart, query DB for most popular keys and SET them in cache before accepting traffic.</li>
+          <li><strong>Shadow traffic:</strong> Route a copy of production reads to the new cache node before adding it to the ring. It warms up without serving real users.</li>
+          <li><strong>Replicate from peer:</strong> Copy hot keys from a healthy cache node (Redis <code>MIGRATE</code> or snapshot restore).</li>
+        </ul>
+        <p><strong>Gradual invalidation</strong> &mdash; avoid expiring all keys at once (thundering herd on DB):</p>
+        <ul>
+          <li><strong>Jittered TTL:</strong> <code>TTL = base &plusmn; random(0, spread)</code>. Base=5min, spread=30s &rarr; keys expire between 4:30&ndash;5:30 instead of all at 5:00. Spreads DB load evenly.</li>
+          <li><strong>Probabilistic early refresh:</strong> On each read, with small probability (e.g., 0.1%), refresh the key <em>before</em> it expires. Prevents synchronized expiry &mdash; by the time TTL hits, the key is already refreshed.</li>
+          <li><strong>Stale-while-revalidate:</strong> Serve the stale value immediately, fetch fresh value in background. User gets fast response, cache gets updated, DB never sees a spike.</li>
+        </ul>
+      </div>
+
+      <!-- CDN -->
+      <div>
+        <h3>CDN</h3>
+        <p>Edge caches static/semi-dynamic content close to users. Target &gt;95% hit rate for static, 60&ndash;80% for semi-dynamic. Below 50% hit rate, CDN adds latency without benefit &mdash; remove it. Use <code>stale-while-revalidate</code> for grace periods. For sub-100ms dynamic content, consider edge compute (workers + edge KV).</p>
+      </div>
+
+      <!-- API Gateway -->
+      <div>
+        <h3>API Gateway</h3>
+        <p>Central entry point handling TLS termination (1&ndash;3ms), auth (0.1&ndash;20ms &mdash; cache tokens!), rate limiting (0.5&ndash;2ms), routing + transforms (0.1&ndash;1ms). Total overhead: 2&ndash;5ms well-tuned. Account for fanout: <code>Backend RPS = Client RPS &times; Average Fanout Ratio</code>.</p>
+      </div>
+
+      <!-- Circuit Breakers -->
+      <div>
+        <h3>Circuit Breakers</h3>
+        <p>Prevents cascading failure by failing fast when a downstream is unhealthy. Without it: slow downstream blocks threads &rarr; thread pool exhaustion &rarr; your service becomes unresponsive too.</p>
+        <ul>
+          <li><strong>Failure threshold:</strong> % error rate with minimum sample size. Payment: 1%. Third-party API: 10%.</li>
+          <li><strong>Open timeout:</strong> 30s for local services, 60&ndash;90s for DBs, 60&ndash;300s exponential backoff for third-party.</li>
+          <li><strong>Half-open probes:</strong> 3&ndash;5 requests to confirm recovery. Critical paths: 5 probes.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 5: Architecture Patterns                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="architecture">
+    <div class="container">
+      <h2>Architecture Patterns</h2>
+
+      <!-- Monolith vs Microservices -->
+      <div>
+        <h3>Monolith vs Microservices</h3>
+        <p><strong>Monolith</strong> when team is &lt;20 engineers, product is evolving fast, and simplicity matters more than independent scaling. <strong>Microservices</strong> when &gt;50 engineers need to deploy independently, services have different scaling needs, and team can absorb operational complexity. Transition zone (20&ndash;50 engineers): extract services incrementally at proven domain boundaries.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Dimension</th><th>Monolith</th><th>Microservices</th></tr></thead>
+          <tbody>
+            <tr><td>Team size</td><td>&lt;20 engineers</td><td>&gt;50 engineers</td></tr>
+            <tr><td>Deploy speed</td><td>Fast (single artifact)</td><td>Independent per service</td></tr>
+            <tr><td>Scaling</td><td>All-or-nothing</td><td>Per-service</td></tr>
+            <tr><td>Debugging</td><td>One process, stack trace</td><td>Distributed tracing required</td></tr>
+            <tr><td>Data consistency</td><td>Single DB, ACID transactions</td><td>Saga patterns, eventual consistency</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- 2PC vs Saga -->
+      <div>
+        <h3>2PC vs Saga (Distributed Transactions)</h3>
+        <p><strong>2PC (Two-Phase Commit)</strong> when all participants are local (&lt;5ms RTT &mdash; Round-Trip Time), transaction is fast (&lt;100ms), and you need atomicity (bank transfer in same DB). <strong>Saga</strong> when operations span external APIs, are long-running, or cross regions (2&times;80ms RTT makes 2PC prohibitive). Saga trades atomicity for availability &mdash; compensating transactions (refund, cancel) instead of rollback.</p>
+      </div>
+
+      <!-- Pessimistic vs Optimistic Concurrency -->
+      <div>
+        <h3>Pessimistic vs Optimistic Concurrency</h3>
+        <p><strong>Pessimistic</strong> (acquire lock before write) when contention is high (&gt;30% conflicts) &mdash; prevents wasted work. <strong>Optimistic</strong> (write, detect conflict at commit, retry) when contention is low (&lt;5%) &mdash; avoids lock overhead. Gray zone (5&ndash;30%): benchmark both. Lock TTL: set to 3&ndash;5x the p99 operation time (50ms op &rarr; 150&ndash;250ms TTL).</p>
+      </div>
+
+      <!-- Leader Election -->
+      <div>
+        <h3>Leader Election</h3>
+        <p><strong>Raft/Paxos</strong> for consensus with automatic failover and zero data loss &mdash; higher latency (10&ndash;50ms/write) but strongest guarantees. <strong>Lease-based</strong> (TTL lock in Redis/etcd) when you just need "one active worker" &mdash; simpler, faster, split-brain risk if TTL too aggressive. Failover budget = detection (3&ndash;5 missed heartbeats) + election (500ms&ndash;2s) + client reroute (1&ndash;3s).</p>
+      </div>
+
+      <!-- Fan-Out Strategies -->
+      <div>
+        <h3>Fan-Out Strategies</h3>
+        <ul>
+          <li><strong>Fan-out on write (push):</strong> Pre-compute and store results for each consumer. Fast reads, expensive writes. Works when follower count is bounded (&lt;5K).</li>
+          <li><strong>Fan-out on read (pull):</strong> Compute at read time from source of truth. Cheap writes, expensive reads. Works for celebrities (millions of followers).</li>
+          <li><strong>Hybrid:</strong> Push for normal users, pull for celebrities. Threshold: fan-out cost vs read cost crossover.</li>
+        </ul>
+      </div>
+
+      <!-- Hot Key Mitigation -->
+      <div>
+        <h3>Hot Key / Hot Shard Mitigation</h3>
+        <ul>
+          <li><strong>Detection:</strong> Count-Min Sketch (O(1), ~540 KB for 100M keys) beats min-heap (O(log N) per request).</li>
+          <li><strong>Replication:</strong> Replicate hot key to 5&ndash;10 nodes. Reads spread, writes go to all replicas.</li>
+          <li><strong>L1 local cache:</strong> For extreme hot keys (50K+ reads/sec), cache in app-server memory. Tradeoff: staleness (small TTL acceptable).</li>
+          <li><strong>Virtual nodes don't solve hot keys</strong> &mdash; they improve distribution of which keys go where, but a single hot key still maps to one physical node.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 6: Resilience Patterns                               -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="resilience">
+    <div class="container">
+      <h2>Resilience Patterns</h2>
+
+      <!-- Cascading Failure -->
+      <div>
+        <h3>Cascading Failure Prevention</h3>
+        <p>Service C slows down &rarr; B's threads block waiting for C &rarr; B's thread pool exhausts &rarr; A can't reach B &rarr; entire chain fails. Prevention stack:</p>
+        <ol>
+          <li><strong>Timeouts:</strong> Fail fast (200ms) instead of waiting 30s default. Every request reaching a slow dependency gets a bounded penalty.</li>
+          <li><strong>Circuit breakers:</strong> After N failures, stop calling the failing service entirely. Return fallback/cached/degraded response.</li>
+          <li><strong>Bulkheads:</strong> Isolate thread pools per dependency. Slow dependency A can't starve calls to healthy dependency B.</li>
+          <li><strong>Graceful degradation:</strong> Serve partial results. Product page without recommendations is better than 503.</li>
+        </ol>
+      </div>
+
+      <!-- Thundering Herd -->
+      <div>
+        <h3>Thundering Herd</h3>
+        <p>Cache node crashes &rarr; 100K keys expire simultaneously &rarr; millions of requests hit DB at once. Mitigations:</p>
+        <ul>
+          <li><strong>Request coalescing:</strong> 5 concurrent requests for same expired key &rarr; 1 DB query, 4 wait. Impact: 100K queries instead of millions.</li>
+          <li><strong>Stale-while-revalidate:</strong> Serve slightly stale data while refreshing in background.</li>
+          <li><strong>Probabilistic early refresh:</strong> 0.1% of requests trigger refresh before TTL expires, preventing synchronized expiry.</li>
+          <li><strong>Jittered TTL:</strong> TTL = base &plusmn; random(0, 30s). Prevents all keys expiring at the same moment.</li>
+        </ul>
+      </div>
+
+      <!-- Flash Sale / Traffic Spikes -->
+      <div>
+        <h3>Flash Sale / Traffic Spikes</h3>
+        <ul>
+          <li><strong>Virtual waiting room:</strong> Queue users at the edge, release 5K/sec. System never exceeds capacity. Users wait in fair queue instead of experiencing crashes.</li>
+          <li><strong>Fast-fail sold-out check:</strong> In-memory inventory check (0.5ms) before DB (5ms+). 98.9% of attempts are doomed &mdash; reject them instantly.</li>
+          <li><strong>Pre-warm caches:</strong> Load product data and inventory into cache before sale starts.</li>
+        </ul>
+      </div>
+
+      <!-- Exactly-Once Processing -->
+      <div>
+        <h3>Exactly-Once Processing</h3>
+        <p>True exactly-once is impossible in distributed systems. Instead: <strong>at-least-once delivery + idempotency = effectively exactly-once</strong>. Use idempotency keys (payment_id, request_id) to detect and deduplicate replayed messages. For financial systems, a 0.01% duplicate rate = $432K/day in double-charges &mdash; idempotency is mandatory, not optional.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 7: Storage & Specialized Systems                     -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="storage">
+    <div class="container">
+      <h2>Storage &amp; Specialized Systems</h2>
+
+      <!-- Blob Storage Tiers -->
+      <div>
+        <h3>Blob Storage Tiers</h3>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Tier</th><th>$/GB/mo</th><th>Latency</th><th>Use Case</th></tr></thead>
+          <tbody>
+            <tr><td>S3 Standard</td><td>$0.023</td><td>&lt;10ms</td><td>Hot data, accessed within 7 days</td></tr>
+            <tr><td>S3 Infrequent Access</td><td>$0.0125</td><td>&lt;10ms</td><td>Warm data, 8&ndash;90 day access + retrieval fee</td></tr>
+            <tr><td>Glacier Instant</td><td>$0.004</td><td>&lt;10ms</td><td>Cold data &gt;90 days, still fast retrieval</td></tr>
+            <tr><td>Glacier Flexible</td><td>$0.0036</td><td>1&ndash;5min</td><td>Archive, rarely accessed</td></tr>
+            <tr><td>Glacier Deep Archive</td><td>$0.001</td><td>12h</td><td>Compliance retention (7yr), cheapest</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- Bloom Filters -->
+      <div>
+        <h3>Bloom Filters</h3>
+        <p>Probabilistic set membership test. "Definitely not in set" (no false negatives) or "probably in set" (tunable false positive rate). Formula: <code>m = -n &times; ln(p) / (ln 2)&sup2;</code> bits, <code>k = (m/n) &times; ln 2</code> hash functions. Use cases: URL dedup (0.1% false positive rate, 1.8 GB for 1B URLs vs storing URLs at 60 GB), LSM-tree lookups (1% false positive, 12 MB per SSTable), spam filtering (0.01% false positive).</p>
+      </div>
+
+      <!-- Logging at Scale -->
+      <div>
+        <h3>Logging at Scale</h3>
+        <p>Write-heavy workload (2M+ lines/sec) with occasional reads (searches during incidents). Key tradeoffs:</p>
+        <ul>
+          <li><strong>Tiered sampling:</strong> 1% INFO, 25% WARN, 100% ERROR cuts volume 10x while preserving critical data.</li>
+          <li><strong>Hot/warm/cold:</strong> 3 days searchable (Elasticsearch), 30 days queryable (object storage + Parquet), archive beyond.</li>
+          <li><strong>At extreme scale (10x):</strong> Consider label-based indexing (Grafana Loki) over full-text inverted indices &mdash; reduces index storage 5&ndash;10x.</li>
+        </ul>
+      </div>
+
+      <!-- Leaderboard -->
+      <div>
+        <h3>Real-Time Leaderboard</h3>
+        <p>Redis sorted set for top-K queries (O(log N) updates, O(K) top-K retrieval). For "my rank" queries at scale: pre-computed histograms (bucket scores into ranges, local array lookup) give &plusmn;5K accuracy &mdash; invisible to 99.9% of players. Use exact rank (expensive fan-out) only for top 1,000 where precision matters.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 8: Quick Decision Formulas                           -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="formulas">
+    <div class="container">
+      <h2>Quick Decision Formulas</h2>
+
+      <!-- Little's Law & Queuing -->
+      <div class="full-width">
+        <h3>Little's Law &amp; Queue Latency</h3>
+        <p><strong>Little's Law: L = &lambda; &times; W.</strong> It says: the average number of requests "in flight" (queued + being processed) equals the arrival rate multiplied by the average time each request spends in the system. Holds for any stable system &mdash; no assumptions about distribution needed.</p>
+        <div class="table-responsive">
+        <table class="styled-table">
+          <thead><tr><th>Variable</th><th>Meaning</th><th>Concrete Example</th></tr></thead>
+          <tbody>
+            <tr><td><strong>L</strong></td><td>Average requests in the system (waiting in queue + being processed)</td><td>50 RPC requests in flight</td></tr>
+            <tr><td><strong>&lambda;</strong></td><td>Arrival rate (requests/sec)</td><td>1,000 RPC requests/sec arriving</td></tr>
+            <tr><td><strong>W</strong></td><td>Average time each request spends in system (queue wait + processing)</td><td>50ms per request</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p>Check: L = 1,000 req/s &times; 0.05s = 50 requests in flight at any moment. If you see 50 in-flight requests and know they arrive at 1,000/s, each one must be spending 50ms in the system on average.</p>
+      </div>
+
+      <div>
+        <h4>Example 1: "How many requests are stuck waiting?"</h4>
+        <p><strong>Setup:</strong> A single-threaded worker pulls from a queue and processes each request in 1ms. Requests arrive at the queue at 800 req/s.</p>
+        <pre class="line-numbers"><code class="language-text">Given:
+  λ = 800 req/s          (arrival rate)
+  μ = 1 / W_service      (μ is the inverse of service time)
+    = 1 / 1ms
+    = 1 / 0.001s          (1ms = 0.001 seconds)
+    = 1,000 req/s          (max capacity of this worker)
+  ρ = λ / μ = 800 / 1,000 = 0.8  (worker is busy 80% of the time)
+
+Step 1: How long does each request ACTUALLY spend in the system?
+  Formula (M/M/1 — Kendall's notation: M=random arrivals,
+  M=random service times, 1=single worker):
+  W = (1/μ) / (1 - ρ)
+  W = 1ms / (1 - 0.8) = 1ms / 0.2 = 5ms
+
+  The request takes 1ms to process, but spends 5ms total.
+  Where did the other 4ms go? Waiting in the queue.
+
+Step 2: How many requests are sitting in the queue?
+  Formula (Little's Law): L = λ × W
+
+  L_total = λ × W_total
+         = 800 req/s × 5ms (from Step 1)
+         = 800 × 0.005s = 4 requests in the system
+
+  L_processing = λ × W_service
+              = 800 req/s × 1ms (pure processing time, from Given)
+              = 800 × 0.001s = 0.8 requests being processed (on average)
+
+  L_queue = L_total - L_processing = 4 - 0.8 = 3.2 requests waiting
+
+  → Most of the time, ~3 requests are queued doing NOTHING.
+    Each request spends 4ms waiting and only 1ms being processed.</code></pre>
+      </div>
+
+      <div>
+        <h4>Example 2: "How many workers do I need?"</h4>
+        <p><strong>Setup:</strong> A task queue receives 500 image resize tasks/sec. Each takes 2 sec.</p>
+        <pre class="line-numbers"><code class="language-text">Given:
+  λ = 500 tasks/sec       (arrival rate)
+  W_service = 2 sec       (processing time per task)
+
+Step 1: How many tasks are in-flight at any moment?
+  Formula (Little's Law): L = λ × W
+  L = 500 × 2 = 1,000 tasks in the system
+
+  → Need at least 1,000 workers to keep up (one task per worker).
+
+Step 2: What if you only have 200 workers?
+  Processing rate = 200 workers / 2 sec = 100 tasks/sec
+  Backlog growth = 500 (arriving) - 100 (processed) = 400 tasks/sec
+
+  After 10 minutes (600s):
+    Queue depth = 400 tasks/sec × 600s = 240,000 tasks queued
+
+    A new task joining now must wait for all 240,000 tasks
+    ahead of it to be processed first.
+    Formula: wait = queue_depth / processing_rate
+    Wait = 240,000 tasks / 100 tasks/sec = 2,400 sec (40 min!)
+
+    (This is Little's Law rearranged: W = L / λ_effective)
+
+  → System is unstable: queue grows without bound.</code></pre>
+      </div>
+
+      <div>
+        <h4>Example 3: "What happens when latency spikes?"</h4>
+        <p><strong>Setup:</strong> A service has 200 threads and gets 1,000 req/s.</p>
+        <pre class="line-numbers"><code class="language-text">Normal operation (service time = 10ms):
+  Formula (Little's Law): L = λ × W
+  L = 1,000 × 0.01s = 10 requests in flight
+  Thread pool (200) is barely touched. Everything is fine.
+
+Latency spike (service time jumps to 500ms — slow DB, GC pause):
+  L = 1,000 × 0.5s = 500 requests in flight
+  Thread pool (200) is exhausted. 300 requests/sec have no thread.
+  → Those requests queue up or get rejected (503).
+  → Queued requests add MORE load, making latency worse.
+  → This is how a latency spike cascades into a full outage.</code></pre>
+      </div>
+
+      <div>
+        <h4>The Response Time Multiplier (Why Worker Utilization Matters)</h4>
+        <p>From Examples 1&ndash;3, the pattern is: as <strong>worker utilization</strong> (&rho;) rises, wait time grows non-linearly. &rho; = &lambda;/&mu; is the fraction of time a worker is busy processing (not "how full the queue is" &mdash; the queue grows as a <em>consequence</em> of high worker utilization). The exact formula:</p>
+        <pre class="line-numbers"><code class="language-text">Formula (M/M/1):
+  ρ = λ / μ  (worker utilization = arrival rate / worker's processing rate)
+  W = service_time × 1/(1 - ρ)
+
+  The "1/(1-ρ)" is the response time multiplier — how many times
+  SLOWER the request is compared to its pure processing time:
+
+  ρ=50%  → 1/(1-0.5)  = 2×    (comfortable)
+  ρ=60%  → 1/(1-0.6)  = 2.5×  (good target for production)
+  ρ=70%  → 1/(1-0.7)  = 3.3×  (upper target)
+  ρ=80%  → 1/(1-0.8)  = 5×    (starting to hurt — Example 1)
+  ρ=90%  → 1/(1-0.9)  = 10×   (dangerous — small spike = collapse)
+  ρ=95%  → 1/(1-0.95) = 20×   (broken)
+
+Example (from Example 1): service_time = 1ms, ρ = 0.8
+  W = 1ms × 5 = 5ms (request waits 5ms for a 1ms operation)</code></pre>
+        <p>This is why <strong>60&ndash;70% utilization</strong> is the sweet spot. The curve is a hyperbola &mdash; it doesn't degrade linearly, it explodes. At 90%, a 5% traffic bump pushes you to 95% and response time doubles from 10x to 20x.</p>
+      </div>
+
+      <div>
+        <h4>Multiple Consumers (M/M/c)</h4>
+        <p>Adding consumers has <strong>dramatically diminishing returns</strong> because parallelism reduces per-server &rho;:</p>
+        <pre class="line-numbers"><code class="language-text">Example: λ=80/s, μ=100/s per consumer, service=10ms
+
+  c=1: ρ=80%, Wq=40ms    (baseline)
+  c=2: ρ=40%, Wq=2.7ms   (15× better)
+  c=3: ρ=27%, Wq=0.4ms   (7× better)
+  c=4: ρ=20%, Wq=0.06ms  (diminishing returns)</code></pre>
+        <p><strong>Variance matters:</strong> Real systems use M/G/c (general service time). Multiply M/M/c wait time by <code>(1 + C<sub>S</sub><sup>2</sup>) / 2</code> where C<sub>S</sub> = &sigma;/mean. High variance (C<sub>S</sub>=2) gives 2.5&times; worse queuing than exponential. Consider separate queues for heavy tasks.</p>
+      </div>
+
+      <div>
+        <h3>Fleet &amp; Capacity Sizing</h3>
+        <pre class="line-numbers"><code class="language-text">nodes       = ceil(peak_QPS / per_node_capacity)
+shards      = max(ceil(QPS / shard_cap), ceil(data / shard_storage))
+replicas    = enough to survive N failures + maintain throughput
+cache_size  = working set for target hit rate (Zipfian: sqrt(N) lower bound)
+rate_limit  = 80% of capacity at SLO latency
+pool_size   = peak_RPS * avg_response_time_sec * 1.5</code></pre>
+      </div>
+
+      <div>
+        <h3>Back-of-Envelope Constants</h3>
+        <pre class="line-numbers"><code class="language-text">1 day   ~= 10^5 seconds    (86,400)
+1 year  ~= 3 * 10^7 seconds (31,536,000)
+peak    = 3-10x average</code></pre>
+      </div>
+
+      <div>
+        <h3>Powers of 2 &harr; Human Units</h3>
+        <p>The key insight: <strong>2^10 &asymp; 10^3</strong>, so every 10 bits &asymp; 3 decimal digits. This lets you convert between machine units (bytes, always powers of 2) and human units (thousands, millions, billions) instantly.</p>
+        <pre class="line-numbers"><code class="language-text">Unit Conversion Ladder:
+
+  1 B   = 1 byte
+  1 KB  = 10^3 B    = 1,000 bytes
+  1 MB  = 10^6 B    = 10^3 KB   = 1,000 KB
+  1 GB  = 10^9 B    = 10^6 KB   = 10^3 MB  = 1,000 MB
+  1 TB  = 10^12 B   = 10^9 KB   = 10^6 MB  = 10^3 GB
+  1 PB  = 10^15 B   = 10^12 KB  = 10^9 MB  = 10^6 GB  = 10^3 TB
+
+Quick mental math — each step up is ×10^3 (÷10^3 going down):
+  bytes → KB: drop 3 zeros     (5,000,000 B = 5,000 KB = 5 MB)
+  KB → MB:    drop 3 zeros
+  MB → GB:    drop 3 zeros
+  GB → TB:    drop 3 zeros
+
+Powers of 2 ↔ Powers of 10:
+  2^10 ~= 10^3  (1,024 ≈ 1K)     →  1 KB
+  2^20 ~= 10^6  (1,048,576 ≈ 1M) →  1 MB
+  2^30 ~= 10^9                    →  1 GB
+  2^40 ~= 10^12                   →  1 TB</code></pre>
+
+        <pre class="line-numbers"><code class="language-text">Example 1: "1 billion users × 1 KB each = how much storage?"
+  1B × 1 KB = 10^9 × 10^3 bytes = 10^12 bytes = 1 TB
+
+Example 2: "64 GB server, 1 KB sessions — how many fit?"
+  64 GB = 64 × 10^9 bytes.  Each session = 10^3 bytes.
+  64 × 10^9 / 10^3 = 64 × 10^6 = 64 million sessions.
+
+Example 3: "100 million messages/day, 2 KB each — daily storage?"
+  10^8 × 2 × 10^3 = 2 × 10^11 bytes
+  = 200 × 10^9 bytes = 200 GB/day
+
+Example 4: "1 billion requests/day — what QPS?"
+  10^9 / 10^5 sec/day = 10,000 QPS</code></pre>
+      </div>
+
+      <div>
+        <h3>Latency Hierarchy</h3>
+        <pre class="line-numbers"><code class="language-text">L1 cache ref:           1 ns
+L2 cache ref:           4 ns
+RAM ref:              100 ns
+SSD random read:      100 us
+Network (same region):  0.5 - 5 ms
+Network (cross-region): 50 - 200 ms
+Disk seek (HDD):       10 ms</code></pre>
+      </div>
+
+      <div>
+        <h3>Availability</h3>
+        <pre class="line-numbers"><code class="language-text">99.9%   = 8.76 hours/year downtime
+99.99%  = 52.6 minutes/year
+99.999% = 5.26 minutes/year
+
+Series:   A_total = A1 * A2 * ... * An
+Parallel: A_total = 1 - (1 - A1) * (1 - A2)</code></pre>
+      </div>
+
+      <div>
+        <h3>Tail Latency Amplification</h3>
+        <pre class="line-numbers"><code class="language-text">Fan-out to N services:
+  P(all respond within p99) = 0.99^N
+
+  N=5:   95.1% fast  (4.9% slow)
+  N=10:  90.4% fast  (9.6% slow)
+  N=50:  60.5% fast  (39.5% slow)</code></pre>
+      </div>
+
+      <div>
+        <h3>Write Consistency Latency</h3>
+        <pre class="line-numbers"><code class="language-text">ONE:          ~2ms
+LOCAL_QUORUM: ~12ms  (majority in local DC)
+QUORUM:       ~45ms  (cross-region majority)
+ALL:          ~180ms (every node)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Section 9: Related Topics                                    -->
+  <!-- ============================================================ -->
+  <section class="section" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="related-topics">
+        <a href="design-principles.html" class="related-link">Design Principles</a>
+        <a href="back-of-envelope.html" class="related-link">Back-of-Envelope Math</a>
+        <a href="load-balancing.html" class="related-link">Load Balancing</a>
+        <a href="caching.html" class="related-link">Caching</a>
+        <a href="rate-limiting.html" class="related-link">Rate Limiting</a>
+        <a href="database-sharding.html" class="related-link">Database Sharding</a>
+        <a href="database-replication.html" class="related-link">Database Replication</a>
+        <a href="consistent-hashing.html" class="related-link">Consistent Hashing</a>
+        <a href="cap-theorem.html" class="related-link">CAP Theorem</a>
+        <a href="sql-vs-nosql.html" class="related-link">SQL vs NoSQL</a>
+        <a href="message-queues.html" class="related-link">Message Queues</a>
+        <a href="microservices.html" class="related-link">Microservices</a>
+        <a href="circuit-breakers.html" class="related-link">Circuit Breakers</a>
+        <a href="distributed-transactions.html" class="related-link">Distributed Transactions</a>
+        <a href="cdn.html" class="related-link">CDN</a>
+        <a href="api-gateway.html" class="related-link">API Gateway</a>
+        <a href="websockets.html" class="related-link">WebSockets</a>
+        <a href="blob-storage.html" class="related-link">Blob Storage</a>
+        <a href="leader-election.html" class="related-link">Leader Election</a>
+        <a href="observability.html" class="related-link">Observability</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Sidebar JS -->
+  <script src="../js/sidebar.js"></script>
+</body>
+</html>

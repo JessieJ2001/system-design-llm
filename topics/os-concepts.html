@@ -1,0 +1,1450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OS Concepts &mdash; System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="networking-fundamentals.html">Networking</a></li>
+        <li><a href="caching.html">Caching</a></li>
+        <li><a href="load-balancing.html">Load Balancing</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>OS Concepts for System Design</h1>
+      <p class="hero-subtitle">Operating system primitives &mdash; scheduling, virtual memory, locks, and journaling &mdash; map directly to the patterns you use in distributed systems. Understanding the OS layer sharpens your intuition for load balancing, caching, concurrency control, and durability.</p>
+      <span class="hero-meta">30 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>
+        Every distributed system pattern you encounter in system design has a direct ancestor inside the operating system kernel. <strong>Process scheduling</strong> is the single-machine version of load balancing: the OS decides which process gets the CPU next using algorithms like round-robin, shortest-job-first, and priority scheduling &mdash; the same algorithms a load balancer uses to distribute requests across servers. <strong>Virtual memory and paging</strong> are the kernel&rsquo;s caching layer: when RAM is full, the OS evicts pages using LRU or CLOCK, exactly the way a cache like Redis evicts keys when it hits its <code>maxmemory</code> limit.
+      </p>
+      <p>
+        <strong>Locks and semaphores</strong> coordinate access to shared resources on a single machine. In distributed systems, these become distributed locks (ZooKeeper, etcd, Redlock), but the core problems &mdash; deadlock, priority inversion, starvation &mdash; are identical. <strong>Write-ahead logging (WAL)</strong>, which file systems use for crash recovery, is the same durability mechanism that databases like PostgreSQL and SQLite rely on. <strong>Process isolation</strong> via address spaces is the foundation for the container isolation (cgroups and namespaces) that makes microservice deployments possible.
+      </p>
+      <p>
+        Studying these parallels is not academic trivia. When you understand <em>why</em> an OS scheduler uses preemption, you understand why a load balancer needs health checks. When you understand why the OS adds jitter to page replacement timers, you understand why you add jitter to cache TTLs. The OS is the original distributed system textbook, running on a single machine.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Animated Diagram: Round-Robin &mdash; OS Scheduler vs. Load Balancer</h2>
+      <div class="animation-container" id="os-animation-container">
+        <canvas id="os-canvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">
+          Top: a CPU scheduler cycles through 4 processes in round-robin, allocating time slices. Bottom: a load balancer does the same round-robin across 4 servers. The algorithm is identical &mdash; only the resource being shared differs.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>Process Scheduling Algorithms</h3>
+      <p>The OS scheduler decides which process runs on the CPU next. The fundamental algorithms are:</p>
+      <ol>
+        <li><strong>FIFO / FCFS (First-Come, First-Served)</strong> &mdash; Processes run in arrival order. Simple but suffers from the <em>convoy effect</em>: a long-running process blocks everything behind it. Distributed parallel: a single-threaded request queue with no timeout &mdash; like a single-threaded server processing requests in order, where one slow request blocks everything.</li>
+        <li><strong>SJF (Shortest Job First)</strong> &mdash; The process with the smallest expected runtime runs next. Optimal for minimizing average wait time, but requires knowing job duration in advance. Distributed parallel: routing requests to the handler with the shortest expected processing time.</li>
+        <li><strong>Round-Robin</strong> &mdash; Each process gets a fixed time quantum (e.g., 10 ms). After the quantum expires, the process is preempted and placed at the back of the queue. Fair but adds context-switch overhead. Distributed parallel: round-robin load balancing gives each request a fair time slice.</li>
+        <li><strong>Priority Scheduling</strong> &mdash; Each process has a priority. Higher-priority processes run first. Risk of <em>starvation</em> (low-priority processes never run). Solved with <em>aging</em> &mdash; gradually boosting priority over time. Distributed parallel: priority queues in rate limiting (premium users get higher priority).</li>
+        <li><strong>Multilevel Feedback Queue (MLFQ)</strong> &mdash; Multiple queues with different priority levels. New processes start in the highest-priority queue. If a process uses its full time quantum, it drops to a lower-priority queue. I/O-bound processes (which voluntarily yield the CPU before their quantum expires) stay in high-priority queues. CPU-bound processes gradually sink to lower queues where they get longer quanta but less frequent turns. Distributed parallel: this is exactly how some load balancers handle mixed traffic &mdash; short requests get fast-tracked, long requests are deprioritized to prevent head-of-line blocking.</li>
+        <li><strong>CFS (Completely Fair Scheduler)</strong> &mdash; Linux&rsquo;s default since 2.6.23. Uses a red-black tree keyed by <em>virtual runtime</em> (vruntime). The process with the smallest vruntime runs next. Weights (nice values) adjust the rate at which vruntime accumulates. Distributed parallel: weighted round-robin or least-connections load balancing.</li>
+      </ol>
+
+      <h4>Worked Example: Comparing Scheduling Algorithms</h4>
+      <p>To see how these algorithms differ in practice, let&rsquo;s trace through the same workload with four processes:</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Process</th><th>Arrival Time</th><th>Burst Time (ms)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>P1</td><td>0</td><td>8</td></tr>
+          <tr><td>P2</td><td>1</td><td>4</td></tr>
+          <tr><td>P3</td><td>2</td><td>2</td></tr>
+          <tr><td>P4</td><td>3</td><td>1</td></tr>
+        </tbody>
+      </table></div>
+
+      <h5>FCFS (First-Come, First-Served)</h5>
+      <p>Processes run in the order they arrive. No preemption &mdash; once a process starts, it runs to completion.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Running</th><th>Event</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0&ndash;8</td><td>P1</td><td>P1 arrives at T=0, starts immediately. P2 arrives at T=1, P3 at T=2, P4 at T=3 &mdash; all wait.</td></tr>
+          <tr><td>8&ndash;12</td><td>P2</td><td>P1 finishes. P2 (arrived T=1) starts next.</td></tr>
+          <tr><td>12&ndash;14</td><td>P3</td><td>P2 finishes. P3 starts.</td></tr>
+          <tr><td>14&ndash;15</td><td>P4</td><td>P3 finishes. P4 starts.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Wait times:</strong> P1 = 0, P2 = 8 &minus; 1 = 7, P3 = 12 &minus; 2 = 10, P4 = 14 &minus; 3 = 11. <strong>Average wait = (0 + 7 + 10 + 11) / 4 = 7.0 ms.</strong></p>
+      <p>The problem is clear: P4 only needs 1 ms of CPU time but waits 11 ms. This is the <em>convoy effect</em> &mdash; short jobs stuck behind a long one. In system design, this is like a single-threaded server where one slow database query blocks every subsequent request.</p>
+
+      <h5>SJF (Shortest Job First, Non-Preemptive)</h5>
+      <p>When the CPU becomes free, pick the process with the shortest burst time from those that have arrived.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Running</th><th>Event</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0&ndash;8</td><td>P1</td><td>At T=0, only P1 has arrived. It runs to completion.</td></tr>
+          <tr><td>8&ndash;9</td><td>P4</td><td>At T=8, P2 (burst 4), P3 (burst 2), P4 (burst 1) are all waiting. Shortest is P4.</td></tr>
+          <tr><td>9&ndash;11</td><td>P3</td><td>P4 finishes. Remaining: P2 (burst 4), P3 (burst 2). Shortest is P3.</td></tr>
+          <tr><td>11&ndash;15</td><td>P2</td><td>P3 finishes. Only P2 remains.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Wait times:</strong> P1 = 0, P4 = 8 &minus; 3 = 5, P3 = 9 &minus; 2 = 7, P2 = 11 &minus; 1 = 10. <strong>Average wait = (0 + 5 + 7 + 10) / 4 = 5.5 ms.</strong></p>
+      <p>SJF reduces average wait from 7.0 to 5.5 ms by serving short jobs first. The parallel in system design: routing requests to the handler with the shortest expected processing time reduces overall latency.</p>
+
+      <h5>Round-Robin (Time Quantum = 3 ms)</h5>
+      <p>Each process gets up to 3 ms of CPU time, then is preempted and placed at the back of the ready queue.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Running</th><th>Event</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0&ndash;3</td><td>P1</td><td>P1 runs for 3 ms (5 ms remaining). P2, P3 have arrived. Queue: [P2, P3, P1].</td></tr>
+          <tr><td>3&ndash;6</td><td>P2</td><td>P2 runs for 3 ms (1 ms remaining). P4 has arrived. Queue: [P3, P1, P4, P2].</td></tr>
+          <tr><td>6&ndash;8</td><td>P3</td><td>P3 runs for 2 ms (done &mdash; burst was only 2). Queue: [P1, P4, P2].</td></tr>
+          <tr><td>8&ndash;9</td><td>P4</td><td>P4 runs for 1 ms (done &mdash; burst was only 1). Queue: [P1, P2].</td></tr>
+          <tr><td>9&ndash;12</td><td>P1</td><td>P1 runs for 3 ms (2 ms remaining). Queue: [P2, P1].</td></tr>
+          <tr><td>12&ndash;13</td><td>P2</td><td>P2 runs for 1 ms (done). Queue: [P1].</td></tr>
+          <tr><td>13&ndash;15</td><td>P1</td><td>P1 runs for 2 ms (done).</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Wait times:</strong> P1: finished at 15, burst 8, arrived 0, so wait = 15 &minus; 8 &minus; 0 = 7. P2: finished at 13, burst 4, arrived 1, wait = 13 &minus; 4 &minus; 1 = 8. P3: finished at 8, burst 2, arrived 2, wait = 8 &minus; 2 &minus; 2 = 4. P4: finished at 9, burst 1, arrived 3, wait = 9 &minus; 1 &minus; 3 = 5. <strong>Average wait = (7 + 8 + 4 + 5) / 4 = 6.0 ms.</strong></p>
+      <p>Round-robin&rsquo;s average wait (6.0 ms) is between FCFS (7.0) and SJF (5.5), but it provides <strong>fairness</strong>: no process waits too long before getting some CPU time. The tradeoff is more context switches. In system design, round-robin load balancing gives each server a fair share of traffic, even if it is not optimal for minimizing latency.</p>
+
+      <h5>Priority Scheduling (Preemptive)</h5>
+      <p>Assign priorities (lower number = higher priority): P3 = 1, P4 = 2, P2 = 3, P1 = 4. When a higher-priority process arrives, it preempts the running process.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Running</th><th>Event</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0&ndash;1</td><td>P1</td><td>Only P1 (priority 4) is available. Runs for 1 ms (7 ms remaining).</td></tr>
+          <tr><td>1&ndash;2</td><td>P2</td><td>P2 arrives (priority 3 &lt; 4). Preempts P1. Runs for 1 ms (3 ms remaining).</td></tr>
+          <tr><td>2&ndash;4</td><td>P3</td><td>P3 arrives (priority 1 &lt; 3). Preempts P2. Runs for 2 ms (done).</td></tr>
+          <tr><td>4&ndash;5</td><td>P4</td><td>P3 done. P4 (priority 2) is higher than P2 (3) and P1 (4). Runs 1 ms (done).</td></tr>
+          <tr><td>5&ndash;8</td><td>P2</td><td>P4 done. P2 (priority 3) beats P1 (priority 4). Runs 3 ms (done).</td></tr>
+          <tr><td>8&ndash;15</td><td>P1</td><td>Only P1 remains. Runs 7 ms (done).</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Wait times:</strong> P1: finished 15, burst 8, arrived 0, wait = 15 &minus; 8 &minus; 0 = 7. P2: finished 8, burst 4, arrived 1, wait = 8 &minus; 4 &minus; 1 = 3. P3: finished 4, burst 2, arrived 2, wait = 4 &minus; 2 &minus; 2 = 0. P4: finished 5, burst 1, arrived 3, wait = 5 &minus; 1 &minus; 3 = 1. <strong>Average wait = (7 + 3 + 0 + 1) / 4 = 2.75 ms.</strong></p>
+      <p>Priority scheduling gives the best average wait here because short, high-priority processes run immediately. The danger is <strong>starvation</strong>: if high-priority processes keep arriving, low-priority P1 could wait forever. In system design, this is the same risk with priority queues in rate limiting &mdash; premium users get served fast, but free-tier users might be starved during high traffic.</p>
+
+      <h5>MLFQ (Multilevel Feedback Queue)</h5>
+      <p>MLFQ uses multiple priority queues. The key rules:</p>
+      <ol>
+        <li>New processes start in the highest-priority queue (Queue 0).</li>
+        <li>If a process uses its entire time quantum without yielding, it drops to the next lower-priority queue.</li>
+        <li>If a process voluntarily yields (e.g., for I/O) before the quantum expires, it stays in its current queue.</li>
+        <li>Lower-priority queues get longer time quanta (e.g., Q0 = 2 ms, Q1 = 4 ms, Q2 = 8 ms).</li>
+      </ol>
+      <p><strong>Why this is clever:</strong> I/O-bound processes (which do short bursts of computation then wait for I/O) naturally stay in the high-priority queue because they yield before using their quantum. CPU-bound processes (which use the full quantum) sink to lower queues. This means interactive, latency-sensitive work gets fast-tracked, while batch work runs in the background with less frequent but longer time slices.</p>
+      <p><strong>System design parallel:</strong> This is exactly how some load balancers handle mixed traffic. Short API requests (like health checks or reads) are fast-tracked through a high-priority queue, while long-running requests (like report generation or bulk uploads) are deprioritized to prevent them from hogging resources and causing head-of-line blocking for interactive traffic.</p>
+
+      <h3>Virtual Memory and Page Replacement</h3>
+      <p>Virtual memory gives each process the illusion of having its own contiguous address space. The OS divides memory into <strong>pages</strong> (typically 4 KB) and maps virtual pages to physical frames. When physical memory is full and a new page is needed, the OS must <strong>evict</strong> an existing page &mdash; this is page replacement, and it is exactly the same problem as cache eviction.</p>
+      <ol>
+        <li><strong>LRU (Least Recently Used)</strong> &mdash; Evict the page that hasn&rsquo;t been accessed for the longest time. Optimal in theory for temporal locality workloads but expensive to implement exactly (requires maintaining access ordering). Distributed parallel: LRU eviction in Redis and Memcached.</li>
+        <li><strong>CLOCK (Second-Chance)</strong> &mdash; An approximation of LRU that avoids the overhead of maintaining a full access order. Pages are arranged in a circular buffer with a reference bit. The &ldquo;clock hand&rdquo; sweeps: if the bit is set, clear it and move on; if the bit is clear, evict that page. Distributed parallel: Redis&rsquo;s approximated LRU samples random keys instead of maintaining true ordering.</li>
+        <li><strong>Second-Chance / Enhanced CLOCK</strong> &mdash; Uses both a reference bit and a dirty bit. Prefers evicting clean, unreferenced pages (cheapest to evict since no write-back needed). Distributed parallel: multi-tier cache eviction that considers both recency and write cost.</li>
+      </ol>
+
+      <h4>Page Fault: Step-by-Step Walkthrough</h4>
+      <p>A <strong>page fault</strong> occurs when a process tries to access a page that is not currently in physical memory. Here is exactly what happens, step by step:</p>
+      <ol>
+        <li><strong>CPU executes instruction</strong> that accesses virtual address <code>0x1A2B3C</code>.</li>
+        <li><strong>MMU (Memory Management Unit)</strong> extracts the page number (<code>0x1A2B3</code>) and looks it up in the <strong>page table</strong>.</li>
+        <li><strong>Present bit = 0</strong> &rarr; <strong>PAGE FAULT.</strong> The page exists on disk but is not loaded in RAM.</li>
+        <li><strong>OS interrupt handler is invoked.</strong> The CPU traps into kernel mode.</li>
+        <li><strong>OS finds a free frame</strong> in physical memory. If no free frames exist, the OS runs a page replacement algorithm (LRU, CLOCK, etc.) to evict an existing page. If the evicted page is &ldquo;dirty&rdquo; (modified), it must first be written back to disk.</li>
+        <li><strong>OS reads the needed page from disk</strong> into the free frame. This takes approximately <strong>5 ms on SSD</strong> or <strong>10 ms on HDD</strong>.</li>
+        <li><strong>OS updates the page table:</strong> page <code>0x1A2B3</code> &rarr; frame 42, present bit = 1.</li>
+        <li><strong>OS restarts the instruction.</strong> This time, the MMU finds the page in the page table, translates to a physical address, and the memory access succeeds in approximately <strong>100 ns</strong>.</li>
+      </ol>
+      <div class="callout callout-info">
+        <h4>The Cost of a Page Fault</h4>
+        <p>A page fault costs <strong>5,000,000 ns</strong> (5 ms for SSD) vs. <strong>100 ns</strong> for a normal memory access. That is a <strong>50,000x penalty.</strong> This is why page replacement algorithms matter so much &mdash; and it is the exact same tradeoff as a cache hit vs. cache miss in system design. A Redis cache hit takes ~0.5 ms; a cache miss that falls through to a database query takes ~5&ndash;50 ms. Same order-of-magnitude penalty, same reason to optimize the eviction policy.</p>
+      </div>
+
+      <h4>Page Replacement Algorithms: Worked Example</h4>
+      <p>To see how different algorithms perform, let&rsquo;s trace through the same <strong>reference string</strong> (the sequence of page accesses) with <strong>3 frames</strong> of physical memory:</p>
+      <p><strong>Reference string:</strong> 1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5</p>
+
+      <h5>FIFO (First-In, First-Out)</h5>
+      <p>Evict the page that has been in memory the longest, regardless of how recently it was accessed.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Access</th><th>Frame 1</th><th>Frame 2</th><th>Frame 3</th><th>Fault?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td><strong>1</strong></td><td>&mdash;</td><td>&mdash;</td><td>YES</td></tr>
+          <tr><td>2</td><td>1</td><td><strong>2</strong></td><td>&mdash;</td><td>YES</td></tr>
+          <tr><td>3</td><td>1</td><td>2</td><td><strong>3</strong></td><td>YES</td></tr>
+          <tr><td>4</td><td><strong>4</strong></td><td>2</td><td>3</td><td>YES (evict 1, oldest)</td></tr>
+          <tr><td>1</td><td>4</td><td><strong>1</strong></td><td>3</td><td>YES (evict 2)</td></tr>
+          <tr><td>2</td><td>4</td><td>1</td><td><strong>2</strong></td><td>YES (evict 3)</td></tr>
+          <tr><td>5</td><td><strong>5</strong></td><td>1</td><td>2</td><td>YES (evict 4)</td></tr>
+          <tr><td>1</td><td>5</td><td>1</td><td>2</td><td>NO (hit)</td></tr>
+          <tr><td>2</td><td>5</td><td>1</td><td>2</td><td>NO (hit)</td></tr>
+          <tr><td>3</td><td>5</td><td><strong>3</strong></td><td>2</td><td>YES (evict 1)</td></tr>
+          <tr><td>4</td><td>5</td><td>3</td><td><strong>4</strong></td><td>YES (evict 2)</td></tr>
+          <tr><td>5</td><td>5</td><td>3</td><td>4</td><td>NO (hit)</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Total page faults: 9 out of 12 accesses.</strong> FIFO is simple but does not consider how recently a page was used. A page that was accessed just moments ago can be evicted simply because it was loaded first.</p>
+
+      <h5>LRU (Least Recently Used)</h5>
+      <p>Evict the page that has not been accessed for the longest time.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Access</th><th>Frame 1</th><th>Frame 2</th><th>Frame 3</th><th>Fault?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td><strong>1</strong></td><td>&mdash;</td><td>&mdash;</td><td>YES</td></tr>
+          <tr><td>2</td><td>1</td><td><strong>2</strong></td><td>&mdash;</td><td>YES</td></tr>
+          <tr><td>3</td><td>1</td><td>2</td><td><strong>3</strong></td><td>YES</td></tr>
+          <tr><td>4</td><td><strong>4</strong></td><td>2</td><td>3</td><td>YES (evict 1, LRU)</td></tr>
+          <tr><td>1</td><td>4</td><td><strong>1</strong></td><td>3</td><td>YES (evict 2, LRU)</td></tr>
+          <tr><td>2</td><td>4</td><td>1</td><td><strong>2</strong></td><td>YES (evict 3, LRU)</td></tr>
+          <tr><td>5</td><td><strong>5</strong></td><td>1</td><td>2</td><td>YES (evict 4, LRU)</td></tr>
+          <tr><td>1</td><td>5</td><td>1</td><td>2</td><td>NO (hit)</td></tr>
+          <tr><td>2</td><td>5</td><td>1</td><td>2</td><td>NO (hit)</td></tr>
+          <tr><td>3</td><td><strong>3</strong></td><td>1</td><td>2</td><td>YES (evict 5, LRU)</td></tr>
+          <tr><td>4</td><td>3</td><td><strong>4</strong></td><td>2</td><td>YES (evict 1, LRU)</td></tr>
+          <tr><td>5</td><td>3</td><td>4</td><td><strong>5</strong></td><td>YES (evict 2, LRU)</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Total page faults: 10 out of 12 accesses.</strong> In this particular reference string, LRU actually performs slightly worse than FIFO! This happens because the working set (5 pages) is larger than the number of frames (3), causing both algorithms to thrash. With a working set that fits in memory, LRU significantly outperforms FIFO for workloads with temporal locality.</p>
+
+      <p><strong>These are the SAME algorithms used in cache eviction</strong> (see the <a href="caching.html">Caching deep-dive</a>). LRU for page replacement = LRU for cache eviction. FIFO page replacement = FIFO cache eviction. The page frames are the cache slots; the pages are the cached values; a page fault is a cache miss.</p>
+
+      <h3>Context Switching</h3>
+      <p>A <strong>context switch</strong> occurs when the OS stops one process and starts (or resumes) another on the same CPU. This happens when a process&rsquo;s time quantum expires (preemption), when a process blocks on I/O, or when a higher-priority process arrives.</p>
+
+      <h4>What Gets Saved and Restored</h4>
+      <p>When the OS switches from Process A to Process B, it must save A&rsquo;s entire execution state and load B&rsquo;s state. This includes:</p>
+      <ul>
+        <li><strong>Program counter (PC)</strong> &mdash; the address of the next instruction Process A would execute.</li>
+        <li><strong>CPU registers</strong> &mdash; all general-purpose registers, the stack pointer, frame pointer, and status/flags register.</li>
+        <li><strong>Memory mappings</strong> &mdash; the page table base register (CR3 on x86) is updated to point to Process B&rsquo;s page table, so the MMU translates virtual addresses using B&rsquo;s address space instead of A&rsquo;s.</li>
+        <li><strong>FPU / SIMD state</strong> &mdash; floating-point registers and vector registers (SSE, AVX). These are large (512+ bytes for AVX-512) and are sometimes lazily saved (only saved if the new process actually uses them).</li>
+        <li><strong>Kernel stack</strong> &mdash; each process has its own kernel stack for handling system calls and interrupts.</li>
+      </ul>
+
+      <h4>Why Context Switching Is Expensive</h4>
+      <p>The <strong>direct cost</strong> of saving and restoring registers takes approximately <strong>1&ndash;5 microseconds</strong>. But the much larger cost is indirect:</p>
+      <ol>
+        <li><strong>CPU cache pollution:</strong> The CPU caches (L1: ~32 KB, L2: ~256 KB, L3: ~8&ndash;32 MB) contain Process A&rsquo;s data. After switching to Process B, the cache is &ldquo;cold&rdquo; for B &mdash; B&rsquo;s initial memory accesses will be cache misses (~5&ndash;100 ns penalty each). On a cache-sensitive workload, warming up the cache can take <strong>10&ndash;100 microseconds</strong>.</li>
+        <li><strong>TLB flush:</strong> The Translation Lookaside Buffer (TLB) caches recent virtual-to-physical address translations. When you switch page tables (different process = different address space), the TLB entries become invalid and must be flushed. Each subsequent memory access incurs a TLB miss, requiring a page table walk (~30&ndash;100 ns). Modern CPUs use ASIDs (Address Space IDs) to tag TLB entries per-process, avoiding full flushes &mdash; but the TLB is small (64&ndash;1536 entries), so thrashing still occurs under heavy switching.</li>
+        <li><strong>Pipeline flush:</strong> The CPU&rsquo;s instruction pipeline and branch predictor state are invalidated, causing initial mispredictions in the new process.</li>
+      </ol>
+      <div class="callout callout-info">
+        <h4>System Design Parallel</h4>
+        <p>Context switching in the OS is directly analogous to <strong>connection migration in load balancing</strong>. When a request is moved from Server A to Server B (e.g., during a rolling deploy or failover), all the session state must be transferred, and Server B&rsquo;s caches are cold for that session. The &ldquo;warmup penalty&rdquo; is the same concept: Server B takes several requests before its local caches (CPU cache, page cache, application-level cache) are hot for the migrated workload. This is why graceful draining (finish in-flight requests before migrating) is preferred over abrupt migration.</p>
+      </div>
+
+      <h3>Threads vs. Processes</h3>
+      <p>A <strong>process</strong> is an isolated unit of execution with its own virtual address space, file descriptors, and kernel resources. A <strong>thread</strong> is a lightweight unit of execution within a process &mdash; threads within the same process share the same address space, heap, and file descriptors, but each has its own stack, program counter, and registers.</p>
+
+      <h4>Key Differences</h4>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Property</th><th>Processes</th><th>Threads</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Memory</td><td>Isolated address spaces. Process A cannot read Process B&rsquo;s memory.</td><td>Shared address space. Thread A can read/write the same memory as Thread B.</td></tr>
+          <tr><td>Creation cost</td><td>Heavy (~10 ms to fork). Requires duplicating page tables, file descriptor tables.</td><td>Light (~50 &micro;s). Only allocates a new stack and thread control block.</td></tr>
+          <tr><td>Context switch</td><td>Expensive (~5 &micro;s). Requires TLB flush and page table switch.</td><td>Cheaper (~1&ndash;2 &micro;s). No TLB flush needed (same address space).</td></tr>
+          <tr><td>Crash isolation</td><td>One process crashing does not affect others.</td><td>One thread crashing (e.g., segfault) kills the entire process.</td></tr>
+          <tr><td>Communication</td><td>Requires IPC (pipes, sockets, shared memory). Slow.</td><td>Direct memory sharing. Fast but requires synchronization.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4>Race Conditions and Why They Happen</h4>
+      <p>Because threads share memory, two threads can access the same variable simultaneously. A <strong>race condition</strong> occurs when the result depends on the timing of thread execution. Example: two threads both increment a shared counter <code>count = count + 1</code>. This single line compiles to three CPU operations: (1) read <code>count</code> from memory into a register, (2) add 1 to the register, (3) write the register back to memory. If Thread A reads <code>count = 5</code>, then Thread B reads <code>count = 5</code> before A writes back, both write 6 &mdash; and an increment is lost. The counter should be 7 but ends up as 6.</p>
+
+      <h4>Concurrency Primitives</h4>
+      <p><strong>Mutex (Mutual Exclusion):</strong> A mutex is a lock that allows only one thread to access a shared resource at a time. Thread A calls <code>lock()</code>, accesses the shared variable, then calls <code>unlock()</code>. If Thread B tries to call <code>lock()</code> while A holds it, Thread B is <strong>blocked</strong> (the OS puts it to sleep) until A calls <code>unlock()</code>. This prevents the race condition above, but at the cost of serializing access &mdash; only one thread can be in the critical section at a time.</p>
+      <p><strong>Semaphore:</strong> A semaphore is a generalized mutex with a counter. A <strong>counting semaphore(N)</strong> allows up to N threads to access a resource simultaneously. When a thread acquires the semaphore, the counter decrements. When it releases, the counter increments. If the counter is 0, acquiring blocks the thread until another thread releases. A mutex is simply a semaphore with N=1. Use case: limiting concurrent database connections to a pool of 10 &mdash; use a semaphore(10).</p>
+
+      <h4>Deadlock: Four Conditions</h4>
+      <p>A <strong>deadlock</strong> occurs when two or more threads are permanently blocked, each waiting for a resource held by the other. A deadlock requires <strong>all four</strong> of these conditions to hold simultaneously:</p>
+      <ol>
+        <li><strong>Mutual exclusion:</strong> At least one resource is non-shareable (only one thread can hold it at a time).</li>
+        <li><strong>Hold and wait:</strong> A thread holds one resource while waiting to acquire another.</li>
+        <li><strong>No preemption:</strong> Resources cannot be forcibly taken from a thread &mdash; the thread must release them voluntarily.</li>
+        <li><strong>Circular wait:</strong> Thread A holds Resource 1 and waits for Resource 2. Thread B holds Resource 2 and waits for Resource 1.</li>
+      </ol>
+      <p><strong>Breaking any one condition prevents deadlock.</strong> The most common strategy is breaking circular wait by imposing a <strong>global ordering</strong> on resource acquisition: always acquire Lock A before Lock B. If every thread follows this ordering, circular wait becomes impossible. In distributed systems, the same principle applies to distributed locks &mdash; always acquire locks in a consistent order across services.</p>
+
+      <h3>I/O Models</h3>
+      <p>How a program waits for I/O (disk reads, network data, etc.) fundamentally determines how many concurrent operations it can handle. There are four models, each trading simplicity for scalability:</p>
+
+      <h4>Blocking I/O</h4>
+      <p>The simplest model. You call <code>read()</code> and your thread is <strong>frozen</strong> until data arrives. The thread cannot do anything else while waiting. Analogy: standing at a restaurant counter waiting for your food &mdash; you cannot do anything else until it is ready.</p>
+      <p><strong>Cost:</strong> If each request blocks for I/O, you need one thread per concurrent request. At 1,000 concurrent requests, that is 1,000 threads, each consuming ~1 MB of stack space = 1 GB of memory just for stacks, plus massive context-switch overhead.</p>
+
+      <h4>Non-blocking I/O</h4>
+      <p>You call <code>read()</code> and if data is not ready, it returns <strong>immediately</strong> with an error code (<code>EAGAIN</code>). Your thread is not blocked, but you must <strong>poll repeatedly</strong> to check if data has arrived. Analogy: checking the restaurant counter every 30 seconds &mdash; &ldquo;Is my food ready? No? OK, I&rsquo;ll check again.&rdquo;</p>
+      <p><strong>Cost:</strong> Busy-waiting wastes CPU cycles. Polling too frequently burns CPU; polling too infrequently adds latency. Rarely used directly &mdash; it is a building block for the next model.</p>
+
+      <h4>I/O Multiplexing (select / poll / epoll)</h4>
+      <p>You register interest in <strong>multiple file descriptors</strong> with a single system call. The OS tells you which ones are ready. Analogy: giving the restaurant your phone number &mdash; they text you when <em>any</em> of your orders is ready. You can place many orders and wait for a single notification.</p>
+      <ul>
+        <li><strong><code>select()</code></strong> &mdash; The original (1983). You pass a set of file descriptors; the kernel checks all of them and returns which are ready. Problem: it checks <strong>every</strong> file descriptor every time &mdash; O(n) per call. Limited to 1,024 file descriptors on most systems.</li>
+        <li><strong><code>poll()</code></strong> &mdash; Similar to <code>select()</code> but removes the 1,024 FD limit. Still O(n) per call.</li>
+        <li><strong><code>epoll</code></strong> (Linux, 2002) / <strong><code>kqueue</code></strong> (BSD) &mdash; The breakthrough. Instead of checking every file descriptor, the kernel maintains an interest list and uses <strong>callbacks</strong>. When data arrives on a socket, the kernel adds it to a ready list. Your <code>epoll_wait()</code> call only returns the file descriptors that <strong>actually have events</strong> &mdash; <strong>O(1) per event</strong>, regardless of how many total connections exist. This is why Nginx and Node.js can handle 100,000+ concurrent connections on a single thread.</li>
+      </ul>
+
+      <h4>Async I/O (io_uring)</h4>
+      <p>The most advanced model. You submit I/O requests to a queue, and the kernel completes them in the background. You do not block, you do not poll &mdash; you check a completion queue when you are ready. <code>io_uring</code> (Linux 5.1+) uses shared ring buffers between userspace and kernel, eliminating system call overhead entirely for submitted I/O operations.</p>
+
+      <h4>The C10K Problem</h4>
+      <p>In 2000, servers struggled to handle <strong>10,000 concurrent connections</strong>. The bottleneck was the thread-per-connection model:</p>
+      <ul>
+        <li><strong>10,000 threads</strong> &times; 1 MB stack = <strong>10 GB of memory</strong> just for thread stacks.</li>
+        <li><strong>Context switching:</strong> With 10K threads on a 4-core machine, each core has 2,500 threads. At ~5 &micro;s per context switch, the scheduling overhead alone consumes significant CPU time.</li>
+        <li><strong><code>select()</code></strong> checks all 10,000 FDs every call = O(10,000) &times; thousands of calls/sec = massive CPU waste.</li>
+      </ul>
+      <p><strong>The solution:</strong> Event-driven I/O with <code>epoll</code>/<code>kqueue</code>. One thread runs an event loop handling thousands of connections. No per-connection threads, no per-connection memory overhead. <strong>Nginx proved this model.</strong> A single Nginx worker (one thread, one core) handles 10,000+ connections with a few hundred KB of memory. Apache&rsquo;s prefork model (one process per connection) fell over at ~256 concurrent connections.</p>
+      <div class="callout callout-info">
+        <h4>System Design Parallel</h4>
+        <p>The C10K solution is exactly why <strong>Node.js, Nginx, and Redis</strong> use event loops. A single-threaded event loop with <code>epoll</code> can handle more concurrent connections than a multi-threaded server with blocking I/O, because the bottleneck is not CPU but memory and scheduling overhead. This is also why modern proxies (Envoy, HAProxy) and databases (Redis) chose the event-driven model. Understanding this tradeoff is critical when designing high-concurrency services.</p>
+      </div>
+
+      <h3>Inter-Process Communication (IPC)</h3>
+      <p>Processes on the same machine communicate through pipes, shared memory, message queues, and sockets. These map directly to distributed system communication patterns:</p>
+      <ul>
+        <li><strong>Pipes / Unix sockets</strong> &rarr; point-to-point gRPC or HTTP between two services</li>
+        <li><strong>Shared memory</strong> &rarr; shared cache (Redis) or shared database</li>
+        <li><strong>POSIX message queues</strong> &rarr; Kafka, RabbitMQ, SQS</li>
+        <li><strong>Signals</strong> &rarr; webhook callbacks, event notifications</li>
+      </ul>
+
+      <h3>File System Journaling and Write-Ahead Logging</h3>
+      <p>File systems like ext4 and XFS use a <strong>journal</strong> (write-ahead log) to ensure crash consistency. Before modifying data on disk, the file system writes the intended changes to a sequential log. If the system crashes mid-write, recovery replays the log to reach a consistent state. This is exactly the same mechanism databases use:</p>
+      <ol>
+        <li><strong>Write the change to the WAL</strong> (sequential write, fast).</li>
+        <li><strong>Apply the change to the actual data structures</strong> (potentially random I/O, slower).</li>
+        <li><strong>On crash recovery</strong>, replay any WAL entries that weren&rsquo;t fully applied.</li>
+      </ol>
+      <p>PostgreSQL&rsquo;s WAL, MySQL&rsquo;s redo log, and SQLite&rsquo;s journal all follow this pattern &mdash; a pattern the OS invented decades earlier.</p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Apply OS Thinking When</h4>
+          <ul>
+            <li><strong>Designing scheduling or routing algorithms</strong> &mdash; OS scheduling theory gives you the vocabulary and analysis frameworks (fairness, starvation, convoy effects) for load balancer design.</li>
+            <li><strong>Choosing eviction policies</strong> &mdash; LRU, LFU, CLOCK, and their tradeoffs were solved in the OS context first. Apply the same analysis to cache eviction, connection pool management, and buffer pool sizing.</li>
+            <li><strong>Implementing concurrency control</strong> &mdash; Mutexes, read-write locks, and semaphores have direct distributed analogues. Understanding deadlock conditions (hold-and-wait, no preemption, circular wait) helps prevent distributed deadlocks. <a href="concurrency-control.html">See the full Concurrency Control deep-dive &rarr;</a></li>
+            <li><strong>Designing durability mechanisms</strong> &mdash; WAL, checkpointing, and crash recovery are OS file system patterns. Use them when building databases, event stores, or any system requiring crash-safe writes.</li>
+            <li><strong>Sizing thread pools and connection pools</strong> &mdash; OS scheduling theory (Little&rsquo;s Law, queuing theory) directly informs how many worker threads or connections your service needs.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don&rsquo;t Over-Apply When</h4>
+          <ul>
+            <li><strong>Distributed systems have partial failure</strong> &mdash; A single OS either works or crashes entirely. In a distributed system, one node can fail while others remain healthy. OS models that assume all-or-nothing failure break down.</li>
+            <li><strong>Network latency changes everything</strong> &mdash; An OS context switch costs ~1-10 &micro;s. A network round-trip costs 0.5-100 ms &mdash; 1,000-100,000x more. Strategies that assume cheap coordination (fine-grained locking) don&rsquo;t translate.</li>
+            <li><strong>No global clock or central scheduler</strong> &mdash; The OS has a single kernel scheduler with global state. Distributed systems have no omniscient scheduler. Algorithms that rely on centralized decisions need redesign.</li>
+            <li><strong>Ordering guarantees differ</strong> &mdash; OS IPC on a single machine guarantees FIFO ordering on pipes. Distributed message queues may deliver out of order, duplicate, or lose messages entirely.</li>
+            <li><strong>Security boundaries are different</strong> &mdash; OS process isolation protects against bugs, not adversaries with network access. Container isolation is not VM-level security. Don&rsquo;t confuse namespace isolation with true sandboxing.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>I/O and Concurrency Models</h3>
+      <p>The evolution of how servers handle concurrent connections mirrors OS-level I/O evolution:</p>
+      <ol>
+        <li><strong>Process-per-connection (Classic)</strong> &mdash; Apache httpd&rsquo;s prefork MPM. Each connection gets its own process with full isolation. Simple but expensive: each process costs ~2-10 MB of memory plus fork overhead. Breaks at a few thousand connections.</li>
+        <li><strong>Thread-per-request</strong> &mdash; Java servlet containers (Tomcat). Threads are cheaper than processes (~1 MB stack) but still limited by context-switch overhead and memory. Typical ceiling: 200-500 threads per server.</li>
+        <li><strong>Event-driven (epoll/kqueue)</strong> &mdash; Nginx, Node.js, HAProxy. A single thread handles thousands of connections using non-blocking I/O multiplexing. The kernel does the scheduling via <code>epoll_wait()</code>. Handles 10,000+ concurrent connections (the C10K problem, solved).</li>
+        <li><strong>Thread-per-core (Seastar/ScyllaDB)</strong> &mdash; Each CPU core runs one application thread. All I/O is asynchronous. No locks (each core owns its data partition). Eliminates context switches and cache-line bouncing. ScyllaDB achieves 1M+ ops/sec per node with this model.</li>
+        <li><strong>io_uring (Linux 5.1+)</strong> &mdash; A shared ring buffer between userspace and kernel for async I/O submission and completion. Eliminates system call overhead for I/O. Used by modern databases and proxies for 2-3x throughput improvement over <code>epoll</code>.</li>
+        <li><strong>eBPF (Extended Berkeley Packet Filter)</strong> &mdash; Programmable kernel: run custom code inside the kernel without modifying it. Used for network filtering (XDP), observability (bpftrace), and security (Falco). Replaces what previously required kernel modules.</li>
+      </ol>
+
+      <h3>Container Isolation as Modern Process Isolation</h3>
+      <p>Traditional OS process isolation gives each process its own virtual address space. Modern container isolation uses two kernel primitives to create lightweight, isolated environments:</p>
+      <ul>
+        <li><strong>Namespaces</strong> &mdash; Isolate what a process can <em>see</em>: PID namespace (separate process trees), network namespace (separate network stacks), mount namespace (separate file systems), user namespace (separate user IDs). Each container gets its own &ldquo;view&rdquo; of the system.</li>
+        <li><strong>cgroups (control groups)</strong> &mdash; Limit what a process can <em>use</em>: CPU time, memory, I/O bandwidth, number of processes. Kubernetes uses cgroup limits to enforce resource requests and limits on pods.</li>
+      </ul>
+      <p>Containers are not VMs &mdash; they share the host kernel. This makes them faster to start (milliseconds vs. seconds) but provides weaker isolation (a kernel exploit affects all containers on the host).</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Assumptions Behind OS Scheduling Models</h4>
+        <ul>
+          <li><strong>Processes are cooperative or preemptible</strong> &mdash; The OS can forcibly take the CPU away. In distributed systems, you cannot forcibly &ldquo;preempt&rdquo; a request being processed by another service. You can only time it out.</li>
+          <li><strong>Context switch cost is bounded and known</strong> &mdash; Typically 1-10 &micro;s. In distributed systems, the &ldquo;context switch&rdquo; is re-routing a request, which involves network latency (0.5-100 ms) &mdash; orders of magnitude more expensive and highly variable.</li>
+          <li><strong>The scheduler has accurate, real-time information about process state</strong> &mdash; The kernel knows each process&rsquo;s CPU time, memory usage, and I/O state. In distributed systems, load information is always stale (propagation delay), leading to suboptimal decisions like herd behavior.</li>
+          <li><strong>Single failure domain</strong> &mdash; If the OS crashes, all processes crash. There is no partial failure. Distributed systems must handle scenarios where the scheduler (load balancer) is alive but some backends are unreachable.</li>
+          <li><strong>Shared memory is fast and consistent</strong> &mdash; OS processes can share memory with ns-level access. Distributed &ldquo;shared state&rdquo; (databases, caches) involves network round-trips and consistency protocols.</li>
+        </ul>
+        <p style="margin-top: 1rem; margin-bottom: 0;"><strong>When assumptions break down:</strong> Any time you are tempted to directly transplant an OS algorithm to a distributed system, check whether the coordination cost (network latency, stale information, partial failure) invalidates the algorithm&rsquo;s assumptions. The <em>concept</em> transfers; the <em>implementation</em> rarely does.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <p>Good sizing starts with an SLO, not a guess. Every OS-level parameter &mdash; thread pool depth, page cache size, cgroup limit, CPU affinity mask &mdash; should be <em>derived</em> from a measurable target. The examples below walk through the reasoning from SLO to kernel configuration.</p>
+
+      <!-- SLO Example 1: High-Throughput Web Server -->
+      <h3>SLO Example 1: High-Throughput Web Server</h3>
+      <p><strong>SLO:</strong> p99 response latency &lt; 10 ms, sustaining 100K concurrent connections.</p>
+
+      <div class="callout callout-info">
+        <h4>Deriving the Configuration</h4>
+        <p><strong>Thread pool size:</strong> At 100K concurrent connections with 10 ms average service time, Little&rsquo;s Law gives <code>L = &lambda; &times; W</code>. If each connection issues 1 RPS, that is 100K RPS &times; 0.01 s = <strong>1,000 concurrent in-flight requests</strong>. But 1,000 threads on a 16-core machine means ~62 threads per core &mdash; context switch overhead alone (each switch ~5 &micro;s) consumes <code>62 &times; 5 &micro;s / 10 ms = 3.1%</code> of each quantum. Tolerable, but the tail latency risk is real.</p>
+        <p><strong>Better approach &mdash; epoll:</strong> Switch from thread-per-connection to event-driven I/O with <code>epoll</code>. Use 16 worker threads (one per core), each running an event loop multiplexing thousands of connections. Context switches drop to near zero. The p99 budget is spent on application logic, not scheduling.</p>
+        <p><strong>Memory budget:</strong> Each TCP connection consumes ~10 KB of kernel buffer space (send + receive). At 100K connections: <code>100,000 &times; 10 KB = ~1 GB</code> just for socket buffers. Add 4 KB per connection for application state = another 400 MB. Total: <strong>~1.5 GB minimum</strong>, so a 4 GB node leaves 2.5 GB for the application and page cache.</p>
+        <p><strong>File descriptors:</strong> Set <code>ulimit -n 131072</code> (100K connections + headroom for files, pipes, and internal sockets).</p>
+        <p style="margin-bottom: 0;"><strong>Kernel tuning:</strong> <code>net.core.somaxconn = 65535</code>, <code>net.ipv4.tcp_max_syn_backlog = 65535</code>, <code>net.core.netdev_max_backlog = 50000</code>. Without these, the kernel drops connections before they reach your application, and your p99 becomes &ldquo;connection refused.&rdquo;</p>
+      </div>
+
+      <!-- SLO Example 2: Database Engine -->
+      <h3>SLO Example 2: Database Engine</h3>
+      <p><strong>SLO:</strong> p99 read latency &lt; 1 ms, sustaining 500K IOPS.</p>
+
+      <div class="callout callout-info">
+        <h4>Deriving the Configuration</h4>
+        <p><strong>Page cache sizing:</strong> A single NVMe read takes ~100 &micro;s. To hit p99 &lt; 1 ms, at least 99% of reads must be served from memory. If the working set is 50 GB, the page cache must hold at least <code>50 GB &times; 0.99 = 49.5 GB</code>. Use a 64 GB machine and pin the buffer pool to avoid eviction.</p>
+        <p><strong>Huge pages:</strong> At 50 GB, standard 4 KB pages require 13.1 million page table entries. TLB misses become a bottleneck &mdash; each miss costs ~30 ns (L2 TLB) to ~100 ns (page table walk). Switch to 2 MB huge pages: only 25,600 entries, easily fitting in the TLB. This alone can reduce p99 by 200&ndash;500 &micro;s under high concurrency.</p>
+        <p><strong>I/O scheduler:</strong> For NVMe SSDs, use <code>none</code> (noop) scheduler. The CFQ or mq-deadline schedulers add latency reordering requests for spinning disks that do not exist. With <code>none</code>, requests pass directly to the device driver.</p>
+        <p><strong>Direct I/O vs. buffered:</strong> Use <code>O_DIRECT</code> for the database engine to bypass the kernel page cache and manage its own buffer pool. This avoids double-caching (data in both kernel page cache and database buffer pool) and gives the database precise control over eviction, which is critical for keeping the right 99% of pages hot.</p>
+        <p style="margin-bottom: 0;"><strong>IOPS budget:</strong> 500K IOPS across 4 NVMe drives (each rated ~200K random read IOPS) leaves headroom. But the CPU cost matters: each <code>io_submit</code> syscall costs ~1 &micro;s. At 500K IOPS, that is 0.5 seconds of CPU per second &mdash; roughly <strong>1 core</strong> spent just submitting I/O. Use <code>io_uring</code> with submission queue batching to cut this by 5&ndash;10x.</p>
+      </div>
+
+      <!-- SLO Example 3: Container Orchestrator -->
+      <h3>SLO Example 3: Container Orchestrator</h3>
+      <p><strong>SLO:</strong> p99 container startup latency &lt; 2 seconds, supporting 1,000 containers per node.</p>
+
+      <div class="callout callout-info">
+        <h4>Deriving the Configuration</h4>
+        <p><strong>cgroup limits:</strong> With 1,000 containers on a 128 GB / 32-core node, the naive split is 128 MB memory and 0.032 cores per container. But workloads are bursty. Use <strong>overcommit</strong>: set memory requests to 128 MB (guaranteed minimum) but limits to 512 MB, relying on statistical multiplexing. The overcommit ratio of 4:1 works when containers have uncorrelated peak usage.</p>
+        <p><strong>Memory overcommit policy:</strong> Set <code>vm.overcommit_memory = 0</code> (heuristic) rather than <code>1</code> (always). With <code>1</code>, the kernel promises memory it does not have, and the OOM killer fires unpredictably. With <code>0</code>, <code>malloc</code> returns NULL when memory is exhausted, giving applications a chance to degrade gracefully.</p>
+        <p><strong>OOM policy:</strong> Set <code>oom_score_adj = -999</code> for the kubelet and container runtime so they survive OOM events. For application containers, set <code>oom_score_adj</code> proportional to priority: low-priority batch jobs get +500 (killed first), critical services get -500 (killed last).</p>
+        <p><strong>Startup latency budget:</strong> The 2 s budget breaks down as: image pull (precached = 0 ms, cold = seconds &mdash; so always pre-pull), filesystem setup via overlayfs (~50 ms), cgroup creation (~10 ms), namespace creation (~20 ms), process fork+exec (~5 ms), application init (remaining budget). The OS overhead is ~85 ms, leaving 1.9 s for the application. If startup exceeds 2 s, the bottleneck is almost always the application, not the kernel.</p>
+        <p style="margin-bottom: 0;"><strong>PID limits:</strong> Set <code>pids.max</code> in the PID cgroup to 512 per container. A fork bomb in one container must not exhaust the system-wide PID space (default <code>kernel.pid_max = 32768</code>, raise to 4194304 on dense nodes).</p>
+      </div>
+
+      <!-- SLO Example 4: Real-Time Data Pipeline -->
+      <h3>SLO Example 4: Real-Time Data Pipeline</h3>
+      <p><strong>SLO:</strong> p99 end-to-end processing latency &lt; 50 ms, sustaining 1M events/sec.</p>
+
+      <div class="callout callout-info">
+        <h4>Deriving the Configuration</h4>
+        <p><strong>CPU pinning:</strong> At 1M events/sec with a 50 ms budget, each event gets 50 &micro;s of wall-clock time. A single context switch (~5 &micro;s) eats 10% of that budget. Eliminate involuntary switches by pinning worker threads to dedicated cores using <code>taskset</code> or <code>pthread_setaffinity_np</code>. Use <code>isolcpus</code> boot parameter to keep the kernel scheduler off those cores entirely.</p>
+        <p><strong>NUMA-aware allocation:</strong> On a 2-socket machine, a memory access to the remote NUMA node costs ~100 ns vs. ~70 ns for local. At 1M events/sec, if 10% of allocations hit remote memory, that is <code>100K &times; 30 ns = 3 ms</code> per second of added latency. Use <code>numactl --membind</code> or <code>set_mempolicy(MPOL_BIND)</code> to force allocations to the local node. Structure the pipeline so each stage runs on cores attached to the same NUMA node as its data.</p>
+        <p><strong>Context switch budget:</strong> With 16 dedicated cores processing 1M events/sec, each core handles 62,500 events/sec. At 50 &micro;s per event and ~16 &micro;s per context switch pair (save + restore), you can afford at most <code>(50 &micro;s - processing_time) / 16 &micro;s</code> switches per event &mdash; effectively zero for tight budgets. This mandates a <strong>thread-per-core, run-to-completion</strong> architecture: each core runs one thread that polls for work, never blocks, never switches.</p>
+        <p><strong>Memory allocation:</strong> Avoid <code>malloc</code>/<code>free</code> in the hot path (each call can trigger <code>mmap</code>/<code>munmap</code> syscalls, each costing ~1 &micro;s). Pre-allocate ring buffers sized for the burst window: at 1M events/sec and a 1-second burst buffer, allocate <code>1M &times; event_size</code> upfront. For 256-byte events, that is 256 MB per ring buffer.</p>
+        <p style="margin-bottom: 0;"><strong>Kernel bypass:</strong> At this scale, even syscall overhead matters. Each <code>read</code>/<code>write</code> syscall costs ~200 ns. At 1M events/sec over the network, that is 200 ms/sec of CPU &mdash; 20% of one core just entering and leaving the kernel. Use DPDK or <code>io_uring</code> with registered buffers to batch or eliminate syscalls.</p>
+      </div>
+
+      <!-- Interactive Canvas: Throughput vs Thread Count -->
+      <h3>Interactive: Throughput vs. Thread Count</h3>
+      <p>The graph below models how throughput changes as you increase the thread/process count on a 16-core machine. Hover over data points to see the exact values. Notice the plateau region where adding threads no longer helps, followed by degradation as context-switching overhead dominates.</p>
+
+      <div style="position: relative; background: #1a1a2e; border-radius: 12px; padding: 24px; margin: 24px 0;">
+        <canvas id="throughputCanvas" width="760" height="420" style="width: 100%; max-width: 760px; display: block; margin: 0 auto; cursor: crosshair;"></canvas>
+        <div id="canvasTooltip" style="display: none; position: absolute; background: rgba(15,15,35,0.95); color: #e0e0e0; border: 1px solid #7c5cbf; border-radius: 6px; padding: 8px 12px; font-family: 'JetBrains Mono', monospace; font-size: 13px; pointer-events: none; z-index: 10; line-height: 1.5; box-shadow: 0 4px 12px rgba(0,0,0,0.4);"></div>
+        <div style="display: flex; justify-content: center; gap: 24px; margin-top: 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #a0a0b8;">
+          <span><span style="display: inline-block; width: 12px; height: 12px; background: #7c5cbf; border-radius: 50%; margin-right: 4px; vertical-align: middle;"></span> Throughput (RPS)</span>
+          <span><span style="display: inline-block; width: 12px; height: 12px; background: #e74c6f; border-radius: 50%; margin-right: 4px; vertical-align: middle;"></span> p99 Latency (ms)</span>
+          <span style="color: #50c878;">&#9650; Optimal zone</span>
+        </div>
+      </div>
+
+      <script>
+      (function() {
+        var canvas = document.getElementById('throughputCanvas');
+        var ctx = canvas.getContext('2d');
+        var tooltip = document.getElementById('canvasTooltip');
+        var W = canvas.width, H = canvas.height;
+        var PAD = { top: 40, right: 70, bottom: 50, left: 70 };
+        var plotW = W - PAD.left - PAD.right;
+        var plotH = H - PAD.top - PAD.bottom;
+        var CORES = 16;
+
+        // Model: throughput and latency vs thread count
+        function model(threads) {
+          // Throughput rises linearly up to ~cores, plateaus, then degrades
+          var useful = Math.min(threads, CORES);
+          var csOverhead = threads > CORES ? (threads - CORES) * 0.003 : 0; // fraction lost to ctx switches
+          csOverhead = Math.min(csOverhead, 0.85);
+          var throughput = useful * 6250 * (1 - csOverhead); // base 6250 RPS per core
+          // Latency: base 1ms, rises with contention
+          var baseLat = 1.0;
+          var latency = baseLat + (csOverhead * 80) + (threads > CORES ? Math.pow((threads - CORES) / 200, 2) * 20 : 0);
+          return { throughput: Math.max(throughput, 500), latency: latency };
+        }
+
+        // Generate data points
+        var threadCounts = [];
+        for (var t = 1; t <= 512; t += (t < 32 ? 1 : (t < 128 ? 4 : 8))) threadCounts.push(t);
+        var data = threadCounts.map(function(t) { var m = model(t); return { threads: t, throughput: m.throughput, latency: m.latency }; });
+
+        var maxThroughput = 0, maxLatency = 0;
+        data.forEach(function(d) {
+          if (d.throughput > maxThroughput) maxThroughput = d.throughput;
+          if (d.latency > maxLatency) maxLatency = d.latency;
+        });
+        maxThroughput = Math.ceil(maxThroughput / 10000) * 10000;
+        maxLatency = Math.ceil(maxLatency / 10) * 10;
+        var maxThreads = 512;
+
+        function xPos(threads) { return PAD.left + (threads / maxThreads) * plotW; }
+        function yThroughput(val) { return PAD.top + plotH - (val / maxThroughput) * plotH; }
+        function yLatency(val) { return PAD.top + plotH - (val / maxLatency) * plotH; }
+
+        function draw(hoverIdx) {
+          ctx.clearRect(0, 0, W, H);
+
+          // Background grid
+          ctx.strokeStyle = 'rgba(120,120,160,0.15)';
+          ctx.lineWidth = 1;
+          for (var i = 0; i <= 5; i++) {
+            var gy = PAD.top + (plotH / 5) * i;
+            ctx.beginPath(); ctx.moveTo(PAD.left, gy); ctx.lineTo(W - PAD.right, gy); ctx.stroke();
+          }
+          for (var i = 0; i <= 5; i++) {
+            var gx = PAD.left + (plotW / 5) * i;
+            ctx.beginPath(); ctx.moveTo(gx, PAD.top); ctx.lineTo(gx, PAD.top + plotH); ctx.stroke();
+          }
+
+          // Optimal zone highlight (around 14-20 threads)
+          var zoneLeft = xPos(12), zoneRight = xPos(24);
+          ctx.fillStyle = 'rgba(80,200,120,0.08)';
+          ctx.fillRect(zoneLeft, PAD.top, zoneRight - zoneLeft, plotH);
+          ctx.strokeStyle = 'rgba(80,200,120,0.3)';
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath(); ctx.moveTo(zoneLeft, PAD.top); ctx.lineTo(zoneLeft, PAD.top + plotH); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(zoneRight, PAD.top); ctx.lineTo(zoneRight, PAD.top + plotH); ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Optimal label
+          ctx.fillStyle = '#50c878';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('optimal', (zoneLeft + zoneRight) / 2, PAD.top + 14);
+
+          // Throughput line
+          ctx.strokeStyle = '#7c5cbf';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          data.forEach(function(d, i) {
+            var x = xPos(d.threads), y = yThroughput(d.throughput);
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+
+          // Latency line
+          ctx.strokeStyle = '#e74c6f';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          data.forEach(function(d, i) {
+            var x = xPos(d.threads), y = yLatency(d.latency);
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+
+          // Axes
+          ctx.strokeStyle = '#555570';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(PAD.left, PAD.top); ctx.lineTo(PAD.left, PAD.top + plotH); ctx.lineTo(W - PAD.right, PAD.top + plotH); ctx.stroke();
+          // Right y axis
+          ctx.beginPath(); ctx.moveTo(W - PAD.right, PAD.top); ctx.lineTo(W - PAD.right, PAD.top + plotH); ctx.stroke();
+
+          // Axis labels
+          ctx.fillStyle = '#a0a0b8';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          for (var i = 0; i <= 5; i++) {
+            var tv = Math.round((maxThreads / 5) * i);
+            ctx.fillText(tv, PAD.left + (plotW / 5) * i, PAD.top + plotH + 20);
+          }
+          ctx.fillText('Thread / Process Count', PAD.left + plotW / 2, H - 5);
+
+          // Left Y axis (throughput)
+          ctx.textAlign = 'right';
+          ctx.fillStyle = '#7c5cbf';
+          for (var i = 0; i <= 5; i++) {
+            var val = Math.round((maxThroughput / 5) * (5 - i));
+            ctx.fillText((val / 1000).toFixed(0) + 'K', PAD.left - 8, PAD.top + (plotH / 5) * i + 4);
+          }
+          ctx.save();
+          ctx.translate(14, PAD.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('Throughput (RPS)', 0, 0);
+          ctx.restore();
+
+          // Right Y axis (latency)
+          ctx.textAlign = 'left';
+          ctx.fillStyle = '#e74c6f';
+          for (var i = 0; i <= 5; i++) {
+            var val = (maxLatency / 5) * (5 - i);
+            ctx.fillText(val.toFixed(0) + 'ms', W - PAD.right + 8, PAD.top + (plotH / 5) * i + 4);
+          }
+          ctx.save();
+          ctx.translate(W - 8, PAD.top + plotH / 2);
+          ctx.rotate(Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('p99 Latency (ms)', 0, 0);
+          ctx.restore();
+
+          // Title
+          ctx.fillStyle = '#e0e0e0';
+          ctx.font = 'bold 14px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Throughput & Latency vs. Thread Count (16-core machine)', W / 2, 20);
+
+          // Hover point
+          if (hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length) {
+            var d = data[hoverIdx];
+            var x = xPos(d.threads);
+            // Throughput dot
+            ctx.fillStyle = '#7c5cbf';
+            ctx.beginPath(); ctx.arc(x, yThroughput(d.throughput), 5, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+            // Latency dot
+            ctx.fillStyle = '#e74c6f';
+            ctx.beginPath(); ctx.arc(x, yLatency(d.latency), 5, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+            // Vertical guide
+            ctx.strokeStyle = 'rgba(200,200,220,0.25)';
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + plotH); ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        }
+
+        draw(null);
+
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H / rect.height);
+
+          if (mx < PAD.left || mx > W - PAD.right || my < PAD.top || my > PAD.top + plotH) {
+            tooltip.style.display = 'none';
+            draw(null);
+            return;
+          }
+
+          // Find nearest data point
+          var bestIdx = 0, bestDist = Infinity;
+          data.forEach(function(d, i) {
+            var dx = Math.abs(xPos(d.threads) - mx);
+            if (dx < bestDist) { bestDist = dx; bestIdx = i; }
+          });
+
+          draw(bestIdx);
+          var d = data[bestIdx];
+          var csTime = d.threads > CORES ? ((d.threads - CORES) * 0.003 * 100).toFixed(1) : '0.0';
+          tooltip.innerHTML = '<strong>' + d.threads + ' threads</strong><br>'
+            + 'Throughput: ' + Math.round(d.throughput).toLocaleString() + ' RPS<br>'
+            + 'p99 Latency: ' + d.latency.toFixed(1) + ' ms<br>'
+            + 'Ctx-switch overhead: ' + csTime + '%';
+          // Position tooltip
+          var tipRect = canvas.parentElement.getBoundingClientRect();
+          var canvasRect = canvas.getBoundingClientRect();
+          var tx = (e.clientX - tipRect.left) + 16;
+          var ty = (e.clientY - tipRect.top) - 20;
+          if (tx + 220 > tipRect.width) tx = tx - 240;
+          tooltip.style.left = tx + 'px';
+          tooltip.style.top = ty + 'px';
+          tooltip.style.display = 'block';
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+          draw(null);
+        });
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Capacity planning without an SLO is guessing. With an SLO, every resource parameter becomes a derivation. The process follows a repeatable loop:</p>
+
+      <div class="callout callout-info">
+        <h4>The SLO-to-Configuration Loop</h4>
+        <ol style="margin: 0; padding-left: 20px;">
+          <li><strong>Define the SLO:</strong> Pick the metric (p99 latency, throughput, availability) and the target number. Be specific: &ldquo;p99 read latency &lt; 5 ms at 200K QPS&rdquo; not &ldquo;fast reads.&rdquo;</li>
+          <li><strong>Build a latency budget:</strong> Decompose the SLO into stages. For a read request: network RTT (0.5 ms) + kernel syscall (0.2 ms) + page cache lookup (0.01 ms) + application logic (1 ms) + serialization (0.3 ms) = 2.01 ms. The remaining 2.99 ms is your safety margin.</li>
+          <li><strong>Identify the kernel parameters that affect each stage:</strong> Syscall overhead &rarr; io_uring vs. read(). Page cache hit rate &rarr; memory sizing, huge pages, <code>vm.swappiness</code>. CPU scheduling &rarr; thread count, pinning, <code>isolcpus</code>. Network &rarr; <code>SO_BUSY_POLL</code>, interrupt coalescing.</li>
+          <li><strong>Compute initial values from the budget:</strong> Use Little&rsquo;s Law, queuing theory (M/M/c for thread pools), and hardware specs (NVMe IOPS, memory bandwidth) to derive starting configurations.</li>
+          <li><strong>Load test and measure:</strong> Run a realistic workload at target QPS. Measure p50, p95, p99, p999. If p99 exceeds the SLO, identify which budget stage is over and tune the corresponding parameter.</li>
+          <li><strong>Iterate:</strong> Tighten one parameter at a time. Re-measure. Stop when the SLO is met with at least 20% headroom (to absorb traffic spikes and GC pauses).</li>
+        </ol>
+      </div>
+
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>SLO Type</th>
+            <th>Primary OS Lever</th>
+            <th>Secondary OS Lever</th>
+            <th>Measurement Tool</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Low latency (p99 &lt; N ms)</td>
+            <td>CPU pinning + <code>isolcpus</code></td>
+            <td>NUMA-aware allocation, huge pages</td>
+            <td><code>perf sched latency</code>, <code>bpftrace</code></td>
+          </tr>
+          <tr>
+            <td>High throughput (N K RPS)</td>
+            <td>Thread pool sizing (Little&rsquo;s Law)</td>
+            <td><code>epoll</code> / <code>io_uring</code>, kernel bypass</td>
+            <td><code>mpstat</code>, <code>vmstat</code>, app metrics</td>
+          </tr>
+          <tr>
+            <td>High IOPS (N K IOPS)</td>
+            <td>Page cache sizing, <code>O_DIRECT</code></td>
+            <td>I/O scheduler (<code>none</code>), <code>io_uring</code></td>
+            <td><code>iostat</code>, <code>blktrace</code>, <code>fio</code></td>
+          </tr>
+          <tr>
+            <td>Container density (N pods/node)</td>
+            <td>cgroup limits, overcommit ratio</td>
+            <td>OOM policy, PID limits</td>
+            <td><code>cadvisor</code>, <code>kubectl top</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><strong>Key insight:</strong> The SLO determines which OS knobs matter. A throughput SLO makes you care about thread count and syscall overhead. A latency SLO makes you care about context switches and NUMA topology. A density SLO makes you care about cgroups and overcommit. Tuning the wrong lever wastes effort and can make things worse &mdash; more threads improve throughput but degrade tail latency; more memory improves cache hit rate but increases GC pause times.</p>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K Users</span>
+          <h4>Single-Process</h4>
+          <p>One process handles everything. Flask, Rails, or Express with a single worker. Concurrency comes from the OS scheduler time-slicing between I/O operations. No need to think about thread pools or async I/O. The OS handles it.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K Users</span>
+          <h4>Multi-Threaded</h4>
+          <p>Switch to a multi-threaded or multi-process server (Gunicorn with workers, Tomcat thread pool). Tune thread pool size using Little&rsquo;s Law. Start caring about <code>ulimit</code> and file descriptor limits. Begin monitoring context switch rates.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M Users</span>
+          <h4>Event-Driven</h4>
+          <p>Adopt event-driven architecture (Nginx, Node.js) or async frameworks (asyncio, Netty). Use <code>epoll</code>/<code>kqueue</code> for I/O multiplexing. Handle C10K+ connections per node. OS-level tuning matters: <code>net.core.somaxconn</code>, <code>vm.swappiness</code>, huge pages for database buffer pools.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ Users</span>
+          <h4>Distributed + Thread-Per-Core</h4>
+          <p>Multiple machines, each running optimized thread-per-core architectures (ScyllaDB, Redpanda). OS concepts now applied across machines: distributed scheduling (Kubernetes scheduler), distributed eviction (tiered caching), distributed WAL (Raft log). eBPF for observability at kernel level.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>Priority Inversion</h3>
+      <p>
+        <strong>What happened:</strong> The Mars Pathfinder rover (1997) experienced repeated system resets on Mars. A high-priority task was blocked waiting for a lock held by a low-priority task, while a medium-priority task kept preempting the low-priority task &mdash; preventing it from ever releasing the lock. The watchdog timer interpreted the stall as a system hang and reset the computer.
+      </p>
+      <p>
+        <strong>Distributed parallel:</strong> Priority inversion occurs in distributed systems when a high-priority request is blocked by a lock or resource held by a low-priority service that is starved of CPU or network bandwidth by medium-priority traffic. Priority queues in message brokers can exhibit the same pattern: a high-priority message waits for a consumer that is busy processing medium-priority messages.
+      </p>
+      <p>
+        <strong>Mitigation:</strong> Priority inheritance (the lock holder temporarily inherits the priority of the highest-priority waiter). In distributed systems: ensure critical-path services have dedicated resources, use separate queues for different priority levels, set aggressive timeouts on lock acquisition.
+      </p>
+
+      <h3>Thundering Herd on Wake</h3>
+      <p>
+        <strong>What happened:</strong> When a process calls <code>accept()</code> on a shared listening socket, the kernel historically woke <em>all</em> processes waiting on that socket, even though only one could accept the connection. N-1 processes woke up, found no connection, and went back to sleep &mdash; wasting CPU cycles.
+      </p>
+      <p>
+        <strong>Distributed parallel:</strong> This is identical to the <em>cache stampede</em> problem. When a popular cache key expires, all concurrent requests for that key simultaneously query the database. N-1 of those queries are redundant. It is also the same as the thundering herd in service discovery: when a failed backend recovers, all clients that were retrying rush to it simultaneously, overloading it again.
+      </p>
+      <p>
+        <strong>Mitigation:</strong> Linux&rsquo;s <code>EPOLLEXCLUSIVE</code> flag (added in 4.5) wakes only one waiting process. For cache stampede: use request coalescing (singleflight), probabilistic early refresh, or a lock on cache population. For service recovery: use jittered backoff and gradual traffic ramp-up.
+      </p>
+
+      <h3>OOM Killer and Resource Exhaustion</h3>
+      <p>
+        <strong>What happened:</strong> A production database server ran out of memory. The Linux OOM killer selected and terminated the database process (because it was the largest memory consumer) rather than the runaway log aggregator that caused the memory pressure. The database went offline, taking the entire application down.
+      </p>
+      <p>
+        <strong>Distributed parallel:</strong> In Kubernetes, a container exceeding its memory limit is OOM-killed and restarted. If the memory limit is set too low for the workload, the container enters a crash loop. If set too high, it starves other containers on the same node. The same tradeoff exists: the OOM killer (or Kubernetes OOM eviction) is a blunt instrument that doesn&rsquo;t understand application priority.
+      </p>
+      <p>
+        <strong>Mitigation:</strong> Set <code>oom_score_adj</code> to protect critical processes (<code>-1000</code> for databases). In Kubernetes: use <code>Guaranteed</code> QoS (requests = limits) for critical pods. Set resource limits based on actual usage profiling, not guesses. Monitor memory usage trends and alert before reaching limits.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>What It Tells You</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>cpu_utilization</code></td>
+            <td>How saturated the CPU is</td>
+            <td>Alert at &gt;80% sustained (5 min)</td>
+          </tr>
+          <tr>
+            <td><code>context_switches/sec</code></td>
+            <td>Scheduling overhead, thread contention</td>
+            <td>Alert if &gt;50,000/sec per core</td>
+          </tr>
+          <tr>
+            <td><code>page_faults/sec</code> (major)</td>
+            <td>Memory pressure, swapping</td>
+            <td>Page if major faults &gt;100/sec</td>
+          </tr>
+          <tr>
+            <td><code>memory_usage_pct</code></td>
+            <td>How close to OOM</td>
+            <td>Alert at &gt;85%, page at &gt;95%</td>
+          </tr>
+          <tr>
+            <td><code>open_file_descriptors</code></td>
+            <td>Connection/file handle pressure</td>
+            <td>Alert at &gt;80% of <code>ulimit</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>High latency?</strong></p>
+        <p>&rarr; Check CPU utilization. If &gt;90%: Are context switches high? &rarr; Yes: Too many threads. Reduce pool size. &rarr; No: CPU-bound work. Profile with <code>perf top</code>.</p>
+        <p>&rarr; CPU is fine but latency is high? Check for major page faults. &rarr; If yes: Memory pressure. Check <code>vm.swappiness</code>, increase RAM or reduce working set. &rarr; If no: Check I/O wait (<code>iowait</code> in <code>top</code>). High iowait means disk is the bottleneck.</p>
+        <p>&rarr; Everything looks normal? Check file descriptor count. If near limit, connections are being refused.</p>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Setting</th>
+            <th>What It Controls</th>
+            <th>Recommended Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>ulimit -n</code></td>
+            <td>Max open file descriptors per process</td>
+            <td>65536+ for servers</td>
+          </tr>
+          <tr>
+            <td><code>vm.swappiness</code></td>
+            <td>How aggressively the kernel swaps to disk</td>
+            <td>1&ndash;10 for databases (avoid swapping). Default 60 is too high for latency-sensitive workloads.</td>
+          </tr>
+          <tr>
+            <td><code>net.core.somaxconn</code></td>
+            <td>Max socket listen backlog</td>
+            <td>4096+ (default 128 is too low for high-traffic servers)</td>
+          </tr>
+          <tr>
+            <td><code>fs.file-max</code></td>
+            <td>System-wide file descriptor limit</td>
+            <td>1,000,000+ for servers handling many connections</td>
+          </tr>
+          <tr>
+            <td><code>transparent_hugepage</code></td>
+            <td>Automatic huge page allocation</td>
+            <td>Disable (<code>madvise</code>) for databases &mdash; THP compaction causes latency spikes</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>OS Scheduling + Containers (cgroup CPU limits)</h3>
+      <p>
+        Kubernetes CPU limits use cgroup CPU bandwidth control. A container with a 1-CPU limit gets 100 ms of CPU time per 100 ms period. If it exhausts its quota early, it is <strong>throttled</strong> (paused) until the next period &mdash; even if the host CPU is idle. This causes unpredictable latency spikes. Many teams have seen P99 latency jump 10x because of cgroup throttling, not actual CPU contention.
+      </p>
+      <p><strong>Mitigation:</strong> Use CPU requests (guaranteed share) but avoid hard CPU limits, or set limits significantly higher than requests. Monitor <code>container_cpu_cfs_throttled_seconds_total</code> in Prometheus.</p>
+
+      <h3>Virtual Memory + JVM (GC pauses from page faults)</h3>
+      <p>
+        The JVM pre-allocates a large heap (e.g., 32 GB). The OS lazily allocates physical pages: memory is only backed by physical RAM when first written. During garbage collection, the GC must scan the entire heap. If parts of the heap have been swapped to disk, GC triggers <strong>major page faults</strong>, turning a 50 ms GC pause into a 5-second stall.
+      </p>
+      <p><strong>Mitigation:</strong> Set <code>vm.swappiness=1</code>. Use <code>-XX:+AlwaysPreTouch</code> to force the JVM to touch all heap pages at startup. Use huge pages (<code>-XX:+UseTransparentHugePages</code> or explicit huge pages) to reduce TLB misses during GC.</p>
+
+      <h3>Locks + Distributed Systems</h3>
+      <p>
+        An OS mutex operation takes ~25 ns (uncontended). A distributed lock (Redlock, ZooKeeper) takes 1-10 ms &mdash; 40,000 to 400,000x slower. Code that acquires and releases locks frequently (e.g., per-request locking) works fine with OS mutexes but becomes a devastating bottleneck with distributed locks. Additionally, distributed locks can be <em>falsely released</em> if the lock holder pauses (GC, preemption) and the lock TTL expires.
+      </p>
+      <p><strong>Mitigation:</strong> Use distributed locks sparingly &mdash; only for coordination, not for per-request synchronization. Use fencing tokens to prevent stale lock holders from corrupting data.</p>
+
+      <h3>File System + Database (fsync guarantees)</h3>
+      <p>
+        Databases rely on <code>fsync()</code> to ensure data reaches persistent storage. But <code>fsync()</code> behavior varies across file systems and hardware. On ext4 before Linux 4.13, a failed <code>fsync()</code> could silently lose data and report success on the next call (the &ldquo;PostgreSQL fsync bug&rdquo;). Some SSDs have buggy firmware that reports <code>fsync()</code> completion before data is actually persistent.
+      </p>
+      <p><strong>Mitigation:</strong> Use <code>O_DIRECT</code> + <code>fdatasync()</code> for databases that need guaranteed durability. Test with tools like <code>diskchecker.pl</code>. Use batteries or capacitors on hardware RAID controllers. In cloud environments, use provisioned IOPS storage (e.g., AWS io2) for database volumes.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Impact of OS-Level Optimization</h4>
+        <p>Understanding OS-level resource usage patterns can dramatically reduce cloud costs:</p>
+        <ul>
+          <li><strong>Right-sizing instances:</strong> Most cloud instances are over-provisioned. Profiling actual CPU usage (often 10-30% average) and memory footprint lets you downsize. Moving from <code>m5.2xlarge</code> ($280/mo) to <code>m5.xlarge</code> ($140/mo) across 20 instances saves $33,600/year.</li>
+          <li><strong>Thread pool tuning:</strong> An oversized thread pool wastes memory (each thread costs ~1 MB of stack). With 500 threads across 50 instances, reducing to 100 threads (per Little&rsquo;s Law) frees 20 GB of RAM fleet-wide &mdash; potentially allowing smaller instances.</li>
+          <li><strong>Avoiding swap:</strong> A swapping server performs 100-1,000x worse than a properly-sized one. One right-sized instance beats two under-provisioned, swapping instances.</li>
+          <li><strong>Huge pages for databases:</strong> Enabling huge pages for database buffer pools can improve throughput 5-10%, meaning you need fewer replicas to handle the same read load.</li>
+          <li><strong>Dominant cost driver:</strong> For CPU-bound workloads (compute), CPU is the bottleneck. For memory-bound workloads (caches, databases), RAM is the bottleneck. Profile first, then pick instance types that match your profile (compute-optimized vs. memory-optimized).</li>
+        </ul>
+        <p style="margin-bottom: 0;"><strong>Cost of ignorance:</strong> Teams that don&rsquo;t understand OS fundamentals consistently over-provision by 2-4x, spending $50K-200K/year more than necessary on a medium-scale deployment.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>ScyllaDB: Thread-Per-Core Architecture</h3>
+      <p>
+        ScyllaDB rewrote Cassandra in C++ using the <strong>Seastar framework</strong>, which assigns one application thread per CPU core. Each core owns a shard of data. There are no locks, no context switches between application threads, and no cache-line bouncing. The result: ScyllaDB achieves 1M+ ops/sec on a single node &mdash; 10x the throughput of Cassandra on the same hardware. The OS scheduling overhead that Cassandra pays (hundreds of threads, constant context switching) is eliminated entirely.
+      </p>
+
+      <h3>Nginx: Event-Driven Model</h3>
+      <p>
+        Nginx uses a small number of worker processes (typically one per CPU core), each running an event loop with <code>epoll</code>. A single Nginx worker can handle 10,000+ concurrent connections because it never blocks: all I/O is non-blocking, and the worker processes requests as events. This is a direct application of the OS event-driven I/O model. Apache&rsquo;s prefork model (process-per-connection) could handle ~256 concurrent connections before memory exhaustion; Nginx handles 10,000+ with less memory.
+      </p>
+
+      <h3>Linux CFS Scheduler</h3>
+      <p>
+        The Completely Fair Scheduler maintains a red-black tree of all runnable processes, keyed by virtual runtime. The process with the lowest vruntime runs next. The &ldquo;nice&rdquo; value adjusts the rate at which vruntime accumulates: nice -20 (highest priority) accumulates vruntime slowly, getting more CPU. This is the OS equivalent of weighted round-robin load balancing, where higher-weight servers receive proportionally more traffic.
+      </p>
+
+      <h3>Docker/Kubernetes: cgroups and Namespaces</h3>
+      <p>
+        Docker containers are just processes with cgroup limits and namespace isolation. Kubernetes extends this by adding a <strong>cluster-level scheduler</strong> (kube-scheduler) that assigns pods to nodes &mdash; the distributed equivalent of the OS scheduler assigning processes to CPUs. The kube-scheduler uses bin-packing algorithms (fitting pods into nodes based on resource requests) that directly parallel the OS memory allocator&rsquo;s strategies for fitting pages into physical frames.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>A round-robin scheduler simulation, side-by-side with its load balancer equivalent. Same algorithm, different domain:</p>
+<pre class="line-numbers"><code class="language-python">import itertools
+from collections import deque
+
+# === OS Concept: Round-Robin CPU Scheduler ===
+class RoundRobinScheduler:
+    """Simulates a CPU scheduler with a fixed time quantum."""
+    def __init__(self, time_quantum=10):
+        self.queue = deque()       # ready queue of processes
+        self.quantum = time_quantum
+        self.clock = 0
+
+    def add_process(self, name, burst_time):
+        self.queue.append({"name": name, "remaining": burst_time})
+
+    def run(self):
+        print("=== CPU Scheduler (Round-Robin) ===")
+        while self.queue:
+            proc = self.queue.popleft()
+            run_time = min(self.quantum, proc["remaining"])
+            self.clock += run_time
+            proc["remaining"] -= run_time
+            print(f"  t={self.clock:3d}ms | CPU -> {proc['name']} "
+                  f"(ran {run_time}ms, {proc['remaining']}ms left)")
+            if proc["remaining"] > 0:
+                self.queue.append(proc)  # back of queue
+            else:
+                print(f"         {proc['name']} COMPLETED")
+
+# === Distributed Parallel: Round-Robin Load Balancer ===
+class RoundRobinLoadBalancer:
+    """Routes requests to servers in round-robin order."""
+    def __init__(self, servers):
+        self.servers = servers
+        self.cycle = itertools.cycle(servers)
+
+    def route(self, request_id):
+        server = next(self.cycle)
+        print(f"  Request #{request_id} -> {server}")
+        return server
+
+# --- Demo: same algorithm, different domains ---
+scheduler = RoundRobinScheduler(time_quantum=10)
+for name, burst in [("P1", 25), ("P2", 15), ("P3", 30), ("P4", 10)]:
+    scheduler.add_process(name, burst)
+scheduler.run()
+
+print("\n=== Load Balancer (Round-Robin) ===")
+lb = RoundRobinLoadBalancer(["srv-A", "srv-B", "srv-C", "srv-D"])
+for req in range(1, 9):
+    lb.route(req)
+</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Benchmarking Thread Pool Sizes</h3>
+      <ul>
+        <li><strong>Sweep the variable:</strong> Run your service with thread pool sizes of 10, 25, 50, 100, 200, 500, 1000. Measure throughput, P50/P99 latency, and CPU context switch rate at each size.</li>
+        <li><strong>Find the knee:</strong> Plot throughput vs. thread count. You will see throughput increase linearly, plateau, then <em>decrease</em> as context-switch overhead dominates. The plateau is your optimal range.</li>
+        <li><strong>Tools:</strong> Use <code>wrk</code> or <code>k6</code> for load generation, <code>perf stat</code> for context switch counts, <code>vmstat 1</code> for real-time CPU/memory/swap monitoring.</li>
+      </ul>
+
+      <h3>Profiling with perf and Flamegraphs</h3>
+      <ul>
+        <li>Run <code>perf record -g -p &lt;pid&gt;</code> under load for 30 seconds, then generate a flamegraph with Brendan Gregg&rsquo;s <code>flamegraph.pl</code>.</li>
+        <li>Look for wide bars in the flamegraph: these are hot functions consuming the most CPU. If <code>schedule()</code> or <code>__schedule</code> (the kernel scheduler) is a significant fraction, you have too many threads.</li>
+        <li>If <code>page_fault</code> appears, you have memory pressure or a working set larger than physical memory.</li>
+      </ul>
+
+      <h3>Chaos Testing for OS-Level Failures</h3>
+      <ul>
+        <li><strong>Memory pressure:</strong> Use <code>stress-ng --vm 4 --vm-bytes 80%</code> to simulate memory exhaustion. Verify your application degrades gracefully and your OOM score protects critical processes.</li>
+        <li><strong>CPU saturation:</strong> Use <code>stress-ng --cpu $(nproc)</code> to saturate all cores. Verify your service&rsquo;s latency increases but it does not crash or drop connections.</li>
+        <li><strong>File descriptor exhaustion:</strong> Lower <code>ulimit -n</code> and test that your service logs a clear error and rejects new connections rather than crashing.</li>
+        <li><strong>Network partition simulation:</strong> Use <code>tc</code> (traffic control) or <code>toxiproxy</code> to add latency or drop packets. Verify timeouts and retries work correctly.</li>
+      </ul>
+
+      <h3>Common Benchmarking Mistakes</h3>
+      <ul>
+        <li>Testing with unrealistic concurrency (1 thread generating requests is not the same as 1,000 concurrent users).</li>
+        <li>Not warming up the JVM / runtime before measuring (first requests hit JIT compilation and cold caches).</li>
+        <li>Measuring average latency instead of percentiles &mdash; averages hide tail latency.</li>
+        <li>Benchmarking on a different OS/kernel version than production (scheduler behavior, <code>epoll</code> semantics, and cgroup behavior differ between kernel versions).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How does an OS scheduler relate to load balancing algorithms?</summary>
+        <div class="answer">
+          <p>
+            An OS scheduler and a load balancer solve the same fundamental problem: <strong>distributing work across limited resources fairly and efficiently</strong>. The OS scheduler distributes CPU time slices across processes; a load balancer distributes requests across servers.
+          </p>
+          <p>
+            The algorithms are directly analogous. <strong>Round-robin</strong> scheduling gives each process a fixed time quantum, just as round-robin load balancing sends each request to the next server in the list. <strong>Shortest-Job-First</strong> scheduling minimizes average wait time by running the shortest process next, paralleling <strong>Least-Connections</strong> load balancing which routes to the server with the fewest active requests. <strong>CFS</strong> (weighted fair scheduling) in Linux mirrors <strong>weighted round-robin</strong> in load balancers, where servers with more capacity receive proportionally more traffic.
+          </p>
+          <p>
+            The key difference is information availability. The OS scheduler has perfect, real-time knowledge of every process&rsquo;s state. A distributed load balancer has stale, approximate information about each backend&rsquo;s load. This information gap is why &ldquo;power of two random choices&rdquo; works well in distributed systems: instead of trying to find the globally optimal backend (which requires stale global state), pick two random backends and send to the less loaded one. This achieves near-optimal load distribution with only local decisions.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What happens when a process/server is unresponsive? (OS uses preemption; LB uses health checks.) How does priority scheduling map to weighted routing? How would you prevent starvation in both contexts?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain LRU page replacement and how the same algorithm is used in caching</summary>
+        <div class="answer">
+          <p>
+            When physical memory is full and a new page needs to be loaded, the OS must choose a page to evict. <strong>LRU (Least Recently Used)</strong> evicts the page that has not been accessed for the longest time. The intuition is temporal locality: pages accessed recently are likely to be accessed again soon.
+          </p>
+          <p>
+            In caching systems (Redis, Memcached, CDN caches), LRU eviction works identically. When the cache reaches its memory limit, the key that has not been accessed for the longest time is evicted to make room for new entries. Redis implements <em>approximated LRU</em>: instead of maintaining a global access-time ordering (expensive), it samples 5 random keys and evicts the oldest among them. This is the same tradeoff the OS makes with the CLOCK algorithm &mdash; an approximation of LRU that avoids the overhead of maintaining exact access ordering.
+          </p>
+          <p>
+            Both contexts face the same weakness: <strong>scan pollution</strong>. A sequential scan (reading a large file in the OS, or iterating over all keys in a cache) touches every page/key once, evicting frequently-used entries. Solutions are the same in both domains: the OS uses <strong>CLOCK-Pro</strong> (which tracks both recency and frequency); caches use <strong>W-TinyLFU</strong> (Caffeine) or <strong>ARC</strong> (which partitions the cache into recently-used and frequently-used segments).
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Why is true LRU expensive to implement? (Requires moving an entry to the head of a list on every access &mdash; O(1) but high constant factor due to pointer updates and cache-line invalidation.) How does Redis&rsquo;s approximated LRU compare to true LRU? What about LFU?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>What is the thundering herd problem and where does it appear in both OS and distributed systems?</summary>
+        <div class="answer">
+          <p>
+            The <strong>thundering herd</strong> occurs when multiple waiters are awakened simultaneously for a resource that only one can use. In the OS: multiple processes blocked on <code>accept()</code> for a listening socket are all woken when a new connection arrives, but only one can accept it. The rest waste CPU waking up and going back to sleep.
+          </p>
+          <p>
+            In distributed systems, the thundering herd manifests in several places: (1) <strong>Cache stampede</strong>: a popular cache key expires, and hundreds of concurrent requests all miss the cache and simultaneously query the database. (2) <strong>Service recovery</strong>: a backend server recovers from an outage, and all clients that were retrying rush to it at once, overloading it immediately. (3) <strong>Leader election</strong>: the leader dies, and all followers simultaneously try to become the new leader.
+          </p>
+          <p>
+            The solutions follow the same principle in both domains: <strong>reduce the number of simultaneous wakers</strong>. The OS added <code>EPOLLEXCLUSIVE</code> to wake only one process. For cache stampede: use <em>request coalescing</em> (singleflight pattern &mdash; only one goroutine/thread populates the cache; others wait for it), probabilistic early refresh (refresh before TTL expires), or a mutex on cache population. For service recovery: use <em>jittered backoff</em> so clients retry at staggered intervals, and ramp traffic gradually to recovered backends.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How does <code>singleflight</code> work internally? What is probabilistic early refresh and how do you tune the window? What happens if the cache-population lock itself becomes a bottleneck?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do containers use OS primitives for isolation?</summary>
+        <div class="answer">
+          <p>
+            Containers are not virtual machines. A container is a regular Linux process (or group of processes) with two OS mechanisms applied: <strong>namespaces</strong> for visibility isolation and <strong>cgroups</strong> for resource limits.
+          </p>
+          <p>
+            <strong>Namespaces</strong> control what a process can see. The PID namespace gives each container its own process tree (PID 1 is the container&rsquo;s init process, not the host&rsquo;s). The network namespace gives each container its own network stack (interfaces, routing tables, iptables rules). The mount namespace gives a separate filesystem view. The user namespace maps container root (UID 0) to an unprivileged UID on the host.
+          </p>
+          <p>
+            <strong>cgroups</strong> control what a process can use. CPU cgroup limits the percentage of CPU time (via CFS bandwidth control). Memory cgroup limits RAM and enforces OOM kills when exceeded. I/O cgroup limits disk bandwidth. PID cgroup limits the number of processes (preventing fork bombs).
+          </p>
+          <p>
+            Kubernetes builds on top of this: resource <em>requests</em> set the cgroup&rsquo;s guaranteed share (used by the scheduler for bin-packing), and resource <em>limits</em> set the hard cap (cgroup max). The kube-scheduler is the distributed equivalent of the OS scheduler: it assigns pods to nodes the way the kernel assigns processes to CPUs, considering available resources, affinity rules, and anti-affinity constraints.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What is the security implication of sharing a kernel? (A kernel exploit from inside a container affects all containers on the host.) How does CPU throttling in cgroup v2 differ from v1? What is a &ldquo;Guaranteed&rdquo; vs. &ldquo;Burstable&rdquo; QoS class in Kubernetes?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Thread-per-request vs event-driven &mdash; tradeoffs for a web server?</summary>
+        <div class="answer">
+          <p>
+            <strong>Thread-per-request</strong> (Tomcat, classic Apache) assigns a dedicated thread to each incoming request. The thread blocks on I/O (database queries, downstream API calls) and resumes when the response arrives. This is simple to program (synchronous, sequential code) but expensive: each thread consumes ~1 MB of stack, and context-switching between hundreds of threads adds overhead. Practical limit: ~200-500 concurrent requests per server.
+          </p>
+          <p>
+            <strong>Event-driven</strong> (Nginx, Node.js, Netty) uses a single thread (or one per core) running an event loop. All I/O is non-blocking; the thread registers interest in I/O completion and moves on to handle other requests. When I/O completes, the kernel notifies the thread via <code>epoll</code>/<code>kqueue</code>. This can handle 10,000+ concurrent connections with minimal memory because there is no per-connection thread overhead.
+          </p>
+          <p>
+            The tradeoff is between <strong>programming simplicity</strong> and <strong>resource efficiency</strong>. Thread-per-request code is easier to read and debug (a stack trace shows the full request path). Event-driven code requires callbacks, promises, or async/await, making error handling and debugging harder. However, event-driven is strictly better for I/O-bound workloads with high concurrency. For CPU-bound workloads, the difference is minimal (you need the same number of CPU cores either way).
+          </p>
+          <p>
+            Modern approaches like <strong>virtual threads</strong> (Java 21 Loom, Go goroutines) try to give you both: the programming model of thread-per-request with the efficiency of event-driven. The runtime multiplexes millions of lightweight virtual threads onto a small number of OS threads.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What is the C10K problem and how does <code>epoll</code> solve it? How do Go goroutines achieve M:N threading? What is the thread-per-core model and when is it superior to event-driven?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How would you size a thread pool for a service?</summary>
+        <div class="answer">
+          <p>
+            Start with <strong>Little&rsquo;s Law</strong>: <code>pool_size = throughput &times; average_latency</code>. If your service needs to handle 2,000 RPS and each request takes 25 ms on average, you need <code>2000 &times; 0.025 = 50</code> concurrent threads. Add 20-50% headroom for variance, so 60-75 threads.
+          </p>
+          <p>
+            Refine based on whether the work is <strong>CPU-bound</strong> or <strong>I/O-bound</strong>. For CPU-bound work, the optimal thread count is <code>num_cores</code> (adding more threads just adds context-switch overhead with no throughput gain). For I/O-bound work, use the formula <code>num_cores &times; (1 + wait_time / compute_time)</code>. A service spending 80% of time waiting on database responses and 20% computing can use <code>4 cores &times; (1 + 4) = 20</code> threads.
+          </p>
+          <p>
+            <strong>Validate empirically:</strong> Theoretical sizing is a starting point. Run load tests sweeping pool sizes and measure actual throughput and P99 latency. Plot the results: you will see a curve that rises, plateaus, and then drops. The plateau region is your operating range. Operating at the left edge of the plateau (fewest threads that achieve peak throughput) minimizes memory usage and context-switch overhead.
+          </p>
+          <p>
+            <strong>Watch for hidden queues:</strong> If your thread pool is undersized, requests queue up in the socket backlog (<code>somaxconn</code>). If that fills up, the OS drops connections. Monitor queue depth and set a bounded queue with a rejection policy (fail-fast) rather than an unbounded queue that silently accumulates latency.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How does this change with virtual threads? (Pool size becomes less important because virtual threads are cheap, but you still need to limit concurrency to protect downstream services.) What about separate pools for different workload types?</p>
+        </div>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>OS scheduling algorithms are load balancing algorithms.</strong> Round-robin, SJF, weighted fair queuing &mdash; they appear in both domains. Understanding the OS versions gives you deep intuition for the distributed versions.</li>
+        <li><strong>Page replacement is cache eviction.</strong> LRU, CLOCK, and their limitations (scan pollution) apply identically to Redis, Memcached, and CDN caches. Modern solutions (W-TinyLFU, ARC) solve the same problems the OS solved with CLOCK-Pro.</li>
+        <li><strong>OS locks teach you distributed lock pitfalls.</strong> Deadlock, priority inversion, and starvation are identical problems. But distributed locks are 100,000x slower, so use them sparingly.</li>
+        <li><strong>Write-ahead logging is the universal durability pattern.</strong> File system journals, database WALs, and event logs all use the same technique: write intent to a sequential log before applying changes.</li>
+        <li><strong>Containers are just OS processes with namespaces and cgroups.</strong> Understanding these primitives demystifies Docker and Kubernetes. The kube-scheduler is the distributed version of the kernel scheduler.</li>
+        <li><strong>Thread pool sizing follows Little&rsquo;s Law.</strong> <code>pool_size = throughput &times; latency</code>. Too few threads = underutilization. Too many threads = context-switch thrashing. Always validate empirically.</li>
+        <li><strong>The thundering herd is universal.</strong> It appears as OS socket wakeup storms, cache stampedes, and service recovery avalanches. The solution is always the same: reduce simultaneous wakeups with coalescing, exclusivity, and jittered backoff.</li>
+        <li><strong>OS-level tuning saves real money.</strong> <code>vm.swappiness</code>, <code>ulimit</code>, <code>somaxconn</code>, and huge page settings can mean the difference between needing 10 servers and needing 20.</li>
+        <li><strong>The concept transfers; the implementation rarely does.</strong> Always check whether network latency, partial failure, and stale information invalidate the assumptions of the OS algorithm you are borrowing.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <p>Continue exploring related system design topics:</p>
+      <ul>
+        <li><a href="networking-fundamentals.html">Networking Fundamentals</a> &mdash; TCP, UDP, and the network stack that the OS manages. Understanding sockets, congestion control, and the kernel&rsquo;s role in networking.</li>
+        <li><a href="caching.html">Caching</a> &mdash; Deep dive into the distributed equivalents of OS page replacement: LRU eviction, cache-aside, write-through, and modern policies like W-TinyLFU.</li>
+        <li><a href="load-balancing.html">Load Balancing</a> &mdash; The distributed version of OS process scheduling. Round-robin, weighted, least-connections, and the power of two random choices.</li>
+        <li><a href="message-queues.html">Message Queues</a> &mdash; The distributed equivalent of OS IPC. Kafka as a distributed log mirrors the OS write-ahead log pattern.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="networking-fundamentals.html" class="prev">Networking Fundamentals</a>
+      <a href="design-principles.html" class="next">Design Principles</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== Round-Robin: OS Scheduler vs. Load Balancer Animation =====
+    (function () {
+      const canvas = document.getElementById('os-canvas');
+      const container = document.getElementById('os-animation-container');
+
+      const PROCESS_COLORS = [
+        { fill: '#dbeafe', color: '#2563eb', label: 'P1' },
+        { fill: '#dcfce7', color: '#16a34a', label: 'P2' },
+        { fill: '#fef3c7', color: '#d97706', label: 'P3' },
+        { fill: '#fce7f3', color: '#db2777', label: 'P4' },
+      ];
+      const SERVER_COLORS = [
+        { fill: '#dbeafe', color: '#2563eb', label: 'Srv A' },
+        { fill: '#dcfce7', color: '#16a34a', label: 'Srv B' },
+        { fill: '#fef3c7', color: '#d97706', label: 'Srv C' },
+        { fill: '#fce7f3', color: '#db2777', label: 'Srv D' },
+      ];
+
+      const SLICE_DURATION = 1.5; // seconds per time slice
+      const CYCLE = SLICE_DURATION * 4; // full round-robin cycle
+
+      function drawOSAnimation(ctx, time, w, h) {
+        const midY = h / 2;
+        const topSection = midY - 20;
+        const botSection = midY + 20;
+
+        // --- Divider ---
+        drawDashedLine(ctx, 40, midY, w - 40, midY, { color: '#cbd5e1', width: 1, dash: [8, 6] });
+        drawLabel(ctx, w / 2, midY - 8, 'Same algorithm, different resource', {
+          color: '#94a3b8', fontSize: 11, bold: false
+        });
+
+        // Current active index
+        const cycleTime = time % CYCLE;
+        const activeIdx = Math.floor(cycleTime / SLICE_DURATION) % 4;
+        const sliceProgress = (cycleTime % SLICE_DURATION) / SLICE_DURATION;
+
+        // === TOP: CPU Scheduler ===
+        drawLabel(ctx, w / 2, 18, 'OS: Round-Robin CPU Scheduler', {
+          color: '#1e293b', fontSize: 14, bold: true
+        });
+
+        // CPU box
+        const cpuX = 80;
+        const cpuY = topSection / 2 + 20;
+        const isActive = sliceProgress < 0.85; // small gap between slices
+
+        drawBox(ctx, cpuX - 35, cpuY - 22, 70, 44, {
+          color: isActive ? PROCESS_COLORS[activeIdx].color : '#94a3b8',
+          fill: isActive ? PROCESS_COLORS[activeIdx].fill : '#f1f5f9',
+          text: 'CPU',
+          fontSize: 14
+        });
+
+        // Process boxes
+        const procStartX = 200;
+        const procSpacing = (w - procStartX - 40) / 4;
+        for (let i = 0; i < 4; i++) {
+          const px = procStartX + i * procSpacing + procSpacing / 2;
+          const py = cpuY;
+          const isRunning = i === activeIdx && isActive;
+          const pc = PROCESS_COLORS[i];
+
+          drawBox(ctx, px - 30, py - 18, 60, 36, {
+            color: isRunning ? pc.color : '#cbd5e1',
+            fill: isRunning ? pc.fill : '#f8f9fa',
+            text: pc.label,
+            fontSize: 12
+          });
+
+          if (isRunning) {
+            drawStatusBadge(ctx, px, py - 28, 'RUNNING', 'success');
+            // Animated arrow from CPU to active process
+            const arrowProgress = ease.inOut(Math.min(sliceProgress * 2, 1));
+            const arrowStartX = cpuX + 35;
+            const arrowEndX = px - 30;
+            const arrowY = py;
+            drawArrow(ctx, arrowStartX, arrowY, arrowStartX + (arrowEndX - arrowStartX) * arrowProgress, arrowY, {
+              color: pc.color, width: 2, headSize: 8
+            });
+          } else {
+            drawLabel(ctx, px, py - 28, 'WAIT', {
+              color: '#94a3b8', fontSize: 9, bold: true
+            });
+          }
+        }
+
+        // Time quantum indicator
+        const quantumBarX = procStartX;
+        const quantumBarY = cpuY + 30;
+        const quantumBarW = w - procStartX - 40;
+        drawBox(ctx, quantumBarX, quantumBarY, quantumBarW, 8, {
+          color: '#e2e8f0', fill: '#f1f5f9', radius: 4
+        });
+        // Fill based on slice progress
+        if (isActive) {
+          ctx.save();
+          ctx.fillStyle = PROCESS_COLORS[activeIdx].color;
+          ctx.globalAlpha = 0.6;
+          ctx.beginPath();
+          ctx.roundRect(quantumBarX, quantumBarY, quantumBarW * sliceProgress * 0.85, 8, 4);
+          ctx.fill();
+          ctx.restore();
+        }
+        drawLabel(ctx, procStartX + quantumBarW / 2, quantumBarY + 14, 'Time Quantum', {
+          color: '#94a3b8', fontSize: 10
+        });
+
+        // === BOTTOM: Load Balancer ===
+        const lbSectionTop = botSection;
+        drawLabel(ctx, w / 2, lbSectionTop + 8, 'Distributed: Round-Robin Load Balancer', {
+          color: '#1e293b', fontSize: 14, bold: true
+        });
+
+        // Load balancer diamond
+        const lbX = 80;
+        const lbY = lbSectionTop + (h - lbSectionTop) / 2 + 5;
+
+        drawLoadBalancer(ctx, lbX, lbY, {
+          color: isActive ? SERVER_COLORS[activeIdx].color : '#0891b2',
+          fill: isActive ? SERVER_COLORS[activeIdx].fill : '#ecfeff',
+          label: 'Load Balancer',
+          size: 38
+        });
+
+        // Server boxes
+        for (let i = 0; i < 4; i++) {
+          const sx = procStartX + i * procSpacing + procSpacing / 2;
+          const sy = lbY;
+          const isTarget = i === activeIdx && isActive;
+          const sc = SERVER_COLORS[i];
+
+          drawServer(ctx, sx, sy, {
+            width: 60, height: 36,
+            color: isTarget ? sc.color : '#cbd5e1',
+            fill: isTarget ? sc.fill : '#f8f9fa',
+            label: sc.label,
+            healthy: true
+          });
+
+          if (isTarget) {
+            drawStatusBadge(ctx, sx, sy - 30, 'ACTIVE', 'success');
+            // Request dot moving from LB to server
+            const dotProgress = ease.inOut(Math.min(sliceProgress * 3, 1));
+            drawMovingDot(ctx, lbX + 19, lbY, sx - 30, sy, dotProgress, {
+              color: sc.color, radius: 5
+            });
+          }
+        }
+
+        // Request counter
+        const totalRequests = Math.floor(time / SLICE_DURATION);
+        drawLabel(ctx, lbX, lbY + 38, `Req #${totalRequests + 1}`, {
+          color: '#64748b', fontSize: 10, bold: true
+        });
+      }
+
+      const animation = createAnimation(canvas, drawOSAnimation, { height: 420 });
+      setupControls(container, animation);
+    })();
+  </script>
+
+</body>
+</html>

@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K15 — GPU-Fleet Autoscaling &amp; Multi-Tenancy — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K15 &mdash; GPU-Fleet Autoscaling &amp; Multi-Tenancy <span style="font-weight:400;font-size:.55em;color:#64748b;">(scale on the right signal, pack many tenants)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable, multi-tenant</em> GPU fleet &mdash; when GPUs are expensive and take tens of seconds to warm, traffic is 10:1 bursty, and many models/tenants share the hardware &mdash; by scaling on a <em>leading</em> signal (not GPU-util, which saturates <em>after</em> latency degrades) with headroom &ge; the cold-start budget, then bin-packing and isolating tenants on what is left?</strong> This page derives why GPU-util is the wrong signal, then D12 (right signal + prewarm, incl. capacity-stockout &amp; cache-warm headroom), <strong>D58</strong> (scale-<em>down</em> / drain asymmetry), D19 (power/thermal ceiling), the K15 half of D18 (placement/quota + burstable-reclaim), and D43 (heterogeneous bin-packing across GPU generations).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; a <a href="K10_data-parallelism.html">K10</a>/<a href="K21_fast-model-loading-and-cold-start.html">K21</a> consumer (DP degree = the scale unit; cold-start = the headroom floor) &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K21_fast-model-loading-and-cold-start.html">K21</a> / <a href="K4_continuous-batching-and-scheduling.html">K4</a> / <a href="K10_data-parallelism.html">K10</a> &bull; dedicated scenario: <strong>L5</strong> &bull; ~18 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the autoscaling chain). Approve / redirect the arc, the <strong>why-GPU-util-is-the-wrong-signal derivation</strong>, deep-dive placement (<strong>D12 right signal + prewarm &mdash; co-host K21; D19 power/thermal &mdash; co-host K1; D18 K15-half placement/quota &mdash; co-host K4; D43 heterogeneous bin-packing</strong>), the <strong>rule-11 autoscale-signal spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Queue-depth / TTFT under burst (primary)</strong> &mdash; scale on a leading signal with headroom &ge; cold-start so capacity is hot <em>before</em> the queue grows.</li>
+          <li><strong>Cost-shape ($/mo)</strong> &mdash; minimise idle GPU-hours: scale-to-zero idle models, pack heterogeneous models, share the base across tenants.</li>
+          <li><strong>Per-tenant tail latency</strong> &mdash; fleet-level placement + quota bounds the noisy-neighbour blast radius (the K15 half of D18; on-GPU isolation is K4&rsquo;s).</li>
+          <li><strong>Achieved MFU vs spec</strong> &mdash; D19: sustained power/thermal derate means the fleet must be sized on <em>achieved</em>, not spec, throughput.</li>
+          <li><strong>Lost-work / killed-request rate on scale-down &amp; reclaim</strong> &mdash; D58 drains in-flight long generations before tear-down; D18 bounds burstable-quota reclaim so a scale-in or tenant-reclaim doesn&rsquo;t kill in-flight work.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Cold-start is tens of seconds so reactive (util-based) scaling always arrives after the SLO breach; scale on a <em>leading</em> signal (queue-depth / TTFT-slope) with headroom = <code>cold_start &times; peak_ramp_rate</code>; then minimise idle GPU-hours by scale-to-zero + heterogeneous bin-packing + shared-base multiplexing, and isolate tenants by fleet placement + quota.</p>
+      <ul>
+        <li><strong>Is:</strong> why GPU-util is the <em>wrong</em> autoscale signal (derived); D12 (scale on the right signal + predictive prewarm vs the cold-start budget; co-host <a href="K21_fast-model-loading-and-cold-start.html#d12">K21</a>); D19 (power/thermal: the sustained-MFU derate &amp; the datacenter-kW ceiling; co-host <a href="K1_serving-fundamentals.html">K1</a>); the K15 half of D18 (which tenant on which GPU &mdash; placement + quota + blast-radius isolation); D43 (heterogeneous-fleet bin-packing &amp; GPU fragmentation); the autoscale-signal/policy rule-11 spectrum. <strong>Added on review:</strong> <strong>D58</strong> (scale-<em>down</em> &ne; scale-up &mdash; draining in-flight long generations before tear-down); the scale-up that can <em>fail</em> (GPU capacity-stockout fallback) and the new-replica <em>cache-warm</em> window folded into D12&rsquo;s headroom; the reserved/on-demand/spot <strong>purchase-mix</strong> portfolio and <strong>heterogeneous GPU-generation</strong> placement as fleet cost knobs; <strong>burstable/work-conserving quota + reclaim</strong> as the second half of D18-K15; the in-scope slice of a <strong>global capacity pool</strong> (follow-the-sun trough &rarr; <a href="K16_batch-inference-pipelines.html">K16</a> batch, ties D44).</li>
+        <li><strong>Is not:</strong> the single-GPU scheduler (<a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; K15 is fleet-level); cold-start <em>mechanics</em> (<a href="K21_fast-model-loading-and-cold-start.html">K21</a> owns that deep dive &mdash; K15 owns only the <em>budget</em> it consumes); the <em>on-GPU</em> WFQ-over-tokens isolation mechanism (<a href="K4_continuous-batching-and-scheduling.html#d18">K4</a>/D18 &mdash; K15 owns fleet placement; rule of two); per-tenant <em>billing / API rate-limiting</em> (API-product layer &mdash; out of curriculum); cross-region <em>request routing</em> / data-residency steering (<a href="K2_kv-cache.html">K2</a> Role-2 spectrum point (7) / API-product layer &mdash; K15 owns where the GPUs physically <em>are</em> and trough reuse, not which region a request is steered to); Kubernetes / Ray <em>internals</em> (named as tools, not their internals).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> Cold-start <em>mechanics</em> (snapshot/restore, weight streaming) are <a href="K21_fast-model-loading-and-cold-start.html#d49">K21</a>&rsquo;s; K15 consumes the cold-start <em>time</em> as the headroom floor (D12 is co-hosted &mdash; K21 owns the <em>budget</em>, K15 owns the <em>signal/policy</em>). On-GPU WFQ-over-tokens is <a href="K4_continuous-batching-and-scheduling.html#d18">K4</a>&rsquo;s (D18 co-hosted &mdash; K4 owns the on-GPU slice, K15 owns fleet placement). The roofline D19 derates is <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s. <strong>D58</strong> (scale-down drain) is the <em>autoscaler&rsquo;s planned reclaim</em> decision: <a href="K22_fault-tolerance-multi-gpu-inference.html#d23">K22</a>/D23 owns <em>unplanned</em> group-fault recovery and <strong>L7</strong> owns drain-on-<em>deploy</em> &mdash; K15 owns only the scale-in drain-vs-kill <em>cost</em> knob; cite the K22 recovery mechanism, don&rsquo;t duplicate. Generic capacity/headroom is <a href="../../topics/canonicals/cross-cutting.html#capacity">cross-cutting.html</a> &mdash; refine with LLM numbers, never duplicate.</div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Autoscaling Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>GPUs are expensive and slow to warm; traffic is 10:1 bursty</strong> &rarr; scale the fleet with load.</li>
+        <li><strong>Problem:</strong> cold-start is tens of seconds, so <em>reactive</em> (util-based) scaling blows the SLO &mdash; the scale-up arrives <em>after</em> the breach.</li>
+        <li>&rarr; scale on a <strong>leading signal</strong> (queue-depth / TTFT-slope) + warm <strong>headroom</strong> &ge; cold-start time (D12).</li>
+        <li><strong>Problem [added]:</strong> the scale-up can <em>fail</em> &mdash; the cloud returns <em>no capacity</em> (spot reclaim / on-demand stockout / quota cap / region-out) &rarr; capacity-tiered fallback (committed floor + on-demand + spot); headroom is also a <em>reserved-capacity</em> decision, not only a time budget.</li>
+        <li><strong>Problem [added]:</strong> a fresh replica is <em>not</em> at steady-state &mdash; its K2-Role-2 reuse cache is cold &rarr; headroom must cover <code>cold_start + cache_warm</code>, not cold_start alone.</li>
+        <li><strong>Problem:</strong> headroom is expensive &rarr; <strong>scale-to-zero</strong> idle models &rarr; cold-start tax &rarr; snapshot/restore (<a href="K21_fast-model-loading-and-cold-start.html#d49">K21</a> owns the mechanism &mdash; cite, don&rsquo;t duplicate).</li>
+        <li><strong>Problem [added] &mdash; the twin nobody states:</strong> scaling <em>down</em> &ne; scaling up &mdash; a replica picked for tear-down may hold in-flight 30k-token generations; kill = lost work + SLO breach, wait = slower scale-down = keep paying for idle GPUs &rarr; <strong>D58</strong>: stop-accept&rarr;lame-duck&rarr;drain-timeout&rarr;kill, the drain-wait $ vs killed-work crossover.</li>
+        <li><strong>Problem:</strong> many models/tenants share the fleet &rarr; bin-packing + fragmentation + noisy-neighbour.</li>
+        <li>&rarr; <strong>multiplex</strong> (S-LoRA shared base) + <strong>isolate</strong> (WFQ &mdash; <a href="K4_continuous-batching-and-scheduling.html#d18">K4</a>/D18; <strong>+ burstable/work-conserving quota &amp; the reclaim-latency tax [added]</strong>) + <strong>MIG</strong> + fleet placement (D18 K15-half) + <strong>heterogeneous-GPU-generation [added]</strong> packing (D43, across A100/H100/H200/B200).</li>
+        <li><strong>And:</strong> sustained power/thermal derates achieved MFU below spec, and datacenter-kW &mdash; not budget &mdash; is the real ceiling on &ldquo;just add GPUs&rdquo; (D19); and the control loop&rsquo;s dead-time = cold-start &rarr; high gain <em>oscillates</em> [added] (feed-forward prewarm + dead-time-aware hysteresis, not just min-dwell).</li>
+        <li><strong>Objective:</strong> meet the SLO through a 10:1 burst at the minimum $ &mdash; minimum idle GPU-hours <em>and</em> the right reserved-floor + on-demand + spot <strong>purchase-mix [added]</strong>.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>expensive + slow-to-warm GPUs, 10:1 burst &rarr; scale with load &rarr; problem: cold-start &gt; SLO so reactive scaling is too late &rarr; scale on a leading signal + headroom (D12, incl. capacity-stockout fallback &amp; cache-warm) &rarr; problem: headroom is expensive &rarr; scale-to-zero &rarr; cold-start tax &rarr; snapshot (K21) &rarr; problem: scaling <strong>down</strong> &ne; up &mdash; drain in-flight long generations (D58) &rarr; problem: shared fleet, many tenants &rarr; multiplex + isolate (+ burstable-reclaim) + pack across GPU generations (D18 K15-half, D43) &rarr; constraint: power/thermal + kW ceiling (D19) &rarr; objective: SLO under burst at minimum $ via the reserved/on-demand/spot mix</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 860" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="270" y="14" width="700" height="54" rx="8"/>
+        <text class="t" x="620" y="36" text-anchor="middle">GPUs expensive + slow to warm; traffic 10:1 bursty</text>
+        <text class="s" x="620" y="54" text-anchor="middle">scale the fleet with load &middot; §1</text>
+
+        <line x1="620" y1="68" x2="620" y2="96"/>
+        <text class="l" x="636" y="86">problem</text>
+
+        <rect class="bd" x="250" y="96" width="740" height="54" rx="8"/>
+        <text class="t" x="620" y="118" text-anchor="middle">Cold-start = tens of s &rArr; reactive (GPU-util) scaling blows the SLO</text>
+        <text class="s" x="620" y="136" text-anchor="middle">util saturates AFTER latency degrades &mdash; scale-up too late &middot; §2</text>
+
+        <line x1="620" y1="150" x2="620" y2="178"/>
+        <text class="l" x="636" y="168">fix (D12)</text>
+
+        <rect class="bs" x="235" y="178" width="770" height="64" rx="8"/>
+        <text class="t" x="620" y="200" text-anchor="middle">D12 &mdash; scale on a LEADING signal + headroom = (cold-start + cache-warm)</text>
+        <text class="s" x="620" y="218" text-anchor="middle">queue-depth / TTFT-slope; min_headroom = (cold_start + cache_warm) &times; peak_ramp</text>
+        <text class="s" x="620" y="233" text-anchor="middle">+ capacity-stockout fallback: committed floor + on-demand + spot (co-host K21) &middot; §3</text>
+
+        <line x1="620" y1="242" x2="620" y2="270"/>
+        <text class="l" x="636" y="260">problem</text>
+
+        <rect class="bd" x="290" y="270" width="660" height="50" rx="8"/>
+        <text class="t" x="620" y="290" text-anchor="middle">Headroom is expensive &rarr; scale-to-zero idle models</text>
+        <text class="s" x="620" y="308" text-anchor="middle">&rarr; cold-start tax on first request &rarr; snapshot/restore (K21/D49) &middot; §3</text>
+
+        <line x1="620" y1="320" x2="620" y2="348"/>
+        <text class="l" x="636" y="338">problem (D58)</text>
+
+        <rect class="bs" x="235" y="348" width="770" height="58" rx="8"/>
+        <text class="t" x="620" y="372" text-anchor="middle">D58 [added] &mdash; scale-DOWN &ne; scale-up: drain in-flight long generations</text>
+        <text class="s" x="620" y="390" text-anchor="middle">stop-accept &rarr; lame-duck &rarr; drain-timeout &rarr; kill; drain-wait $ vs killed-work &middot; §3</text>
+
+        <line x1="620" y1="406" x2="620" y2="434"/>
+        <text class="l" x="636" y="424">problem</text>
+
+        <rect class="bd" x="270" y="434" width="700" height="50" rx="8"/>
+        <text class="t" x="620" y="454" text-anchor="middle">Many models/tenants share the fleet</text>
+        <text class="s" x="620" y="472" text-anchor="middle">bin-packing + GPU fragmentation + noisy-neighbour &middot; §3</text>
+
+        <line x1="620" y1="484" x2="620" y2="512"/>
+        <text class="l" x="636" y="502">fix (D18 / D43)</text>
+
+        <rect class="bs" x="215" y="512" width="810" height="58" rx="8"/>
+        <text class="t" x="620" y="536" text-anchor="middle">Multiplex (S-LoRA) + isolate (WFQ K4/D18 + burstable-quota reclaim) + MIG + placement</text>
+        <text class="s" x="620" y="554" text-anchor="middle">D18 K15-half = which tenant on which GPU; D43 = pack across A100/H100/H200/B200 &middot; §3</text>
+
+        <line x1="620" y1="570" x2="620" y2="598"/>
+        <text class="l" x="636" y="588">hard constraint (D19)</text>
+
+        <rect class="bs" x="250" y="598" width="740" height="54" rx="8"/>
+        <text class="t" x="620" y="620" text-anchor="middle">D19 &mdash; sustained power/thermal derate + datacenter-kW ceiling</text>
+        <text class="s" x="620" y="638" text-anchor="middle">achieved MFU &lt; spec; &ldquo;just add GPUs&rdquo; bounded by rack kW (co-host K1) &middot; §3</text>
+
+        <line x1="620" y1="652" x2="620" y2="680"/>
+        <text class="l" x="636" y="670">and the signal varies</text>
+
+        <rect class="bs" x="250" y="680" width="740" height="54" rx="8"/>
+        <text class="t" x="620" y="702" text-anchor="middle">Rule 11 &mdash; the autoscale-signal/policy spectrum</text>
+        <text class="s" x="620" y="720" text-anchor="middle">GPU-util &rarr; req-rate &rarr; queue-depth &rarr; TTFT-slope/SLO-burn &rarr; predictive prewarm &middot; §3</text>
+
+        <line x1="620" y1="734" x2="620" y2="762"/>
+
+        <rect class="bc" x="270" y="762" width="700" height="66" rx="8"/>
+        <text class="t" x="620" y="786" text-anchor="middle">Objective: meet the SLO through a 10:1 burst</text>
+        <text class="s" x="620" y="804" text-anchor="middle">at minimum $ &mdash; idle GPU-hours + reserved/on-demand/spot purchase-mix &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; expensive, slow-to-warm GPUs under 10:1 bursty traffic.</li>
+        <li><span class="bd">&#9313;</span> <strong>Problem</strong> &mdash; cold-start &gt; SLO, so reactive util-based scaling is structurally too late.</li>
+        <li><span class="bs">&#9314;</span> <strong>D12</strong> &mdash; scale on a leading signal + headroom = (cold-start + cache-warm) &times; ramp, with a capacity-stockout fallback (co-host K21).</li>
+        <li><span class="bd">&#9315;</span> <strong>Problem</strong> &mdash; headroom is expensive &rarr; scale-to-zero &rarr; cold-start tax &rarr; snapshot (K21/D49).</li>
+        <li><span class="bs">&#9316;</span> <strong>D58 [added]</strong> &mdash; scale-down &ne; scale-up: drain in-flight long generations before tear-down (drain-wait $ vs killed-work).</li>
+        <li><span class="bd">&#9317;</span> <strong>Problem</strong> &mdash; shared fleet: bin-packing, fragmentation, noisy-neighbour.</li>
+        <li><span class="bs">&#9318;</span> <strong>D18 K15-half / D43</strong> &mdash; multiplex + isolate (+ burstable-quota reclaim) + MIG + which-tenant-on-which-GPU placement; heterogeneous bin-pack across GPU generations.</li>
+        <li><span class="bs">&#9319;</span> <strong>D19</strong> &mdash; sustained power/thermal derate + datacenter-kW ceiling caps &ldquo;just add GPUs&rdquo; (co-host K1).</li>
+        <li><span class="bs">&#9320;</span> <strong>Rule 11</strong> &mdash; the autoscale-signal/policy spectrum, weakest&rarr;strongest, each with its cliff.</li>
+        <li><span class="bc">&#9321;</span> <strong>Objective</strong> &mdash; meet the SLO through a 10:1 burst at minimum $ (idle GPU-hours + the reserved/on-demand/spot purchase-mix).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> a GPU is the most expensive unit in the system and takes tens of seconds to load a model and warm up (cite <a href="K21_fast-model-loading-and-cold-start.html">K21</a>), while real traffic swings ~10:1 diurnally and bursts faster than that &mdash; static peak-provisioning wastes most of the fleet most of the time, and naive reactive scaling cannot add capacity fast enough to hold the SLO. <b>Solution (what the page builds):</b> a fleet controller that scales on a <em>leading</em> signal with headroom matched to the cold-start budget, then packs and isolates many models/tenants onto the capacity it keeps.<span class="meta">number: idle GPU-hours wasted by static peak-provisioning at 10:1 on the trace (the $ the page attacks) &mdash; cites K1 (fleet/cost), K21 (cold-start budget) &middot; canonical: gpu-inference-cost-shapes.html (idle GPU-hours)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where the autoscaler sits &mdash; the fleet controller above the DP replicas (not a layer, not the engine)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader needs to know what physically scales. <b>Solution:</b> the scale unit is a <strong>DP replica</strong> (a whole TP&times;PP&times;EP engine &mdash; cite <a href="K10_data-parallelism.html">K10</a>); the autoscaler is a control loop <em>outside</em> the engine that adds/removes replicas and decides which tenant/model lands on which GPU. It changes nothing inside the forward pass; it changes how many replicas exist and where. State this before any math.<span class="meta">no number (placement fact) &mdash; cites K10 (DP replica = the scale unit), K4 (the per-GPU scheduler it sits above) &middot; diagram: fleet controller &rarr; N DP replicas, with the leading-signal feedback edge from queue/TTFT</span></p>
+
+      <p class="stub"><span class="ps">[ADDED] Problem&rarr;Solution stub (G6 &mdash; the scale <em>unit</em> is itself a knob).</span> <b>Problem:</b> K15 treats the DP replica as a fixed atomic scale unit, but <em>what each replica is</em> is a fleet decision: few big replicas (TP=8 &mdash; high per-replica throughput, coarse scale-step, big blast radius, poor bin-pack) vs many small ones (TP=2 &mdash; finer granularity, better packing, lower per-replica throughput). A coarse unit quantises the scale-step &mdash; you cannot add half a replica &rarr; <code>Imb(N)</code> over-provisioning at small scale (the D35 small-scale tax, fleet-side). <b>Solution:</b> pick the replica tuple <em>as the autoscale unit</em> from the burst shape, not only from model fit. <b>Rule of two:</b> <a href="K6_parallelism-overview.html">K6</a> owns the tuple <em>for fit</em>; K15 owns <em>which tuple to deploy as the scale unit</em> given the 10:1 burst.<span class="meta">number: scale-step quantisation waste (few-big vs many-small) at small N on the trace &mdash; cites K6 (tuple), K10 (replica unit), K22 (blast radius per shape) &middot; real: vLLM TP-degree-per-pool, Ray Serve replica config</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; one request through a fleet that scales right vs wrong</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> A burst begins; the canonical request T1 <code>&quot;I like cat, why?&quot;</code> arrives at <code>t=0</code> as the fleet hits its knee. <b>Without leading-signal scaling (GPU-util):</b> util reads ~60% (the memory-bound decode loop keeps the SMs &ldquo;busy&rdquo;) so no scale-up fires; the request queues behind the growing backlog &rArr; its <em>TTFT blows the SLO</em>, and even when util finally rises the new replica is still tens of seconds from serving. <b>With leading-signal scaling + headroom:</b> queue-depth/TTFT-slope crossed the threshold one cold-start ago, a warm replica is already serving &rArr; the <em>same</em> request meets TTFT. Show with-vs-without explicitly on this one request; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (D12 puts cold-start time + ramp rate in) &middot; diagram: the request&rsquo;s queue-wait under util-scaling (blown) vs leading-signal-scaling (met), the cold-start gap drawn to scale</span></p>
+
+      <h3 id="why-util">Why GPU-util is the wrong signal (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> the obvious autoscale signal &mdash; GPU utilisation &mdash; is structurally lagging. <b>Solution, derived:</b> (a) the memory-bound decode loop keeps the SM busy reading weights, so util <em>saturates</em> while the queue is still draining; (b) at the knee, util &asymp; flat (~60%) but <code>queue &prop; (&lambda;&minus;&micro;)&middot;t</code> grows linearly &rArr; <strong>TTFT explodes while util still reads ~60%</strong>; (c) therefore the signal must be the <em>derivative of latency / the queue depth</em>, and the control horizon must be &ge; the cold-start time or the correction lands after the breach (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a> for why decode keeps util high; <a href="K21_fast-model-loading-and-cold-start.html">K21</a> for the horizon). This is <em>why</em> D12&rsquo;s signal spectrum exists.<span class="meta">number: the (util, queue, TTFT) curves at the knee on the trace &mdash; util ~60% flat while TTFT 10&times;s &mdash; cites K1 #decode, K21 (cold-start horizon) &middot; diagram: three stacked time-series (util flat, queue linear, TTFT exploding) with the knee marked</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where autoscaling &amp; tenancy sit in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> Fleet controller &rarr; pools of DP replicas (one per model/precision tier); a router shards requests across replicas (cross-link <a href="K10_data-parallelism.html#d39">K10/D39</a>); a placement layer decides which tenant/model occupies which GPU (shared-base S-LoRA vs MIG slice vs dedicated). The autoscaler reads queue-depth/TTFT per pool and the cold-start budget per model.<span class="meta">no new number &mdash; cites K10 (replica + router), K4 (per-GPU scheduler), K21 (per-model cold-start) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; fleet controller, pools, placement</strong>controller &rarr; per-model replica pools &rarr; router; placement layer mapping tenants/models onto GPUs (shared-base, MIG, dedicated); the leading-signal feedback loop. Drawn after arc approval.</div>
+
+      <h3 id="d12" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D12 &mdash; autoscale on the right signal + predictive prewarm vs the cold-start budget (co-host <a href="K21_fast-model-loading-and-cold-start.html#d12">K21</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> util-based autoscale reacts <em>after</em> the SLO breach, and one cold-start (tens of s, <a href="K21_fast-model-loading-and-cold-start.html">K21</a>) is longer than the SLO &rarr; the scale-up arrives too late. <b>Solution:</b> scale on queue-depth / TTFT-slope / SLO-burn / KV-util; <em>predict</em> the diurnal+burst curve and prewarm so capacity is hot before load arrives; <code>min_headroom = cold_start_time &times; peak_ramp_rate</code>. <b>Crossover:</b> keep-warm cost vs cold-start SLO-violation cost &mdash; the headroom that minimises total. <b>Rule of two:</b> K21 owns the cold-start <em>budget</em>; K15 owns the <em>signal/policy</em> that consumes it.<span class="meta">number: min_headroom on the trace = cold_start(K21) &times; peak ramp; keep-warm $ vs SLO-violation $ crossover &mdash; cites K21 #d12 (budget), K1 (cost) &middot; real: K8s HPA-on-custom-metrics, KEDA, Ray Serve autoscaler, predictive ASG + URLs</span></p>
+
+      <p class="stub"><span class="ps">[ADDED] Problem&rarr;Solution stub (G2 + G5 &mdash; D12&rsquo;s headroom is incomplete).</span> <b>Problem (G2 &mdash; the scale-up can <em>fail</em>):</b> <code>headroom = cold_start &times; ramp</code> assumes the GPUs <em>exist</em>; at frontier scale the dominant scale-up tail risk is the cloud returning <em>no capacity</em> (spot reclaim, on-demand stockout, quota cap, region-out). <b>Solution:</b> capacity-tiered targets &mdash; a committed/reserved <em>floor</em> + on-demand for the diurnal band + spot for the burst tail; an <em>unsatisfiable-scale-up</em> fallback (degrade per <a href="K4_continuous-batching-and-scheduling.html#d13">K4/D13</a> rather than wait forever); headroom expressed as a <em>reserved-capacity</em> reservation, not only a time budget. <b>Problem (G5 &mdash; a fresh replica is not at steady-state):</b> a newly added replica has a <em>cold</em> K2-Role-2 KV-reuse cache &rarr; below-steady-state throughput for a cache-warm window, so naive D12 under-provisions <em>during</em> the burst it is absorbing. <b>Solution:</b> <code>min_headroom = (cold_start + cache_warm) &times; peak_ramp</code>; optionally pre-warm the reuse cache on the new replica (cross-link <a href="K2_kv-cache.html">K2</a> Role 2 / <strong>L9</strong>). <b>Rule of two:</b> <a href="K21_fast-model-loading-and-cold-start.html#d12">K21</a> owns the cold-start budget; K15 owns folding capacity-availability + cache-warm into the headroom <em>policy</em>.<span class="meta">number: P(scale-up unsatisfiable) &rarr; reserved-floor sizing on the trace; cache_warm window vs cold_start on the trace (the extra headroom it implies) &mdash; cites K21 #d12, K2 (Role-2 warm), K4 #d13 (degrade fallback) &middot; real: AWS capacity reservations / GCP committed-use + Spot, vLLM APC warm-up + URLs</span></p>
+
+      <h3 id="d53" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D58 [ADDED] &mdash; scale-<em>down</em> &ne; scale-up: draining in-flight long generations before tear-down</h3>
+      <p class="stub"><span class="ps">[ADDED] Deep-dive stub (the page&rsquo;s biggest structural hole &mdash; the whole arc above is scale-<em>up</em>).</span> <b>Problem:</b> the autoscaler decides to remove a replica (scale-in, scale-to-zero, or a spot reclaim it must front-run) &mdash; but that replica may hold in-flight 30k-token reasoning generations. <em>Kill them</em> &rarr; lost GPU-hours already spent + a hard SLO breach for those users; <em>wait for them</em> &rarr; scale-down is slow, so you keep paying for the idle GPU exactly when the cost objective wants it gone &mdash; the asymmetry that makes scale-down a first-class policy, not the mirror of scale-up. <b>Solution:</b> a staged drain &mdash; (1) deregister from the router (stop accepting <em>new</em> requests), (2) lame-duck (finish in-flight, optionally migrate short ones), (3) <em>drain-timeout</em>, (4) force-kill survivors with recovery per <a href="K22_fault-tolerance-multi-gpu-inference.html#d23">K22</a>/D23 (replay-from-prompt vs drop). <b>Crossover (a formula, not a vibe):</b> set the drain-timeout where <code>marginal idle-GPU-$ of waiting &Delta;t &gt; P(req still running at &Delta;t) &times; (lost-work GPU-$ + SLO-violation cost)</code> &mdash; the long tail of generation length (cross-link <a href="K19_reasoning-model-serving.html#d47">K19/D47</a>) sets the survival curve, so a reasoning fleet needs a far longer drain than a short-output one. <b>Rule of two:</b> <a href="K22_fault-tolerance-multi-gpu-inference.html#d23">K22</a>/D23 owns <em>unplanned</em> group-fault recovery; <strong>L7</strong> owns drain-on-<em>deploy</em>; K15 owns the <em>autoscaler&rsquo;s planned scale-in</em> &mdash; <em>when</em> to reclaim a replica and the drain-vs-kill cost knob &mdash; cite K22 for the in-flight-recovery mechanism, don&rsquo;t duplicate.<span class="meta">number: drain-timeout that minimises (idle-GPU-$ + killed-work-$) on the trace using the K19/D47 generation-length tail; killed-request count vs drain-wait minutes, both directions &mdash; cites K1 (GPU-$/min), K19/D47 (length tail), K22/D23 (recovery), K4 (lame-duck stop-accept) &middot; real: Kubernetes preStop + terminationGracePeriodSeconds, Ray Serve graceful-shutdown drain, vLLM abort, KServe drain + URLs &middot; cross-link L5 (spot reclaim = an induced scale-down), L7 (planned-drain twin)</span></p>
+
+      <h3 id="d19" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D19 &mdash; power/thermal: the sustained-MFU derate &amp; the datacenter-kW ceiling (co-host <a href="K1_serving-fundamentals.html">K1</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> roofline numbers assume peak clocks; sustained inference power-caps / clock-throttles the GPU &rarr; real throughput 10&ndash;25% below spec, so a fleet sized on spec is under-provisioned; and a datacenter has a hard power/cooling cap &rarr; &ldquo;just add GPUs&rdquo; is physically bounded by rack kW. <b>Solution:</b> derate the K1 roofline by a measured sustained-MFU factor in fleet sizing; treat DC kW as a hard constraint in the cost model; at the power ceiling optimise tokens/Joule, not tokens/$. <b>Rule of two:</b> K1 owns the roofline; K15 owns the fleet-sizing consequence.<span class="meta">number: spec vs sustained-MFU derate (10&ndash;25%) on the trace &rarr; the extra GPUs that implies; tokens/Joule at the kW ceiling &mdash; cites K1 (roofline), pricing-constants.html &middot; real: nvidia-smi -pl power-capping, DC power-capping schedulers + URLs &middot; cross-link L5 (reshapes the cost model)</span></p>
+
+      <h3 id="d18" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D18 (K15 half) &mdash; fleet-level multi-tenant placement &amp; quota (co-host <a href="K4_continuous-batching-and-scheduling.html#d18">K4</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a tenant&rsquo;s burst can evict another tenant&rsquo;s models or starve them fleet-wide. <b>Solution:</b> per-tenant fleet quota, blast-radius isolation (a tenant&rsquo;s burst can&rsquo;t evict another&rsquo;s models across the fleet), dedicated vs shared pools, which-tenant-on-which-GPU placement. <b>Rule of two:</b> <a href="K4_continuous-batching-and-scheduling.html#d18">K4</a>/D18 owns the <em>on-GPU</em> WFQ-over-tokens slice; K15 owns <em>fleet placement</em> &mdash; state the placement half, cite K4 for the on-GPU mechanism, don&rsquo;t duplicate.<span class="meta">number: per-tenant quota bounding fleet-wide tail-latency blast radius on the trace &mdash; cites K4 #d18 (on-GPU mechanism) &middot; real: Run:ai, K8s namespace quota, Ray Serve placement groups + URLs</span></p>
+
+      <p class="stub"><span class="ps">[ADDED] Problem&rarr;Solution stub (G7 &mdash; the missing half of D18-K15).</span> <b>Problem:</b> <em>strict</em> per-tenant fleet quota wastes GPUs &mdash; a tenant&rsquo;s reserved slice sits idle while another tenant is throttled below the idle fleet. <em>Work-conserving</em> (burstable) quota lets a tenant borrow idle capacity &mdash; but when the owner&rsquo;s burst returns the borrowed GPU must be <em>reclaimed</em>: the borrowing model is evicted/cold-started off it &rarr; an <em>induced</em> cold-start (a reclaim-latency tax), and a reclaim storm if many tenants burst together. <b>Solution:</b> burstable quota with a guaranteed floor + a bounded, prioritised <em>reclaim</em> path (preempt borrowed lowest-priority first &mdash; K4/D18 on-GPU; K15 chooses <em>which borrowed replica</em>), reclaim-rate limiting + hysteresis to avoid the storm. <b>Crossover:</b> borrow aggressiveness &mdash; more borrowing recovers more idle GPU-$ but raises reclaim-latency risk for the owner; pick the floor/ceiling where owner-tail-latency stays under SLO. <b>Rule of two:</b> <a href="K4_continuous-batching-and-scheduling.html#d18">K4/D18</a> owns the on-GPU preemption; K15 owns the fleet-level borrow/reclaim policy.<span class="meta">number: idle GPU-$ recovered by burstable vs strict quota, vs the owner reclaim-latency it costs, on the trace &mdash; cites K4 #d18 (on-GPU preempt), K21 (induced cold-start) &middot; real: YARN/K8s burstable QoS, Run:ai over-quota + fairness, Slurm preemption + URLs</span></p>
+
+      <h3 id="d43" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D43 &mdash; heterogeneous-fleet bin-packing &amp; GPU fragmentation</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a fleet serving a 70B (2 GPUs), several 13B (1 GPU), and 50k LoRA adapters over a shared 70B base &mdash; naive placement <em>strands</em> GPUs (a node with 1 free GPU can&rsquo;t host a 2-GPU model = fragmentation) and a hot model can&rsquo;t grow because its GPUs are scattered. <b>Solution:</b> best-fit-decreasing placement by GPU footprint, MIG slicing for sub-GPU models, S-LoRA/Punica shared-base multiplexing (50k adapters &asymp; 1 base + tiny per-adapter delta), gang-scheduling for multi-GPU models, periodic defrag/consolidation. <b>Crossover:</b> MIG slice granularity (finer = better packing, worse per-slice perf + isolation); consolidate vs migration cost.<span class="meta">number: stranded GPUs under naive vs best-fit on the trace fleet mix; S-LoRA base-sharing factor &mdash; cites K1 (footprints), K10 (replica unit) &middot; real: Run:ai, NVIDIA MIG, S-LoRA/Punica, KubeRay placement groups + URLs</span></p>
+
+      <p class="stub"><span class="ps">[ADDED] Problem&rarr;Solution stub (G4 &mdash; one fleet, many GPU generations).</span> <b>Problem:</b> a real fleet accumulates A100 + H100 + H200 + B200; D43 packs <em>same-type</em> GPUs by model footprint, but &ldquo;scale up&rdquo; is also &ldquo;on <em>which generation</em>&rdquo; &mdash; a memory-heavy model needs H200&rsquo;s larger HBM, a latency-critical one B200&rsquo;s FP4/clocks, batch/offline can run on cheap older A100s. Treating the fleet as homogeneous either strands the wrong tier or misses the cheapest goodput/$. <b>Solution:</b> generation-aware placement &mdash; route each model to the cheapest generation whose HBM + roofline (cite <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s hardware table) meets its SLO, push lower-precision tiers (cite <a href="K14_quantization.html">K14</a>) onto older HW, reserve the newest GPUs for SLO-critical pools; the autoscale unit is <em>(model, generation)</em>, not just model. <b>Crossover:</b> goodput/$ per generation &mdash; an older GPU wins until its SLO-meeting batch can no longer hit the latency target. <b>Rule of two:</b> K1 owns the per-GPU constants; K15 owns generation-aware fleet placement; distinct from D43 (same-type footprint packing).<span class="meta">number: goodput/$ per generation on the trace &rarr; the crossover model-size where H200 beats A100-at-FP8 &mdash; cites K1 (HW table), K14 (precision tiers), pricing-constants.html &middot; real: mixed-generation clusters (A100/H100/H200), MIG on older HW for small models + URLs</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the autoscale-signal/policy spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> GPU-util (worst &mdash; lags the SLO) &rarr; request-rate (no latency awareness) &rarr; queue-depth (leading) &rarr; TTFT-slope / SLO-burn-rate (directly SLO-coupled) &rarr; predictive forecast+prewarm (SoTA). Sub-knob: scale-to-zero vs keep-warm (cold-start SLO cost vs idle-GPU cost). Each: what it scales on, the two-sided cliff, the named system.<span class="meta">number: the SLO-violation vs idle-cost crossover per signal on the trace &mdash; cites K1 (cost), K21 (cold-start) &middot; real: HPA-util, HPA-custom, KEDA, predictive ASG + URLs</span></p>
+
+      <h3 id="cost-mix">Fleet cost-mix &mdash; the reserved / on-demand / spot purchase portfolio [ADDED, G3]</h3>
+      <p class="stub"><span class="ps">[ADDED] Problem&rarr;Solution stub (the real $ knob the objective hides).</span> <b>Problem:</b> &ldquo;minimum idle GPU-hours&rdquo; ignores that the <em>same</em> GPU-hour has three prices &mdash; the dominant fleet cost lever is the purchase portfolio, not just how many GPUs run. <b>Solution:</b> a reserved/committed-use <em>floor</em> sized to the diurnal <em>trough</em> (cheapest $/hr, must commit) + on-demand for the predictable diurnal band + spot/preemptible for the burst tail (cheapest, can vanish &mdash; ties D58 reclaim + the G2 stockout fallback). <b>Crossover (a formula):</b> commit reserved up to the load level where <code>P(running) &times; (on-demand &minus; reserved) &gt; (1 &minus; P(running)) &times; reserved-idle-$</code> &mdash; over-commit pays for idle reserved, under-commit pays the on-demand premium + spot-stockout risk. <b>Rule of two:</b> cite <a href="../../topics/pricing-constants.html">pricing-constants.html</a> / <a href="../canonicals/gpu-inference-cost-shapes.html">gpu-inference-cost-shapes.html</a> for the price constants; K15 owns the portfolio <em>knob</em>; <strong>L5</strong> is the dedicated scenario.<span class="meta">number: $/mo of all-on-demand vs reserved-floor + on-demand + spot at 10:1 on the trace; the commit level the crossover picks &mdash; cites pricing-constants.html, K1 (fleet sizing), canonical gpu-inference-cost-shapes.html &middot; real: AWS RI/Savings-Plan + Spot, GCP CUD + Spot, reserved-baseline + burst-spot fleets + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Scale signal:</b> the rule-11 spectrum. <b>Headroom:</b> <code>cold_start &times; peak_ramp</code> &mdash; too low blows SLO on burst, too high wastes idle GPU-hours. <b>Scale-to-zero threshold:</b> idle time before tear-down &mdash; aggressive saves $, costs cold-start tax. <b>MIG granularity / pack policy:</b> D43 crossover. <b>Per-tenant quota:</b> D18 crossover. Each with its chosen value, reason, and cliff on each side.<span class="meta">numbers: per-knob crossover (composes with D12 / D18 / D43) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Static peak-provisioning</b> &mdash; disq: pays peak GPU-hours 24/7 (the naive baseline); <em>wins</em> only when traffic is flat and the SLO is unforgiving and budget is unconstrained. (b) <b>Reactive util-based HPA</b> &mdash; disq: lags the SLO by the cold-start time (derived in &sect;2); <em>wins</em> when cold-start &laquo; SLO (small CPU services, not GPU LLM). (c) <b>Over-provision + no multi-tenancy (dedicated GPU per model)</b> &mdash; disq: strands capacity, no base-sharing; <em>wins</em> for a single huge tenant with strict isolation needs. (d) <b>Per-tenant billing / API rate-limiting as the control</b> &mdash; disq: API-product layer, not a GPU mechanism; <em>out of scope</em> &mdash; flag the boundary, do not cover. <b>[ADDED]</b> (e) <b>all-on-demand (no reserved/spot mix)</b> &mdash; disq: pays the on-demand premium on the whole diurnal band; <em>wins</em> only when traffic is wholly unpredictable and commitment is impossible (see the G3 cost-mix stub). (f) <b>kill-on-scale-down (no drain)</b> &mdash; disq: every scale-in kills in-flight long generations; <em>wins</em> only for stateless/short-output models where killed-work &asymp; 0 (see D58).<span class="meta">number: the crossover disqualifying each ($ for (a); cold-start/SLO ratio for (b); stranded GPUs for (c)) &mdash; cites K1 (cost), K21 (cold-start) &middot; contrast L5</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Scale-up arrives after the breach</b> &mdash; util-signal + cold-start &gt; SLO &rarr; sustained TTFT violation through the burst; first move: leading signal + headroom (llm-bottlenecks.html). <b>Scale-flapping / thrash</b> &mdash; noisy signal scales up&harr;down repeatedly, each cycle pays cold-start; first move: hysteresis + min dwell (llm-bottlenecks.html). <b>Noisy-neighbour fleet eviction</b> &mdash; a tenant burst evicts other tenants&rsquo; models fleet-wide; first move: per-tenant quota + blast-radius isolation (gpu-failure-modes.html &mdash; cross-tenant blast radius). <b>Power/thermal under-provision</b> &mdash; fleet sized on spec MFU runs short under sustained load (gpu-inference-cost-shapes.html). <b>Fragmentation deadlock</b> &mdash; free GPUs exist but scattered so a multi-GPU model can&rsquo;t place (llm-bottlenecks.html). <b>[ADDED] Scale-up unsatisfiable</b> &mdash; the cloud returns no capacity (spot/on-demand stockout) so the planned scale-up never lands &rarr; degrade per K4/D13, fall back to the reserved floor (gpu-failure-modes.html &mdash; capacity stockout). <b>[ADDED] Scale-down work-kill</b> &mdash; scale-in/reclaim tears down a replica with in-flight long generations &rarr; lost GPU-hours + SLO breach; first move: D58 staged drain (llm-bottlenecks.html). <b>[ADDED] Reclaim storm</b> &mdash; many tenants burst together &rarr; mass borrowed-capacity reclaim &rarr; correlated induced cold-starts; first move: reclaim-rate limit + floor (llm-bottlenecks.html). <b>[ADDED] Control-loop oscillation</b> &mdash; loop dead-time = cold-start; high gain &rarr; the fleet hunts up/down (not mere signal noise); first move: feed-forward prewarm (D12) + dead-time-aware gain, not just min-dwell (llm-bottlenecks.html &mdash; scale-flap, refined).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (scale-lag, flap/oscillation, fragmentation, scale-down work-kill, reclaim-storm), llm/canonicals/gpu-failure-modes.html (cross-tenant fleet eviction, capacity stockout), llm/canonicals/gpu-inference-cost-shapes.html (power-derate under-provision) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> Kubernetes HPA on custom metrics, KEDA (event-driven autoscaling), Ray Serve autoscaler, predictive ASGs; Run:ai &amp; NVIDIA MIG (slicing + fractional GPU), S-LoRA / Punica (shared-base multiplexing), KubeRay placement groups (gang scheduling). Each: which point on the rule-11 spectrum / which packing strategy it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (dedicated home &mdash; spot-autoscaling cost; D12/D19/D43<strong>/D58</strong> load-bearing; G2 stockout + G3 cost-mix); <a href="../scenarios/L4-multi-tenant-lora-platform.html">L4</a> (multi-tenant LoRA &mdash; D43/D18 + G7 burstable-reclaim); <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a> (rolling-deploy double-fleet &mdash; a K15 headroom consumer; <strong>D58</strong> is the planned-drain twin of the deploy drain); <a href="../scenarios/L9-cache-aware-reuse-serving.html">L9</a> (cache cold right after scale-out &mdash; G5 cache-warm headroom; routing &times; autoscale). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K21_fast-model-loading-and-cold-start.html#d12">K21</a> &mdash; cold-start mechanics; D12 co-host (K21 owns the budget, K15 owns the signal/policy &mdash; rule of two).</li>
+        <li><a href="K10_data-parallelism.html">K10</a> &mdash; the DP replica is the scale unit; D39 cross-replica routing interacts with placement.</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html#d18">K4</a> &mdash; D18 on-GPU WFQ-over-tokens; K15 owns fleet placement (rule of two).</li>
+        <li><a href="K14_quantization.html">K14</a> &mdash; multi-precision tiers are a fleet lever (cheaper replicas).</li>
+        <li><a href="K1_serving-fundamentals.html">K1</a> &mdash; the roofline D19 derates; the capacity/cost math; the HW table G4 places against.</li>
+        <li><a href="K22_fault-tolerance-multi-gpu-inference.html#d23">K22</a> &mdash; D58 force-kill in-flight recovery; the planned scale-in drain is the twin of K22/D23&rsquo;s <em>unplanned</em> group loss (rule of two).</li>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; owns the parallelism tuple for fit; K15 owns which tuple is the autoscale unit (G6).</li>
+        <li><a href="K16_batch-inference-pipelines.html">K16</a> &mdash; the diurnal trough &amp; follow-the-sun capacity runs K16 batch at lowest priority (D44; the in-scope global-pool slice of G9).</li>
+        <li><a href="K19_reasoning-model-serving.html#d47">K19/D47</a> &mdash; the generation-length tail that sets D58&rsquo;s drain-timeout survival curve.</li>
+        <li><a href="../../topics/canonicals/cross-cutting.html#capacity">cross-cutting.html#capacity</a> &mdash; generic capacity/headroom (refine with LLM numbers, don&rsquo;t duplicate).</li>
+        <li><strong>Out of scope (named, not covered):</strong> the single-GPU scheduler (<a href="K4_continuous-batching-and-scheduling.html">K4</a>); cold-start <em>mechanics</em> (<a href="K21_fast-model-loading-and-cold-start.html">K21</a>); per-tenant billing / API rate-limiting (API-product layer); cross-region <em>request routing</em> / residency steering (<a href="K2_kv-cache.html">K2</a> Role-2 (7) / API layer &mdash; K15 owns where GPUs physically are + trough reuse, not request steering &mdash; G9); Kubernetes/Ray internals (named as tools).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

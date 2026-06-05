@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Top-K Most Frequent URLs — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Top-K Most Frequent URLs</h1>
+      <p class="hero-subtitle">Finding the 100 most visited pages from a billion page views per hour &mdash; when exact counts do not fit in memory on a single machine.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~25 min read &bull; LC #347 (Top K Frequent Elements)</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- LC kernel banner                                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>LC kernel.</strong> Top K Frequent Elements (LC&nbsp;#347). Textbook structure: a <code>HashMap&lt;item, count&gt;</code> built by one pass over the array, then either a min-heap of size <code>k</code> over the entries (<code>O(n log k)</code>) or bucket-sort by count (<code>O(n)</code>) to pull the top <code>k</code>. <strong>Three properties that break on an unbounded high-volume stream:</strong> (1) <em>memory is <code>O(distinct keys)</code></em> &mdash; the array is finite, but a page-view stream has no end and (worst case) every URL is distinct, so the hashmap grows to 100&nbsp;GB+; (2) <em>no mergeability</em> &mdash; you cannot split the stream across machines and add up partial hashmaps cheaply, and you cannot merge two partial top-<code>k</code> lists into a correct global top-<code>k</code> (a key that's #101 on every shard can be #1 globally); (3) <em>no freshness / windowing</em> &mdash; LC counts a static array once; "top-100 in the <em>last hour</em>" needs old events to stop counting. The C8 production cousin replaces the exact hashmap with a fixed-size <strong>frequency sketch</strong> (Count-Min / Space-Saving &mdash; cite <a href="../canonicals/sketches.html#cms">sketches.html#cms</a>, <a href="../canonicals/sketches.html#space-saving">#space-saving</a>) that is <code>O(1/&epsilon;)</code>, <em>mergeable</em> (associative &mdash; the property the distributed fan-in needs), and a rotating bank of them for windowing, paired with the same min-heap for the top-<code>k</code> extraction.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are building a real-time analytics dashboard for a large web platform. The primary query: <strong>"What are the top 100 most visited URLs in the past hour?"</strong> &mdash; the trending list every product surface shows.</p>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Reused by.</strong> The trending-topics overlay in <a href="45-autocomplete-suggest.html">#45 (search autocomplete)</a> and the trending-topics / mute-filter surfacing in <a href="41-home-timeline-fanout.html">#41 (home-timeline fan-out)</a> <em>are</em> this design &mdash; they consume the mergeable sketch + min-heap derived here. If you change the sketch sizing or the partition scheme on this page, those pages inherit it.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>System class &amp; functional requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <p><strong>Class:</strong> automation pipeline (stream-processing) with an algorithmic kernel &mdash; it folds an unbounded event stream into a small derived structure and serves a fixed query; it is <em>not</em> a queryable analytics DB (that would bring an ad-hoc-query FR and a per-row read-latency NFR &mdash; out of scope). Functional requirements:</p>
+        <ul>
+          <li><strong>Ingest the page-view stream.</strong> Accept <code>(url, ts)</code> events at the firehose rate; fire-and-forget.</li>
+          <li><strong>Maintain an approximate top-K.</strong> Track the <code>k</code> most-frequent URLs over the active window, updated continuously.</li>
+          <li><strong>Serve "current top-K" queries.</strong> Return the ranked list with (approximate) counts, on demand, in milliseconds.</li>
+          <li><strong>Window the counts.</strong> "Last hour" means events older than the window stop contributing; granularity ~1&nbsp;minute is fine.</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> exact counts (a separate batch path handles billing/SLA reporting &mdash; covered in the MapReduce alternative below); per-user / personalized top-K (a different cardinality story &mdash; flagged as a probe); arbitrary group-bys ("top URLs <em>per country</em>") &mdash; the dashboard query is fixed; click-through / dwell-time ranking &mdash; this counts visits only; raw-event storage and replay &mdash; that's the event log's job (Kafka / S3), not this pipeline's.</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) the URL popularity distribution is heavy-tailed / Zipfian &mdash; the top ~10&nbsp;M URLs carry ~99% of traffic (cite <a href="../canonicals/access-patterns.html#power-law">access-patterns.html#power-law</a>); the design must still survive the worst case (every event distinct); (2) <code>K&nbsp;&asymp;&nbsp;100</code> &mdash; small relative to the distinct-key count; (3) error tolerance <code>&epsilon;&nbsp;&asymp;&nbsp;0.0001</code> (an item that's within ~100K of the threshold on a 1B-event window can be a false positive &mdash; acceptable for a trending widget, not for billing); (4) window = sliding 1&nbsp;hour, ~1&nbsp;min granularity (not all-time; all-time would drop the rotation machinery); (5) a single internal tenant (the platform's own traffic) &mdash; multi-tenant top-K-per-customer is a probe.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarification ledger</h3>
+        <ul>
+          <li><em>Approximate OK, or must counts be exact?</em> &rarr; approximate for the dashboard; exact only on the batch path (drives sketch vs. hashmap).</li>
+          <li><em>Window: last hour sliding, or fixed clock-hour buckets, or all-time?</em> &rarr; sliding 1&nbsp;h, ~1&nbsp;min granularity (drives rotating sketches vs. a single sketch).</li>
+          <li><em>How big is <code>K</code>, and is it fixed?</em> &rarr; ~100, fixed (drives heap size; <code>K=10⁴</code> would still be a heap, <code>K=</code>"all above a threshold" would be Space-Saving's natural output).</li>
+          <li><em>One global list, or per-segment (country / device / tenant)?</em> &rarr; one global list (per-segment multiplies cardinality &mdash; the personalized-top-K probe).</li>
+          <li><em>Traffic today and growth?</em> &rarr; ~1B events/h now (~278K/s); plan for 10&times; (drives the shard count and the partition-by-key decision).</li>
+          <li><em>Is there already a durable event log we can read?</em> &rarr; yes, Kafka (drives the ingest transport and the batch path's source).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Scale</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Page views per hour</td><td>1,000,000,000 (1 billion)</td></tr>
+              <tr><td>Page views per second</td><td>~278,000</td></tr>
+              <tr><td>Average URL length</td><td>~100 bytes</td></tr>
+              <tr><td>Result needed</td><td>Top 100 URLs by visit count</td></tr>
+              <tr><td>Freshness requirement</td><td>Updated every minute (near real-time)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>The Memory Challenge</h3>
+        <p>To find the top-100 most frequent URLs, you need to count how many times each unique URL appears. The question is: how much memory does that take?</p>
+        <pre class="line-numbers"><code class="language-text">Worst case: every page view is a unique URL.
+  1 billion unique URLs x (100 bytes URL + 8 bytes count) = 108 GB
+  Does not fit in a single machine's memory (typical: 64 GB).
+
+Realistic case: 90% are duplicates.
+  100 million unique URLs x 108 bytes = ~10.8 GB
+  Fits in one machine, but barely. And what if traffic doubles?
+
+Optimistic case: 99% are duplicates (heavy-tailed distribution).
+  10 million unique URLs x 108 bytes = ~1.08 GB
+  Comfortable for one machine.</code></pre>
+      </div>
+
+      <p class="full-width">We need a design that works even in the worst case, and ideally scales horizontally as traffic grows.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p class="full-width">This section establishes only the memory facts the Naive Design needs (how big exact counts are) and forward-references the sketch that Iteration&nbsp;1 introduces &mdash; it does not <em>use</em> the sketch in any Naive-Design calculation.</p>
+
+      <div>
+        <h3>Approach 1: Exact Counts with Hash Map</h3>
+        <pre class="line-numbers"><code class="language-text">Data structure: HashMap&lt;URL, count&gt;
+Memory per entry: 100B (URL) + 8B (count) + 40B (hash map overhead) = ~148B
+Unique URLs (worst case): 1 billion
+Total memory: 1B x 148B = 148 GB → does NOT fit on one machine.
+
+Unique URLs (realistic): 100 million
+Total memory: 100M x 148B = 14.8 GB → fits, but tight.</code></pre>
+      </div>
+
+      <div>
+        <h3>Approach 2: Count-Min Sketch (Approximate) &mdash; introduced in Iteration&nbsp;1</h3>
+        <p>A <strong>Count-Min Sketch</strong> estimates per-item frequencies in <code>O(1/&epsilon;)</code> memory by hashing each item into <code>d</code> rows of <code>w</code> counters and reading back the minimum of the <code>d</code> hit counters (it never underestimates; over-count &le; <code>&epsilon;&middot;N</code> with probability &ge; <code>1&minus;&delta;</code>). Full mechanism, the why-the-minimum argument, and the Space-Saving / Heavy-Keeper alternatives are in <a href="../canonicals/sketches.html#cms">sketches.html#cms</a> &mdash; we don't restate them. What this page contributes is the <em>sizing</em> for this workload and the consequences (windowing, partitioning, the heap pairing); those are below and in Iteration&nbsp;1.</p>
+      </div>
+
+      <div>
+        <h4>Sizing the Sketch</h4>
+        <p>The Count-Min Sketch has two parameters that control accuracy:</p>
+        <ul>
+          <li><strong>&epsilon; (epsilon):</strong> error bound. The estimated count for any item is at most the true count + &epsilon; &times; N, where N is the total number of events.</li>
+          <li><strong>&delta; (delta):</strong> failure probability. The probability that the error exceeds &epsilon; &times; N.</li>
+        </ul>
+        <pre class="line-numbers"><code class="language-text">Width:  w = ⌈e / ε⌉      (e = 2.718, Euler's number)
+Depth:  d = ⌈ln(1/δ)⌉
+
+For ε = 0.001 (0.1% error), δ = 0.01 (99% confidence):
+  w = ⌈2.718 / 0.001⌉ = 2,718
+  d = ⌈ln(100)⌉ = ⌈4.605⌉ = 5
+
+  Total cells: 2,718 x 5 = 13,590
+  Memory: 13,590 x 4 bytes/counter = 54,360 bytes ≈ 54 KB
+
+For ε = 0.0001 (0.01% error), δ = 0.01 (99% confidence):
+  w = ⌈2.718 / 0.0001⌉ = 27,183
+  d = 5
+
+  Total cells: 27,183 x 5 = 135,915
+  Memory: 135,915 x 4 bytes = 543,660 bytes ≈ 540 KB</code></pre>
+      </div>
+
+      <div>
+        <h4>What Does the Error Mean Concretely?</h4>
+        <pre class="line-numbers"><code class="language-text">With ε = 0.001 and N = 1 billion events:
+  Maximum overestimate for any URL: 0.001 x 1,000,000,000 = 1,000,000
+
+  If the true count for "example.com/popular" is 5,000,000,
+  the sketch might report up to 6,000,000 (overestimate by 1M).
+
+  If the true 100th most popular URL has 3,000,000 views,
+  a URL with only 2,000,000 views could appear to have 3,000,000
+  (2M + 1M overestimate) → false positive in the top-100.
+
+With ε = 0.0001 and N = 1 billion:
+  Maximum overestimate: 0.0001 x 1,000,000,000 = 100,000
+
+  Much tighter. A URL needs to be within 100K of the threshold to
+  be a false positive, which is unlikely for URLs with millions of views.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Memory Comparison</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Approach</th><th>Memory</th><th>Accuracy</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Exact HashMap (worst case)</td><td>148 GB</td><td>100%</td></tr>
+              <tr><td>Exact HashMap (realistic)</td><td>14.8 GB</td><td>100%</td></tr>
+              <tr><td>Count-Min Sketch (&epsilon;=0.001)</td><td>54 KB</td><td>Within 1M of true count</td></tr>
+              <tr><td>Count-Min Sketch (&epsilon;=0.0001)</td><td>540 KB</td><td>Within 100K of true count</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="full-width">The Count-Min Sketch uses <strong>275,000x less memory</strong> than exact counting (540 KB vs 148 GB). The tradeoff: counts are approximate. For a top-100 dashboard, this is almost always acceptable.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design</h2>
+      <p>The absolute simplest thing that could work &mdash; the LC&nbsp;#347 kernel, run once per minute on the last hour of events: collect all ~1&nbsp;billion page-view events of the window, build an exact <code>HashMap&lt;URL, count&gt;</code>, sort by count, return the top 100. No sketch, no streaming, no partitioning &mdash; just the textbook algorithm at scale.</p>
+
+      <div>
+        <h3>Why This Fails</h3>
+        <pre class="line-numbers"><code class="language-text">Step 1: Collect all 1B events in memory.
+  Memory needed: 1B x 100B = 100 GB → does not fit.
+
+Step 2 (alternative): Write all events to disk, external sort.
+  Disk: 100 GB of data.
+  External merge sort: O(N log N) with disk I/O.
+  At 200 MB/sec disk throughput: multiple passes over 100 GB.
+  Time estimate: 10-30 minutes for the sort alone.
+
+Step 3: Scan sorted file, count consecutive URLs, keep top 100.
+  One more pass over 100 GB: ~500 seconds.
+
+Total time: ~30-40 minutes. Not real-time.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks (cite <a href="../canonicals/bottlenecks.html">bottlenecks.html</a> / <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h2>
+      <ul class="full-width">
+        <li><strong>Memory capacity bound</strong> (cite <a href="../canonicals/bottlenecks.html#memory-capacity-bound">bottlenecks.html#memory-capacity-bound</a> &mdash; aggravated by <a href="../canonicals/bottlenecks.html#cardinality-explosion">#cardinality-explosion</a>): 100&nbsp;GB of raw events &mdash; or even just the exact <code>HashMap</code> over the distinct URLs (up to 148&nbsp;GB worst case) &mdash; does not fit in one machine's RAM. The bound is set by the <em>distinct-key count</em>, which the stream can drive arbitrarily high.</li>
+        <li><strong>Latency / freshness</strong>: the external-sort path is ~30&nbsp;min; the dashboard needs a refresh every minute. The whole batch shape is wrong for the freshness NFR.</li>
+        <li><strong>No horizontal scaling path</strong>: doubling traffic doubles the single-machine load with nowhere to put it. The matching failure mode when the box does fall over is <a href="../canonicals/failure-modes.html#backlog-overflow">failure-modes.html#backlog-overflow</a> &mdash; events pile up faster than the one node drains them.</li>
+        <li><strong>No windowing</strong>: "top-100 in the last hour" needs old events to stop counting; re-sorting the whole dataset every minute re-does <code>O(N&nbsp;log&nbsp;N)</code> work for a result that barely moved.</li>
+      </ul>
+      <p class="full-width">Iterations 1&ndash;2 close these in order: the sketch fixes the memory/cardinality bound and enables streaming (freshness); per-key partitioning gives the horizontal path; rotating sketches give windowing.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Count-Min Sketch + Min-Heap (Single Machine)     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Count-Min Sketch + Min-Heap (Single Machine)</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck in the Naive Design</h3>
+        <p>The dominant bottleneck is <strong>memory capacity, set by the distinct-key count</strong> (cite <a href="../canonicals/bottlenecks.html#memory-capacity-bound">bottlenecks.html#memory-capacity-bound</a> + <a href="../canonicals/bottlenecks.html#cardinality-explosion">#cardinality-explosion</a>): the exact <code>HashMap</code> is <code>O(distinct URLs)</code> = up to 148&nbsp;GB &mdash; it doesn't fit, and even when it does (~14.8&nbsp;GB realistic) it's one traffic-doubling away from not fitting. The architectural decision to revisit (cite <a href="../canonicals/bottleneck-to-decisions.html#cardinality">bottleneck-to-decisions.html#cardinality</a>): <em>does this count need to be exact?</em> &mdash; if not, swap the exact structure for a fixed-size sketch. Secondary bottleneck: the batch shape is wrong for freshness &mdash; fold the stream incrementally instead. Both are addressed by the same move: a streaming sketch + heap.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Exact <code>HashMap&lt;URL, count&gt;</code> (the LC kernel as-is)</strong> &mdash; rejected: memory is <code>O(distinct keys)</code>, unbounded on this stream (the disqualifying constraint). Survives only if you can bound distinct URLs <em>and</em> over-provision for growth &mdash; neither holds here. Kept for the <em>batch</em> path (bounded slice per mapper) &mdash; see the MapReduce alternative.</li>
+          <li><strong>Count-Min Sketch</strong> (chosen) &mdash; <code>O(1/&epsilon;)</code> memory, over-counts only (never under), <em>linear &amp; mergeable</em> (adding two CMS arrays cell-wise gives the CMS of the union &mdash; the property Iteration&nbsp;2's fan-in needs), trivially supports rotation for windowing. Cite <a href="../canonicals/sketches.html#cms">sketches.html#cms</a>. Disqualifying weakness it <em>doesn't</em> have for us: its over-count grows with total stream volume <code>N</code> &mdash; fine at <code>&epsilon;=10⁻⁴</code> for a million-view threshold, would be a problem if the threshold were small.</li>
+          <li><strong>Space-Saving (Stream-Summary)</strong> &mdash; viable alternative: tracks exactly the top-<code>m</code> candidates in <code>O(m)</code> counters, gives a tighter error <em>for the heavy hitters specifically</em> and emits the top-K directly (no separate heap needed). Rejected as the primary because it's harder to make <em>mergeable</em> across shards (merging two Stream-Summaries is not the clean cell-wise add CMS gives) &mdash; and Iteration&nbsp;2 leans on mergeability. Cite <a href="../canonicals/sketches.html#space-saving">sketches.html#space-saving</a>. (A real system often runs <em>both</em> &mdash; CMS for mergeable counts, Space-Saving per shard for the candidate set; that's the final design's refinement.)</li>
+          <li><strong>Heavy-Keeper</strong> &mdash; viable alternative: a count-with-exponential-decay sketch tuned for heavy hitters with much lower error than CMS at the same size, by aggressively decaying cold keys. Rejected as the primary for the same mergeability reason and because its decay interacts awkwardly with our explicit rotation-based windowing; noted as a per-shard refinement. Cite <a href="../canonicals/sketches.html#heavy-keeper">sketches.html#heavy-keeper</a>.</li>
+        </ul>
+        <p>The chosen move: a Count-Min Sketch for approximate frequency counting + a min-heap of size 100 for the current top-K, fed by the live stream.</p>
+      </div>
+
+      <p>Process the event stream in real-time using two data structures: a Count-Min Sketch for approximate frequency counting, and a min-heap of size 100 for tracking the current top-K.</p>
+
+      <div class="full-width">
+        <h3>The Algorithm</h3>
+        <pre class="line-numbers"><code class="language-python">class TopKTracker:
+    def __init__(self, k=100, cms_width=27183, cms_depth=5):
+        self.k = k
+        self.cms = CountMinSketch(width=cms_width, depth=cms_depth)
+        self.heap = MinHeap()          # min-heap ordered by count
+        self.in_heap = {}              # URL → current count in heap
+
+    def process_event(self, url):
+        # Step 1: Update the Count-Min Sketch
+        self.cms.increment(url)
+        estimated_count = self.cms.query(url)
+
+        # Step 2: Update the top-K heap
+        if url in self.in_heap:
+            # URL already in heap: update its count
+            self.in_heap[url] = estimated_count
+            self.heap.update(url, estimated_count)
+
+        elif len(self.heap) < self.k:
+            # Heap not full yet: add directly
+            self.heap.push(url, estimated_count)
+            self.in_heap[url] = estimated_count
+
+        elif estimated_count > self.heap.peek_min_count():
+            # New count exceeds the smallest in the heap: replace
+            evicted_url = self.heap.pop_min()
+            del self.in_heap[evicted_url]
+            self.heap.push(url, estimated_count)
+            self.in_heap[url] = estimated_count
+
+        # If count <= heap minimum: this URL is not in top-K, ignore.
+
+    def get_top_k(self):
+        return self.heap.get_all_sorted_descending()</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Step-by-Step Walkthrough</h3>
+        <p>Let us trace through a small example with K=3 and 10 events to see how the algorithm works:</p>
+        <pre class="line-numbers"><code class="language-text">Events (in order):  /home, /about, /home, /pricing, /home, /about, /docs, /pricing, /pricing, /about
+
+Processing each event:
+
+Event 1: /home
+  CMS: /home → 1
+  Heap (size 0 < 3): add /home(1)
+  Heap: [/home:1]
+
+Event 2: /about
+  CMS: /about → 1
+  Heap (size 1 < 3): add /about(1)
+  Heap: [/about:1, /home:1]
+
+Event 3: /home
+  CMS: /home → 2
+  /home in heap → update count
+  Heap: [/about:1, /home:2]
+
+Event 4: /pricing
+  CMS: /pricing → 1
+  Heap (size 2 < 3): add /pricing(1)
+  Heap: [/about:1, /pricing:1, /home:2]     (min-heap: root is smallest)
+
+Event 5: /home
+  CMS: /home → 3
+  /home in heap → update
+  Heap: [/about:1, /pricing:1, /home:3]
+
+Event 6: /about
+  CMS: /about → 2
+  /about in heap → update
+  Heap: [/pricing:1, /about:2, /home:3]
+
+Event 7: /docs
+  CMS: /docs → 1
+  Heap full (size 3). /docs count (1) ≤ heap min (1). Skip.
+  Heap: [/pricing:1, /about:2, /home:3]     (unchanged)
+
+Event 8: /pricing
+  CMS: /pricing → 2
+  /pricing in heap → update
+  Heap: [/pricing:2, /about:2, /home:3]
+
+Event 9: /pricing
+  CMS: /pricing → 3
+  /pricing in heap → update
+  Heap: [/about:2, /pricing:3, /home:3]
+
+Event 10: /about
+  CMS: /about → 3
+  /about in heap → update
+  Heap: [/about:3, /pricing:3, /home:3]
+
+Final top-3: /home:3, /pricing:3, /about:3
+True counts:  /home:3, /pricing:3, /about:3, /docs:1
+Result: Correct!</code></pre>
+      </div>
+
+      <div>
+        <h3>Performance Analysis</h3>
+        <pre class="line-numbers"><code class="language-text">Per-event cost:
+  CMS update:    O(d) = O(5) hash computations + 5 counter increments
+  CMS query:     O(d) = O(5) hash + min of 5 values
+  Heap update:   O(log K) = O(log 100) ≈ O(7)
+  Total per event: O(d + log K) ≈ O(12) operations
+
+Throughput:
+  278,000 events/sec x 12 operations = 3.34 million operations/sec
+  A single modern CPU core handles ~100M simple operations/sec.
+  Processing uses ~3.3% of one core. Trivially fast.
+
+Memory:
+  CMS: 540 KB
+  Heap: 100 entries x ~108 bytes = ~10.8 KB
+  in_heap map: 100 entries x ~148 bytes = ~14.8 KB
+  Total: ~566 KB — less than 1 MB.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <strong>From 148 GB to 566 KB.</strong> The Count-Min Sketch + min-heap approach uses roughly 260,000x less memory than exact counting, processes 278K events/sec on a fraction of one CPU core, and provides results at any moment without waiting for a batch to complete.
+      </div>
+
+      <div class="full-width">
+        <h3>Handling the 1-Hour Window</h3>
+        <p>The requirement is "top-100 in the <em>last hour</em>." Events older than 1 hour must stop contributing to counts. Two approaches:</p>
+      </div>
+
+      <div>
+        <h4>Approach A: Rotating Sketches</h4>
+        <pre class="line-numbers"><code class="language-text">Maintain 60 sketches, one per minute.
+
+Minute 0-1:   Write to sketch_0.
+Minute 1-2:   Write to sketch_1.
+...
+Minute 59-60: Write to sketch_59.
+Minute 60-61: Reset sketch_0 and reuse for the new minute.
+
+To query the last hour: sum the counts across all 60 sketches.
+
+Memory: 60 x 540 KB = 32.4 MB. Still tiny.
+
+Trade-off: 1-minute granularity for window eviction.
+Some events might be counted for up to 61 minutes.</code></pre>
+      </div>
+
+      <div>
+        <h4>Approach B: Sliding Window with Decay</h4>
+        <p>Use a single sketch but apply exponential decay. Multiply all counters by a decay factor every minute. Recent events contribute more; old events fade away. This is less precise but uses only one sketch.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>The one node dies</strong> &rarr; <a href="../canonicals/failure-modes.html#bad-deploy">failure-modes.html#bad-deploy</a> / process crash: the sketch + heap live only in RAM, so a crash loses the current window. Detection: heartbeat / no-emit alarm. Recovery: replay the last hour of events from the Kafka log into a fresh sketch (minutes) &mdash; or, until Iteration&nbsp;2, accept a gap. This is the "no failure story" property of the LC kernel, unfixed at this iteration &mdash; it's a single-machine design.</li>
+          <li><strong>Ingest outpaces the consumer</strong> &rarr; <a href="../canonicals/failure-modes.html#backlog-overflow">failure-modes.html#backlog-overflow</a>: at 278K events/s the fold uses ~3% of one core, so this is comfortable now &mdash; but a 10&times; spike or a GC pause stalls the consumer and the Kafka lag grows. Detection: consumer-lag metric. Recovery here: none structural (one node) &mdash; Iteration&nbsp;2's sharding is the real fix; in the interim, shed (sample) the stream and count the drop.</li>
+          <li><strong>The sketch saturates / over-counts blow up</strong> &rarr; <a href="../canonicals/failure-modes.html#data-corruption">failure-modes.html#data-corruption</a> (logical, not bit-level): if the operator under-sizes the sketch (too small <code>w</code>) for the actual distinct-key count, collisions inflate every count and the heap fills with false positives. Detection: sample-and-compare against an exact count on a small slice (a canary). Recovery: re-size the sketch (an offline parameter change) &mdash; see Operations in the Final Design for the canary protocol.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Distributed Version                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Distributed Top-K Across Multiple Machines</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck in Iteration 1</h3>
+        <p>Two limits remain. (1) <strong>Single-node throughput &amp; the matching failure mode</strong> &mdash; one consumer folds 278K events/s at ~3% of a core today, but a 10&times; growth (2.78M/s) or a runaway-hot URL pushes it toward <a href="../canonicals/bottlenecks.html#network-bandwidth-bound">bottlenecks.html#network-bandwidth-bound</a> (the NIC, not the CPU, becomes the wall &mdash; 2.78M&nbsp;&times;&nbsp;~100&nbsp;B&nbsp;=&nbsp;~280&nbsp;MB/s of event payload, well into multi-Gbps territory), and a crash blinds the whole window. (2) <strong>No redundancy</strong> &mdash; the design has a single point of failure. The architectural decision to revisit (cite <a href="../canonicals/bottleneck-to-decisions.html#hot-partition">bottleneck-to-decisions.html#hot-partition</a>): partition the stream &mdash; but <em>by what key?</em> &mdash; so each shard sees a complete sub-problem. The move is mechanically clean precisely because the CMS is <em>mergeable</em> (the property we chose it for in Iteration&nbsp;1).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Partition by <code>hash(URL)</code>, per-shard CMS + heap, merge top-K lists</strong> (chosen) &mdash; every event for a URL lands on one shard, so each shard's local top-K is exact-within-CMS-error <em>for its key range</em>, and the global top-K is the merge of <code>N</code> local lists of size &ge;<code>K</code> (a key in the global top-<code>K</code> can't be missing from its owning shard's top-<code>K</code>). Cite <a href="../canonicals/sharding-strategies.html#hash">sharding-strategies.html#hash</a>. Disqualifying weakness it can have but doesn't here: a single mega-hot URL still pins one shard &mdash; tolerable because that one URL is one counter increment, not state growth (and a salted-key split is the probe if it ever isn't).</li>
+          <li><strong>Broadcast the whole stream to every shard, each keeps a full sketch</strong> &mdash; rejected: it doesn't reduce per-node ingest at all (every node still eats 278K&nbsp;&times;&nbsp;... events/s) &mdash; the throughput bottleneck (the disqualifying constraint) is untouched; it only buys redundancy, expensively. Useful only as a degenerate "replicate for HA" option, dominated by per-key sharding + replicating each shard.</li>
+          <li><strong>One fat node, scaled vertically</strong> &mdash; rejected: there's no machine large enough for the worst-case exact count, and even with the sketch the NIC bandwidth (the disqualifying constraint) caps a single box; no failure story either.</li>
+          <li><strong>Partition randomly, coordinator re-aggregates per-URL counts</strong> &mdash; rejected: a URL's count is split across shards, so no shard sees the true count and the coordinator would have to receive <em>all</em> distinct URLs from <em>all</em> shards to re-sum (cite <a href="../canonicals/bottlenecks.html#coordinator-bottleneck">bottlenecks.html#coordinator-bottleneck</a>) &mdash; the coordinator's fan-in is the disqualifying constraint, and it re-creates the cardinality problem at the coordinator.</li>
+        </ul>
+      </div>
+
+      <p>A single machine handles 278K events/sec easily. But if traffic grows to 10 billion events/hour (2.78M events/sec), or if we want redundancy, we distribute the work.</p>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 700 370" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGray2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+
+          <!-- Event Stream -->
+          <rect x="230" y="10" width="240" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="35" text-anchor="middle" font-weight="600" fill="#2563eb">Event Stream: 278K events/sec</text>
+
+          <!-- Arrow down to Partitioner -->
+          <line x1="350" y1="50" x2="350" y2="75" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+
+          <!-- Partitioner -->
+          <rect x="250" y="75" width="200" height="45" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="95" text-anchor="middle" font-weight="600" fill="#334155">Partitioner</text>
+          <text x="350" y="112" text-anchor="middle" fill="#64748b" font-size="11">hash(URL) % 10</text>
+
+          <!-- Arrows from Partitioner to Workers -->
+          <line x1="270" y1="120" x2="95" y2="165" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+          <line x1="320" y1="120" x2="265" y2="165" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+          <line x1="380" y1="120" x2="435" y2="165" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+          <line x1="430" y1="120" x2="605" y2="165" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+
+          <!-- Worker 0 -->
+          <rect x="20" y="165" width="150" height="55" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="95" y="187" text-anchor="middle" font-weight="600" fill="#1e40af">Worker 0</text>
+          <text x="95" y="207" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+
+          <!-- Worker 1 -->
+          <rect x="190" y="165" width="150" height="55" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="265" y="187" text-anchor="middle" font-weight="600" fill="#1e40af">Worker 1</text>
+          <text x="265" y="207" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+
+          <!-- Dots -->
+          <text x="370" y="197" text-anchor="middle" fill="#64748b" font-size="18" font-weight="bold">...</text>
+
+          <!-- Worker 9 -->
+          <rect x="400" y="165" width="150" height="55" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="475" y="187" text-anchor="middle" font-weight="600" fill="#1e40af">Worker 9</text>
+          <text x="475" y="207" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+
+          <!-- Memory annotation -->
+          <rect x="565" y="165" width="120" height="55" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4"/>
+          <text x="625" y="187" text-anchor="middle" fill="#64748b" font-size="11">566 KB each</text>
+          <text x="625" y="205" text-anchor="middle" fill="#64748b" font-size="11">~28K evt/sec</text>
+
+          <!-- Arrows from Workers to Coordinator -->
+          <line x1="95" y1="220" x2="270" y2="270" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+          <line x1="265" y1="220" x2="320" y2="270" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+          <line x1="475" y1="220" x2="430" y2="270" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+
+          <!-- Coordinator -->
+          <rect x="250" y="270" width="200" height="45" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="290" text-anchor="middle" font-weight="600" fill="#334155">Coordinator</text>
+          <text x="350" y="307" text-anchor="middle" fill="#64748b" font-size="11">merges top-K from each worker</text>
+
+          <!-- Arrow to Result -->
+          <line x1="350" y1="315" x2="350" y2="335" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+
+          <!-- Result -->
+          <rect x="255" y="335" width="190" height="30" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="355" text-anchor="middle" font-weight="600" fill="#2563eb">Top-100 Result</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Why Partition by hash(URL)?</h3>
+        <p>If we partition events randomly, the same URL could be split across multiple workers. Worker A might see 3,000 visits to <code>/home</code> and Worker B might see 2,500 visits. Neither worker sees the true count of 5,500. The coordinator would need to re-aggregate, which defeats the purpose.</p>
+
+        <p>By partitioning on <code>hash(URL)</code>, all events for the same URL go to the same worker. Each worker sees the complete count for its assigned URLs. Its local top-100 is exact (within CMS approximation error) for its partition.</p>
+      </div>
+
+      <div>
+        <h3>The Coordination Step</h3>
+        <pre class="line-numbers"><code class="language-text">Every 60 seconds:
+  1. Each worker emits its local top-100:
+     [{url: "/home", count: 5500}, {url: "/pricing", count: 4200}, ...]
+
+  2. Coordinator collects 10 x 100 = 1,000 candidates.
+
+  3. Coordinator picks the top-100 from these 1,000 candidates.
+     Simple: sort 1,000 items by count, take first 100.
+     Time: O(1000 log 1000) ≈ trivial (microseconds).
+
+  4. Coordinator publishes the global top-100 to the dashboard.</code></pre>
+      </div>
+
+      <div>
+        <h3>Is This Exact?</h3>
+        <p>Almost. The global top-100 is correct <em>if</em> every globally top-100 URL appears in at least one worker's local top-100. Since each URL is assigned to exactly one worker (hash partitioning), the URL with the globally 100th-highest count must be in its assigned worker's local top-100. This is guaranteed as long as each worker tracks at least 100 candidates &mdash; which it does.</p>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <strong>Edge case:</strong> If we did NOT partition by URL (random distribution), then a URL's count is split across workers. No single worker sees the full count, and a globally popular URL might not appear in any worker's local top-100. With hash partitioning, this cannot happen.
+      </div>
+
+      <div>
+        <h3>Scaling</h3>
+        <pre class="line-numbers"><code class="language-text">10 workers, each handling ~28K events/sec:
+  Per-worker CPU: ~0.3% of one core (trivial)
+  Per-worker memory: ~566 KB (CMS + heap)
+  Total memory: ~5.7 MB
+
+To handle 10x traffic (10B events/hour):
+  100 workers, each handling ~28K events/sec
+  Total memory: ~57 MB
+  Coordination: merge 100 x 100 = 10K candidates → trivial</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>A shard dies mid-window</strong> &rarr; <a href="../canonicals/failure-modes.html#bad-deploy">failure-modes.html#bad-deploy</a> / node loss: that shard's key range goes dark &mdash; the top-K is missing whatever was popular in that ~10% of the hash space. Fix: run each shard with a warm replica that consumes the same Kafka partitions (Kafka's offset bookkeeping makes the failover clean) and checkpoints its sketch bank to S3 every minute; a fresh replica rebuilds from the last checkpoint + replay-since-checkpoint (seconds, not minutes). Detection: per-shard heartbeat + Kafka consumer-group rebalance. Until then, the coordinator emits the merged list flagged "shard <code>j</code> stale" rather than silently dropping it.</li>
+          <li><strong>A single mega-hot URL pins one shard</strong> &rarr; <a href="../canonicals/failure-modes.html#hot-key-meltdown">failure-modes.html#hot-key-meltdown</a>: hash partitioning sends all of one URL to one shard; if that URL alone is, say, 30% of all traffic, that shard does 30% of the work. It's only a counter increment (no state growth), so it's far less dangerous than a hot key in a stateful store &mdash; but at extreme skew the fix is salted-key splitting (send <code>(url, rand()%S)</code> to <code>S</code> shards, sum the <code>S</code> counters at query time). Flagged as a probe; detection is per-shard ingest-rate imbalance.</li>
+          <li><strong>The coordinator stalls or its emit is slow</strong> &rarr; <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes.html#slow-dependency</a>: the dashboard goes stale, but the shards keep folding &mdash; nothing is lost, just not published. The coordinator is stateless (it merges <code>N</code> lists of <code>K</code>), so a standby takes over instantly; the dashboard shows the last good list with its age. Detection: emit-age gauge on the dashboard.</li>
+          <li><strong>The sketch is mis-sized after a traffic shape change</strong> &rarr; <a href="../canonicals/failure-modes.html#data-corruption">failure-modes.html#data-corruption</a> (logical): distinct-URL count climbed, <code>w</code> no longer big enough, over-counts inflate &mdash; same as Iteration&nbsp;1's mode, now fleet-wide. Fix: the canary-compare-against-exact protocol (Operations, Final Design) plus a per-shard "estimated distinct keys" gauge (an HLL alongside the CMS &mdash; cheap) that trips a re-size alarm.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Exact Alternative: MapReduce                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="exact-mapreduce">
+    <div class="container">
+      <h2>Alternative: Exact Count with MapReduce</h2>
+      <p>If approximate counts are not acceptable (e.g., for billing, SLA reporting), use a batch approach with MapReduce or a distributed SQL engine.</p>
+
+      <div class="full-width">
+        <h3>The MapReduce Job</h3>
+        <pre class="line-numbers"><code class="language-text">Map phase:
+  - 100 mappers, each processing 1B / 100 = 10M events.
+  - Each mapper builds a local HashMap&lt;URL, count&gt;.
+  - Worst case: 10M unique URLs x 148B = ~1.48 GB per mapper. Fits in memory.
+  - Each mapper emits its top-100.
+
+Shuffle phase:
+  - 100 mappers x 100 entries = 10,000 candidate (URL, count) pairs.
+  - Shuffled to a single reducer (small enough).
+
+Reduce phase:
+  - Reducer receives 10,000 (URL, count) pairs.
+  - Groups by URL, sums counts from all mappers.
+
+  Wait — if mappers each count their local slice independently and emit
+  top-100, a URL that is #101 on every mapper might actually be the true #1
+  globally (if its traffic is evenly distributed across mappers).
+
+  Fix: Mappers emit ALL (URL, count) pairs, not just top-100.
+  Reducer groups by URL, sums counts, sorts, takes top-100.
+
+  Shuffle data: 100M unique URLs x (100B + 8B) x 100 mappers?
+  No — each unique URL appears on multiple mappers, but the reducer
+  sums them. Shuffle size: 100M unique x 108B x avg_mappers_per_url.
+
+  Better approach: partition by hash(URL) so each mapper gets a
+  disjoint set of URLs. Then each mapper's top-100 is globally correct
+  for its partition (same as the distributed streaming approach).</code></pre>
+      </div>
+
+      <div>
+        <h3>Timing</h3>
+        <pre class="line-numbers"><code class="language-text">Map phase: Read 10M events x 100B = 1GB per mapper.
+  At 500 MB/sec read speed: 2 seconds to read.
+  Counting: 10M hash lookups ≈ ~50ms.
+  Map phase total: ~2-3 seconds per mapper (parallelized).
+
+Shuffle: 100 x 100 entries = 10K records = ~1 MB. Instant.
+
+Reduce: Sort 10K entries = microseconds.
+
+Total: ~3-5 seconds for the batch job.
+But: only available AFTER the hour ends (batch, not streaming).</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Streaming vs Batch: Tradeoff Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Dimension</th><th>CMS + Heap (Streaming)</th><th>MapReduce (Batch)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Memory</td><td>~566 KB per worker</td><td>~1.5 GB per mapper</td></tr>
+              <tr><td>Accuracy</td><td>Approximate (within &epsilon;&times;N)</td><td>Exact</td></tr>
+              <tr><td>Latency</td><td>Real-time (results available instantly)</td><td>Available after batch completes (~seconds to minutes)</td></tr>
+              <tr><td>Complexity</td><td>Low (streaming processor)</td><td>Medium (batch job orchestration)</td></tr>
+              <tr><td>Windowing</td><td>Natural (rotating sketches)</td><td>Requires re-running the job per window</td></tr>
+              <tr><td>Best for</td><td>Dashboards, monitoring, trending</td><td>Billing, exact reports, auditing</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+      <p>In practice, use both approaches for different use cases:</p>
+
+      <div class="full-width">
+        <h3>Real-Time Path (Dashboards, Trending)</h3>
+        <svg viewBox="0 0 720 400" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlueF" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGrayF" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+
+          <!-- Kafka -->
+          <rect x="210" y="10" width="300" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="35" text-anchor="middle" font-weight="600" fill="#2563eb">Kafka: page-view events</text>
+
+          <!-- Arrow -->
+          <line x1="360" y1="50" x2="360" y2="75" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlueF)"/>
+
+          <!-- Partitioner -->
+          <rect x="230" y="75" width="260" height="42" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="360" y="95" text-anchor="middle" font-weight="600" fill="#334155">Partitioner: hash(URL) % N</text>
+
+          <!-- Arrows to Workers -->
+          <line x1="280" y1="117" x2="110" y2="155" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+          <line x1="360" y1="117" x2="360" y2="155" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+          <line x1="440" y1="117" x2="610" y2="155" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+
+          <!-- Worker 1 -->
+          <rect x="20" y="155" width="180" height="65" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="110" y="177" text-anchor="middle" font-weight="600" fill="#1e40af">Worker 1</text>
+          <text x="110" y="195" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+          <text x="110" y="210" text-anchor="middle" fill="#64748b" font-size="10">60 rotating sketches</text>
+
+          <!-- Worker 2 -->
+          <rect x="270" y="155" width="180" height="65" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="177" text-anchor="middle" font-weight="600" fill="#1e40af">Worker 2</text>
+          <text x="360" y="195" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+          <text x="360" y="210" text-anchor="middle" fill="#64748b" font-size="10">60 rotating sketches</text>
+
+          <!-- Worker N -->
+          <rect x="520" y="155" width="180" height="65" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="610" y="177" text-anchor="middle" font-weight="600" fill="#1e40af">Worker N</text>
+          <text x="610" y="195" text-anchor="middle" fill="#64748b" font-size="11">CMS + heap</text>
+          <text x="610" y="210" text-anchor="middle" fill="#64748b" font-size="10">60 rotating sketches</text>
+
+          <!-- Dots -->
+          <text x="480" y="192" text-anchor="middle" fill="#64748b" font-size="18" font-weight="bold">...</text>
+
+          <!-- Arrows to Coordinator -->
+          <line x1="110" y1="220" x2="305" y2="265" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+          <line x1="360" y1="220" x2="360" y2="265" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+          <line x1="610" y1="220" x2="415" y2="265" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGrayF)"/>
+
+          <!-- Coordinator -->
+          <rect x="260" y="265" width="200" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="360" y="290" text-anchor="middle" font-weight="600" fill="#334155">Coordinator</text>
+
+          <!-- Arrow to Dashboard -->
+          <line x1="360" y1="305" x2="360" y2="335" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlueF)"/>
+
+          <!-- Dashboard -->
+          <rect x="190" y="335" width="340" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="360" text-anchor="middle" font-weight="600" fill="#2563eb">Dashboard: top-100, updated every 60s</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Batch Path (Exact Counts for Billing/Reports)</h3>
+        <svg viewBox="0 0 700 240" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowGreenF" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- Hourly batch job -->
+          <rect x="40" y="20" width="180" height="40" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="130" y="45" text-anchor="middle" font-weight="600" fill="#16a34a">Hourly Batch Job</text>
+
+          <!-- Arrow -->
+          <line x1="220" y1="40" x2="260" y2="40" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreenF)"/>
+
+          <!-- Read from event log -->
+          <rect x="260" y="15" width="250" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="385" y="37" text-anchor="middle" font-weight="600" fill="#334155">Read from Event Log</text>
+          <text x="385" y="55" text-anchor="middle" fill="#64748b" font-size="11">Kafka / S3</text>
+
+          <!-- Arrow -->
+          <line x1="385" y1="65" x2="385" y2="95" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreenF)"/>
+
+          <!-- MapReduce -->
+          <rect x="210" y="95" width="350" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="385" y="117" text-anchor="middle" font-weight="600" fill="#16a34a">MapReduce</text>
+          <text x="385" y="135" text-anchor="middle" fill="#64748b" font-size="11">partition by hash(URL), count, merge top-100</text>
+
+          <!-- Arrow -->
+          <line x1="385" y1="145" x2="385" y2="175" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreenF)"/>
+
+          <!-- Reporting DB -->
+          <rect x="220" y="175" width="330" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="385" y="200" text-anchor="middle" font-weight="600" fill="#334155">Exact top-100 in Reporting Database</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Resource Summary</h3>
+        <pre class="line-numbers"><code class="language-text">Real-time path (10 workers):
+  Memory:    10 x 60 sketches x 540 KB = 324 MB total
+  CPU:       < 1 core total
+  Network:   10 x 100 entries every 60s = negligible
+
+Batch path (100 mappers, runs hourly):
+  Memory:    100 x 1.5 GB = 150 GB total (but only for ~5 seconds)
+  CPU:       100 cores for ~5 seconds = 500 core-seconds per hour
+  Storage:   Reads from existing event log (no extra storage)</code></pre>
+      </div>
+
+      <!-- ─────── C10: concrete technology choices ─────── -->
+      <div class="full-width">
+        <h3>Concrete technology choices (C10)</h3>
+        <ul>
+          <li><strong>Stream transport: Kafka.</strong> Need: durable, partitioned-by-key, replayable (the failure story <em>is</em> "replay the last hour"), high throughput. <em>Kinesis</em> &mdash; managed and simpler ops, but per-shard 1&nbsp;MB/s ingest / 2&nbsp;MB/s egress caps make the shard count for 280&nbsp;MB/s awkward (~280 shards) and 24&nbsp;h–365&nbsp;d retention is fine but pricier per GB at this volume; viable if you want zero Kafka ops. <em>Pulsar</em> &mdash; tiered storage and per-message TTL are nice, but it adds BookKeeper as a second system to operate for no win here. We pick Kafka: the key-ordered partition <em>is</em> our shard, consumer-group rebalance <em>is</em> our failover, and the ecosystem (Kafka Streams / Flink) is the obvious home for the fold. Cite <a href="../message-queues.html">message-queues.html</a>.</li>
+          <li><strong>Per-shard sketch runtime: a custom in-process sketch inside a Flink (or Kafka Streams) operator.</strong> Need: <code>O(d)</code> per-event update, mergeable, checkpointable, ~ns per op. <em>A library</em> (Apache DataSketches / stream-lib) &mdash; yes, use the library's CMS/Space-Saving implementation <em>inside</em> the operator; "custom" means "ours runs in our process," not "we re-implement the math." <em>Redis with a CMS module</em> (RedisBloom's <code>CMS.*</code>) &mdash; rejected: every event becomes a network round-trip to Redis (~ms vs ~ns in-process) &mdash; at 278K&nbsp;events/s that's 278K&nbsp;Redis ops/s per shard, and you've moved the bottleneck onto Redis for nothing. <em>Druid / ClickHouse approximate-topK</em> (<code>topN</code> / <code>topK()</code>) &mdash; great for the <em>query</em> side if the dashboard also wants ad-hoc top-K-per-segment, but it's a columnar store ingesting rows, not a streaming fold; it'd duplicate the pipeline. We keep the fold in-process; Druid/ClickHouse is the optional ad-hoc-query annex (a probe). Cite <a href="../canonicals/sketches.html#cms">sketches.html#cms</a>.</li>
+          <li><strong>Serving store for the materialized top-K: Redis (or even just the coordinator's RAM).</strong> The output is one tiny list (≤ a few KB) refreshed every ~60&nbsp;s and read by the dashboard. <em>Redis</em> &mdash; one <code>SET trending:hourly &lt;json&gt;</code> per minute; fast reads, trivially HA, and it doubles as a place to stash a few historical snapshots; chosen. <em>A small Postgres</em> &mdash; overkill for a single key written once a minute; only worth it if the trending list must be queried relationally (joined to URL metadata) &mdash; then it's a tiny table, not a load concern. <em>In-memory on the coordinator</em> &mdash; fine and the cheapest, but a coordinator restart loses the last list for one cycle; Redis costs ~nothing and removes that. Cite <a href="../caching.html">caching.html</a>.</li>
+        </ul>
+        <p>Real-system shape: this is essentially what Twitter/X's "trends" and similar trending pipelines do &mdash; a partitioned stream into a streaming engine running heavy-hitter sketches, with a tiny materialized list served from a cache; the batch path is the warehouse re-running an exact <code>GROUP BY ... ORDER BY count DESC LIMIT k</code> for reporting.</p>
+      </div>
+
+      <!-- ─────── C8: LC kernel → production cousin ─────── -->
+      <div class="full-width">
+        <h3>LC kernel &rarr; production cousin (property trade) (C8)</h3>
+        <p>Four properties of the LC&nbsp;#347 "hashmap of counts, then heap/bucket-sort for top-K" that <em>actually</em> changed:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property</th><th>Textbook (LC #347)</th><th>Production cousin</th><th>Why the swap</th></tr></thead>
+            <tbody>
+              <tr><td>Counting structure / memory</td><td>exact <code>HashMap&lt;item, count&gt;</code> &mdash; <code>O(distinct keys)</code></td><td>Count-Min Sketch (+ Space-Saving per shard for the candidate set) &mdash; <code>O(1/&epsilon;)</code>, independent of distinct-key count</td><td>the stream is unbounded; the worst case is 148&nbsp;GB; the sketch is ~540&nbsp;KB &mdash; ~275,000&times; smaller (cite <a href="../canonicals/sketches.html#cms">sketches.html#cms</a>, <a href="../canonicals/sketches.html#space-saving">#space-saving</a>)</td></tr>
+              <tr><td>Error</td><td>exact</td><td>over-count only, &le; <code>&epsilon;&middot;N</code> w.p. &ge; <code>1&minus;&delta;</code> (e.g. &le; 100K on a 1B-event window at <code>&epsilon;=10⁻⁴</code>); never under-counts, so a true heavy hitter is never dropped</td><td>a trending widget tolerates a near-threshold mis-rank; the batch path keeps the exact answer for billing/SLA (cite <a href="../canonicals/failure-modes.html#data-corruption">failure-modes#data-corruption</a> for the saturation hazard)</td></tr>
+              <tr><td>Mergeability</td><td>n/a (one array, one pass)</td><td><em>associative</em> &mdash; CMS arrays add cell-wise; rotating sketches sum across the window; per-shard top-K lists merge into a correct global top-K because each key has exactly one owning shard</td><td>this is the property that makes the distributed fan-in (Iter&nbsp;2) and the windowing (rotating sketches) work at all; an exact hashmap doesn't merge cheaply and partial top-K lists don't merge correctly without it</td></tr>
+              <tr><td>Update cost</td><td><code>O(1)</code> hashmap put</td><td><code>O(d)</code> hashes + counter bumps (<code>d&asymp;5</code>) + <code>O(log K)</code> heap touch &mdash; still ~ns; ~3% of one core at 278K&nbsp;events/s/node</td><td>negligible cost for the memory + mergeability win; the bottleneck moved from RAM to NIC bandwidth, which sharding handles</td></tr>
+              <tr><td>Freshness / windowing</td><td>counts a static array once</td><td>continuous streaming fold; "last hour" = a rotating bank of 60 one-minute sketches summed at query time (~1-min eviction granularity)</td><td>"top-100 in the last hour" needs old events to age out; re-running the whole count every minute is <code>O(N log N)</code> wasted work</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ─────── C9: schema / API sketch ─────── -->
+      <div class="full-width">
+        <h3>State, topic config &amp; query API (C9; cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text"># --- Kafka topic for the page-view firehose ---
+topic: page-views
+  partitions: 100                 # = shard count; key = hash(url) so all events for a URL co-locate
+  replication.factor: 3           # survive a broker loss
+  retention.ms: 7_200_000         # 2 h -- covers the 1 h window + replay-since-checkpoint headroom
+  compression.type: lz4
+  # consumers: one consumer group "topk-shards"; each shard owns ~1 partition; rebalance = failover.
+
+# --- Per-shard in-RAM state (lives on the owning shard; checkpointed to S3 every 60 s) ---
+struct ShardState {
+    sketch_bank: [CountMinSketch; 60]   # one per minute; ~540 KB each -> ~32 MB; index = (now_minute % 60)
+    distinct_est: HyperLogLog           # cheap; trips the "re-size the CMS" alarm if distinct keys climb
+    heap: MinHeap<(url, est_count)>     # size K (=100..few-hundred); the local top-K candidate set
+    in_heap: HashMap<url, est_count>    # K entries; membership + current count
+    consumed_offsets: map<partition, offset>   # checkpointed alongside, for clean replay-since-checkpoint
+}
+
+# --- Checkpoint object (S3) ---
+s3://topk-checkpoints/{shard_id}/{epoch_minute}.snap   # flat dump of ShardState + consumed_offsets
+
+# --- Materialized output (Redis), refreshed by the coordinator every ~60 s ---
+SET trending:hourly  {"as_of": "2026-05-10T12:34:00Z", "window_sec": 3600,
+                      "items": [{"url": "...", "approx_count": 5_500_000, "rank": 1}, ...]}   # <= a few KB
+
+# --- Read API: "show me the current top-K"  (cite api-design-patterns#pagination, #errors, #versioning) ---
+GET /v1/trending?window=1h&k=100&cursor=...
+  -> 200 { as_of, window_sec, items:[{url, approx_count, rank}], next_cursor }   # cursor pagination per #pagination
+  -> 400  { type:"about:blank#bad-window", title:"unsupported window", ... }     # problem+json per #errors
+  -> 503  (coordinator has no fresh list; client may serve last-known with the stale flag)
+  # window in {5m, 1h} (= which subset of the 60 sketches to sum); k <= 1000; results are approximate (header X-Approx: true).
+  # versioning: URL prefix /v1/ per #versioning. No idempotency/concurrency concerns -- it's a read-only endpoint.
+</code></pre>
+        <p>API conventions (pagination, error envelope, versioning) cite <a href="../canonicals/api-design-patterns.html#pagination">api-design-patterns.html#pagination</a> / <a href="../canonicals/api-design-patterns.html#errors">#errors</a> / <a href="../canonicals/api-design-patterns.html#versioning">#versioning</a> &mdash; not restated; only the scenario-specific parameters (<code>window</code>, <code>k</code>, the <code>X-Approx</code> header) are inline.</p>
+      </div>
+
+      <!-- ─────── Cross-cutting coverage X1–X8 ─────── -->
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>The event firehose is internal (mTLS between collectors and Kafka); the read API is read-only and behind the dashboard's auth; checkpoints in S3 are encrypted-at-rest with bucket policy locked to the shard role. No write API to abuse. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>The pipeline counts <em>URLs</em>, not users &mdash; no PII enters the sketch (a URL with a user-id query param would be the exception; collectors strip those). The output is aggregate-only ("this URL got ~5.5M visits"), so there's no re-identification surface; raw events live only in Kafka under its retention TTL and the analytics team's policy. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>Durable state = Kafka (replicated, 3&times;) + the S3 checkpoints; the shards and coordinator are stateless-modulo-checkpoint. A region/AZ loss: failover the consumer group to the surviving AZ's standby shards (they rebuild from the latest S3 checkpoint + replay-since-checkpoint, seconds). RPO &asymp; the checkpoint interval (~60&nbsp;s) of <em>approximate</em> state &mdash; tolerable; the exact batch path re-derives from the event log regardless. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>Cold-start of a fresh shard = fetch its latest S3 checkpoint (~32&nbsp;MB) + replay the Kafka partition from the checkpointed offset (~1&nbsp;min of events &asymp; tens of MB) &mdash; seconds. Fleet sizing: <code>nodes = ceil(peak_qps / per-node-rate)</code> with +30% headroom (burst traffic, rolling deploys, a node down). Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>N/A &mdash; there's no large dependency mesh; shards consume from Kafka partitions 1:1, the coordinator fans in <code>N</code> small lists. No connection-count-vs-fleet-size problem to subset around.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>Each region runs its own shard fleet + coordinator (a region is a cell); a global top-K is the merge of per-region top-K lists (mergeable, again). A single region's failure is contained to that region's slice. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>The dashboard can either poll <code>GET /v1/trending</code> every ~60&nbsp;s or subscribe to a push channel (SSE/WebSocket) the coordinator writes to on each new list &mdash; the list is tiny so either works; push removes the polling-vs-freshness tension. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>N/A for the counting pipeline (it's an origin-side fold). The <em>consumers</em> push it to the edge: <a href="45-autocomplete-suggest.html">#45</a> caches the trending overlay at edge POPs &mdash; that page owns the edge concern. Cite <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ─────── Degradation contract ─────── -->
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p>When a <strong>shard dies</strong> &rarr; its key range goes dark until the standby (warm replica on the same Kafka partitions, checkpointing every 60&nbsp;s) takes over (seconds); during the gap the coordinator publishes the merged list flagged <code>{"degraded": ["shard 7"]}</code> rather than silently dropping ~10% of the hash space. When the <strong>coordinator stalls</strong> &rarr; shards keep folding (nothing lost); the dashboard serves the last list with an <code>as_of</code> timestamp and goes amber past a staleness threshold; a stateless standby coordinator takes over instantly. When <strong>ingest spikes 10&times;</strong> &rarr; if the shard fleet can't be scaled out fast enough, each shard samples the stream (count the dropped fraction, surface it as a per-shard <code>sampled_pct</code> gauge so the published counts can be scaled / flagged) rather than letting Kafka lag unbounded &mdash; the trending <em>ranking</em> survives sampling far better than absolute counts do. When the <strong>sketch is found mis-sized</strong> (the distinct-keys HLL or the canary-vs-exact compare trips) &rarr; raise an alarm; the counts stay usable (over-count is bounded, just looser) until the next maintenance window applies a bigger <code>w</code> (a config push + rolling restart, replaying from checkpoint). The query API <em>never</em> throws on a hot-path read: no fresh list &rarr; <code>503</code> + the client serves last-known; unknown <code>window</code> &rarr; <code>400</code>. The invariant: <em>the trending list degrades (staler, looser-counted, missing a slice and saying so) but is never silently wrong and the exact batch path is always available as the source of truth.</em> Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a> + <a href="../canonicals/failure-modes.html#backlog-overflow">#backlog-overflow</a>.</p>
+      </div>
+
+      <!-- ─────── Operations (C6) ─────── -->
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> Per-shard Kafka consumer lag (&rarr; the freshness NFR &mdash; lag &times; event-rate is the staleness); coordinator emit-age / publish-interval (&rarr; "updated every minute"); per-shard estimated-distinct-keys (HLL) and CMS load factor (&rarr; the accuracy NFR &mdash; trips a re-size alarm before over-counts blow up); canary error rate = |CMS estimate &minus; exact count| on a small sampled slice, per shard (&rarr; accuracy, ground-truthed); per-shard ingest-rate imbalance (&rarr; hot-key detection); per-shard <code>sampled_pct</code> (&rarr; load-shedding visibility); query API p99 + 503 rate; checkpoint-write success + age (&rarr; the recovery-time NFR); standby-lag for each shard's replica.</li>
+          <li><strong>Rollout / canary for sketch sizing.</strong> Sketch parameters (<code>w</code>, <code>d</code>, the rotation count, <code>K</code>) are config, not code. To re-size: deploy the new parameters to one canary shard (it covers ~1/N of the key space), run it alongside the old shard on the same partitions for a window, compare the canary's top-K and counts against (a) the old shard's and (b) an exact count of that slice; promote fleet-wide only if the canary error is within the <code>&epsilon;</code> budget; rolling-restart shards (each rebuilds from its last checkpoint, so no gap). The picker binary itself rolls out as a standard service deploy gated on the lag / emit-age / canary-error SLIs.</li>
+          <li><strong>Migration (single-node &rarr; sharded).</strong> From the Iteration-1 single-node tracker to the Iteration-2 sharded fleet: stand up the <code>N</code>-partition Kafka topic and the <code>N</code> shards consuming it <em>in parallel</em> with the old single-node consumer (both read the firehose &mdash; Kafka lets you have two consumer groups); the coordinator initially just mirrors the old single node's list, then switches to merging the <code>N</code> shard lists once they've warmed (one window); cut the dashboard over; retire the single node. Re-keying isn't an issue &mdash; the sketch is approximate and rebuilds in one window anyway, so there's no "migrate the old state" step. Rollback = point the coordinator back at the single node.</li>
+          <li><strong>Headroom.</strong> Fleet sized at +30% over <code>ceil(peak_qps / per-node-rate)</code> &mdash; reason: burst traffic (a viral event spikes the firehose), rolling deploys (a fraction of shards restarting), and a node-down without immediate replacement. The sketch is sized for ~10&times; today's distinct-key estimate (the cost of being generous is linear in <code>w</code> and the absolute numbers are KB) &mdash; reason: a traffic-shape change (a crawler, a misconfigured client) can multiply distinct URLs overnight, and an under-sized sketch silently degrades accuracy whereas an over-sized one just wastes a few MB.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p class="full-width">Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal.</p>
+
+      <div>
+        <h3>What if the stream is 100&times; tomorrow &mdash; 100B events/hour (~28M events/sec)? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>The memory side is a non-event: the sketch is <code>O(1/&epsilon;)</code>, not <code>O(N)</code> &mdash; 60 rotating sketches per shard is still ~32&nbsp;MB no matter how many events flow through them (the over-count bound <code>&epsilon;&middot;N</code> grows, so to hold a 100&times;-larger <code>N</code> at the same absolute slack you'd want <code>w</code> ~100&times; bigger &mdash; that's still only ~50&nbsp;MB per sketch, ~3&nbsp;GB per shard for the bank; fine). The throughput side is just more shards: <code>nodes = ceil(28M / per-node-rate)</code> &mdash; if a node comfortably folds ~280K&nbsp;events/s (10&times; today's per-node load, still well under a core but now NIC-relevant at ~28&nbsp;MB/s), that's ~100 shards; the coordinator merges 100&times;100 = 10K candidates, microseconds. The one genuinely new decision is hot-key skew at this scale: one mega-popular URL is now 28M/s&times;(its share) of events on one shard &mdash; if that's > a single NIC, salted-key splitting (the probe). Nothing structural breaks; you turn the shard knob and maybe the salt knob.</p>
+      </div>
+
+      <div>
+        <h3>Why not just use exact counts &mdash; aren't sketches a premature optimization? <span style="font-weight:normal;font-size:0.85em;">(alt-engine)</span></h3>
+        <p>Exact counting means a <code>HashMap</code> sized to the <em>distinct-key count</em>, which on an unbounded stream is unbounded &mdash; up to 148&nbsp;GB worst case, and "realistic" 14.8&nbsp;GB is one traffic-doubling from not fitting. The sketch is ~540&nbsp;KB. That's not a marginal optimization; it's the difference between "fits on a laptop" and "doesn't fit on one machine." And the sketch buys two things exact counts can't: <em>mergeability</em> (the distributed fan-in and the windowing both depend on associativity &mdash; an exact hashmap doesn't merge cheaply and partial top-K lists don't merge correctly) and <em>bounded streaming cost</em> (<code>O(d)</code> per event, no rehashing). If a particular interview really has a bounded distinct-key count (say "at most 1M product SKUs ever") <em>and</em> exactness matters &mdash; then yes, an exact <code>HashMap</code> + heap is correct and simpler; we'd say so. Here the premise (every page view potentially a new URL) makes that bound false.</p>
+      </div>
+
+      <div>
+        <h3>What changes if the top-K must be exact &mdash; e.g. it feeds billing or an SLA report? <span style="font-weight:normal;font-size:0.85em;">(regulatory / correctness)</span></h3>
+        <p>That's a different SLO, and it's already on the page: the <em>batch path</em> (MapReduce / a warehouse <code>GROUP BY url ORDER BY count DESC LIMIT k</code>, partitioned by <code>hash(url)</code> so each reducer's slice is exact). The real-time sketch path stays as the dashboard's live view; the exact path produces the authoritative numbers after the hour closes (~seconds of compute over the event log). The two coexist: approximate-and-now for the widget, exact-and-soon for the ledger &mdash; never try to make one structure do both. If the exactness requirement extends to <em>real-time</em> exact counts (rare), you're back to "bound the distinct keys and run an exact hashmap, sharded by key" &mdash; possible only if that bound exists. Cite the streaming-vs-batch tradeoff table above.</p>
+      </div>
+
+      <div>
+        <h3>A shard dies mid-window &mdash; what does the dashboard actually show? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>For the seconds until the standby takes over: the coordinator still publishes a list, but it's the merge of the <code>N&minus;1</code> live shards, flagged <code>{"degraded": ["shard 7"]}</code> &mdash; so whatever was popular in shard 7's ~10% of the hash space is temporarily under-represented, and the dashboard can show a banner instead of pretending the list is complete. The standby (warm replica on the same Kafka partitions, checkpointing its sketch bank to S3 every 60&nbsp;s) rebuilds from the latest checkpoint + replay-since-checkpointed-offset &mdash; that's ~32&nbsp;MB of state + ~1&nbsp;min of events, so seconds, not minutes. Kafka's consumer-group rebalance is what makes the failover clean (the standby just resumes the partitions). The exact batch path is unaffected &mdash; it reads the event log, which lost nothing. Cite <a href="../canonicals/failure-modes.html#bad-deploy">failure-modes#bad-deploy</a>.</p>
+      </div>
+
+      <div>
+        <h3>Where's the cost, and which knob moves it? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>There isn't a meaningful one. The real-time fleet is ~10 small nodes (a few hundred MB of sketch total, &lt; 1 core total) &mdash; tens of dollars a month; the batch path borrows ~100 cores for ~5&nbsp;s an hour &mdash; cents; the Redis serving store holds one tiny key. The dominant <em>nearby</em> cost is Kafka retention &mdash; storing 1B events/hour &times; ~100&nbsp;B for the 2&nbsp;h retention window is ~200&nbsp;GB resident, trivial, and that log exists for the whole platform anyway, not for this pipeline (cite <a href="../design-moves/cost-shapes.html#stream-processing">cost-shapes.html#stream-processing</a> + <a href="../design-moves/cost-shapes.html#telemetry">#telemetry</a>). The cost-shape lesson: a streaming-aggregation primitive is cheap; its value is in what it <em>avoids</em> &mdash; here, the 148&nbsp;GB box you'd otherwise need, and the 30-minute batch latency. The only knob with a real bill is sketch width <code>w</code> (accuracy vs. RAM &mdash; linear, and the absolute numbers are KB&ndash;MB), and the rotation count (windowing granularity vs. RAM &mdash; 60 vs. 600 sketches is 32&nbsp;MB vs. 320&nbsp;MB; still nothing). Don't size this by its own bill.</p>
+      </div>
+
+      <div>
+        <h3>How do you roll out the sharded version from the single-node design without an incident? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Run them in parallel. Kafka lets two consumer groups read the same firehose, so stand up the <code>N</code>-partition topic (key = <code>hash(url)</code>) and the <code>N</code> shards alongside the existing single-node consumer; the coordinator starts by just echoing the single node's list (zero behaviour change), then &mdash; once the shards have folded one full window &mdash; switches to merging the <code>N</code> shard lists; cut the dashboard over; decommission the single node. There's no "migrate the old state" step because the sketch is approximate and rebuilds in one window anyway. Rollback at any point = point the coordinator back at the single node (it's still running until you decommission it). Then re-size the per-shard sketches via the canary protocol if the per-shard distinct-key count warrants it.</p>
+      </div>
+
+      <div>
+        <h3>The top-K looks wrong &mdash; some URL that shouldn't be there is #3. Where do you look? <span style="font-weight:normal;font-size:0.85em;">(monitoring / debug)</span></h3>
+        <p>Decision tree off the SLI dashboard: (1) <em>Is it a near-threshold false positive?</em> &mdash; check the canary error metric (|CMS estimate &minus; exact| on a sampled slice) and the CMS load factor / distinct-keys HLL for that URL's shard; if distinct keys climbed past what <code>w</code> can hold, collisions are inflating counts &rarr; re-size (canary protocol). (2) <em>Is a shard degraded?</em> &mdash; check the coordinator's <code>degraded</code> flag and per-shard heartbeat; a missing shard skews the merge. (3) <em>Is the list stale?</em> &mdash; check <code>as_of</code> / coordinator emit-age; a stuck coordinator shows an old list that "looks wrong" because reality moved. (4) <em>Is the stream being sampled?</em> &mdash; check per-shard <code>sampled_pct</code>; under load-shed, absolute counts are scaled estimates and the ranking can wobble at the margins. (5) <em>Is it actually right?</em> &mdash; cross-check against the exact batch path's last completed hour; the sketch never under-counts, so a true heavy hitter is never <em>missing</em> &mdash; a spurious <em>extra</em> entry is always over-count noise or a stale/degraded read, and every one of those has a gauge. Cite <a href="../canonicals/failure-modes.html#data-corruption">failure-modes#data-corruption</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ol class="full-width">
+        <li><strong>Probabilistic data structures trade accuracy for massive memory savings.</strong> A Count-Min Sketch uses 540 KB to approximate what would take 148 GB with exact counting. The error is bounded and quantifiable.</li>
+        <li><strong>Partition by the grouping key.</strong> When distributing, partition events by <code>hash(URL)</code> so each worker sees the complete count for its URLs. Random partitioning splits counts across workers, making local top-K unreliable.</li>
+        <li><strong>Streaming and batch serve different needs.</strong> Use streaming (CMS + heap) for real-time dashboards where approximate results are fine. Use batch (MapReduce) for exact counts needed for billing or SLA reporting.</li>
+        <li><strong>The min-heap is the key to top-K.</strong> You do not need to sort all items. A min-heap of size K lets you find the top-K from a stream in O(N log K) time and O(K) space. For K=100, <code>log K ≈ 7</code>, which is almost free.</li>
+        <li><strong>Time windows require rotation.</strong> To support "last hour" queries, maintain multiple sketches (one per minute) and rotate them. Querying sums across all active sketches. This adds 60x memory but 60 x 540 KB = 32 MB is still tiny.</li>
+        <li><strong>Always do the memory math first.</strong> The entire design hinges on whether exact counts fit in memory. If they do (10M uniques = 1.5 GB), use exact counting. If they might not (100M+ uniques), probabilistic structures become necessary.</li>
+        <li><strong>The LC #347 kernel survives at scale by trading three properties.</strong> The textbook "hashmap of counts &rarr; heap" becomes a Count-Min/Space-Saving sketch + min-heap, distributed and mergeable: memory goes from <code>O(distinct keys)</code> to <code>O(1/&epsilon;)</code>; exactness becomes a bounded over-count; and you gain associativity &mdash; which is precisely what the distributed fan-in and the rotating-window machinery are built on. Name that trade in an interview; don't just say "use a Count-Min Sketch."</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../canonicals/sketches.html#cms" class="card topic-card">
+          <h3>Sketches: Count-Min &amp; Space-Saving</h3>
+          <p>The frequency-sketch family this page is built on &mdash; mechanism, error bounds, mergeability, and the Space-Saving / Heavy-Keeper alternatives.</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#cardinality-explosion" class="card topic-card">
+          <h3>Bottleneck: cardinality explosion</h3>
+          <p>The shape-determining failure here &mdash; memory scaling with the distinct-key count of an unbounded stream. First move: a fixed-size sketch.</p>
+        </a>
+        <a href="../canonicals/access-patterns.html#power-law" class="card topic-card">
+          <h3>Access pattern: power-law / Zipf</h3>
+          <p>Why a few URLs carry almost all the traffic &mdash; the access shape that makes "top-K" meaningful and shapes the sketch sizing.</p>
+        </a>
+        <a href="45-autocomplete-suggest.html" class="card topic-card">
+          <h3>#45 Search autocomplete</h3>
+          <p>Consumes this design: the trending-query overlay on autocomplete suggestions <em>is</em> this mergeable sketch + heap, cached at edge POPs.</p>
+        </a>
+        <a href="41-home-timeline-fanout.html" class="card topic-card">
+          <h3>#41 Home-timeline fan-out</h3>
+          <p>Consumes this design: trending-topics surfacing (and the mute-filter machinery) reuses the top-K pipeline derived here.</p>
+        </a>
+        <a href="16-topk-largest.html" class="card topic-card">
+          <h3>#16 Top-K largest (static dataset)</h3>
+          <p>The sister scenario: uniform distribution, batch, <em>exact</em> &mdash; MapReduce + per-shard heap instead of a sketch. Same LC kernel, different constraints.</p>
+        </a>
+        <a href="../bloom-filters.html" class="card topic-card">
+          <h3>Bloom Filters</h3>
+          <p>Another probabilistic data structure (set membership). Shares the multi-hash approach with Count-Min Sketch.</p>
+        </a>
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>Kafka as the partitioned, replayable event stream feeding the top-K pipeline &mdash; the partition is the shard, the consumer-group rebalance is the failover.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+
+</body>
+</html>

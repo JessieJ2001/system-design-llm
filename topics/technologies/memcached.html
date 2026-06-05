@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memcached — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-caches.html">Caches Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Memcached</h1>
+    <p class="hero-subtitle">Multi-threaded, in-memory, ephemeral string-only cache. Slab allocator avoids fragmentation; LRU per slab; no persistence; no native cluster (client-side hashing). The simplest possible "key &rarr; bytes" remote cache &mdash; that simplicity is the feature.</p>
+    <p class="hero-meta">multi-thread &bull; slab + LRU &bull; pure cache &bull; client-hashed</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <ul>
+      <li>One process, multiple I/O threads.</li>
+      <li><strong>Slab allocator:</strong> memory carved into slab classes (e.g., 96B / 120B / 144B / ... up to 1MB). Each item lands in the smallest fitting slab. Avoids malloc fragmentation; trades space for speed.</li>
+      <li><strong>LRU per slab class:</strong> each slab has its own LRU list. Eviction within a class. Modern Memcached has segmented LRU (HOT / WARM / COLD).</li>
+      <li><strong>Hash table</strong> indexes all keys to items.</li>
+      <li><strong>No persistence:</strong> restart = empty cache.</li>
+      <li><strong>No native cluster:</strong> clients use consistent hashing across N Memcached servers; each server independent.</li>
+      <li>Wire protocol: text or binary; recent versions added meta protocol for richer ops.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>set / get</h3>
+      <pre class="line-numbers"><code class="language-text">set key value [flags] [expires]
+1. Hash key &rarr; pick I/O thread or shared state under lock
+2. Find slab class for value size
+3. Allocate from free list / evict LRU tail
+4. Store; chain into hash table
+5. Return STORED
+
+get key:
+1. Hash table lookup
+2. Touch LRU (refresh recency)
+3. Stream value back</code></pre>
+    </div>
+    <div>
+      <h3>cas (check-and-set)</h3>
+      <pre class="line-numbers"><code class="language-text">cas adds a version token
+client must send the version they read
+server rejects if changed since read
+&mdash; gives atomic compare-and-set without WATCH-style</code></pre>
+    </div>
+    <div>
+      <h3>incr / decr</h3>
+      <pre class="line-numbers"><code class="language-text">Atomic numeric ops on existing keys (string-as-int)
+Used for counters in classic web stack</code></pre>
+    </div>
+    <div>
+      <h3>multi-get</h3>
+      <pre class="line-numbers"><code class="language-text">Client sends batched gets to one server (one round trip)
+Or fan-out to multiple servers via consistent hash
+Multi-get pipelining is a big perf win for cache-aside</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li>None native. Each server independent.</li>
+      <li>Pattern: replicate hot keys at the client (write to two servers).</li>
+      <li>Some forks (e.g., MemCachier) have replication.</li>
+      <li>EVCache (Netflix) is a Memcached fork with multi-AZ + replication.</li>
+      <li>Consistency: per-key linearizable on one server; cluster-wide is whatever the client does.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li><strong>Client-side</strong> consistent hashing (ketama is the canonical algo).</li>
+      <li>Add / remove a server = small fraction of keys remap.</li>
+      <li>No coordination protocol, no cluster bus, no slot resharding tooling.</li>
+      <li>Hot key still pegs one server; replicate hot keys client-side.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>get / set: O(1) average (hash table).</li>
+      <li>incr / decr: O(1).</li>
+      <li>multi-get: O(K) for K keys on one server; client may fan out.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>~200k ops/sec/core (multi-thread); typically 1M+ ops/sec/server with multiple cores.</li>
+      <li>P99 latency: &lt; 1 ms LAN.</li>
+      <li>RAM-bound; up to whatever your box has.</li>
+      <li>Single-server scales linearly with cores up to NIC saturation.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use Memcached when&hellip;</h3>
+      <ul>
+        <li>Pure ephemeral cache (cache-aside).</li>
+        <li>Max throughput per core matters.</li>
+        <li>Memory only stores opaque bytes (string + flags).</li>
+        <li>You don't need data structures or persistence.</li>
+        <li>Existing infra has it (Facebook, Twitter scale).</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use Memcached when&hellip;</h3>
+      <ul>
+        <li>Need data structures (use Redis ZSET, Hash, Stream).</li>
+        <li>Need persistence (use Redis AOF / RDB).</li>
+        <li>Need replication / HA (use Redis or EVCache).</li>
+        <li>Need cluster slot management (use Redis Cluster).</li>
+        <li>Need pub/sub or queues.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li><strong>Slab class fragmentation</strong>: certain sizes evict prematurely while others have room. Use <code>slab_reassign</code> or restart.</li>
+      <li><strong>Hot server</strong> from skewed key distribution; replicate hot keys client-side.</li>
+      <li><strong>Restart loses cache</strong>; expect a thundering herd on cold start.</li>
+      <li><strong>Item size limit</strong>: 1 MB by default; raise with <code>-I</code> if needed.</li>
+      <li><strong>Connection limit</strong>: <code>-c</code> default 1024.</li>
+      <li><strong>LRU "calf" effect</strong>: a flood of new keys evicts hot ones; segmented LRU helps.</li>
+      <li>Memcached returns "STORED" but doesn't fsync &mdash; restart loses everything (by design).</li>
+      <li>No native ACL until very recent versions; production usually network-isolated.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>AWS: ElastiCache for Memcached.</li>
+      <li>GCP: Memorystore for Memcached.</li>
+      <li>Azure: (no native; use AKS).</li>
+      <li>Open-source: Memcached itself; mcrouter (FB's proxy); EVCache (Netflix fork).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Single server</td><td>Simple, max throughput per core</td><td>Run one instance</td></tr>
+        <tr><td>N servers, client consistent-hashing</td><td>Horizontal scale</td><td>Client lib (ketama) hashes keys</td></tr>
+        <tr><td>mcrouter (Facebook)</td><td>Proxy with routing rules</td><td>Hot/cold tiers, replicated pools, prefix routing</td></tr>
+        <tr><td>EVCache (Netflix)</td><td>Multi-AZ replication for high availability</td><td>Writes go to multiple AZs</td></tr>
+        <tr><td>ElastiCache cluster mode</td><td>Managed N servers</td><td>AWS handles instances; client-side hashing still</td></tr>
+        <tr><td>Two-tier (L1 in-process + L2 Memcached)</td><td>Lower latency for hottest keys</td><td>Client lib checks local cache first</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Cache-aside in front of slow DB.</li>
+      <li>Session store (small, ephemeral).</li>
+      <li>Page fragment cache.</li>
+      <li>Object cache (serialized).</li>
+      <li>Counter via incr/decr.</li>
+      <li>Negative cache for 404s.</li>
+      <li>Multi-get for batch fetch.</li>
+      <li>NOT distributed lock (no atomics across servers).</li>
+      <li>NOT durable storage.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li><code>-m</code> memory size.</li>
+      <li><code>-t</code> threads.</li>
+      <li><code>-c</code> connection limit.</li>
+      <li><code>-I</code> max item size (default 1 MB).</li>
+      <li><code>-e</code> external SSD (extstore) for spillover.</li>
+      <li><code>-o no_modern</code> / <code>-o slab_reassign</code>.</li>
+      <li>Segmented LRU on by default in modern versions.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>Memory: items + key/value &times; 1.5 (overhead).</li>
+      <li>Threads: ~1 per core.</li>
+      <li>Connections: app concurrency &times; servers; tune <code>-c</code>.</li>
+      <li>Hot keys: replicate client-side.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Server crash: data lost; ring shrinks; small fraction of keys remap.</li>
+      <li>Network partition: client-side; just cache miss until reachable.</li>
+      <li>Hot key: one server pegged.</li>
+      <li>OOM: eviction.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>None; rebuild from source.</li>
+      <li>EVCache pattern: write to multiple AZ pools so single-AZ loss doesn't cold-start the cache.</li>
+      <li>Pre-warm cache on deploy from primary store.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Migration paths</h2>
+    <ul>
+      <li>Memcached &rarr; Redis: change client lib; usually trivial. Consider Redis if you'll grow into data structures.</li>
+      <li>Memcached &rarr; ElastiCache: lift-and-shift.</li>
+      <li>Add mcrouter in front: gradual; no app change.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>SASL auth (5.0+), but rarely used; production is network-isolated.</li>
+      <li>TLS via <code>--enable-tls</code> in modern builds.</li>
+      <li>Bind to private subnet; never expose 11211 to the internet (UDP amplification attack history).</li>
+      <li>Disable UDP unless absolutely needed.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>None. Run one Memcached fleet per tenant tier.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li><code>stats</code> command: get/set count, hit ratio, evictions, bytes.</li>
+      <li><code>stats slabs</code>: per-slab usage and evictions.</li>
+      <li><code>stats items</code>: per-class item info.</li>
+      <li>Hit ratio is the key SLI &mdash; aim &gt; 90% for cache-aside.</li>
+      <li>Eviction rate: spike means too small or hot-keyset shifted.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Treating Memcached as durable storage.</li>
+      <li>Single huge value &gt; 1 MB without raising <code>-I</code>.</li>
+      <li>UDP exposure to internet (amplification attack).</li>
+      <li>Restart on deploy &rarr; cache stampede on cold start.</li>
+      <li>One key for all features (no segmentation).</li>
+      <li>No TTL &rarr; eviction unpredictable.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>RAM-only; cheaper than Redis at the same RAM (no replicas).</li>
+      <li>Cloud (ElastiCache Memcached): per-node-hour by RAM tier.</li>
+      <li>No replication = simpler bill.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>Memcached</th><th>Redis</th><th>EVCache</th></tr></thead>
+      <tbody>
+        <tr><td>Data types</td><td>Strings only</td><td>Many (lists, sets, ZSETs, streams)</td><td>Strings (Memcached fork)</td></tr>
+        <tr><td>Threading</td><td>Multi-thread</td><td>Single-thread per shard</td><td>Multi-thread</td></tr>
+        <tr><td>Persistence</td><td>None</td><td>AOF + RDB</td><td>None</td></tr>
+        <tr><td>Replication</td><td>None native</td><td>Native</td><td>Multi-AZ</td></tr>
+        <tr><td>Cluster</td><td>Client hashing</td><td>Native cluster</td><td>Replicated pools</td></tr>
+        <tr><td>Pick when</td><td>Pure cache, max throughput</td><td>Anything beyond pure cache</td><td>Multi-AZ Memcached at scale</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy uniform</td><td>Multi-thread; client hashing</td><td>Add servers</td><td>Replicate hot keys</td></tr>
+        <tr><td>Hot key</td><td>One server pegged</td><td>Replicate to N keys client-side</td><td>L1 in-proc cache</td></tr>
+        <tr><td>Bursty</td><td>RAM absorbs</td><td>Larger box</td><td>More servers</td></tr>
+        <tr><td>Long-tail cold</td><td>RAM = bill</td><td>extstore on SSD</td><td>Don't cache long-tail</td></tr>
+        <tr><td>Cold start</td><td>Empty after restart</td><td>Pre-warm from source</td><td>EVCache for multi-AZ</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>Memcached docs &amp; wiki.</li>
+      <li>"Scaling Memcache at Facebook" (NSDI 2013) &mdash; the canonical paper.</li>
+      <li>Netflix EVCache blog series.</li>
+      <li>Twitter's mcrouter (now Facebook open-source).</li>
+      <li>Production: Facebook (massive deploy), Twitter, Wikipedia.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-caches.html">Caches comparison</a></li>
+    <li><a href="redis.html">Redis (sibling)</a></li>
+    <li><a href="../caching.html">Caching (concept)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

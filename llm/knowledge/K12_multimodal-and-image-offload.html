@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K12 — Multimodal &amp; Image Offload (vision-language serving) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K12 &mdash; Multimodal &amp; Image Offload <span style="font-weight:400;font-size:.55em;color:#64748b;">(vision-language serving)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable</em> multimodal serving path &mdash; when the vision encoder has the <em>opposite</em> roofline to the LLM and one image explodes into 1&ndash;3k prefill tokens &mdash; without a ViT idling in every LLM replica and starving the GPU fleet?</strong> This page derives the encoder cost profile, then encoder&harr;LLM disaggregation, the embedding handoff, the embedding cache, and ragged variable-resolution batching.</p>
+      <p class="hero-meta">GPU-serving SoT &bull; cites <a href="K5_disaggregated-serving.html">K5</a> / <a href="K2_kv-cache.html#d32">K2</a> / <a href="K1_serving-fundamentals.html">K1</a> / <a href="K4_continuous-batching-and-scheduling.html">K4</a> / <a href="interconnect-and-collectives.html">K20</a> / <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="../../topics/blob-storage.html">blob-storage</a> &bull; dedicated scenario: <strong>L2</strong> &bull; ~20 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the multimodal chain). Approve / redirect the arc, the encoder-cost-profile derivation, deep-dive placement (<strong>D27 ragged variable-resolution batching</strong>, <strong>D41 encoder&harr;LLM disaggregation + the embedding handoff</strong>), the <strong>K12-owns-embedding-cache / K2&middot;D32-owns-image-token-KV / semantic-cache-out-of-scope</strong> three-way boundary, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>TTFT / Goodput (image-dominated prefill)</strong> &mdash; one image is 1&ndash;3k prefill tokens; encoder offload + the embedding cache cut the image-token prefill cost off the LLM&rsquo;s critical path.</li>
+          <li><strong>Throughput / Encoder-MFU</strong> &mdash; ragged variable-resolution batching (D27) kills the ViT padding waste that collapses encoder MFU.</li>
+          <li><strong>Cost ($)</strong> &mdash; a separate autoscaled encoder pool (D41) stops a ViT sitting idle in every LLM replica burning HBM + GPU-hours.</li>
+          <li><strong>cache-hit (embedding cache)</strong> &mdash; a re-uploaded image / re-sent document skips re-encoding entirely (the K12-owned cache; the KV-side twin is <a href="K2_kv-cache.html#d32">K2/D32</a>).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> An image becomes 1&ndash;3k embedding tokens via a ViT whose roofline is the <em>opposite</em> of the LLM&rsquo;s; give the encoder its own autoscaled pool, cache its output, batch it raggedly, and stream the embeddings to the LLM-prefill pool.</p>
+      <ul>
+        <li><strong>Is:</strong> why the encoder is a separate GPU cost profile (derived, the K5/D35 argument on <em>modality</em>); D27 (ragged variable-resolution image batching &mdash; dynamic tiling); D41 (encoder&harr;LLM disaggregation + the embedding handoff = the K5/D8 analog); the <em>encoder-output embedding cache</em> (content-addressed); the image-tokenization-granularity rule-11 sweep.</li>
+        <li><strong>Is not:</strong> the <em>KV cache</em> for the resulting image tokens + its content-addressed reuse key (<a href="K2_kv-cache.html#d32">K2/D32</a> &mdash; the KV-side twin; same image, two caches, owned apart); semantic / embedding-similarity caching (out of curriculum); the vision model&rsquo;s <em>training</em> (training-side); OCR / PDF&rarr;text parsing before the LLM (application-layer); the embedding-handoff cost <em>primitive</em> / fabric topology (<a href="K1_serving-fundamentals.html#collectives">K1</a> / <a href="interconnect-and-collectives.html">K20</a>). All named &amp; linked in &sect;7.</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule &mdash; the three-way cache disambiguation (carried here, owned per rule of two).</strong> <strong>K12 owns:</strong> the encoder roofline, encoder disaggregation, and the <em>encoder-output embedding cache</em> (skip <em>re-encoding</em> the same image). <strong>K2/D32 owns:</strong> the <em>KV cache</em> for the resulting image tokens + its content-addressed reuse key (skip <em>LLM prefill</em> over them). <strong>Out of scope:</strong> semantic / embedding-similarity caching (named, not covered). The K5/D35 disaggregate-or-colocate inequality is K5&rsquo;s &mdash; K12 <em>applies</em> it on modality, never re-derives it; the transfer cost primitive is K1/K20&rsquo;s. <strong>This page derives the encoder cost profile and the colocate-vs-disaggregate-encoder crossover &mdash; it never re-derives the K5 inequality, the cost primitive, or the image-token KV machinery.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Multimodal Spine (stated up front, before &sect;1)</h2>
+      <p>The chain &mdash; each link a section below; the decision-tree SVG <em>is</em> this chain:</p>
+      <ul>
+        <li><strong>Image/audio enters as raw bytes</strong> &rarr; a ViT/encoder turns it into embedding &ldquo;tokens&rdquo; (1 image &rarr; 1&ndash;3k LLM tokens).</li>
+        <li><strong>New problem:</strong> the encoder has the <em>opposite</em> roofline to the LLM &mdash; compute-bound, fixed-depth, no KV, all-forward (vs the memory-BW-bound autoregressive LLM).</li>
+        <li><strong>New problem:</strong> colocating a ViT in every LLM replica wastes the fleet &mdash; the ViT idles between image requests, burns LLM HBM, and image tokens dominate prefill.</li>
+        <li>&rarr; <strong>disaggregate the encoder pool</strong> &mdash; the K5/D35 argument on <em>modality</em> instead of <em>phase</em>; ship the embeddings (D41, the K5/D8 analog).</li>
+        <li><strong>New problem:</strong> repeated images are re-encoded every request.</li>
+        <li>&rarr; a <strong>content-addressed embedding cache</strong> (K12-owned; the KV-side twin is <a href="K2_kv-cache.html#d32">K2/D32</a>).</li>
+        <li><strong>New problem:</strong> variable image sizes make the ViT batch half padding &rArr; encoder MFU collapses.</li>
+        <li>&rarr; <strong>dynamic tiling / ragged encoder batch</strong> (D27 &mdash; the K4 <code>cu_seqlens</code> pattern applied to tiles).</li>
+        <li><strong>Objective:</strong> image-dominated prefill served at the SLO, encoder MFU high, no ViT idling in the LLM fleet.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>image in &rarr; ViT &rarr; 1&ndash;3k embedding tokens &rarr; new problem: opposite roofline to the LLM &rarr; new problem: colocated ViT wastes the fleet &rarr; disaggregate the encoder pool + ship embeddings (D41) &rarr; new problem: repeated images re-encoded &rarr; content-addressed embedding cache &rarr; new problem: variable sizes &rarr; half-padding &rarr; ragged variable-resolution batching (D27) &rarr; objective: image-dominated prefill at the SLO, encoder MFU high</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 720" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="300" y="16" width="640" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Image/audio in &rarr; ViT &rarr; 1&ndash;3k embedding &ldquo;tokens&rdquo; per image</text>
+        <text class="s" x="620" y="58" text-anchor="middle">a 4-image prompt &asymp; 12k prefill tokens &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="102"/>
+        <text class="l" x="636" y="91">new problem</text>
+
+        <rect class="bd" x="300" y="102" width="640" height="56" rx="8"/>
+        <text class="t" x="620" y="126" text-anchor="middle">Encoder has the OPPOSITE roofline to the LLM</text>
+        <text class="s" x="620" y="144" text-anchor="middle">compute-bound, fixed-depth, NO KV, all-forward &middot; §2</text>
+
+        <line x1="620" y1="158" x2="620" y2="188"/>
+        <text class="l" x="636" y="177">new problem</text>
+
+        <rect class="bd" x="300" y="188" width="640" height="56" rx="8"/>
+        <text class="t" x="620" y="212" text-anchor="middle">Colocating a ViT in every LLM replica wastes the fleet</text>
+        <text class="s" x="620" y="230" text-anchor="middle">ViT idles between images; image tokens dominate prefill</text>
+
+        <line x1="620" y1="244" x2="620" y2="274"/>
+        <text class="l" x="636" y="263">disaggregate</text>
+
+        <rect class="bs" x="250" y="274" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="298" text-anchor="middle">D41 &mdash; separate encoder pool + embedding handoff</text>
+        <text class="s" x="620" y="316" text-anchor="middle">the K5/D35 argument on <tspan font-style="italic">modality</tspan>; handoff = K5/D8 analog &middot; §3</text>
+
+        <line x1="620" y1="330" x2="620" y2="360"/>
+        <text class="l" x="636" y="349">new problem</text>
+
+        <rect class="bd" x="300" y="360" width="640" height="56" rx="8"/>
+        <text class="t" x="620" y="384" text-anchor="middle">Repeated images are re-encoded every request</text>
+        <text class="s" x="620" y="402" text-anchor="middle">full ViT FLOPs paid again for an identical image</text>
+
+        <line x1="620" y1="416" x2="620" y2="446"/>
+        <text class="l" x="636" y="435">cache</text>
+
+        <rect class="bp" x="250" y="446" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="470" text-anchor="middle">Content-addressed embedding cache (K12-owned)</text>
+        <text class="s" x="620" y="488" text-anchor="middle">skip re-encode; KV-side twin = K2/D32 (owned apart) &middot; §3</text>
+
+        <line x1="620" y1="502" x2="620" y2="532"/>
+        <text class="l" x="636" y="521">new problem &rarr; fix</text>
+
+        <rect class="bs" x="250" y="532" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="556" text-anchor="middle">D27 &mdash; variable sizes &rarr; half-padding &rarr; ragged batching</text>
+        <text class="s" x="620" y="574" text-anchor="middle">dynamic tiling + K4 <tspan font-family="monospace">cu_seqlens</tspan> on tiles + bucketed res &middot; §3</text>
+
+        <line x1="620" y1="588" x2="620" y2="618"/>
+
+        <rect class="bc" x="300" y="618" width="640" height="64" rx="8"/>
+        <text class="t" x="620" y="644" text-anchor="middle">Objective: image-dominated prefill at the SLO</text>
+        <text class="s" x="620" y="662" text-anchor="middle">encoder MFU high; no ViT idling in the LLM fleet &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; image/audio &rarr; ViT &rarr; 1&ndash;3k embedding tokens; a 4-image prompt &asymp; 12k prefill tokens (the number that justifies the page).</li>
+        <li><span class="b">&#9313;</span> <strong>New problem &mdash; opposite roofline</strong> &mdash; the ViT is compute-bound, fixed-depth, no-KV, all-forward; the LLM is memory-BW-bound autoregressive.</li>
+        <li><span class="b">&#9314;</span> <strong>New problem &mdash; colocation wastes the fleet</strong> &mdash; a ViT in every LLM replica idles between images and burns LLM HBM.</li>
+        <li><span class="b">&#9315;</span> <strong>D41 &mdash; disaggregate the encoder pool</strong> &mdash; the K5/D35 inequality applied on <em>modality</em>; the embedding handoff is the K5/D8 analog.</li>
+        <li><span class="b">&#9316;</span> <strong>New problem &mdash; re-encode waste</strong> &mdash; repeated images pay full ViT FLOPs every request.</li>
+        <li><span class="b">&#9317;</span> <strong>Embedding cache</strong> &mdash; content-addressed (image-hash + preprocessing + encoder-version); K12-owned; KV-side twin = K2/D32.</li>
+        <li><span class="b">&#9318;</span> <strong>D27 &mdash; ragged variable-resolution batching</strong> &mdash; dynamic tiling + the K4 <code>cu_seqlens</code> ragged-batch pattern on tiles + bucketed resolutions.</li>
+        <li><span class="b">&#9319;</span> <strong>Objective</strong> &mdash; image-dominated prefill served at the SLO, encoder MFU high, no ViT idling in the LLM fleet.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> vision/audio encoders have a different GPU cost profile than the LLM, <em>and</em> one image blows up the prefill token count &mdash; 1 image &asymp; 1&ndash;3k LLM tokens, so a 4-image prompt &asymp; 12k <em>prefill</em> tokens and the LLM prefill cost is dominated by image tokens, not text. Colocating a ViT in every LLM replica then wastes the fleet (the ViT idles between image requests; the LLM idles during encode; encoder weights eat LLM HBM). <b>Solution (what the page builds):</b> derive the encoder cost profile, give it its own autoscaled pool, cache its output content-addressed, batch it raggedly, and stream the embeddings to the LLM-prefill pool.<span class="meta">number: image-token prefill cost vs text-token prefill cost on the trace (1.5k img tok vs 6 text tok) &mdash; cites K1 §3 (#prefill, #roofline) &middot; canonical: gpu-inference-cost-shapes.html</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where the encoder sits &mdash; image embeddings enter the residual stream as positions</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the LLM only consumes <em>token embeddings</em>; an image is raw pixels. <b>Solution:</b> a ViT/encoder maps the image to <code>[n_img_tokens, d_model]</code> embedding vectors that are <em>injected into the sequence as ordinary positions</em>; the LLM then computes Q,K,V over them exactly like text (cite K0 for the <code>[n_img_tokens, d_model]</code> residual-stream shape). The encoder is a pre-stage <em>before</em> the LLM forward pass &mdash; that placement is <em>why</em> it can be a separate pool.<span class="meta">no number (placement fact) &mdash; cites K0 (image embeddings enter the residual stream as tokens; the <code>[n_img_tokens, d_model]</code> shape) &middot; diagram: image &rarr; ViT &rarr; embedding tokens spliced into the text-token sequence</span></p>
+
+      <h3 id="walkthrough">The walkthrough on a real multimodal prompt &mdash; what the encoder does to the sequence</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact, concrete &amp; plain).</span> Canonical trace, multimodal variant: a user sends <strong>[a cat photo] + <code>&quot;I like cat, why?&quot;</code></strong>. Tokenize: the photo &rarr; ViT &rarr; &asymp;1.5k embedding tokens; the text &rarr; 6 tokens; concatenated into one &asymp;1506-position sequence. <b>Prefill:</b> the LLM prefills all &asymp;1506 positions in parallel (causal mask) &mdash; image tokens dominate the prefill compute &asymp;250&times; the text. The ViT runs <em>once</em>, all-forward, no KV. <b>Decode:</b> the answer decodes token-by-token; the image is <em>never re-encoded</em> (its embeddings/KV already resident). Show with-vs-without encoder offload and with-vs-without the embedding cache <em>on this one trace</em>; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 D27/D41 compare batching/placement &middot; diagram: the [cat photo + text] sequence; ViT pre-stage; image-token-dominated prefill block</span></p>
+
+      <h3 id="derive">Why the encoder is a separate GPU cost profile (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> the ViT and the LLM are run on the same GPU but stress it oppositely. <b>Solution, derived:</b> (a) the ViT is <strong>fixed-depth, non-autoregressive, all-forward, no KV</strong> &rarr; high stable arithmetic intensity &rarr; <strong>compute-bound, high stable MFU</strong>; (b) the autoregressive LLM decode is <strong>memory-BW-bound</strong> (arithmetic intensity &asymp;1, cite K1 #decode/#roofline) &mdash; the <em>opposite</em> roofline; (c) different roofline &rArr; different scaling unit &rArr; the <em>same</em> K5/D35 disaggregate-or-colocate inequality, but on <strong>modality</strong> instead of <strong>phase</strong>; (d) the number that justifies the whole page: 1 image &rarr; 1&ndash;3k tokens, a 4-image prompt &asymp; 12k prefill tokens &mdash; prefill is dominated by image tokens. This single derivation motivates encoder offload (D41), the embedding cache, and the K2/D32 KV consequence.<span class="meta">number: ViT MFU vs LLM-decode MBU on the trace; 4-image prompt prefill-token count &mdash; cites K1 #prefill/#roofline/#decode, K5 #d35 (the inequality this applies on modality)</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where the encoder sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> Two autoscaled pools &mdash; a ViT/encoder pool and the LLM-prefill/decode pool &mdash; with the encoder output <code>[n_img_tokens, d_model]</code> crossing the fabric to the LLM-prefill GPU. The transfer cost primitive &amp; topology are K1/K20 (cite, don&rsquo;t re-derive); the disaggregation <em>pattern</em> is K5 (cite). Blob storage holds the uploaded image (<a href="../../topics/blob-storage.html">blob-storage</a>).<span class="meta">no new number &mdash; cites K5 (disaggregation pattern), K20 (embedding-handoff BW + topology), K1, blob-storage.html</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the two-pool topology</strong>blob store &rarr; ViT pool (compute-bound, no KV) &rarr; embedding handoff over the fabric &rarr; LLM prefill/decode pool (memory-BW-bound); embedding cache sidecar. Drawn after arc approval.</div>
+
+      <h3 id="d27" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D27 &mdash; ragged variable-resolution image batching (dynamic tiling)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> images arrive at different resolutions; padding every image to the max patch count &rarr; the ViT batch is half padding &rarr; encoder MFU collapses (a 256&times;256 thumbnail padded to a 4K screenshot&rsquo;s patch count &asymp; 16&times; wasted encoder FLOPs). <b>Solution:</b> dynamic tiling (split each image into native-resolution tiles, variable tile count/image) + a <strong>ragged encoder batch</strong> (the K4 <code>cu_seqlens</code> ragged-batch pattern applied to tiles) + bucketed resolutions. <b>Crossover:</b> bucket granularity &mdash; few buckets = pad waste, many = poor batch fill; pick the bucket set that keeps encoder MFU above target.<span class="meta">number: padding waste for a batch {4K screenshot, 256&sup2; thumbnail, 1024&sup2; photo} unbatched-padded vs tiled+packed on the trace (&asymp;16&times;) &mdash; cites K1 (encoder roofline), K4 (the <code>cu_seqlens</code> ragged-batch pattern) &middot; real: Qwen2-VL dynamic resolution, InternVL tiling, NaViT (patch-n&rsquo;-pack) + URLs</span></p>
+
+      <h3 id="d41" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D41 &mdash; encoder&harr;LLM disaggregation &amp; the embedding handoff (the K5 pattern on modality)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the K5/D8 analog; plan named &ldquo;encoder&harr;LLM disaggregation&rdquo; but never derived the handoff).</span> <b>Problem:</b> the ViT pool and LLM pool have different rooflines and must scale independently, but the encoder output <code>[n_img_tokens, d_model]</code> must cross from the encoder GPU to the LLM-prefill GPU. <b>Solution:</b> separate autoscaled pools + an embedding transfer that is the K5/D8 analog &mdash; stream image embeddings while the encoder finishes the next image; GPUDirect-RDMA zero-copy. <b>Crossover (both directions):</b> <code>embedding_bytes / BW_link</code> vs re-running the encoder on the LLM GPU &mdash; colocate when the encoder is cheap and the link slow; disaggregate when image-heavy and the link fast.<span class="meta">number: 8 img/s &times; 1.5k tok &times; d_model=8192 &times; 2 B per-second embedding volume vs the re-encode FLOPs on the trace &mdash; cites K1 (encoder cost), K20 (BW_link), K5 #d8 (the layer-wise pipelined-handoff analog), #d35 &middot; real: NVIDIA Dynamo multimodal, vLLM encoder offload + URLs</span></p>
+
+      <h3 id="embcache">The embedding cache &mdash; content-addressed (the K12-owned cache; the three-way disambiguation)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub + the rule-of-two boundary.</span> <b>Problem:</b> an identical image re-uploaded each turn pays full ViT FLOPs again. <b>Solution:</b> a content-addressed cache keyed by <code>H(raw image bytes)</code> (or post-encoder embedding hash) <strong>+ preprocessing params</strong> (resize, tiling, frame-sampling fps) <strong>+ encoder model/version</strong> &mdash; a hit skips re-encoding entirely. <b>The three-way disambiguation (mandatory, prevents the common conflation):</b> &#9312; the <em>encoder-output embedding cache</em> &mdash; skip <em>re-encoding</em> &mdash; <strong>K12 (here)</strong>; &#9313; the LLM <em>KV cache</em> for the image tokens &mdash; skip <em>LLM prefill</em> &mdash; <strong><a href="K2_kv-cache.html#d32">K2/D32</a></strong>; &#9314; <em>semantic / embedding-similarity caching</em> &mdash; <strong>out of scope</strong> (named, not covered). Different keys, hit conditions, owners.<span class="meta">number: ViT GPU-seconds saved per cache hit on the trace (1.5k-token image) &mdash; cites K2 #d32 (the KV-side twin &amp; its content key) &middot; real: vLLM multimodal prefix-cache / mm_hash, SGLang multimodal RadixAttention + URLs &middot; <b>scope boundary stated in place (rule of two)</b></span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the image-tokenization granularity policy</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> fixed-low-res (cheap; cliff: OCR / dense-image quality loss) &rarr; fixed-high-res (accurate; cliff: prefill-cost explosion on small images) &rarr; <strong>dynamic tiling</strong> (Qwen2-VL; cliff: variable token count complicates batching/KV &rarr; D27) &rarr; adaptive token budget / perceiver-resampler (compress to N tokens regardless of resolution; cliff: information bottleneck). Two-sided: too few image tokens &rarr; quality; too many &rarr; the prefill-cost explosion. <b>Pick</b> per workload &mdash; OCR/document &rarr; tiling/high-res; thumbnail-heavy &rarr; resampler.<span class="meta">number: image-token count &amp; prefill cost per policy on the trace (the &asymp;16&times; small-image waste) &mdash; cites K1 #prefill &middot; real: fixed (LLaVA-1.5), dynamic tiling (Qwen2-VL/InternVL), resampler (Flamingo/Qwen-VL Perceiver) + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> The encoder-pool size vs LLM-pool size (the D41 colocate-vs-disaggregate crossover), the resolution-bucket set (D27 pad-waste vs batch-fill), the image-tokenization granularity (rule-11), and the embedding-cache key/TTL &mdash; each with its chosen value, reason, and the cliff on each side.<span class="meta">numbers: the crossover per knob (composes with D27 / D41 / rule-11) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt &mdash; the D41 spine).</span> (a) <b>Colocated ViT per LLM replica</b> &mdash; disq: the ViT idles between image requests and burns LLM HBM with encoder weights; <em>wins</em> only at tiny image volume / cheap encoder / slow link (the D41 crossover read the other way). (b) <b>No embedding cache (re-encode every request)</b> &mdash; disq: pays full ViT FLOPs per repeated image; <em>wins</em> only when images are never repeated. (c) <b>Fixed-resolution, no tiling</b> &mdash; disq: pad waste or quality loss; <em>wins</em> only when all images are the same size. (d) <b>OCR / PDF&rarr;text instead of a visual encoder</b> &mdash; disq: application-layer, discards visual information; out of the GPU-serving scope. Each: when it actually wins.<span class="meta">number: the crossover value disqualifying each (image volume &times; link BW for (a); repeat rate for (b); size variance for (c)) &mdash; cites K5 #d35, K1, K20 &middot; contrast L2 (dedicated multimodal scenario)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Encoder-pool saturation</b> &mdash; an image burst backs up the handoff and starves LLM prefill (llm-bottlenecks.html); <b>embedding-handoff transfer failure / stale embedding</b> mid-flight (gpu-failure-modes.html, the K5/D8 analog); <b>wrong-embedding reuse</b> from a bad cache key (preprocessing/encoder-version not folded in &mdash; the D32 correctness analog, silent visual corruption); <b>ragged-batch pad collapse</b> if the resolution-bucket set is mis-tuned (encoder MFU floor &mdash; llm-bottlenecks.html).<span class="meta">cites llm/canonicals/gpu-failure-modes.html (embedding-handoff failure; wrong-embedding reuse), llm/canonicals/llm-bottlenecks.html (encoder-pool saturation, ragged-batch pad collapse) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> Qwen2-VL (naive dynamic resolution &mdash; D27), InternVL (tiling &mdash; D27), NaViT / patch-n&rsquo;-pack (ragged encoder batch &mdash; D27), NVIDIA Dynamo multimodal (encoder disaggregation + embedding handoff &mdash; D41), vLLM encoder offload + multimodal prefix-cache / <code>mm_hash</code> (the embedding cache), SGLang multimodal RadixAttention. Each: which K12 decision it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L2-multimodal-vlm-serving.html">L2</a> (dedicated multimodal scenario &mdash; D27 ragged batching + D41 disaggregation + the embedding cache are its spine); <a href="../scenarios/L9-cache-aware-reuse-serving.html">L9</a> (agent/assistant platform re-sending uploaded docs/images &mdash; reuse economics). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K5_disaggregated-serving.html#d35">K5</a> &mdash; encoder&harr;LLM disaggregation = the K5 disaggregate-or-colocate inequality on <em>modality</em>; D41 is the K5/<a href="K5_disaggregated-serving.html#d8">D8</a> pipelined-handoff analog. K12 <em>applies</em> it, never re-derives it.</li>
+        <li><a href="K2_kv-cache.html#d32">K2 / D32</a> &mdash; the KV-side twin: the <em>KV cache</em> for the resulting image tokens + its content-addressed reuse key. Same image, two caches, owned apart (the three-way disambiguation).</li>
+        <li><a href="K1_serving-fundamentals.html#prefill">K1</a> &mdash; the encoder roofline (#roofline/#decode) + the image-token prefill-cost number (#prefill).</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; the <code>cu_seqlens</code> ragged-batch pattern D27 reuses; async encode + backpressure.</li>
+        <li><a href="interconnect-and-collectives.html">K20</a> &mdash; the embedding-handoff bandwidth + fabric topology (the transfer cost primitive).</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> &mdash; image embeddings enter the residual stream as tokens; the <code>[n_img_tokens, d_model]</code> shape.</li>
+        <li><a href="../../topics/blob-storage.html">blob-storage</a> &mdash; image/document upload + storage (the source the ViT pool reads).</li>
+        <li><strong>Out of scope (named, not covered):</strong> the image-token <em>KV cache</em> + its content key (<a href="K2_kv-cache.html#d32">K2/D32</a> &mdash; K12 stops at the embedding); semantic / embedding-similarity caching (out of curriculum); the vision model&rsquo;s <em>training</em> (training-side); OCR / PDF&rarr;text parsing before the LLM (application-layer &mdash; K12 is the <em>visual</em> encoder path).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

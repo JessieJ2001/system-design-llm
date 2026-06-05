@@ -1,0 +1,1544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observability — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="microservices.html">Microservices</a></li>
+        <li><a href="circuit-breakers.html">Circuit Breakers</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Observability</h1>
+      <p class="hero-subtitle">Understand the internal state of any distributed system through the three pillars &mdash; logging, metrics, and distributed tracing &mdash; so you can diagnose problems you never anticipated.</p>
+      <span class="hero-meta">35 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>
+        Observability is the ability to understand the internal state of a system by examining its external outputs. Unlike traditional monitoring, which answers pre-defined questions ("Is the server up? Is CPU above 80%?"), observability lets you ask <strong>new questions you didn't anticipate</strong> when you designed the system. When an on-call engineer gets paged at 3 AM for a problem nobody has seen before, observability is what lets them diagnose it without deploying new code or adding new log statements.
+      </p>
+      <p>
+        The concept rests on <strong>three pillars</strong>. <strong>Logs</strong> are discrete, timestamped events &mdash; a record of what happened at a specific moment (e.g., "user 42 got a 500 error on /checkout"). <strong>Metrics</strong> are aggregated numerical measurements over time &mdash; counters, gauges, and histograms that tell you things like request rate, error percentage, and p99 latency. <strong>Traces</strong> are records of a single request's journey through multiple services, showing exactly where time was spent and where failures occurred.
+      </p>
+      <p>
+        Individually, each pillar is useful but limited. Metrics tell you <em>something</em> is wrong but not <em>what</em>. Logs tell you what happened in one service but not the full picture across services. Traces show the request path but don't aggregate well. The power of observability comes from correlating all three: a metric spike triggers an alert, you drill into traces to find the slow service, then you pull the correlated logs from that service to find the root cause. This correlation &mdash; usually through shared identifiers like <code>trace_id</code> and <code>span_id</code> &mdash; is what separates observability from simply having three monitoring tools.
+      </p>
+
+      <h3>What Each Pillar Captures That the Others Cannot</h3>
+      <p>
+        Think of the three pillars as three different lenses on the same system. Each one answers a fundamentally different question:
+      </p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Pillar</th><th>What It Records</th><th>Question It Answers</th><th>Concrete Example</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Logs</strong></td>
+            <td>Individual events with full context</td>
+            <td><strong>WHAT happened?</strong></td>
+            <td>"User 123 failed to login from IP 1.2.3.4 at 14:32:05 &mdash; invalid password."</td>
+          </tr>
+          <tr>
+            <td><strong>Metrics</strong></td>
+            <td>Aggregated numerical measurements over time</td>
+            <td><strong>HOW MUCH is happening?</strong></td>
+            <td>"Login failure rate = 2.3% in the last 5 minutes. This is 4x higher than the baseline."</td>
+          </tr>
+          <tr>
+            <td><strong>Traces</strong></td>
+            <td>Request path across services with timing</td>
+            <td><strong>WHERE did time go?</strong></td>
+            <td>"Request abc-123 went Auth &rarr; UserDB &rarr; Cache &rarr; Response, total 230ms. The UserDB call took 180ms."</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <h4>Why You Need All Three Together</h4>
+      <p>
+        Consider this incident scenario at an e-commerce company:
+      </p>
+      <ol>
+        <li><strong>Metrics ALERT you</strong>: The <code>login_failures_total</code> counter spikes. Your dashboard shows the login failure rate jumped from 0.5% to 15% in the last 3 minutes. An SLO-based alert fires.</li>
+        <li><strong>Logs help you DIAGNOSE</strong>: You query your structured logs: <code>SELECT reason, count(*) FROM logs WHERE service='auth' AND level='ERROR' GROUP BY reason</code>. You see that 95% of failures have <code>reason: "database_timeout"</code>. The logs show which database host is timing out and which query is stuck.</li>
+        <li><strong>Traces help you PINPOINT</strong>: You pull a sample trace for a failed login. The trace shows: Auth Service (5ms) &rarr; User Database query (29,500ms &mdash; timeout!). The DB call span has attributes showing it hit replica <code>db-replica-3</code>. That specific replica is the problem.</li>
+      </ol>
+      <p>
+        Without metrics, you would not have known there was a problem until users complained. Without logs, you would have known "something is failing" but not what. Without traces, you would have known "the database is timing out" but not which replica or which specific query path.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Distributed Trace in Action</h2>
+      <div class="animation-container" id="obs-animation-container">
+        <canvas id="obs-canvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">
+          A request flows through three services. Each service generates a log entry, increments a metric counter, and produces a trace span. The spans assemble into a complete distributed trace.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>1. Structured Logging</h3>
+      <p>
+        Modern logging goes beyond <code>printf</code>-style text. Structured logs are emitted as JSON objects with consistent fields: <code>timestamp</code>, <code>level</code>, <code>service</code>, <code>trace_id</code>, <code>span_id</code>, <code>message</code>, and arbitrary key-value attributes. This structure enables powerful queries &mdash; "show me all ERROR logs from the payment service in the last hour where <code>user_id = 42</code>" &mdash; without regex gymnastics. Correlation IDs (the <code>trace_id</code>) let you stitch together logs from every service a single request touched.
+      </p>
+
+      <h4>Unstructured vs. Structured: A Concrete Comparison</h4>
+      <p>Consider this log line from a login failure. Here is the <strong>unstructured</strong> version:</p>
+<pre class="line-numbers"><code class="language-text">2024-03-15 14:32:05 ERROR User 123 failed to login from 1.2.3.4 - invalid password</code></pre>
+      <p>And here is the <strong>structured (JSON)</strong> version of the same event:</p>
+<pre class="line-numbers"><code class="language-json">{
+  "timestamp": "2024-03-15T14:32:05Z",
+  "level": "ERROR",
+  "message": "Login failed",
+  "userId": 123,
+  "ip": "1.2.3.4",
+  "reason": "invalid_password",
+  "service": "auth-service",
+  "traceId": "abc-123"
+}</code></pre>
+      <p>
+        <strong>Why structured is better:</strong> You can <em>query</em> it. With structured logs in a centralized store, you can write:
+      </p>
+<pre class="line-numbers"><code class="language-sql">SELECT count(*) FROM logs
+WHERE reason = 'invalid_password'
+  AND ip = '1.2.3.4'
+  AND timestamp > NOW() - INTERVAL '1 hour'</code></pre>
+      <p>
+        This instantly answers: "How many invalid password attempts came from IP 1.2.3.4 in the last hour?" With unstructured logs, you would need to write a fragile regex like <code>/failed to login from (\d+\.\d+\.\d+\.\d+) - invalid password/</code>, which breaks the moment anyone changes the log message wording.
+      </p>
+
+      <h4>Log Levels: When to Use Each</h4>
+      <p>Log levels control verbosity. In production, you typically run at INFO level and above. Each level has a specific purpose:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Level</th><th>When to Use</th><th>Example</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>TRACE</strong></td>
+            <td>Extremely detailed debugging; usually off in production</td>
+            <td><code>"Entering function processPayment with args {amount: 49.99, currency: USD}"</code></td>
+          </tr>
+          <tr>
+            <td><strong>DEBUG</strong></td>
+            <td>Development and troubleshooting; off in production by default</td>
+            <td><code>"Cache miss for key user:123, fetching from DB"</code></td>
+          </tr>
+          <tr>
+            <td><strong>INFO</strong></td>
+            <td>Normal operations worth recording</td>
+            <td><code>"Order #456 created successfully, total=$89.99"</code></td>
+          </tr>
+          <tr>
+            <td><strong>WARN</strong></td>
+            <td>Something unexpected but the system continues working</td>
+            <td><code>"Response time 2.3s exceeded 2s threshold for /api/search"</code></td>
+          </tr>
+          <tr>
+            <td><strong>ERROR</strong></td>
+            <td>Something failed but the system continues</td>
+            <td><code>"Payment gateway returned 503, retrying (attempt 2/3)"</code></td>
+          </tr>
+          <tr>
+            <td><strong>FATAL</strong></td>
+            <td>System is crashing; immediate attention needed</td>
+            <td><code>"Database connection pool exhausted, shutting down"</code></td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p>
+        A practical rule: if you get paged for it, it is ERROR or FATAL. If you want to know about it during an investigation, it is INFO. If you only care during active debugging, it is DEBUG. If you never want it in production, it is TRACE.
+      </p>
+
+      <h3>2. Metrics</h3>
+      <p>
+        Metrics are pre-aggregated numerical data points collected at fixed intervals. There are three fundamental types:
+      </p>
+      <ul>
+        <li><strong>Counters</strong> &mdash; monotonically increasing values (e.g., <code>http_requests_total</code>). You derive rate from the delta between two scrapes.</li>
+        <li><strong>Gauges</strong> &mdash; point-in-time values that go up and down (e.g., <code>active_connections</code>, <code>cpu_usage_percent</code>).</li>
+        <li><strong>Histograms</strong> &mdash; distributions of values across configurable buckets (e.g., request latency). Let you compute percentiles like p50, p95, p99.</li>
+      </ul>
+      <p>
+        Metrics are cheap to store (a single float64 per series per scrape) and fast to query, making them ideal for dashboards and alerts. The tradeoff is that aggregation discards individual events &mdash; you know the p99 is 500ms, but you don't know <em>which</em> requests were slow.
+      </p>
+
+      <h4>Metric Types Explained with Concrete Examples</h4>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Type</th><th>What It Measures</th><th>Operations</th><th>Example</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Counter</strong></td>
+            <td>Cumulative total (only goes up; resets to zero on restart)</td>
+            <td>Increment</td>
+            <td><code>http_requests_total = 1,247,891</code>. To get the rate, compute the delta: if it was 1,247,791 one minute ago, the rate is 100 requests/min.</td>
+          </tr>
+          <tr>
+            <td><strong>Gauge</strong></td>
+            <td>Current value (goes up and down)</td>
+            <td>Set, increment, decrement</td>
+            <td><code>active_connections = 42</code>. Right now there are 42 open connections. A minute ago there were 38. Unlike a counter, it can decrease.</td>
+          </tr>
+          <tr>
+            <td><strong>Histogram</strong></td>
+            <td>Distribution of values across configurable buckets</td>
+            <td>Observe (record a value)</td>
+            <td><code>request_duration_seconds</code> with buckets: <code>{le="0.1": 5000, le="0.5": 8500, le="1.0": 9900, le="+Inf": 10000}</code>. This means: 5000 requests were &le; 100ms, 8500 were &le; 500ms, 9900 were &le; 1s, and 10000 total. From this, you can compute that 100 requests (1%) took more than 1 second.</td>
+          </tr>
+          <tr>
+            <td><strong>Summary</strong></td>
+            <td>Similar to histogram but calculates quantiles client-side</td>
+            <td>Observe</td>
+            <td><code>request_duration{quantile="0.99"} = 0.45</code>. The client computed that the p99 is 450ms. Unlike histograms, summaries cannot be aggregated across multiple instances (you cannot average p99 values to get a global p99).</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <h4>Why Histograms Beat Averages for Latency</h4>
+      <p>
+        Imagine a service handling 100 requests. Average latency = 50ms. Sounds great! But consider this distribution:
+      </p>
+      <ul>
+        <li>99 requests took 10ms each (total: 990ms)</li>
+        <li>1 request took 4,010ms (total: 4,010ms)</li>
+        <li>Average = 5,000ms / 100 = <strong>50ms</strong></li>
+      </ul>
+      <p>
+        The average hides the fact that 1 in 100 users waited <strong>4 seconds</strong>. This is why percentiles matter:
+      </p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Percentile</th><th>Meaning</th><th>Typical Use</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>p50 (median)</strong></td>
+            <td>Half of requests are faster than this</td>
+            <td>Typical user experience</td>
+          </tr>
+          <tr>
+            <td><strong>p95</strong></td>
+            <td>95% of requests are faster</td>
+            <td>SLO target (e.g., "p95 &lt; 200ms")</td>
+          </tr>
+          <tr>
+            <td><strong>p99</strong></td>
+            <td>99% of requests are faster</td>
+            <td>Worst-case for most users</td>
+          </tr>
+          <tr>
+            <td><strong>p99.9</strong></td>
+            <td>1 in 1,000 requests is slower</td>
+            <td>Critical for high-traffic services (1M req/day = 1,000 users hit this daily)</td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p>
+        <strong>Real example:</strong> p50=12ms, p95=45ms, p99=230ms, p99.9=1200ms. The average might be 50ms, but that single number hides the fact that 1% of users wait 230ms or more, and 0.1% wait over a second. If you have 1 million requests per day, that means 1,000 users per day experience a 1.2-second wait. Percentiles reveal what averages conceal.
+      </p>
+
+      <h3>3. Distributed Tracing</h3>
+      <p>
+        A distributed trace represents the end-to-end journey of a single request through your system. Each unit of work within a service is a <strong>span</strong> &mdash; it has a <code>trace_id</code> (shared across all spans in the trace), a <code>span_id</code> (unique to this span), a <code>parent_span_id</code> (linking it to the calling span), a start time, duration, and key-value attributes. When Service A calls Service B, the trace context (trace ID and parent span ID) is propagated via HTTP headers or gRPC metadata, so Service B's spans are linked to Service A's.
+      </p>
+      <p>
+        The result is a tree of spans that shows exactly how a request flowed, where time was spent, and where errors occurred. This is indispensable for debugging latency in microservices, where a single user-facing request might touch 10+ services.
+      </p>
+
+      <h4>The Data Model: Spans and Traces</h4>
+      <p>
+        A <strong>span</strong> is a single unit of work. It has: a span ID (unique identifier), a parent span ID (null for the root span), an operation name, a start time, a duration, a status (OK or ERROR), and key-value tags/attributes (like <code>http.method=GET</code> or <code>db.statement=SELECT...</code>).
+      </p>
+      <p>
+        A <strong>trace</strong> is a tree of spans representing one end-to-end request. The root span is the initial incoming request. Each downstream call creates a child span. The tree structure reveals the full request path and where time was spent.
+      </p>
+
+      <h4>Example Trace: GET /api/user/123</h4>
+      <p>Here is a complete trace showing a user profile lookup that hits a cache miss:</p>
+<pre><code>Trace ID: abc-123
+|
++-- [Span 1] API Gateway: GET /api/user/123             (0ms - 230ms)  total: 230ms
+|   |
+|   +-- [Span 2] Auth Service: validateToken             (5ms - 15ms)   total: 10ms
+|   |
+|   +-- [Span 3] User Service: getUser                   (20ms - 210ms) total: 190ms
+|   |   |
+|   |   +-- [Span 4] Cache: GET user:123                 (22ms - 23ms)  total: 1ms  --> MISS
+|   |   |
+|   |   +-- [Span 5] PostgreSQL: SELECT * FROM users     (25ms - 180ms) total: 155ms <-- BOTTLENECK
+|   |   |             WHERE id=123
+|   |   |
+|   |   +-- [Span 6] Cache: SET user:123                 (182ms - 185ms) total: 3ms
+|   |
+|   +-- [Span 7] Response serialization                  (212ms - 215ms) total: 3ms</code></pre>
+      <p>
+        <strong>Reading this trace:</strong> The total request took 230ms. The bottleneck is Span 5 (the database query, 155ms &mdash; 67% of total time). The cache miss (Span 4) forced the database query. If we improve the DB query (add an index, optimize the query) or increase the cache hit rate (longer TTL, cache warming), we fix the latency. Without this trace, we would only know "the API is slow" but not <em>why</em>.
+      </p>
+
+      <h4>Context Propagation: How Spans Link Across Services</h4>
+      <p>
+        When Service A calls Service B over HTTP, the tracing SDK injects a special header into the outgoing request:
+      </p>
+<pre class="line-numbers"><code class="language-text">traceparent: 00-abc123def456789-span456abc-01
+               |  |                |        |
+               |  trace ID         span ID  sampled flag
+               version</code></pre>
+      <p>
+        Service B receives this header, extracts the trace ID and parent span ID, and creates a new span with <code>traceId = abc123def456789</code> and <code>parentSpanId = span456abc</code>. This linking mechanism is what connects all spans into one coherent trace, even when they come from completely different services written in different languages running on different machines.
+      </p>
+      <p>
+        This is the <strong>W3C Trace Context</strong> standard. All modern tracing libraries (OpenTelemetry, Jaeger, Zipkin) support it. The critical requirement is that <em>every</em> service in the call chain must propagate the header. If even one service drops it, the trace breaks into disconnected fragments.
+      </p>
+
+      <h3>4. OpenTelemetry: The Unified Standard</h3>
+      <p>
+        <strong>OpenTelemetry</strong> (OTel) is the industry-standard framework for instrumenting, generating, collecting, and exporting telemetry data. It emerged from the merger of OpenTracing and OpenCensus in 2019 and is now a CNCF project with broad vendor support. OTel provides a single SDK that produces logs, metrics, and traces with consistent correlation, eliminating the need to instrument your code three different ways for three different backends. Telemetry is exported via the OpenTelemetry Protocol (OTLP) to any compatible backend &mdash; Jaeger, Prometheus, Grafana, Datadog, or your own storage.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Observability When</h4>
+          <ul>
+            <li><strong>Production microservices</strong> &mdash; you cannot debug distributed systems by SSH-ing into servers and reading log files</li>
+            <li><strong>"It's slow" isn't enough</strong> &mdash; you need to pinpoint which service, which dependency, which query is the bottleneck</li>
+            <li><strong>Any system with SLOs</strong> &mdash; you need metrics to measure compliance and alerts to detect violations</li>
+            <li><strong>High-stakes production systems</strong> &mdash; revenue-impacting services where MTTR (Mean Time to Resolution) matters</li>
+            <li><strong>Async workflows</strong> &mdash; tracing request flow through message queues and background jobs</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Over-Invest When</h4>
+          <ul>
+            <li><strong>Simple monolith</strong> &mdash; basic application logs + an APM agent (New Relic, Datadog APM) covers 80% of needs without custom instrumentation</li>
+            <li><strong>Prototype / MVP</strong> &mdash; structured logging is premature when you're validating product-market fit; <code>console.log</code> is fine</li>
+            <li><strong>Storage costs exceed value</strong> &mdash; if you're logging 10TB/day but only query it during incidents once a month, sample more aggressively</li>
+            <li><strong>Small team, simple stack</strong> &mdash; a 3-person team with one database and one server doesn't need Jaeger; a stack trace is usually enough</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic (2000s&ndash;2010s)</h3>
+      <p>
+        <strong>Syslog + flat log files</strong> &mdash; applications wrote unstructured text to <code>/var/log</code>. Operators used <code>grep</code>, <code>awk</code>, and <code>tail -f</code> to debug. Request correlation meant manually grepping for a request ID you embedded in your logs. <strong>Nagios / Zabbix</strong> polled services with health checks and sent email/pager alerts. <strong>StatsD + Graphite</strong> provided basic counters and gauges. This era had monitoring, but not observability &mdash; you could only answer questions you'd thought to ask in advance.
+      </p>
+
+      <h3>Modern (2015&ndash;Present)</h3>
+      <ul>
+        <li><strong>Structured logging (ELK / Splunk / Loki)</strong> &mdash; JSON logs shipped to a centralized store with full-text search, field-based filtering, and log aggregation. Grafana Loki optimizes cost by only indexing labels, not the full log line.</li>
+        <li><strong>Prometheus + Grafana</strong> &mdash; pull-based metrics collection with a powerful query language (PromQL). Histograms, recording rules, and alerting built in. De facto standard for Kubernetes environments.</li>
+        <li><strong>Distributed tracing (Jaeger / Zipkin / Tempo)</strong> &mdash; inspired by Google's Dapper paper (2010). Visualize request flow as a waterfall of spans. Grafana Tempo provides a cost-effective trace backend using object storage.</li>
+        <li><strong>OpenTelemetry</strong> &mdash; vendor-neutral instrumentation SDK that unifies logs, metrics, and traces. Auto-instrumentation libraries reduce manual effort. Context propagation baked in.</li>
+        <li><strong>Continuous profiling (Pyroscope / Parca)</strong> &mdash; always-on CPU and memory profiling at low overhead (&lt;2%). Lets you answer "why is the payment service using 80% CPU?" without reproducing the load in a dev environment.</li>
+        <li><strong>eBPF-based observability (Cilium / Pixie / Coroot)</strong> &mdash; kernel-level instrumentation that requires <em>zero application changes</em>. Captures network flows, DNS queries, HTTP transactions, and even database queries by intercepting system calls. Ideal for polyglot environments where you can't instrument every language.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Instrumentation overhead is negligible</strong> &mdash; we assume adding tracing and metrics adds &lt;2% latency and &lt;5% CPU overhead. This holds for well-designed SDKs (OpenTelemetry) but can break if you log excessively at high throughput, serialize large payloads, or use synchronous exporters.</li>
+          <li><strong>Storage is affordable</strong> &mdash; we assume you can store or sample enough telemetry to be useful. At very high scale (millions of RPS), raw storage becomes expensive and you must sample aggressively, which means you might miss rare events.</li>
+          <li><strong>Engineers know how to query</strong> &mdash; observability tools are only as good as the people using them. If nobody knows PromQL or how to read a trace waterfall, expensive tooling provides little value.</li>
+          <li><strong>Clocks are approximately synchronized</strong> &mdash; distributed traces rely on timestamps from different machines. NTP typically gives &lt;10ms accuracy, which is sufficient. If clock skew exceeds span durations, traces become misleading.</li>
+        </ul>
+      </div>
+
+      <h3>The RED Method (for Services)</h3>
+      <p>
+        For every service, measure three things: <strong>Rate</strong> (requests per second), <strong>Errors</strong> (failed requests per second), and <strong>Duration</strong> (latency distribution, especially p50/p95/p99). These three metrics provide a complete picture of service health. If Rate is flat but Errors spike, something is broken. If Rate and Errors are flat but Duration increases, something is slow. Coined by Tom Wilkie at Grafana Labs.
+      </p>
+
+      <h3>The USE Method (for Resources)</h3>
+      <p>
+        For every resource (CPU, memory, disk, network), measure: <strong>Utilization</strong> (how busy it is, as a percentage), <strong>Saturation</strong> (how much queued work there is beyond capacity), and <strong>Errors</strong> (count of error events). Created by Brendan Gregg. Example: a disk at 90% utilization with high saturation (long I/O queue) is a bottleneck even before errors appear.
+      </p>
+
+      <h4>RED vs. USE: Which Method for Which Situation?</h4>
+      <p>
+        <strong>Use RED for request-driven services</strong> &mdash; API servers, web services, microservices, anything that handles requests from users or other services. RED tells you if the service is healthy from the <em>user's</em> perspective.
+      </p>
+      <p>
+        <strong>Use USE for infrastructure resources</strong> &mdash; CPUs, memory, disks, network interfaces, thread pools, connection pools, database connections. USE tells you if the underlying resources are healthy from the <em>system's</em> perspective.
+      </p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Scenario</th><th>Method</th><th>Key Metrics to Check</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>API endpoint is slow</td>
+            <td><strong>RED</strong></td>
+            <td>Duration p99 increased from 50ms to 500ms. Rate is steady. Error rate unchanged. Diagnosis: something downstream is slow but not failing.</td>
+          </tr>
+          <tr>
+            <td>Database is struggling</td>
+            <td><strong>USE</strong></td>
+            <td>CPU utilization 95%. Saturation: 50 queries waiting in queue. The database is maxed out &mdash; either optimize queries or scale up.</td>
+          </tr>
+          <tr>
+            <td>Payment service failing</td>
+            <td><strong>RED</strong></td>
+            <td>Error rate jumped from 0.1% to 15%. Rate dropped (users getting errors and leaving). Duration increased (retries and timeouts). Something is broken.</td>
+          </tr>
+          <tr>
+            <td>Redis running out of memory</td>
+            <td><strong>USE</strong></td>
+            <td>Memory utilization 98%. Saturation: evictions increasing (Redis is removing keys to make room). Errors: none yet, but imminent if memory hits 100%.</td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p>
+        In practice, you use both methods together. RED alerts you that something is wrong ("checkout latency is up"). USE helps you find the root cause ("the database connection pool is saturated &mdash; all 50 connections are in use and 30 queries are waiting").
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+      <p>
+        Observability infrastructure should be sized to meet your Service Level Objectives, not arbitrary volume targets.
+        Start with the detection requirements, then derive the pipeline configuration backward from there.
+      </p>
+
+      <!-- Example 1: E-commerce -->
+      <h4>1. E-Commerce Platform: Detect p99 Regressions Within 2 Minutes</h4>
+      <p><strong>Context:</strong> 500 microservices, high traffic during flash sales, p99 latency SLO of 300ms on checkout.</p>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Sizing Dimension</th><th>Derivation from SLO</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Scrape interval</td>
+            <td>To detect a p99 regression within 2 min, you need at least 2 data points inside that window. Maximum scrape interval = 2 min &divide; 2 = <strong>60s</strong>. Prefer 15&ndash;30s for meaningful trend.</td>
+            <td><strong>15s scrape interval</strong></td>
+          </tr>
+          <tr>
+            <td>Metrics cardinality budget</td>
+            <td>500 services &times; ~20 RED metrics each &times; avg 50 label combos = 500K series. Add histogram buckets (10 per metric &times; 500 services &times; 5 key endpoints) = +25K series.</td>
+            <td><strong>~525K active series</strong> (fits single Prometheus with 32 GB RAM)</td>
+          </tr>
+          <tr>
+            <td>Alerting pipeline sizing</td>
+            <td>2-min detection &rarr; evaluation interval of 15s, with a <code>for: 1m</code> clause. Alertmanager must process up to 500 firing rules in each cycle. Group wait: 10s, group interval: 30s.</td>
+            <td><strong>Alertmanager: 2 instances</strong> (HA pair), ~200 MB RAM each</td>
+          </tr>
+          <tr>
+            <td>Dashboard query budget</td>
+            <td>SRE dashboards querying 525K series over 6h windows must return in &lt;3s. Requires recording rules for top-level aggregations.</td>
+            <td><strong>~50 recording rules</strong>, query cache at 256 MB</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Example 2: SaaS 99.9% SLO -->
+      <h4>2. SaaS Platform: 99.9% Availability SLO at 1M RPS</h4>
+      <p><strong>Context:</strong> Error budget = 0.1% = 43 min downtime/month. Must detect burn-rate anomalies before budget is exhausted.</p>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Sizing Dimension</th><th>Derivation from SLO</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Log sampling rate</td>
+            <td>At 1M RPS and 1 KB/log, 100% = 86.4 TB/day &mdash; infeasible. Sample INFO at 1%, WARN at 25%, ERROR/FATAL at 100%. Effective volume: ~1M &times; (0.01 &times; 0.8 + 0.25 &times; 0.15 + 1.0 &times; 0.05) = ~95K logs/sec &rarr; <strong>8.2 TB/day</strong>.</td>
+            <td><strong>1% INFO / 25% WARN / 100% ERROR</strong></td>
+          </tr>
+          <tr>
+            <td>Trace sampling rate</td>
+            <td>Tail-based: keep 100% of error traces + 100% of traces &gt;p99 latency + 0.5% of normal traces. At 1M RPS with 0.05% errors and ~1% slow: ~15.5K traces/sec &rarr; ~3.3 TB/day.</td>
+            <td><strong>Tail-based, ~1.5% effective rate</strong></td>
+          </tr>
+          <tr>
+            <td>Error budget burn rate alerting</td>
+            <td>Multi-window burn rate: 5-min window at 14.4x burn + 1-hour window at 6x burn = page. 6-hour window at 3x burn = ticket. Requires 15s evaluation interval on SLO metrics.</td>
+            <td><strong>3-tier burn rate alerts</strong> (page / ticket / log)</td>
+          </tr>
+          <tr>
+            <td>Storage retention</td>
+            <td>Post-incident reviews need 7 days of logs, 30 days of traces (sampled), 13 months of metrics (for YoY comparison). Budget: metrics in Mimir (~$0.015/GB/mo), logs in Loki/S3, traces in Tempo/S3.</td>
+            <td><strong>Logs: 7d hot + 30d cold / Traces: 30d / Metrics: 13mo</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Example 3: Trading -->
+      <h4>3. Real-Time Trading: Anomaly Detection Under 30 Seconds</h4>
+      <p><strong>Context:</strong> 100K events/sec from market data feeds. Must detect order execution anomalies (stuck orders, price drift) within 30s.</p>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Sizing Dimension</th><th>Derivation from SLO</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Streaming metrics pipeline</td>
+            <td>30s detection budget: 5s ingestion + 10s windowed aggregation + 5s rule evaluation + 5s notification + 5s buffer. Requires streaming aggregation (not pull-based scraping). Use Kafka Streams or Flink for pre-aggregation.</td>
+            <td><strong>Kafka (3 brokers) &rarr; Flink (4 task slots) &rarr; Prometheus remote-write</strong></td>
+          </tr>
+          <tr>
+            <td>Alert latency budget</td>
+            <td>5s for Alertmanager evaluation + 5s for PagerDuty webhook delivery. Must bypass group_wait. Use <code>group_wait: 0s</code> for critical trading alerts with separate route.</td>
+            <td><strong>10s end-to-end alert latency</strong>, dedicated critical route</td>
+          </tr>
+          <tr>
+            <td>Metrics resolution</td>
+            <td>At 100K events/sec, per-event metrics are infeasible. Pre-aggregate into 5s windows: count, sum, p50/p99 per instrument. ~2,000 instruments &times; 5 aggregates = 10K series per 5s flush.</td>
+            <td><strong>5s resolution, ~10K series</strong></td>
+          </tr>
+          <tr>
+            <td>Hot storage</td>
+            <td>30s detection requires the latest 5 min of high-resolution data in memory. 10K series &times; 60 points (5 min &divide; 5s) &times; 16 bytes = ~10 MB. Negligible, but query path must be sub-second.</td>
+            <td><strong>In-memory ring buffer</strong>, 5 min retention</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Example 4: Multi-tenant -->
+      <h4>4. Multi-Tenant Platform: Per-Tenant SLO Tracking Across 1,000 Tenants</h4>
+      <p><strong>Context:</strong> Each tenant has its own SLO tier (99.9%, 99.95%, 99.99%). Must isolate noisy neighbors and provide per-tenant dashboards.</p>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Sizing Dimension</th><th>Derivation from SLO</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Label cardinality limits</td>
+            <td>Adding <code>tenant_id</code> as a label across 1,000 tenants: 20 base metrics &times; 50 label combos &times; 1,000 tenants = 1M series. Acceptable if tenant_id is the only high-cardinality label. Must enforce: no nested high-cardinality labels (e.g., no <code>tenant_id</code> + <code>endpoint</code> + <code>user_id</code>).</td>
+            <td><strong>1M series cap</strong>, enforced via <code>metric_relabel_configs</code></td>
+          </tr>
+          <tr>
+            <td>Storage partitioning</td>
+            <td>Per-tenant query isolation requires partitioned storage. Use Mimir/Cortex with tenant-aware sharding. Each tenant's data lands in its own TSDB block prefix. Query limits: 500K series per query, 30s timeout per tenant.</td>
+            <td><strong>Mimir with tenant sharding</strong>, 3 ingesters, 2 compactors</td>
+          </tr>
+          <tr>
+            <td>Dashboard query budget</td>
+            <td>1,000 tenant dashboards auto-refreshing every 30s = 33 queries/sec to the metrics backend. Each query scans ~1K series &times; 6h = ~4 MB. Total query throughput: ~132 MB/s read.</td>
+            <td><strong>Query-frontend with 3 replicas</strong>, result caching at 1 GB</td>
+          </tr>
+          <tr>
+            <td>Per-tenant burn rate alerts</td>
+            <td>1,000 tenants &times; 3 SLO tiers &times; 2 burn-rate windows = 6,000 alerting rules. Prometheus rule evaluation at 15s interval. Partition across 3 ruler instances.</td>
+            <td><strong>6,000 rules across 3 ruler shards</strong>, ~2s evaluation time</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Interactive Canvas Graph -->
+      <h3>Interactive: Storage Cost vs. Retention Period</h3>
+      <p>
+        Drag your mouse over the chart to see how monthly storage costs scale with retention period for each telemetry type.
+        Assumptions: 10K RPS baseline, 1% trace sampling, S3 storage at $0.023/GB/month.
+      </p>
+      <canvas id="sizing-graph" width="800" height="420" style="max-width:100%;border:1px solid var(--border, #333);border-radius:8px;cursor:crosshair;"></canvas>
+      <p id="sizing-tooltip" style="min-height:1.5em;font-family:'JetBrains Mono',monospace;font-size:0.92em;color:var(--text-secondary, #aaa);margin-top:0.5em;">&nbsp;</p>
+      <script>
+      (function() {
+        const canvas = document.getElementById('sizing-graph');
+        const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('sizing-tooltip');
+
+        /* --- Responsive sizing --- */
+        function resizeCanvas() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = 420 * dpr;
+          ctx.scale(dpr, dpr);
+          canvas.style.height = '420px';
+          draw(-1, -1);
+        }
+
+        const PAD = { top: 40, right: 30, bottom: 50, left: 80 };
+
+        /* Data: daily volume in GB, then cost = volume * retention_days * $0.023/30 per month */
+        const series = [
+          { name: 'Metrics (Prometheus/Mimir)', dailyGB: 2.4, color: '#6cf', dash: [] },
+          { name: 'Traces (1% sampled)',        dailyGB: 21.6, color: '#f8a', dash: [6,3] },
+          { name: 'Logs (sampled, WARN+ERROR)', dailyGB: 86.4, color: '#ad6', dash: [2,3] }
+        ];
+
+        const maxDays = 365;
+        const maxCost = 2500; /* $ per month cap for Y axis */
+
+        function costPerMonth(dailyGB, retentionDays) {
+          /* total stored GB = dailyGB * retentionDays, monthly S3 cost */
+          return dailyGB * retentionDays * 0.023;
+        }
+
+        function xToDays(x) {
+          const w = (canvas.width / (window.devicePixelRatio||1)) - PAD.left - PAD.right;
+          return Math.max(0, Math.min(maxDays, ((x - PAD.left) / w) * maxDays));
+        }
+
+        function daysToX(d) {
+          const w = (canvas.width / (window.devicePixelRatio||1)) - PAD.left - PAD.right;
+          return PAD.left + (d / maxDays) * w;
+        }
+
+        function costToY(c) {
+          const h = 420 - PAD.top - PAD.bottom;
+          return PAD.top + h - (Math.min(c, maxCost) / maxCost) * h;
+        }
+
+        function draw(mx, my) {
+          const W = canvas.width / (window.devicePixelRatio||1);
+          const H = 420;
+          ctx.clearRect(0, 0, W, H);
+
+          /* Background */
+          ctx.fillStyle = 'rgba(0,0,0,0.02)';
+          ctx.fillRect(PAD.left, PAD.top, W - PAD.left - PAD.right, H - PAD.top - PAD.bottom);
+
+          /* Grid lines */
+          ctx.strokeStyle = 'rgba(128,128,128,0.2)';
+          ctx.lineWidth = 1;
+          for (let c = 0; c <= maxCost; c += 500) {
+            const y = costToY(c);
+            ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+          }
+          for (let d = 0; d <= maxDays; d += 30) {
+            const x = daysToX(d);
+            ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, H - PAD.bottom); ctx.stroke();
+          }
+
+          /* Axes */
+          ctx.strokeStyle = 'rgba(128,128,128,0.6)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(PAD.left, PAD.top); ctx.lineTo(PAD.left, H - PAD.bottom); ctx.lineTo(W - PAD.right, H - PAD.bottom); ctx.stroke();
+
+          /* Axis labels */
+          ctx.fillStyle = 'rgba(128,128,128,0.8)';
+          ctx.font = '12px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          for (let d = 0; d <= maxDays; d += 60) {
+            ctx.fillText(d + 'd', daysToX(d), H - PAD.bottom + 18);
+          }
+          ctx.textAlign = 'right';
+          for (let c = 0; c <= maxCost; c += 500) {
+            ctx.fillText('$' + c, PAD.left - 8, costToY(c) + 4);
+          }
+          ctx.save();
+          ctx.translate(16, (PAD.top + H - PAD.bottom) / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('Monthly Storage Cost (USD)', 0, 0);
+          ctx.restore();
+          ctx.textAlign = 'center';
+          ctx.fillText('Retention Period', (PAD.left + W - PAD.right) / 2, H - 4);
+
+          /* Title */
+          ctx.fillStyle = 'rgba(180,180,180,0.9)';
+          ctx.font = 'bold 14px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Storage Cost vs. Retention (10K RPS, S3 @ $0.023/GB/mo)', W / 2, 22);
+
+          /* Draw lines */
+          series.forEach(function(s) {
+            ctx.strokeStyle = s.color;
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash(s.dash);
+            ctx.beginPath();
+            for (let d = 0; d <= maxDays; d += 1) {
+              const x = daysToX(d);
+              const y = costToY(costPerMonth(s.dailyGB, d));
+              if (d === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+          });
+
+          /* Hover vertical line + dots */
+          const hoverDays = (mx >= PAD.left && mx <= W - PAD.right) ? xToDays(mx) : -1;
+          if (hoverDays >= 0) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4,4]);
+            const hx = daysToX(hoverDays);
+            ctx.beginPath(); ctx.moveTo(hx, PAD.top); ctx.lineTo(hx, H - PAD.bottom); ctx.stroke();
+            ctx.setLineDash([]);
+
+            var parts = [];
+            series.forEach(function(s) {
+              const c = costPerMonth(s.dailyGB, hoverDays);
+              const y = costToY(c);
+              ctx.fillStyle = s.color;
+              ctx.beginPath(); ctx.arc(hx, y, 5, 0, Math.PI * 2); ctx.fill();
+              ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+              parts.push(s.name + ': $' + Math.round(c) + '/mo');
+            });
+            tooltip.textContent = 'Retention: ' + Math.round(hoverDays) + ' days  |  ' + parts.join('  |  ');
+          } else {
+            tooltip.innerHTML = 'Hover over the chart to explore cost at different retention periods.';
+          }
+
+          /* Legend */
+          var lx = PAD.left + 12;
+          var ly = PAD.top + 14;
+          series.forEach(function(s) {
+            ctx.strokeStyle = s.color; ctx.lineWidth = 2.5; ctx.setLineDash(s.dash);
+            ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(lx + 28, ly); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgba(200,200,200,0.9)';
+            ctx.font = '11px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(s.name, lx + 34, ly + 4);
+            ly += 18;
+          });
+        }
+
+        canvas.addEventListener('mousemove', function(e) {
+          const rect = canvas.getBoundingClientRect();
+          draw(e.clientX - rect.left, e.clientY - rect.top);
+        });
+        canvas.addEventListener('mouseleave', function() {
+          draw(-1, -1);
+        });
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning subsection -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>
+        Traditional capacity planning asks &ldquo;how much data will we generate?&rdquo; SLO-driven capacity planning inverts the question:
+        <strong>&ldquo;What pipeline throughput and latency do we need to protect our SLOs?&rdquo;</strong>
+      </p>
+      <p>The process follows four steps:</p>
+      <ol>
+        <li>
+          <strong>Define detection requirements.</strong> For each SLO, determine the maximum acceptable detection time.
+          Example: a 99.9% availability SLO with a 43-minute monthly error budget can tolerate at most 5-minute detection &mdash;
+          otherwise a single incident could burn the entire budget before anyone notices.
+        </li>
+        <li>
+          <strong>Derive pipeline latency budget.</strong> Break detection time into segments: ingestion latency + aggregation window +
+          rule evaluation interval + notification delivery. Each segment constrains a different infrastructure component.
+          For a 2-minute detection budget: 15s scrape + 30s aggregation + 15s eval + 10s notification + 50s margin.
+        </li>
+        <li>
+          <strong>Size for the SLO, then add headroom.</strong> Calculate the minimum cardinality, throughput, and storage to achieve
+          detection within budget. Then add 2&ndash;3x headroom for traffic spikes (flash sales, viral events). A pipeline that
+          saturates at peak load will introduce lag &mdash; which is invisible SLO risk.
+        </li>
+        <li>
+          <strong>Validate with failure injection.</strong> Simulate the incidents your SLOs are designed to catch (latency injection,
+          error injection, capacity reduction) and measure actual detection time. If detection exceeds your budget, the pipeline is
+          undersized regardless of what the capacity math says.
+        </li>
+      </ol>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>SLO Type</th><th>Detection Budget</th><th>Key Pipeline Constraint</th><th>Sizing Rule of Thumb</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Availability (99.9%)</td><td>&le; 5 min</td><td>Scrape interval + eval interval</td><td>15s scrape, 15s eval, 2x Alertmanager HA</td></tr>
+          <tr><td>Latency (p99 &lt; 500ms)</td><td>&le; 2 min</td><td>Histogram resolution + recording rules</td><td>15s scrape, 10-bucket histograms, 50 recording rules</td></tr>
+          <tr><td>Freshness (data &lt; 30s old)</td><td>&le; 30s</td><td>Streaming pipeline end-to-end latency</td><td>Kafka + Flink, 5s windows, in-memory ring buffer</td></tr>
+          <tr><td>Per-tenant SLO</td><td>&le; 5 min per tenant</td><td>Rule count &times; tenants &times; eval interval</td><td>Shard rulers, partition storage by tenant, cap cardinality per tenant</td></tr>
+        </tbody>
+      </table>
+      <p>
+        The common mistake is sizing observability for average load. SLOs break during peak load &mdash; which is exactly when your observability
+        pipeline is also under maximum stress. Always size for the 95th percentile of your traffic, not the median.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K Users</span>
+          <h4>printf Debugging</h4>
+          <p>Application logs to stdout. <code>console.log</code> / <code>print()</code>. Errors in the terminal. Maybe a free-tier error tracker like Sentry. No metrics, no traces. Debugging means reading logs on the single server.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K Users</span>
+          <h4>Structured Logging + Basic Metrics</h4>
+          <p>Switch to JSON structured logging. Ship logs to a centralized store (ELK, CloudWatch, Loki). Add Prometheus + Grafana for basic metrics (RED method). Set up PagerDuty. <strong>Signal to transition:</strong> first incident where you couldn't find the relevant log because it was on a server that got recycled.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M Users</span>
+          <h4>Distributed Tracing</h4>
+          <p>Microservices make logs alone insufficient. Add Jaeger or Grafana Tempo. Instrument with OpenTelemetry. Add correlation IDs linking logs to traces. Implement SLOs and error budgets. <strong>Signal:</strong> you have a latency spike and can't tell which of 15 services is responsible.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ Users</span>
+          <h4>Unified Pipeline + Profiling</h4>
+          <p>OpenTelemetry Collector as a central pipeline with routing, sampling, and enrichment. Tail-based sampling for traces. Continuous profiling (Pyroscope). eBPF-based observability for uninstrumented services. Observability data lake for long-term analysis. Dedicated SRE team managing the platform.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Log Volume Explosion</h3>
+      <p>
+        <strong>What happened:</strong> A team enabled DEBUG logging in production to diagnose a subtle bug. They forgot to revert. Log volume went from 50 GB/day to 2 TB/day. The centralized logging cluster (Elasticsearch) couldn't keep up &mdash; indexing fell behind, queries timed out, and the cluster went into a red state. All teams lost access to logs for 6 hours during a critical deployment window.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No guardrails on log volume per service. No rate limiting on the log pipeline. DEBUG-level log statements logged request/response bodies, which included large JSON payloads.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Enforce log level controls per environment (never allow DEBUG in prod without a TTL). Rate-limit log ingestion per service. Set up alerts on log volume anomalies. Use sampling for verbose log categories.
+      </p>
+
+      <h3>2. Metric Cardinality Bomb</h3>
+      <p>
+        <strong>What happened:</strong> A well-intentioned developer added a <code>user_id</code> label to an HTTP request duration histogram. With 2 million active users, this created tens of millions of time series. Prometheus memory usage spiked from 8 GB to 120 GB, the instance OOM-killed, and all alerts stopped firing &mdash; including the critical alerts for the billing system, which was simultaneously experiencing errors that went undetected for 45 minutes.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No cardinality checks in the metrics pipeline. No code review process that caught high-cardinality labels.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Enforce cardinality limits (Prometheus <code>sample_limit</code> per scrape target). Use CI/CD linters to flag unbounded label values. Educate developers: user IDs, IP addresses, request IDs, and URLs must never be metric labels &mdash; put them in logs or trace attributes instead.
+      </p>
+
+      <h3>3. Trace Sampling Misses Rare Errors</h3>
+      <p>
+        <strong>What happened:</strong> A payment processing system used 0.1% head-based trace sampling. A race condition caused double-charges for 0.02% of transactions &mdash; roughly 50 per day. None of these transactions were captured in traces because the sampling rate was too low and head-based sampling doesn't bias toward errors. The issue went undetected for weeks until a customer complained.
+      </p>
+      <p>
+        <strong>Root cause:</strong> Head-based sampling randomly decides at the start of a request, before errors occur. Rare errors are statistically unlikely to be sampled.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Use tail-based sampling that keeps 100% of error traces and high-latency traces. For critical paths (payments, auth), consider 100% trace collection. Set up metric-based alerts (error rate) as a safety net independent of tracing.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor (Meta-Observability)</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Metric</th><th>What It Means</th><th>Alert Threshold</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>log_ingest_rate_bytes</code></td><td>How fast logs are being ingested</td><td>Alert if &gt;2x baseline for &gt;10 min</td></tr>
+          <tr><td><code>log_ingest_lag_seconds</code></td><td>Delay between log emission and availability for search</td><td>Page if &gt;5 min</td></tr>
+          <tr><td><code>prometheus_tsdb_head_series</code></td><td>Number of active time series</td><td>Alert if &gt;800K (approaching 1M limit)</td></tr>
+          <tr><td><code>trace_spans_dropped_total</code></td><td>Spans lost due to pipeline saturation</td><td>Alert if &gt;0 sustained for &gt;5 min</td></tr>
+          <tr><td><code>alertmanager_notifications_failed</code></td><td>Failed alert deliveries</td><td>Page immediately (meta-alert must go to separate channel)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>SLOs and Error Budgets</h3>
+      <p>
+        Define SLOs (Service Level Objectives) based on user-facing behavior, not internal metrics. Example: "99.9% of API requests return a non-5xx response within 500ms." This gives you an <strong>error budget</strong> of 0.1% &mdash; roughly 43 minutes of downtime per month. When the budget is nearly exhausted, freeze feature releases and focus on reliability. Track burn rate: if you're consuming error budget 10x faster than expected, that's an active incident.
+      </p>
+
+      <h3>Alert Design: Symptom-Based, Not Cause-Based</h3>
+      <p>
+        <strong>Bad alert:</strong> "CPU usage &gt; 90% on host web-42." CPU might be high but users are perfectly fine &mdash; maybe it is running an efficient batch job. This alert fires constantly and gets ignored. <strong>Good alert:</strong> "p99 latency &gt; 500ms for 5 minutes on /api/checkout." This directly measures user impact. The CPU alert might be useful as a low-priority warning in a Slack channel, but it should never page someone at 3 AM.
+      </p>
+      <p>
+        Every alert should include: a link to the relevant dashboard, a link to a runbook with diagnosis steps, and the SLO it relates to.
+      </p>
+
+      <h4>Alert Fatigue: The Silent Killer</h4>
+      <p>
+        If your on-call team gets 100 alerts per day, they stop reading them. Every alert becomes "snooze and move on." When the truly critical alert fires &mdash; the one that means customers are losing money &mdash; it gets lost in the noise and goes unnoticed for 45 minutes. <strong>Target: fewer than 5 actionable alerts per on-call shift.</strong> If an alert fires more than 5 times in a month without leading to action, delete it or tune it.
+      </p>
+
+      <h4>SLO-Based Alerting: Burn Rate</h4>
+      <p>
+        Instead of alerting on instantaneous threshold violations ("error rate &gt; 1% right now"), alert based on how fast you are consuming your <strong>error budget</strong>. This is called <strong>burn rate alerting</strong>.
+      </p>
+      <p>
+        <strong>Setup:</strong> Suppose your SLO is 99.9% availability over 30 days. That gives you an error budget of 0.1% &mdash; which equals 43.2 minutes of downtime per month. A "1x burn rate" means you are consuming the budget at exactly the expected rate (you will use all 43.2 minutes over 30 days). A "14.4x burn rate" means you are burning 14.4 times faster &mdash; your entire monthly budget will be gone in about 2 days.
+      </p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Burn Rate</th><th>Meaning</th><th>Budget Exhausted In</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>1x</strong></td>
+            <td>Normal error rate</td>
+            <td>30 days (as designed)</td>
+            <td>No action needed</td>
+          </tr>
+          <tr>
+            <td><strong>2x</strong></td>
+            <td>Double the normal errors</td>
+            <td>15 days</td>
+            <td>Create a ticket for business hours</td>
+          </tr>
+          <tr>
+            <td><strong>14.4x</strong></td>
+            <td>Burning 14.4 times faster</td>
+            <td>~2 days</td>
+            <td><strong>Page on-call immediately</strong></td>
+          </tr>
+          <tr>
+            <td><strong>36x</strong></td>
+            <td>Burning 36 times faster</td>
+            <td>~20 hours</td>
+            <td><strong>Urgent page &mdash; wake people up</strong></td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p>
+        The key insight: a 14.4x burn rate means your 30-day error budget will be exhausted in roughly 2 days. That is urgent enough to wake someone up. A 2x burn rate means you will run out in 15 days &mdash; concerning, but it can wait until business hours. This approach eliminates false alarms from brief, harmless spikes while still catching sustained problems before they exhaust your budget.
+      </p>
+      <p>
+        <strong>Multi-window burn rate</strong> (recommended by the Google SRE book): use two windows to avoid false positives. For example, page only if <em>both</em> the 5-minute burn rate exceeds 14.4x <em>and</em> the 1-hour burn rate exceeds 6x. The short window catches sudden spikes. The long window confirms the problem is sustained, not a 30-second blip.
+      </p>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>User reports "it's slow":</strong></p>
+        <p>&rarr; Check the service's RED metrics dashboard. Is latency elevated?</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>Yes:</strong> Is error rate also elevated?</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&rarr; <strong>Yes:</strong> Find a sample error trace. Check the failing span. Read the correlated error logs for that trace_id.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&rarr; <strong>No (slow but not erroring):</strong> Find a slow trace (p99). Identify the bottleneck span. Is it a downstream service? A database query? External API?</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>No (latency looks normal):</strong> Check if the user is in a specific region or on a specific client version. Check CDN/edge metrics. Problem may be client-side.</p>
+      </div>
+
+      <h3>Critical Configuration</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Config</th><th>What It Does</th><th>Recommended Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>OTEL_TRACES_SAMPLER</code></td><td>Controls trace sampling strategy</td><td><code>parentbased_traceidratio</code> with ratio 0.01&ndash;0.1 for high-traffic; tail-based for errors</td></tr>
+          <tr><td>Prometheus <code>scrape_interval</code></td><td>How often metrics are collected</td><td>15s default; 5s for latency-sensitive dashboards</td></tr>
+          <tr><td>Prometheus <code>retention.time</code></td><td>How long raw metrics are kept</td><td>15d local; use Thanos/Cortex for long-term</td></tr>
+          <tr><td>Log retention period</td><td>How long logs are queryable</td><td>7&ndash;30 days hot; 90 days warm; archive to S3 for compliance</td></tr>
+          <tr><td>OTel Collector <code>batch/timeout</code></td><td>How long the collector buffers before sending</td><td>5s (balance between latency and efficiency)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Observability + Microservices</h3>
+      <p>
+        This is the most critical pairing. In a monolith, a stack trace tells you the full call path. In microservices, a request touches 5&ndash;20 services, and a stack trace only shows you one of them. Without distributed tracing, debugging a latency spike means manually correlating timestamps across 20 different log streams. <strong>Pitfall:</strong> if even one service doesn't propagate trace context, the trace breaks into disconnected fragments. Ensure all services use a compatible context propagation format (W3C Trace Context or B3).
+      </p>
+
+      <h3>Observability + Load Balancing</h3>
+      <p>
+        Load balancer metrics (connection count, response time per backend, 5xx rate per backend) are some of the most valuable signals. They give you a single vantage point to compare backend health. <strong>Pitfall:</strong> if you only have metrics from individual backends but not the load balancer, you might miss imbalanced load distribution. A backend can look healthy in isolation while the LB is sending it 10x the traffic of other backends.
+      </p>
+
+      <h3>Observability + Circuit Breakers</h3>
+      <p>
+        Circuit breaker state transitions (closed &rarr; open &rarr; half-open) should be emitted as both metrics and log events. <strong>Pitfall:</strong> if the circuit breaker opens and your metrics stop receiving data from the downstream service, a naive dashboard might show "no errors" &mdash; because no requests are being made. Track the breaker state itself as a gauge metric (<code>circuit_breaker_state{service="payment"} = 1</code> for open).
+      </p>
+
+      <h3>Observability + Message Queues</h3>
+      <p>
+        Tracing across async boundaries (producer &rarr; queue &rarr; consumer) requires injecting trace context into message headers. The trace should show the full flow even when the consumer processes the message minutes later. <strong>Pitfall:</strong> if you create a new trace on the consumer side instead of continuing the producer's trace, you lose the end-to-end view. Also, consumer lag should be a top-line metric: <code>kafka_consumer_group_lag</code> is one of the most important observability signals for event-driven systems.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Drivers</h4>
+        <p>
+          Observability can easily become the largest line item in your infrastructure budget. The dominant cost drivers vary by pillar:
+        </p>
+        <ul>
+          <li><strong>Logs:</strong> Storage and ingestion volume. This is typically 60&ndash;80% of observability cost. Every byte you log costs money to ingest, index, store, and query.</li>
+          <li><strong>Metrics:</strong> Cardinality (number of unique time series). Each series costs ~20 bytes/sample &times; 4 samples/min = 115 KB/day. 1M series = 115 GB/day of metric storage.</li>
+          <li><strong>Traces:</strong> Span volume and retention. Mitigated by sampling.</li>
+        </ul>
+      </div>
+
+      <h3>SaaS Pricing Reality</h3>
+      <p>
+        Datadog, Splunk, and New Relic charge per host, per GB ingested, or per million spans. A medium-sized microservices platform (50 hosts, 100 services, 5K RPS) can easily reach <strong>$50K&ndash;$150K/year</strong>. Large enterprises (1000+ hosts) commonly pay <strong>$500K&ndash;$2M/year</strong>. The convenience is real &mdash; no infrastructure to manage, excellent UIs, ML-powered anomaly detection &mdash; but the cost scales super-linearly with growth.
+      </p>
+
+      <h3>Self-Hosted Alternatives</h3>
+      <p>
+        The Grafana stack (Loki for logs, Prometheus/Mimir for metrics, Tempo for traces) can reduce costs by 10&ndash;40x at scale. Tradeoffs: you need 1&ndash;3 engineers maintaining the platform, upgrades require planning, and you miss SaaS features like ML-based root cause analysis. A common hybrid approach: use SaaS for the first year (move fast), then migrate critical telemetry to self-hosted when the bill becomes painful.
+      </p>
+
+      <h3>Cost Optimization Tips</h3>
+      <ul>
+        <li><strong>Drop verbose log fields</strong> &mdash; don't log request/response bodies in production; log them at DEBUG level only</li>
+        <li><strong>Sample traces intelligently</strong> &mdash; keep 100% of errors and slow requests, sample 1&ndash;5% of successful requests</li>
+        <li><strong>Use log levels</strong> &mdash; INFO for normal operations, WARN for anomalies, ERROR for failures. Production should be INFO+ only.</li>
+        <li><strong>Tiered retention</strong> &mdash; 7 days hot (SSD), 30 days warm (HDD), 90+ days cold (S3 Glacier)</li>
+        <li><strong>Aggregate metrics at the edge</strong> &mdash; use the OTel Collector to pre-aggregate histograms and drop unused labels before they reach your metrics backend</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Google Dapper</h3>
+      <p>
+        Google's <strong>Dapper</strong> (2010 paper) pioneered distributed tracing at scale. It introduced the concepts of trace IDs, span IDs, and parent spans that all modern tracing systems use. Dapper traced billions of requests across Google's infrastructure with extremely low overhead (&lt;0.01% performance impact) by embedding instrumentation in the RPC framework (Stubby) so every service was automatically traced. The key insight: if you instrument the RPC layer, you get tracing for free without developer effort. This idea directly inspired Zipkin (Twitter), Jaeger (Uber), and OpenTelemetry.
+      </p>
+
+      <h3>Uber's Jaeger</h3>
+      <p>
+        Uber built <strong>Jaeger</strong> in 2015 to trace requests across thousands of microservices. At peak, Uber's platform processes millions of traces per second. Jaeger uses adaptive sampling &mdash; it adjusts the sampling rate per service and per endpoint based on traffic volume, ensuring low-traffic endpoints get higher sampling while high-traffic endpoints are sampled more aggressively. Jaeger was donated to the CNCF and is now one of the most widely used open-source tracing backends. Uber also developed <strong>M3</strong>, a metrics platform handling billions of time series, because Prometheus alone couldn't scale to their needs.
+      </p>
+
+      <h3>Netflix's Atlas</h3>
+      <p>
+        Netflix built <strong>Atlas</strong>, a custom time-series metrics system, to handle their scale (hundreds of millions of time series from thousands of instances). Atlas uses an in-memory architecture with dimensional data model (like Prometheus labels) and a stack-based query language. Netflix uses Atlas to power real-time dashboards that detect streaming quality issues within seconds. Their philosophy: metrics should be cheap enough that developers never hesitate to add a new one. Atlas achieves this by keeping per-series storage cost extremely low through aggressive rollup and pre-aggregation.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>OpenTelemetry-style instrumentation in Python &mdash; creating spans, adding attributes, and context propagation across service boundaries:</p>
+<pre class="line-numbers"><code class="language-python">from opentelemetry import trace, metrics
+from opentelemetry.context import attach, detach
+from opentelemetry.trace.propagation import inject, extract
+import logging, json, time
+
+tracer = trace.get_tracer("order-service")
+meter = metrics.get_meter("order-service")
+
+# Metrics: counter and histogram
+order_counter = meter.create_counter("orders_total",
+    description="Total orders processed")
+latency_hist = meter.create_histogram("order_duration_seconds",
+    description="Order processing latency")
+
+logger = logging.getLogger("order-service")
+
+def process_order(request):
+    # Extract trace context from incoming request headers
+    ctx = extract(request.headers)
+    token = attach(ctx)
+
+    try:
+        with tracer.start_as_current_span("process_order") as span:
+            start = time.time()
+            span.set_attribute("user.id", request.user_id)
+            span.set_attribute("order.total", request.total)
+
+            # Structured log with trace correlation
+            logger.info(json.dumps({
+                "event": "order_started",
+                "user_id": request.user_id,
+                "trace_id": span.get_span_context().trace_id,
+                "span_id": span.get_span_context().span_id,
+            }))
+
+            # Call downstream payment service (propagate context)
+            headers = {}
+            inject(headers)  # injects trace context into headers
+            result = call_payment_service(request, headers)
+
+            # Record metrics
+            order_counter.add(1, {"status": "success"})
+            latency_hist.record(time.time() - start)
+            return result
+    except Exception as e:
+        order_counter.add(1, {"status": "error"})
+        span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+        span.record_exception(e)
+        raise
+    finally:
+        detach(token)</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Inject Known Failures</h3>
+      <p>
+        For each pillar, inject a controlled failure and verify detection:
+      </p>
+      <ul>
+        <li><strong>Logs:</strong> Trigger a known error condition. Verify the error appears in your centralized logging within 60 seconds and contains the correct trace ID, service name, and error details.</li>
+        <li><strong>Metrics:</strong> Generate a burst of 5xx errors. Verify the error rate metric spikes on dashboards and an alert fires within your configured window (e.g., 5 minutes).</li>
+        <li><strong>Traces:</strong> Send a test request through the full service chain. Verify the trace shows all expected spans, with correct parent-child relationships and no gaps.</li>
+      </ul>
+
+      <h3>Chaos Testing</h3>
+      <p>
+        Use <strong>toxiproxy</strong> or <strong>Chaos Mesh</strong> to inject latency (e.g., add 2s delay to a downstream service). Verify that: (1) the latency appears in traces as an elongated span, (2) the p99 metric increases, (3) an SLO-based alert fires, and (4) the debug playbook leads you to the correct root cause. Also test your observability pipeline itself &mdash; what happens if the OTel Collector crashes? Do you lose telemetry? Is there a dead letter queue?
+      </p>
+
+      <h3>Load Testing with Observability Validation</h3>
+      <p>
+        Use <strong>k6</strong> or <strong>Locust</strong> to generate realistic load. During the test, verify: dashboards update in real time, query latency on your metrics backend stays under 5 seconds, log search returns results within 10 seconds, and trace lookup by ID completes in under 2 seconds. Common mistake: testing observability on low traffic and being surprised when it falls over at 10x load &mdash; test your observability pipeline at the same scale as your application.
+      </p>
+
+      <h3>Trace Completeness Audit</h3>
+      <p>
+        Periodically sample 100 traces and manually verify: every expected service appears, no "orphan" spans (spans with missing parents), span durations are plausible (no negative durations or missing timestamps), and error spans have corresponding log entries. Automate this with a trace validator that runs as a periodic job.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you design an observability platform for a microservices architecture?</summary>
+        <div class="answer">
+          <p>
+            Start by establishing the three pillars. For <strong>metrics</strong>, deploy Prometheus (or Mimir for multi-tenant) with a 15s scrape interval, using the RED method for every service. For <strong>logging</strong>, standardize on JSON structured logs with mandatory fields (timestamp, service, level, trace_id), ship via Fluent Bit to Grafana Loki or Elasticsearch. For <strong>tracing</strong>, instrument all services with OpenTelemetry SDKs, propagate context via W3C Trace Context headers, and store traces in Jaeger or Grafana Tempo.
+          </p>
+          <p>
+            The critical architectural decision is the <strong>OpenTelemetry Collector</strong> as a central pipeline between your applications and backends. It acts as a buffer, handles tail-based sampling, enriches telemetry with metadata (Kubernetes labels, environment), and decouples your application instrumentation from your backend choice. Deploy it as a DaemonSet (one per node) for metrics and a Deployment (centralized) for tail-based trace sampling.
+          </p>
+          <p>
+            Define SLOs from day one: error rate &lt;0.1%, p99 latency &lt;500ms for user-facing services. Set up SLO-based alerting with burn rate windows. Create standardized dashboards per service (RED metrics) and per-team golden signal dashboards.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle multi-tenancy? How do you prevent cardinality explosions? What's your sampling strategy at 100K RPS?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the difference between monitoring and observability</summary>
+        <div class="answer">
+          <p>
+            <strong>Monitoring</strong> answers known questions: "Is the server up? Is CPU above 80%? Are there more than 10 errors per minute?" You define these checks in advance, and monitoring tells you when thresholds are breached. It's reactive and check-based.
+          </p>
+          <p>
+            <strong>Observability</strong> lets you ask <em>new</em> questions you didn't anticipate. When a novel failure occurs &mdash; "why are users in Brazil seeing 3x latency on checkout, but only on iOS, but only when they have more than 5 items in cart" &mdash; observability gives you the tools to explore and correlate signals to find the answer without deploying new instrumentation.
+          </p>
+          <p>
+            The key enabler is high-cardinality, high-dimensionality data. Monitoring stores a few aggregated metrics. Observability stores rich, detailed events (structured logs, trace spans with attributes) that can be sliced and diced along any dimension. In practice, you need both: monitoring for known failure modes with well-tuned alerts, observability for unknown-unknowns and novel debugging.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Can you have observability without monitoring? How does observability change the on-call experience? What's the cost tradeoff?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does distributed tracing work across service boundaries?</summary>
+        <div class="answer">
+          <p>
+            When Service A makes an RPC call to Service B, the tracing SDK <strong>injects</strong> trace context into the outgoing request (typically as HTTP headers: <code>traceparent</code> and <code>tracestate</code> per the W3C Trace Context standard). This context includes the trace ID, the current span ID (which becomes the parent span ID for Service B), and sampling flags.
+          </p>
+          <p>
+            Service B's tracing SDK <strong>extracts</strong> this context from the incoming request headers. It creates a new span with the same trace ID, a new span ID, and the parent span ID from the incoming context. This linking creates a tree structure: Service A's span is the parent, Service B's span is the child. If Service B calls Service C, the same propagation continues, building a deeper tree.
+          </p>
+          <p>
+            Each service independently exports its spans to the tracing backend (Jaeger, Tempo). The backend assembles the full trace by collecting all spans with the same trace ID and building the tree from parent-child relationships. The result is a waterfall visualization showing the timeline of each span, making it immediately clear where time was spent and where errors occurred.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How does tracing work across async boundaries (message queues)? What happens when one service doesn't propagate context? How do you handle trace context in polyglot environments?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you handle high-cardinality metrics without blowing up your metrics backend?</summary>
+        <div class="answer">
+          <p>
+            High-cardinality metrics are the single most common way teams accidentally break their monitoring. The rule is simple: <strong>never use unbounded values as metric labels</strong>. User IDs, request IDs, IP addresses, full URLs, email addresses &mdash; these are attributes for logs and trace spans, not metric labels.
+          </p>
+          <p>
+            Concrete defenses: (1) Set <code>sample_limit</code> per scrape target in Prometheus so a single service can't create millions of series. (2) Use CI/CD linting to flag new metrics with potentially high-cardinality labels. (3) Pre-aggregate in the OTel Collector &mdash; drop unnecessary labels, merge similar endpoints (e.g., <code>/users/123</code> and <code>/users/456</code> become <code>/users/:id</code>). (4) Use recording rules to pre-compute frequently-queried aggregations. (5) For metrics backends like Mimir or Cortex, configure cardinality limits per tenant.
+          </p>
+          <p>
+            When you genuinely need per-user metrics (e.g., "how many requests did user X make?"), use <strong>exemplars</strong> &mdash; attach a few sample trace IDs to your aggregated metric so you can jump from the metric to specific traces without creating per-user series.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What are recording rules and when should you use them? How do you detect cardinality explosions before they cause outages? What's the difference between Prometheus cardinality limits and TSDB compaction?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design an alerting system that avoids alert fatigue</summary>
+        <div class="answer">
+          <p>
+            Alert fatigue is the number one operational failure mode: when on-call engineers get 200 alerts per shift, they ignore all of them, including the critical one. The fix is a layered approach.
+          </p>
+          <p>
+            <strong>Layer 1 &mdash; SLO-based alerts only page.</strong> Only alert on user-facing symptoms, not infrastructure causes. "p99 latency SLO burn rate &gt; 10x for 5 minutes" pages. "CPU &gt; 90%" does not page &mdash; it goes to a low-priority Slack channel. Use multi-window, multi-burn-rate alerting per the Google SRE book: a fast burn (2% of error budget in 1 hour) pages immediately; a slow burn (5% in 6 hours) creates a ticket.
+          </p>
+          <p>
+            <strong>Layer 2 &mdash; Deduplication and grouping.</strong> If 50 pods in a deployment are all failing the same health check, that's one alert, not 50. Alertmanager's <code>group_by</code> and <code>inhibition</code> rules are essential. A cluster-wide network failure should suppress all downstream service alerts and produce one root-cause alert.
+          </p>
+          <p>
+            <strong>Layer 3 &mdash; Every alert must be actionable.</strong> If an alert fires and the on-call can't do anything about it, delete the alert. Every alert needs: a runbook link, clear severity (page vs. ticket vs. info), and an owner. Review alert frequency monthly; if an alert fires &gt;5 times without leading to action, delete or tune it.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you set error budgets for new services with no baseline? What's the difference between alerting on raw error counts vs. error rates? How do you handle cascading failures in alerting?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you trace a request through an async message queue?</summary>
+        <div class="answer">
+          <p>
+            The key is <strong>context propagation through message headers</strong>. When the producer publishes a message, the tracing SDK injects the current trace context (trace ID, span ID) into the message headers (Kafka headers, RabbitMQ message properties, SQS message attributes). The producer's span represents "publish message" and ends when the message is accepted by the broker.
+          </p>
+          <p>
+            On the consumer side, the SDK extracts trace context from the message headers and creates a new span linked to the producer's span. The consumer span represents "process message." This creates a trace that spans the producer, the queue (visible as the time gap between producer span end and consumer span start &mdash; this gap <em>is</em> your consumer lag), and the consumer's processing.
+          </p>
+          <p>
+            Challenges: (1) <strong>Batching</strong> &mdash; if the consumer processes 100 messages in a batch, you can't link to 100 parent spans. Use <strong>span links</strong> (OpenTelemetry feature) to reference the producer spans without creating a direct parent-child relationship. (2) <strong>Fan-out</strong> &mdash; one message triggers processing in 5 consumers. Each consumer creates its own child span. (3) <strong>Long delays</strong> &mdash; if a message sits in the queue for hours, the trace becomes hard to visualize. Consider starting a new trace on the consumer and using span links to reference the original producer trace.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle dead-letter queue messages in traces? How do you measure end-to-end latency across async boundaries? What about exactly-once processing and trace duplication?</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>Observability is not monitoring.</strong> Monitoring answers known questions; observability lets you ask new ones. You need both.</li>
+        <li><strong>Three pillars, correlated.</strong> Logs, metrics, and traces are individually useful but transformative when linked by correlation IDs (trace_id, span_id).</li>
+        <li><strong>OpenTelemetry is the standard.</strong> It unifies instrumentation across all three pillars and all major languages. Instrument once, export anywhere.</li>
+        <li><strong>RED for services, USE for resources.</strong> Rate/Errors/Duration covers service health. Utilization/Saturation/Errors covers infrastructure health.</li>
+        <li><strong>Cardinality kills metrics.</strong> Never use unbounded values (user IDs, IPs) as metric labels. High-cardinality data belongs in logs and traces.</li>
+        <li><strong>Sampling is mandatory at scale.</strong> Prefer tail-based sampling that keeps 100% of errors and outliers.</li>
+        <li><strong>Alert on symptoms, not causes.</strong> Page on SLO burn rate, not CPU usage. Every alert must be actionable with a runbook link.</li>
+        <li><strong>Observability costs real money.</strong> Log volume is the dominant cost driver. SaaS pricing can be 10&ndash;40x more expensive than self-hosted at scale.</li>
+        <li><strong>Your observability pipeline is infrastructure too.</strong> Monitor your monitoring. If Prometheus goes down, you lose all alerts.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="microservices.html">Microservices Architecture</a> &mdash; observability is essential for operating microservices; learn how services are decomposed and why debugging them requires distributed tracing.</li>
+        <li><a href="circuit-breakers.html">Circuit Breakers</a> &mdash; circuit breaker state transitions are key observability signals; learn how breakers protect services from cascading failures.</li>
+        <li><a href="message-queues.html">Message Queues</a> &mdash; tracing across async boundaries requires context propagation through message headers; learn how queues decouple producers and consumers.</li>
+        <li><a href="api-gateway.html">API Gateway</a> &mdash; the gateway is the ideal place to inject trace context and collect RED metrics for all inbound traffic.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="circuit-breakers.html" class="prev">Circuit Breakers</a>
+      <a href="leader-election.html" class="next">Leader Election</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== Observability Animation: Distributed Trace =====
+    (function () {
+      const canvas = document.getElementById('obs-canvas');
+      const container = document.getElementById('obs-animation-container');
+
+      const CYCLE = 8; // seconds per full cycle
+
+      // Service colors
+      const svcColors = [
+        { name: 'Service A', color: '#2563eb', fill: '#eff6ff', spanColor: '#3b82f6' },
+        { name: 'Service B', color: '#7c3aed', fill: '#f5f3ff', spanColor: '#8b5cf6' },
+        { name: 'Service C', color: '#0891b2', fill: '#ecfeff', spanColor: '#06b6d4' },
+      ];
+
+      function drawObsAnimation(ctx, time, w, h) {
+        const progress = loopProgress(time, CYCLE);
+
+        // Layout constants
+        const leftMargin = 60;
+        const svcWidth = 70;
+        const svcHeight = 50;
+        const svcGap = (w - leftMargin * 2 - svcWidth * 3) / 2;
+        const topY = 40;
+        const svcY = topY + 30;
+
+        // Section areas
+        const logY = svcY + svcHeight + 60;
+        const metricY = logY + 55;
+        const traceY = metricY + 55;
+
+        // Draw title labels
+        drawLabel(ctx, 28, logY + 5, 'LOGS', { color: '#64748b', fontSize: 10, bold: true, align: 'left' });
+        drawLabel(ctx, 28, metricY + 5, 'METRICS', { color: '#64748b', fontSize: 10, bold: true, align: 'left' });
+        drawLabel(ctx, 28, traceY + 5, 'TRACE', { color: '#64748b', fontSize: 10, bold: true, align: 'left' });
+
+        // Horizontal separator lines
+        drawDashedLine(ctx, leftMargin - 10, logY - 15, w - 20, logY - 15, { color: '#e2e8f0' });
+        drawDashedLine(ctx, leftMargin - 10, metricY - 15, w - 20, metricY - 15, { color: '#e2e8f0' });
+        drawDashedLine(ctx, leftMargin - 10, traceY - 15, w - 20, traceY - 15, { color: '#e2e8f0' });
+
+        // Draw services
+        const svcPositions = [];
+        for (let i = 0; i < 3; i++) {
+          const sx = leftMargin + i * (svcWidth + svcGap);
+          svcPositions.push(sx + svcWidth / 2);
+
+          drawServer(ctx, sx + svcWidth / 2, svcY + svcHeight / 2, {
+            width: svcWidth,
+            height: svcHeight,
+            color: svcColors[i].color,
+            fill: svcColors[i].fill,
+            label: svcColors[i].name,
+          });
+        }
+
+        // Arrows between services
+        for (let i = 0; i < 2; i++) {
+          const fromX = leftMargin + i * (svcWidth + svcGap) + svcWidth;
+          const toX = leftMargin + (i + 1) * (svcWidth + svcGap);
+          drawArrow(ctx, fromX, svcY + svcHeight / 2, toX, svcY + svcHeight / 2, {
+            color: '#cbd5e1',
+            width: 1.5,
+            headSize: 7,
+          });
+        }
+
+        // Animate the request dot flowing through services
+        // Phase 0-0.15: dot enters Service A
+        // Phase 0.15-0.30: dot travels A -> B
+        // Phase 0.30-0.45: dot at B
+        // Phase 0.45-0.60: dot travels B -> C
+        // Phase 0.60-0.75: dot at C
+        // Phase 0.75-1.0: all outputs visible, pause
+
+        const phases = [
+          { start: 0, end: 0.10, from: 0, to: 0, type: 'enter' },   // entering A
+          { start: 0.10, end: 0.25, from: 0, to: 1, type: 'travel' }, // A -> B
+          { start: 0.25, end: 0.35, from: 1, to: 1, type: 'enter' },  // at B
+          { start: 0.35, end: 0.50, from: 1, to: 2, type: 'travel' }, // B -> C
+          { start: 0.50, end: 0.60, from: 2, to: 2, type: 'enter' },  // at C
+        ];
+
+        // Find current phase
+        let activeService = -1;
+        for (const phase of phases) {
+          if (progress >= phase.start && progress < phase.end) {
+            const p = (progress - phase.start) / (phase.end - phase.start);
+            if (phase.type === 'travel') {
+              const fromX = svcPositions[phase.from] + svcWidth / 2;
+              const toX = svcPositions[phase.to] - svcWidth / 2;
+              drawMovingDot(ctx, fromX, svcY + svcHeight / 2, toX, svcY + svcHeight / 2, ease.inOut(p), {
+                color: svcColors[phase.to].color,
+                radius: 6,
+              });
+            } else {
+              // Pulse at service
+              const pulseAlpha = 0.3 + 0.5 * Math.sin(p * Math.PI);
+              ctx.save();
+              ctx.globalAlpha = pulseAlpha;
+              ctx.fillStyle = svcColors[phase.from].fill;
+              ctx.strokeStyle = svcColors[phase.from].color;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.arc(svcPositions[phase.from], svcY + svcHeight / 2, svcWidth / 2 + 5, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.restore();
+              activeService = phase.from;
+            }
+            break;
+          }
+        }
+
+        // Determine which services have been "hit"
+        const svcHitThresholds = [0.05, 0.28, 0.53];
+
+        for (let i = 0; i < 3; i++) {
+          const hit = progress >= svcHitThresholds[i];
+          if (!hit) continue;
+
+          const svcCenterX = svcPositions[i];
+
+          // Fade in effect
+          const fadeStart = svcHitThresholds[i];
+          const fadeDur = 0.08;
+          const alpha = Math.min(1, (progress - fadeStart) / fadeDur);
+
+          ctx.save();
+          ctx.globalAlpha = alpha;
+
+          // --- Log entry ---
+          const logX = svcCenterX - svcWidth / 2 - 5;
+          const logW = svcWidth + 10;
+          ctx.fillStyle = svcColors[i].fill;
+          ctx.strokeStyle = svcColors[i].color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(logX, logY, logW, 28, 4);
+          ctx.fill();
+          ctx.stroke();
+
+          // Log text
+          ctx.fillStyle = svcColors[i].color;
+          ctx.font = '500 8px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const logTexts = ['"order started"', '"payment ok"', '"shipped"'];
+          ctx.fillText(logTexts[i], svcCenterX, logY + 14);
+
+          // --- Metric counter ---
+          const counterVal = i + 1;
+          ctx.fillStyle = svcColors[i].fill;
+          ctx.strokeStyle = svcColors[i].color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(logX, metricY, logW, 28, 4);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = svcColors[i].color;
+          ctx.font = '600 10px system-ui, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const metricTexts = ['reqs: +1', 'reqs: +1', 'reqs: +1'];
+          ctx.fillText(metricTexts[i], svcCenterX, metricY + 14);
+
+          // --- Trace span ---
+          // Spans have different widths to show nested timing
+          const spanWidths = [svcWidth + svcGap * 2 + svcWidth * 2 + 10, svcWidth + svcGap + 10, svcWidth - 10];
+          const spanStarts = [
+            svcPositions[0] - svcWidth / 2 - 5,
+            svcPositions[1] - svcWidth / 2,
+            svcPositions[2] - svcWidth / 2 + 5,
+          ];
+          const spanH = 14;
+          const spanYOffset = traceY + i * (spanH + 4);
+
+          ctx.fillStyle = svcColors[i].spanColor;
+          ctx.globalAlpha = alpha * 0.8;
+          ctx.beginPath();
+          ctx.roundRect(spanStarts[i], spanYOffset, spanWidths[i], spanH, 3);
+          ctx.fill();
+
+          ctx.globalAlpha = alpha;
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '600 8px system-ui, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle';
+          const spanLabels = ['span: process_order (200ms)', 'span: charge (120ms)', 'span: ship (80ms)'];
+          ctx.fillText(spanLabels[i], spanStarts[i] + 6, spanYOffset + spanH / 2);
+
+          ctx.restore();
+        }
+
+        // Draw trace ID label when all services are hit
+        if (progress > 0.65) {
+          const traceAlpha = Math.min(1, (progress - 0.65) / 0.1);
+          ctx.save();
+          ctx.globalAlpha = traceAlpha;
+          drawLabel(ctx, w / 2, traceY + 52, 'trace_id: abc-123-def', {
+            color: '#2563eb',
+            fontSize: 11,
+            bold: true,
+          });
+          ctx.restore();
+        }
+      }
+
+      const animation = createAnimation(canvas, drawObsAnimation, { height: 360 });
+      setupControls(container, animation);
+    })();
+  </script>
+
+</body>
+</html>

@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thundering Herd After a Cache Node Failure — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Thundering Herd After a Cache Node Failure</h1>
+      <p class="hero-subtitle">One of 100 Redis nodes dies. 1% of the keyspace goes cold. The database, which was comfortably handling 5K reads/sec, is suddenly hit with 50K reads/sec. Walk through the mechanics of the thundering herd and the layered mitigations that tame it.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You operate a read-heavy web application backed by a distributed cache cluster and a PostgreSQL database.</p>
+
+      <div class="full-width">
+        <h3>The Architecture</h3>
+        <svg viewBox="0 0 700 340" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-arch" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" fill="#64748b">
+              <path d="M 0 0 L 10 5 L 0 10 z"/>
+            </marker>
+          </defs>
+          <!-- Incoming traffic -->
+          <text x="350" y="20" text-anchor="middle" font-weight="bold" fill="#334155" font-size="14">500,000 reads/sec</text>
+          <line x1="350" y1="28" x2="350" y2="58" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <!-- App Servers -->
+          <rect x="225" y="60" width="250" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="85" text-anchor="middle" font-weight="bold" fill="#2563eb">App Servers (x50)</text>
+          <!-- Split -->
+          <line x1="350" y1="100" x2="350" y2="130" stroke="#64748b" stroke-width="1.5"/>
+          <line x1="200" y1="130" x2="500" y2="130" stroke="#64748b" stroke-width="1.5"/>
+          <line x1="200" y1="130" x2="200" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <line x1="500" y1="130" x2="500" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <!-- Labels on branches -->
+          <text x="200" y="148" text-anchor="middle" fill="#16a34a" font-weight="bold" font-size="12">Cache Hit (99%)</text>
+          <text x="500" y="148" text-anchor="middle" fill="#ef4444" font-weight="bold" font-size="12">Cache Miss (1%)</text>
+          <!-- Redis Cluster -->
+          <rect x="100" y="165" width="200" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="200" y="190" text-anchor="middle" font-weight="bold" fill="#2563eb">Redis Cluster</text>
+          <text x="200" y="208" text-anchor="middle" fill="#64748b" font-size="11">100 nodes</text>
+          <text x="200" y="222" text-anchor="middle" fill="#64748b" font-size="11">10M keys total (~100K/node)</text>
+          <!-- PostgreSQL -->
+          <rect x="400" y="165" width="200" height="80" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="500" y="190" text-anchor="middle" font-weight="bold" fill="#334155">PostgreSQL</text>
+          <text x="500" y="208" text-anchor="middle" fill="#64748b" font-size="11">4 read replicas</text>
+          <text x="500" y="222" text-anchor="middle" fill="#64748b" font-size="11">Max 5K QPS each = 20K total</text>
+          <!-- Annotations -->
+          <rect x="100" y="270" width="200" height="50" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+          <text x="200" y="291" text-anchor="middle" fill="#16a34a" font-size="12" font-weight="bold">495,000 reads/sec</text>
+          <text x="200" y="307" text-anchor="middle" fill="#64748b" font-size="11">served from cache</text>
+          <rect x="400" y="270" width="200" height="50" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+          <text x="500" y="291" text-anchor="middle" fill="#ef4444" font-size="12" font-weight="bold">5,000 reads/sec</text>
+          <text x="500" y="307" text-anchor="middle" fill="#64748b" font-size="11">hit database (25% util.)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Steady-State Numbers</h3>
+        <div class="table-responsive">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Total read traffic</td><td>500,000 reads/sec</td></tr>
+            <tr><td>Cache hit rate</td><td>99%</td></tr>
+            <tr><td>Reads served from cache</td><td>495,000/sec</td></tr>
+            <tr><td>Cache misses (hit DB)</td><td>5,000/sec</td></tr>
+            <tr><td>DB read capacity</td><td>20,000 queries/sec (4 replicas x 5K each)</td></tr>
+            <tr><td>DB utilization</td><td>5,000 / 20,000 = 25%</td></tr>
+            <tr><td>Redis nodes</td><td>100</td></tr>
+            <tr><td>Keys per node</td><td>~100,000 (10M total / 100 nodes)</td></tr>
+            <tr><td>Cache key TTL</td><td>5 minutes (300 seconds)</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <p class="full-width">The system is healthy. DB is at 25% utilization with comfortable headroom.</p>
+
+      <div>
+        <h3>The Incident: One Node Dies</h3>
+        <p>At 14:23, Redis node #47 crashes due to a hardware failure. It held approximately 100,000 keys (1% of the total keyspace). Those keys are now gone. Via consistent hashing, requests for those keys are routed to the next node in the ring, which has none of them cached. Every request for those 100K keys is now a cache miss.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe-math">
+    <div class="container">
+      <h2>Back-of-Envelope: Why "1% More Misses" Is Misleading</h2>
+
+      <div>
+        <h3>The Naive Calculation (Wrong)</h3>
+        <pre class="line-numbers"><code class="language-text">1% of keys are uncached.
+If traffic is uniformly distributed:
+  Additional cache misses = 1% of 500,000 = 5,000/sec
+  New DB load = 5,000 (normal misses) + 5,000 (lost node) = 10,000/sec
+  DB capacity = 20,000/sec
+  DB utilization = 10,000 / 20,000 = 50%
+
+This seems fine. The DB has plenty of headroom.
+But this calculation is WRONG.</code></pre>
+      </div>
+
+      <div>
+        <h3>The Thundering Herd (What Actually Happens)</h3>
+        <p>The naive calculation assumes the 5,000 additional misses arrive smoothly, spread evenly across each second. In reality, they arrive in a <strong>burst</strong>.</p>
+
+        <h4>Why It Bursts</h4>
+        <p>Before the node died, all 100,000 keys were cached. Zero requests for those keys hit the DB. At the instant the node dies:</p>
+        <ul>
+          <li>Every app server that requests any of those 100K keys simultaneously discovers a cache miss.</li>
+          <li>There is no coordination between app servers &mdash; they all independently decide to fetch from the DB.</li>
+          <li>For a single popular key that's requested 200 times per second, all 200 requests hit the DB simultaneously in the first second.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h4>The Duplicate Query Problem</h4>
+        <pre class="line-numbers"><code class="language-text">Consider one hot key: "product:12345" (a popular product page)
+  Normal: served from cache, 200 requests/sec, 0 DB queries
+
+  Node dies at T=0:
+  T=0.000s: Request from App Server #1: cache miss → query DB
+  T=0.001s: Request from App Server #2: cache miss → query DB
+  T=0.002s: Request from App Server #3: cache miss → query DB
+  ...
+  T=0.005s: App Server #1's DB query returns. Writes result to cache.
+  T=0.005s+: Subsequent requests find the key in cache again.
+
+  In those 5 milliseconds: ~1 request arrived per millisecond = 1 DB query each.
+  Total DB queries for this ONE key in the first 5ms: ~5
+
+  That's not terrible for one key. But there are 100,000 keys.</code></pre>
+      </div>
+
+      <div>
+        <h4>The Aggregate Burst</h4>
+        <pre class="line-numbers"><code class="language-text">Key distribution follows Zipf's law (a few keys are very hot):
+  Top 1% of keys (1,000 keys): ~50% of traffic for those keys
+  Next 9% (9,000 keys): ~30% of traffic
+  Bottom 90% (90,000 keys): ~20% of traffic
+
+Traffic to lost keys: 500,000/sec * 1% = 5,000 req/sec
+  Hot keys (1,000): 2,500 req/sec for 1,000 keys
+    Average: 2.5 req/sec per key
+    But the hottest key might get 200 req/sec
+
+In the FIRST SECOND after the node dies:
+  - All 5,000 req/sec for lost keys are cache misses
+  - For each key, MULTIPLE requests hit the DB before any one
+    request can fetch the result and repopulate the cache
+  - A DB query takes ~5ms. In 5ms, a key requested 200/sec
+    gets 1 duplicate query.
+  - A key requested 50/sec gets ~0.25 duplicates (sometimes 1)
+
+Total DB queries in first second (estimated):
+  5,000 unique key misses + ~2,000-10,000 duplicate queries
+  = 7,000 - 15,000 queries in the first second
+
+In the FIRST 100ms (the real danger zone):
+  The burst is even more concentrated because all misses happen
+  at once, not spread across the second.
+  Peak instantaneous rate: potentially 20,000-50,000 queries/sec</code></pre>
+      </div>
+
+      <div>
+        <h4>The DB Perspective</h4>
+        <pre class="line-numbers"><code class="language-text">Steady state: 5,000 queries/sec, 25% utilization, 5ms avg latency
+
+Burst hits:
+  T=0s:     DB receives 20,000-50,000 queries/sec
+  T=0.01s:  Connection pools start filling
+  T=0.1s:   DB query latency rises from 5ms to 50ms (10x)
+            (disk I/O saturated, buffer cache thrashing)
+  T=0.5s:   Query latency at 200ms. Some queries timing out.
+  T=1s:     Timeouts cause retries. Retries add MORE load.
+            DB query latency: 500ms+
+  T=2s:     Connection pools on app servers exhausted.
+            New requests can't get a DB connection.
+            Even CACHED requests might fail if they need any DB call.
+  T=5s:     Cascading failure in progress.</code></pre>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.5rem; border-radius: 8px; margin: 1.5rem 0;">
+        <strong>The key insight:</strong> The thundering herd problem is not about the total number of additional cache misses. It's about the <strong>concurrency of identical queries</strong>. When 200 app servers all discover the same cache miss at the same moment, they all make the same DB query simultaneously. 200 identical queries return the same row, but each one consumes DB resources (CPU, I/O, connections).
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>The Naive Design: Cache-Aside with No Coordination</h2>
+
+      <div>
+        <h3>The Code</h3>
+        <pre class="line-numbers"><code class="language-python"># Standard cache-aside pattern — no thundering herd protection
+def get_product(product_id):
+    # Step 1: Check cache
+    cached = redis.get(f"product:{product_id}")
+    if cached:
+        return json.loads(cached)
+
+    # Step 2: Cache miss — query DB
+    product = db.query("SELECT * FROM products WHERE id = %s", product_id)
+
+    # Step 3: Write to cache for next time
+    redis.setex(f"product:{product_id}", 300, json.dumps(product))
+
+    return product</code></pre>
+        <p>This code is correct for a single request. The problem is what happens when 200 concurrent requests all execute Step 1 at the same time, all find a cache miss, and all proceed to Step 2 simultaneously. There is no coordination between them.</p>
+      </div>
+
+      <div>
+        <h3>The Wasted Work</h3>
+        <pre class="line-numbers"><code class="language-text">Timeline for one hot key ("product:12345"):
+
+App Server 1:  [cache miss] → [DB query.......] → [write cache] → done
+App Server 2:  [cache miss] → [DB query.......] → [write cache] → done
+App Server 3:  [cache miss] → [DB query.......] → [write cache] → done
+App Server 4:  [cache miss] → [DB query.......] → [write cache] → done
+...            ...
+App Server 50: [cache miss] → [DB query.......] → [write cache] → done
+
+All 50 queries return the SAME data. 49 of them were wasted.
+The cache is written 50 times with the same value. 49 writes were wasted.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Request Coalescing                               -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration1">
+    <div class="container">
+      <h2>Iteration 1: Request Coalescing (Single-Flight)</h2>
+      <p>The idea: when multiple requests need the same cache key at the same time, only <strong>one</strong> of them should query the database. The others should wait for that one query to complete, then share the result.</p>
+
+      <div>
+        <h3>How It Works</h3>
+        <pre class="line-numbers"><code class="language-text">Step-by-step for key "product:12345":
+
+T=0ms:  Request A arrives. Cache miss.
+        A checks the in-flight map: is anyone fetching "product:12345"?
+        No. A registers itself as the fetcher. Starts DB query.
+
+T=1ms:  Request B arrives. Cache miss.
+        B checks in-flight map: yes, A is fetching "product:12345".
+        B subscribes to A's result. Does NOT query DB. Waits.
+
+T=2ms:  Request C arrives. Same story. Subscribes to A's result.
+
+T=3ms:  Requests D, E arrive. Subscribe to A's result.
+
+T=5ms:  A's DB query returns the product data.
+        A writes result to cache.
+        A broadcasts the result to B, C, D, E.
+        All five requests return simultaneously.
+
+DB queries made: 1 (instead of 5)
+Total time for all requests: 5ms (instead of 5 queries x 5ms each)</code></pre>
+      </div>
+
+      <div>
+        <h3>Implementation</h3>
+        <pre class="line-numbers"><code class="language-python">import threading
+import time
+
+class SingleFlight:
+    """Ensures only one in-flight request per key."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.in_flight = {}  # key -> Event + result
+
+    def do(self, key, fetch_fn):
+        """
+        If no one is fetching `key`, call fetch_fn() and share the result.
+        If someone is already fetching `key`, wait for their result.
+        """
+        with self.lock:
+            if key in self.in_flight:
+                # Someone else is already fetching this key
+                entry = self.in_flight[key]
+            else:
+                # We're the first — register ourselves
+                entry = {"event": threading.Event(), "result": None, "error": None}
+                self.in_flight[key] = entry
+                # Release lock, then fetch
+                # (we must release the lock before the slow DB call)
+
+        if entry["event"].is_set() or key not in self.in_flight:
+            # Result already available (race condition edge case)
+            entry["event"].wait()
+            if entry["error"]:
+                raise entry["error"]
+            return entry["result"]
+
+        # Check if WE are the fetcher (we created the entry)
+        is_fetcher = False
+        with self.lock:
+            if self.in_flight.get(key) is entry and not entry["event"].is_set():
+                is_fetcher = True
+
+        if is_fetcher:
+            try:
+                result = fetch_fn()
+                entry["result"] = result
+            except Exception as e:
+                entry["error"] = e
+            finally:
+                entry["event"].set()  # Wake up all waiters
+                with self.lock:
+                    del self.in_flight[key]
+
+            if entry["error"]:
+                raise entry["error"]
+            return entry["result"]
+        else:
+            # We're a waiter
+            entry["event"].wait(timeout=5.0)
+            if entry["error"]:
+                raise entry["error"]
+            return entry["result"]
+
+
+# Usage
+flight = SingleFlight()
+
+def get_product(product_id):
+    # Check cache first
+    cached = redis.get(f"product:{product_id}")
+    if cached:
+        return json.loads(cached)
+
+    # Cache miss — use single-flight to coalesce DB queries
+    def fetch_from_db():
+        product = db.query("SELECT * FROM products WHERE id = %s", product_id)
+        redis.setex(f"product:{product_id}", 300, json.dumps(product))
+        return product
+
+    return flight.do(f"product:{product_id}", fetch_from_db)</code></pre>
+      </div>
+
+      <div>
+        <h3>Impact</h3>
+        <pre class="line-numbers"><code class="language-text">Without coalescing:
+  100,000 lost keys
+  Each key: average 1-5 duplicate DB queries in first second
+  Total DB queries: 5,000 + 5,000-25,000 duplicates = 10,000-30,000/sec
+  DB is overwhelmed (capacity: 20,000/sec)
+
+With coalescing (per app server):
+  Each app server only sends 1 query per key
+  50 app servers × 1 query per key = 50 queries per key
+  Wait — coalescing is PER APP SERVER, not global!
+
+  A hot key requested 200/sec across 50 servers = 4 req/sec/server
+  Each server coalesces to 1 query per 5ms window = ~1 query
+  50 servers × 1 query = 50 DB queries per key (not 200)
+
+  Still a 4x reduction, but not as dramatic as it first seems.
+
+  For ALL 100K keys in the first second:
+    Without: ~30,000 DB queries/sec (burst)
+    With per-server coalescing: ~7,000-10,000 DB queries/sec
+
+  10,000/sec is within DB capacity (20,000/sec). Situation is stable!</code></pre>
+      </div>
+
+      <div>
+        <h3>Limitation: Per-Server vs Global Coalescing</h3>
+        <p>The implementation above runs on each app server independently. If you have 50 app servers, a popular key still gets 50 DB queries (one per server). For truly global coalescing, you need a centralized mechanism:</p>
+
+        <pre class="line-numbers"><code class="language-python"># Global coalescing using Redis as a distributed lock
+def get_product_global_coalesce(product_id):
+    key = f"product:{product_id}"
+    lock_key = f"lock:{key}"
+
+    # Check cache
+    cached = redis.get(key)
+    if cached:
+        return json.loads(cached)
+
+    # Try to acquire the fetch lock
+    acquired = redis.set(lock_key, "1", nx=True, ex=5)  # NX = only if not exists
+
+    if acquired:
+        # We won the lock — we fetch from DB
+        try:
+            product = db.query("SELECT * FROM products WHERE id = %s", product_id)
+            redis.setex(key, 300, json.dumps(product))
+            return product
+        finally:
+            redis.delete(lock_key)
+    else:
+        # Someone else is fetching — poll the cache
+        for _ in range(50):  # Try for 500ms
+            time.sleep(0.01)  # 10ms
+            cached = redis.get(key)
+            if cached:
+                return json.loads(cached)
+
+        # Timeout — fetch from DB ourselves (fallback)
+        product = db.query("SELECT * FROM products WHERE id = %s", product_id)
+        redis.setex(key, 300, json.dumps(product))
+        return product</code></pre>
+
+        <p>With global coalescing, each key generates exactly <strong>1 DB query</strong> regardless of how many servers need it. 100,000 unique keys = 100,000 DB queries total over the warm-up period, instead of millions.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Probabilistic Early Expiration                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration2">
+    <div class="container">
+      <h2>Iteration 2: Probabilistic Early Expiration</h2>
+      <p>Request coalescing handles the burst after a node failure. But there's another thundering herd scenario: <strong>mass TTL expiration</strong>. If many keys were written at the same time, they all expire at the same time, causing a synchronized stampede.</p>
+
+      <div>
+        <h3>The Problem: Synchronized Expiry</h3>
+        <pre class="line-numbers"><code class="language-text">Suppose a cache warm-up job runs at midnight, writing 1M keys with TTL=300s.
+All 1M keys expire at 12:05:00 AM simultaneously.
+At 12:05:00, every request for those keys is a cache miss.
+
+This is the same thundering herd problem as a node failure,
+except it's 10x worse (1M keys instead of 100K).</code></pre>
+      </div>
+
+      <div>
+        <h3>Solution: Jittered TTLs</h3>
+        <p>Add randomness to the TTL so keys expire at different times:</p>
+        <pre class="line-numbers"><code class="language-python">import random
+
+def cache_set_with_jitter(key, value, base_ttl=300):
+    """
+    Instead of all keys expiring at exactly base_ttl seconds,
+    spread expirations over a range.
+
+    base_ttl = 300s
+    jitter range: 0.8 to 1.2 (±20%)
+    actual TTL: between 240s and 360s
+    """
+    jitter = 0.8 + random.random() * 0.4  # 0.8 to 1.2
+    actual_ttl = int(base_ttl * jitter)
+    redis.setex(key, actual_ttl, json.dumps(value))</code></pre>
+
+        <pre class="line-numbers"><code class="language-text">Without jitter:
+  1M keys expire at T=300s: all 1M keys miss simultaneously
+  DB spike: 1M queries in the first few seconds
+
+With ±20% jitter:
+  Keys expire between T=240s and T=360s
+  Spread over 120 seconds
+  Rate: 1M / 120s ≈ 8,333 misses/sec (smooth, manageable)</code></pre>
+      </div>
+
+      <div>
+        <h3>Probabilistic Early Recomputation (XFetch)</h3>
+        <p>An even smarter approach: instead of waiting for the key to expire and then having a thundering herd, proactively refresh it <em>before</em> it expires. The trick: not every request refreshes early &mdash; only a probabilistic subset.</p>
+
+        <pre class="line-numbers"><code class="language-python">import math
+import random
+import time
+
+def xfetch_get(key, fetch_fn, base_ttl=300, beta=1.0):
+    """
+    XFetch: Probabilistic early recomputation.
+
+    As the key approaches its TTL, an increasing probability of
+    requests will trigger a background refresh BEFORE expiry.
+    This ensures the key is always warm.
+
+    beta controls aggressiveness: higher = refresh earlier.
+    """
+    cached = redis.get(key)
+    if cached is None:
+        # True cache miss — must fetch
+        value, compute_time = _timed_fetch(fetch_fn)
+        expiry = time.time() + base_ttl
+        redis.setex(key, base_ttl, json.dumps({
+            "value": value,
+            "expiry": expiry,
+            "compute_time": compute_time
+        }))
+        return value
+
+    entry = json.loads(cached)
+    ttl_remaining = entry["expiry"] - time.time()
+    compute_time = entry["compute_time"]
+
+    # The XFetch formula:
+    # Recompute if: current_time - (compute_time * beta * ln(random())) >= expiry
+    # Equivalent: refresh if ttl_remaining < compute_time * beta * ln(1/random())
+    should_refresh = ttl_remaining < compute_time * beta * math.log(1 / random.random())
+
+    if should_refresh:
+        # Refresh in background (don't block this request)
+        threading.Thread(target=_background_refresh,
+                        args=(key, fetch_fn, base_ttl)).start()
+
+    return entry["value"]
+
+def _timed_fetch(fetch_fn):
+    start = time.time()
+    result = fetch_fn()
+    compute_time = time.time() - start
+    return result, compute_time
+
+def _background_refresh(key, fetch_fn, base_ttl):
+    value, compute_time = _timed_fetch(fetch_fn)
+    expiry = time.time() + base_ttl
+    redis.setex(key, base_ttl, json.dumps({
+        "value": value,
+        "expiry": expiry,
+        "compute_time": compute_time
+    }))</code></pre>
+      </div>
+
+      <div>
+        <h3>How XFetch Works Intuitively</h3>
+        <pre class="line-numbers"><code class="language-text">Key with TTL=300s, compute_time=5ms:
+
+TTL remaining  | Probability of refresh per request
+300s           | ~0.000%  (key was just written, no need to refresh)
+200s           | ~0.000%  (still plenty of time)
+100s           | ~0.001%  (very unlikely)
+ 10s           | ~0.05%   (slight chance)
+  1s           | ~0.5%    (some requests will trigger refresh)
+  0.1s         | ~5%      (likely refreshed by now)
+
+With 500 requests/sec for this key:
+  At 1s remaining: 500 * 0.005 = ~2.5 requests trigger refresh/sec
+  One of them succeeds (single-flight prevents duplicates)
+  Key is refreshed BEFORE it expires
+
+Result: zero cache misses, zero thundering herd for TTL expiry</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Circuit Breaker on DB                            -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration3">
+    <div class="container">
+      <h2>Iteration 3: Circuit Breaker on the Database</h2>
+      <p>Even with coalescing and jittered TTLs, an unexpected surge might overwhelm the database. The last line of defense: a circuit breaker that protects the DB by stopping queries when it's overloaded.</p>
+
+      <div>
+        <h3>Why Protect the Database?</h3>
+        <pre class="line-numbers"><code class="language-text">When the DB is at 90% capacity:
+  Query latency: ~50ms (10x normal)
+  Adding more queries pushes it to 100%
+  At 100%: latency spikes to 500ms+
+  At 110% (more queries than it can handle):
+    Connection pool exhausts → queries queue → timeouts → retries → more load
+    This is the death spiral.
+
+The circuit breaker breaks the cycle:
+  DB latency > 50ms (2x normal)? → Trip the breaker.
+  Stop sending new queries. Return degraded results.
+  DB load drops. DB recovers. Breaker half-opens. Test. Resume.</code></pre>
+      </div>
+
+      <div>
+        <h3>What to Return When the DB Breaker Is Open</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Strategy</th><th>How It Works</th><th>Trade-off</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Stale cache data</td><td>Keep expired cache entries in a "stale" tier. Serve them when DB is unavailable.</td><td>Data might be minutes/hours old</td></tr>
+              <tr><td>Default values</td><td>Return a pre-defined default (e.g., "product not found" or generic product info)</td><td>Bad user experience</td></tr>
+              <tr><td>Secondary data store</td><td>Read from a less-fresh but always-available store (e.g., a search index)</td><td>Eventual consistency</td></tr>
+              <tr><td>Graceful error</td><td>"This page is temporarily unavailable. Try again in a few seconds."</td><td>Honest but not ideal</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Stale-While-Revalidate Pattern</h3>
+        <pre class="line-numbers"><code class="language-python">def get_product_with_stale_fallback(product_id):
+    key = f"product:{product_id}"
+    stale_key = f"stale:{key}"
+
+    # Check fresh cache
+    cached = redis.get(key)
+    if cached:
+        return json.loads(cached), "fresh"
+
+    # Cache miss — check if DB breaker allows queries
+    if not db_breaker.allow_request():
+        # DB is overloaded — serve stale data if available
+        stale = redis.get(stale_key)
+        if stale:
+            return json.loads(stale), "stale"
+        return None, "unavailable"
+
+    # Fetch from DB (with single-flight coalescing)
+    try:
+        product = flight.do(key, lambda: db.query(
+            "SELECT * FROM products WHERE id = %s", product_id
+        ))
+
+        # Write to fresh cache (5 min TTL)
+        redis.setex(key, 300, json.dumps(product))
+        # Write to stale cache (24 hour TTL — backup for emergencies)
+        redis.setex(stale_key, 86400, json.dumps(product))
+
+        db_breaker.record_success()
+        return product, "fresh"
+    except Exception as e:
+        db_breaker.record_failure()
+
+        # Fallback to stale
+        stale = redis.get(stale_key)
+        if stale:
+            return json.loads(stale), "stale"
+        return None, "error"</code></pre>
+
+        <p>The stale cache uses a much longer TTL (24 hours vs 5 minutes). Under normal operation, the fresh cache handles everything. When the DB is under stress, stale data keeps the site functional. Users see slightly outdated product info (which is better than a broken page).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Warm-Up Math                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="warmup">
+    <div class="container">
+      <h2>Cache Warm-Up: How Long Until Normal?</h2>
+      <p>After the node dies, a new node takes its place (or the keys are redistributed to other nodes). How long until all 100K keys are back in cache?</p>
+
+      <div>
+        <h3>Passive Warm-Up (Wait for Requests)</h3>
+        <pre class="line-numbers"><code class="language-text">Traffic to lost keys: 5,000 unique-key requests/sec
+  (5,000 req/sec for 100K keys, but many are duplicates)
+
+Unique keys populated per second:
+  Depends on request distribution (Zipf's law).
+
+  First second: the hottest ~2,000 keys are requested and cached.
+  By 10 seconds: ~10,000 keys cached (the popular ones).
+  By 60 seconds: ~30,000 keys cached.
+  By 200 seconds: ~80,000 keys cached.
+  The long tail (rarely accessed keys): might take 10+ minutes.
+
+  Practical impact:
+    - After 10 seconds: 90% of TRAFFIC is served from cache
+      (because hot keys are cached first, and they handle most traffic)
+    - After 60 seconds: 99% of traffic from cache
+    - Full warm-up: 3-5 minutes for all keys</code></pre>
+      </div>
+
+      <div>
+        <h3>Active Warm-Up (Pre-Load Keys)</h3>
+        <pre class="line-numbers"><code class="language-python"># If you maintain a list of hot keys, pre-load them into the new node
+def warm_up_cache(lost_keys, batch_size=100):
+    """
+    Pre-fetch hot keys from the DB and load them into cache.
+    Do this in batches to avoid overwhelming the DB.
+    """
+    for i in range(0, len(lost_keys), batch_size):
+        batch = lost_keys[i:i + batch_size]
+
+        # Batch query: fetch 100 products at once (1 DB query, not 100)
+        products = db.query(
+            "SELECT * FROM products WHERE id IN %s",
+            tuple(batch)
+        )
+
+        # Write all to cache
+        pipeline = redis.pipeline()
+        for product in products:
+            key = f"product:{product['id']}"
+            pipeline.setex(key, 300, json.dumps(product))
+        pipeline.execute()
+
+        # Rate limit: don't overwhelm the DB
+        time.sleep(0.01)  # 10ms between batches
+
+# 100K keys / 100 per batch = 1,000 batches
+# 1,000 batches * 10ms = 10 seconds to warm up
+# DB queries: 1,000 batch queries (very manageable)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design: All Mitigations Combined</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 720 520" style="width:100%;max-width:720px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" fill="#64748b">
+              <path d="M 0 0 L 10 5 L 0 10 z"/>
+            </marker>
+            <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" fill="#16a34a">
+              <path d="M 0 0 L 10 5 L 0 10 z"/>
+            </marker>
+            <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" fill="#ef4444">
+              <path d="M 0 0 L 10 5 L 0 10 z"/>
+            </marker>
+          </defs>
+
+          <!-- Request arrives -->
+          <text x="360" y="18" text-anchor="middle" font-weight="bold" fill="#334155" font-size="14">Request arrives for key "product:12345"</text>
+          <line x1="360" y1="24" x2="360" y2="44" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+
+          <!-- Check fresh cache -->
+          <rect x="260" y="46" width="200" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="69" text-anchor="middle" font-weight="bold" fill="#2563eb">Check Fresh Cache</text>
+
+          <!-- Hit branch (right) -->
+          <line x1="460" y1="64" x2="560" y2="64" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+          <text x="500" y="58" text-anchor="middle" fill="#16a34a" font-weight="bold" font-size="12">HIT</text>
+          <rect x="562" y="48" width="140" height="32" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+          <text x="632" y="69" text-anchor="middle" fill="#16a34a" font-size="12">Return (99%)</text>
+
+          <!-- Miss branch (down) -->
+          <line x1="360" y1="82" x2="360" y2="112" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-red)"/>
+          <text x="380" y="102" fill="#ef4444" font-weight="bold" font-size="12">MISS</text>
+
+          <!-- Single-flight check -->
+          <rect x="220" y="114" width="280" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="137" text-anchor="middle" font-weight="bold" fill="#2563eb">Single-Flight: already fetching?</text>
+
+          <!-- Yes branch (left) -->
+          <line x1="220" y1="132" x2="120" y2="132" stroke="#64748b" stroke-width="1.5"/>
+          <line x1="120" y1="132" x2="120" y2="172" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+          <text x="170" y="127" text-anchor="middle" fill="#64748b" font-weight="bold" font-size="12">YES</text>
+          <rect x="40" y="174" width="160" height="36" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="120" y="197" text-anchor="middle" fill="#334155">Wait for result</text>
+          <!-- Wait leads to return -->
+          <line x1="120" y1="210" x2="120" y2="480" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4"/>
+          <line x1="120" y1="480" x2="250" y2="480" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+
+          <!-- No branch (down) -->
+          <line x1="360" y1="150" x2="360" y2="190" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+          <text x="380" y="175" fill="#64748b" font-weight="bold" font-size="12">NO</text>
+
+          <!-- Check circuit breaker -->
+          <rect x="240" y="192" width="240" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="215" text-anchor="middle" font-weight="bold" fill="#2563eb">Check DB Circuit Breaker</text>
+
+          <!-- Open branch (left) -->
+          <line x1="240" y1="210" x2="160" y2="210" stroke="#ef4444" stroke-width="1.5"/>
+          <line x1="160" y1="210" x2="160" y2="260" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-red)"/>
+          <text x="200" y="248" text-anchor="middle" fill="#ef4444" font-weight="bold" font-size="12">OPEN</text>
+
+          <!-- Serve stale -->
+          <rect x="80" y="262" width="160" height="36" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="160" y="285" text-anchor="middle" fill="#334155">Serve stale data</text>
+          <!-- Stale leads to return -->
+          <line x1="160" y1="298" x2="160" y2="460" stroke="#64748b" stroke-width="1.5"/>
+          <line x1="160" y1="460" x2="250" y2="460" stroke="#64748b" stroke-width="1.5"/>
+
+          <!-- Closed branch (down) -->
+          <line x1="360" y1="228" x2="360" y2="268" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+          <text x="395" y="254" fill="#16a34a" font-weight="bold" font-size="12">CLOSED</text>
+
+          <!-- Query DB -->
+          <rect x="280" y="270" width="160" height="36" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="360" y="293" text-anchor="middle" font-weight="bold" fill="#334155">Query DB</text>
+
+          <!-- Success path -->
+          <line x1="360" y1="306" x2="360" y2="346" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+
+          <!-- Write caches -->
+          <rect x="230" y="348" width="260" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="370" text-anchor="middle" fill="#2563eb" font-size="12">Write to fresh cache (TTL 5 min)</text>
+          <text x="360" y="388" text-anchor="middle" fill="#2563eb" font-size="12">Write to stale cache (TTL 24 hr)</text>
+
+          <!-- Update breaker -->
+          <line x1="360" y1="398" x2="360" y2="428" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+          <rect x="250" y="430" width="220" height="32" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="360" y="451" text-anchor="middle" fill="#64748b" font-size="12">Update breaker state</text>
+
+          <!-- Return result -->
+          <line x1="360" y1="462" x2="360" y2="482" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-flow)"/>
+          <rect x="252" y="484" width="216" height="32" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="360" y="505" text-anchor="middle" font-weight="bold" fill="#16a34a">Return result</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>With Mitigations</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Phase</th><th>Duration</th><th>DB Load</th><th>User Experience</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Normal operation</td><td>Indefinite</td><td>5,000/sec (25%)</td><td>Full speed, all data fresh</td></tr>
+              <tr><td>Node failure (first 1s)</td><td>1 second</td><td>7,000-10,000/sec (with coalescing)</td><td>~1% of requests slightly slower (~10ms extra)</td></tr>
+              <tr><td>Warm-up period</td><td>10-60 seconds</td><td>6,000-8,000/sec (declining)</td><td>~0.5% of requests slightly slower</td></tr>
+              <tr><td>Fully recovered</td><td>After ~60s</td><td>5,000/sec (25%)</td><td>Full speed, all data fresh</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Without Mitigations (Naive)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Phase</th><th>Duration</th><th>DB Load</th><th>User Experience</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Node failure (first 1s)</td><td>1 second</td><td>20,000-50,000/sec (burst)</td><td>DB overwhelmed, errors begin</td></tr>
+              <tr><td>Cascade</td><td>2-10 seconds</td><td>DB at 100%+, connections exhausted</td><td>Widespread 503 errors</td></tr>
+              <tr><td>Full outage</td><td>5-30 minutes</td><td>DB unresponsive</td><td>Site down</td></tr>
+              <tr><td>Recovery</td><td>Additional 10-30 min</td><td>Slowly recovering</td><td>Intermittent errors</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <div class="card full-width" style="padding: 2rem;">
+        <ol style="line-height: 2;">
+          <li><strong>The thundering herd is a concurrency problem, not a volume problem.</strong> 5,000 extra cache misses per second sounds manageable. But when those misses all happen simultaneously and generate duplicate DB queries, the burst can be 5-10x the steady-state rate.</li>
+          <li><strong>Request coalescing is the most impactful mitigation.</strong> Ensuring only one DB query per key per cache miss eliminates the duplicate query problem. Per-server coalescing is simple to implement; global coalescing (via distributed locks) is more effective but more complex.</li>
+          <li><strong>Jittered TTLs prevent synchronized expiry.</strong> Add randomness to cache TTLs so keys don't all expire at the same instant. A 20% jitter window spreads the load over time.</li>
+          <li><strong>XFetch (probabilistic early refresh) eliminates TTL-based stampedes entirely.</strong> By refreshing keys before they expire, you avoid cache misses for popular keys altogether.</li>
+          <li><strong>Stale-while-revalidate is your safety net.</strong> Keep a backup copy of cached data with a long TTL. When the DB is overloaded, serve stale data instead of adding more load. Stale data is better than no data.</li>
+          <li><strong>Circuit-break the database.</strong> The DB is a shared resource. When it's under stress, stop sending it more queries. Protect it so it can recover.</li>
+          <li><strong>Warm-up time follows Zipf's law.</strong> The hottest 10% of keys handle 90% of traffic. After a node failure, the most impactful keys are re-cached within seconds. Full warm-up takes minutes, but user impact is minimal after the first few seconds.</li>
+          <li><strong>The best time to add thundering herd protection is before you need it.</strong> By the time you're in a 3 AM incident, it's too late to add coalescing. Build these patterns into your cache-aside implementation from day one.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>Cache eviction algorithms, write-through vs write-behind, and cache invalidation strategies.</p>
+        </a>
+        <a href="../circuit-breakers.html" class="card topic-card">
+          <h3>Circuit Breakers</h3>
+          <p>The circuit breaker state machine, failure counting, and adaptive thresholds for protecting downstream services.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>How keys are distributed across cache nodes, virtual nodes, and what happens when a node is added or removed.</p>
+        </a>
+        <a href="../load-balancing.html" class="card topic-card">
+          <h3>Load Balancing</h3>
+          <p>Distributing traffic across cache nodes and handling node failures gracefully.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

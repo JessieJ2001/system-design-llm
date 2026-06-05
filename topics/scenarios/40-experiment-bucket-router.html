@@ -1,0 +1,1346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Designing an Edge Backend Picker &amp; Experiment Bucket Router &mdash; System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    svg text { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    svg .lbl { font-size: 11px; fill: #334155; }
+    svg .box { fill: #f1f5f9; stroke: #2563eb; stroke-width: 1.5; }
+    svg .accent { fill: #fef3c7; stroke: #d97706; stroke-width: 1.5; }
+    svg .danger { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.5; }
+    svg .ok { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+    svg .cool { fill: #e0f2fe; stroke: #0891b2; stroke-width: 1.5; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="../leetcode.md">LeetCode coverage</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Designing an Edge Backend Picker &amp; Experiment Bucket Router</h1>
+      <p class="hero-subtitle">An in-process routing primitive in every edge-router pod at 2&nbsp;M RPS: for each request, pick a healthy backend from a constantly-mutating 5&nbsp;k-member pool (200 churns/sec from rolling deploys) <em>and</em> deterministically assign the user to an A/B variant from ~200 live experiments &mdash; routing decision p99 &le; 100&nbsp;&micro;s, fleet-wide config convergence &le; 1&nbsp;s, a control-plane outage must never stop routing. We start from the LC #380 array-plus-hashmap with uniform <code>GetRandom</code> &mdash; which connection-saturates the backends, ignores load, and corrupts experiments on every edit &mdash; and iterate to deterministic per-pod subsetting, weighted power-of-two-choices with outlier ejection, layered salted mutex-aware bucketing, and a versioned-delta config plane with staged activation and a last-known-good fallback.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~40 min read &bull; LC #380 (Insert / Delete / GetRandom O(1))</p>
+    </div>
+  </section>
+
+  <!-- LC kernel banner -->
+  <section class="section dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>LC kernel.</strong> Insert / Delete / GetRandom O(1) (LC #380). Textbook structure: an <em>array</em> of items + a <em>hashmap</em> item&rarr;index. Insert: append to the array, record the index. Delete: swap the item with the array's last element, pop, fix the moved element's index in the map. GetRandom: <code>array[rand() % len]</code>. All three O(1); GetRandom is uniform over the current set. <strong>Five properties that break in a production router:</strong> (1) <em>uniform isn't load-aware</em> &mdash; a cold-cache just-deployed backend, or one in a busy zone, gets the same share as a warm idle one &rarr; tail latency and cascading overload; (2) <em>items aren't weightless</em> &mdash; backends advertise capacity, variants have allocation weights; (3) <em>items have health state</em> &mdash; a failing backend must be temporarily <em>ejected</em> and probed back, not just deleted; (4) <em>the set isn't the whole pool</em> &mdash; if every router pod routes to every backend, each backend pays connection cost proportional to the <em>entire router fleet</em>; production needs each pod to use a bounded <em>subset</em>; (5) <em>&ldquo;random&rdquo; for A/B can't be <code>rand()</code></em> &mdash; an A/B assignment must be a deterministic, sticky-per-user, salted, layered function so the same user gets the same variant on every pod for the life of the experiment, and editing one experiment doesn't re-roll everyone. The C8 production cousin: a <em>deterministic balanced subset</em> per pod, picked by <em>weighted power-of-two-choices with outlier ejection</em>, and a parallel <em>experiment</em> instance whose &ldquo;GetRandom&rdquo; is <code>hash(user ‖ experiment ‖ salt)</code> mapped through layered mutex-group ranges.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S0. Scenario & Requirements                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s0-scenario">
+    <div class="container">
+      <h2>S0. Scenario &amp; Requirements</h2>
+      <p>Every edge-router pod &mdash; the L7 proxy that terminates TLS and forwards to the right backend &mdash; embeds a small library that answers two questions per request, in-process, in microseconds: <strong>which backend?</strong> (pick a healthy member of the target service's pool, load-aware) and <strong>which experiment variant?</strong> (deterministically bucket this user into A/B variants of the live experiments). The backend pools mutate constantly (rolling deploys churn ~200 backends/sec); the experiment set changes when product teams edit experiments; both must converge across the whole router fleet within ~1&nbsp;second, and a control-plane outage must leave routing fully functional on the last-known config. This is the routing <em>primitive</em>, not the proxy &mdash; TLS, HTTP parsing, the health-check mechanism itself, and the service-discovery source-of-truth are upstream of us; the experiment <em>analysis</em> pipeline is downstream. The tension: the picker must be O(1)-cheap and lock-free on the hot path, yet load-aware, ejection-aware, connection-bounded, and &mdash; for A/B &mdash; bit-for-bit deterministic across the fleet.</p>
+
+      <div class="full-width">
+        <h3>System class</h3>
+        <p><strong>Class:</strong> infra primitive &mdash; an embedded library + a thin control plane &mdash; see <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>. The FR vocabulary is <em>operations + semantics</em> (what calls it exposes and what guarantees they make), not user-facing capabilities; the load-bearing NFRs are per-call latency, the connection bound it imposes on its dependencies, and config-convergence consistency.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Functional requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <ul>
+          <li><strong><code>pick_backend(pool_id, ctx) &rarr; {backend, attempt_token}</code></strong> &mdash; choose a backend from the pool's currently-healthy, non-ejected members; modes per pool: uniform, capacity-weighted, load-aware (power-of-two-choices), or sticky (hash a session key). Returns a token the caller uses to report the outcome.</li>
+          <li><strong><code>report_outcome(attempt_token, ok | conn_refused | timeout | 5xx)</code></strong> &mdash; feeds the local in-flight-count estimate and the outlier-ejection counter for that backend.</li>
+          <li><strong><code>assign_bucket(user_id, experiment_id) &rarr; variant | not_in_experiment</code></strong> &mdash; deterministically assign a user to a variant; same user &rarr; same variant for the life of the experiment (until re-salted); respect mutual-exclusion groups (a user is in at most one experiment per group).</li>
+          <li><strong><code>eject(backend)</code> / probe-back loop</strong> &mdash; outlier ejection: a backend that accumulates consecutive failures is removed from rotation with exponential backoff; a probe loop returns it when healthy.</li>
+          <li><strong><code>update_pool</code> / <code>update_experiments</code></strong> &mdash; the control plane pushes the current pool membership (with weights, zones) and the experiment config; pods reconcile to the latest version within ~1&nbsp;s.</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> the L7 proxy's TLS / HTTP parsing / connection pooling beyond the subset choice; the health-check <em>mechanism</em> (we consume a health signal); the service-discovery <em>source of truth</em> (we consume its feed); the experiment <em>analysis</em> / stats pipeline (downstream of &ldquo;which variant did this request get&rdquo;); cross-region routing (&ldquo;route to the nearest healthy region&rdquo; is a higher layer &mdash; GeoDNS / anycast); per-request authn/authz.</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) &ldquo;consistency within 1&nbsp;s&rdquo; is <em>eventual</em> &mdash; brief windows where pods disagree on the pool are fine (a request to a just-removed backend gets a fast retry); (2) backends advertise a stable capacity weight and a zone; (3) a session key (for sticky pools) is cheaply extractable from the request; (4) the experiment config is small (~200 experiments &times; ~10 fields &asymp; tens of KB); (5) the platform spans ~10 regions, ~70 router pods per region &rarr; ~700 router pods globally, and a backend pool may be regional <em>or</em> global &mdash; a global pool sees connections from all ~700 pods, which is the structural pressure.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Non-functional requirements (cite <a href="../canonicals/nfr-checklist.html">nfr-checklist.html</a>)</h3>
+        <p>The general checklist plus the infra-primitive additions (per-call latency budget, the resource bound it imposes on dependencies, config-distribution consistency, fail-static behaviour) were walked; the five that bind:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>NFR</th><th>Target</th><th>Where it bites</th></tr></thead>
+            <tbody>
+              <tr><td>Routing-decision latency</td><td>p99 &le; 100&nbsp;&micro;s for <code>pick_backend</code>; p99 &le; 20&nbsp;&micro;s for <code>assign_bucket</code> &mdash; in-process, per request</td><td>the data structure: O(1)-ish, no locks on the hot path, cache-friendly; called 2&nbsp;M&times;/sec</td></tr>
+              <tr><td>Connection bound on backends</td><td>each backend sees &le; C connections (target C &asymp; 64&ndash;128) <em>independent of the router-fleet size</em></td><td>the subset-selection algorithm &mdash; naive &ldquo;every pod &rarr; every backend&rdquo; gives connections-per-backend = N (the fleet size), which grows without bound; this is the dominant structural constraint</td></tr>
+              <tr><td>Config freshness / consistency</td><td>a pod's view of {pool members, weights, ejections, experiments} converges &le; 1&nbsp;s after a control-plane change; eventual, not atomic</td><td>the push path + per-pod apply; 200 churns/sec fanned to ~700 pods</td></tr>
+              <tr><td>A/B determinism</td><td><code>assign_bucket(u, e)</code> is a pure function of <code>(u, e, salt, weights)</code> &mdash; same answer on every pod, every request, for the life of the experiment</td><td>the bucketing hash; salt-versioning; staged activation so the fleet flips variant splits atomically</td></tr>
+              <tr><td>Availability / fail-static</td><td>a control-plane outage must NOT stop routing &mdash; pods keep using their last-known config indefinitely; ejection is local and fail-safe</td><td>the degradation contract; the local cache; the probe-back loop</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Out-of-scope NFRs (named):</strong> multi-region routing (each region runs its own router fleet + control plane); strong consistency on the pool (a removed backend lingering &lt; 1&nbsp;s is fine &mdash; the retry handles it); durability of the picker's in-memory state (it's a pure function of the synced config + local outcomes &mdash; rebuilt on restart from the config fetch).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Constraints (numbers we will use)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Constraint</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>Request rate</td><td>2&nbsp;M RPS per region; ~70 router pods/region; ~10 regions &rarr; ~700 router pods globally</td></tr>
+              <tr><td>Backend pool</td><td>up to 5&nbsp;k backends per pool; churn ~200/sec (rolling deploys) &rarr; ~4%/sec, a full turnover every ~25&nbsp;s during a deploy</td></tr>
+              <tr><td>Experiments</td><td>~200 active experiments; ~2&nbsp;k variant slots total; ~tens of edits/day; config size ~tens of KB</td></tr>
+              <tr><td>Latency budget</td><td><code>pick_backend</code> p99 &le; 100&nbsp;&micro;s; <code>assign_bucket</code> p99 &le; 20&nbsp;&micro;s</td></tr>
+              <tr><td>Consistency</td><td>config convergence &le; 1&nbsp;s fleet-wide; eventual</td></tr>
+              <tr><td>Backend connection target</td><td>C &asymp; 64&ndash;128 connections/backend from the router tier (HTTP/2 multiplexed, ~1 conn per pod&ndash;backend pair)</td></tr>
+              <tr><td>Router pod</td><td>c7g.2xlarge-class: 8 vCPU, 16&nbsp;GB, ~$0.29/hr (cite <a href="../design-moves/pricing-constants.html#compute">pricing-constants#compute</a>) &mdash; but the picker is &lt; 1% of this pod's CPU; the pod exists for TLS + L7</td></tr>
+              <tr><td>Control-plane node</td><td>m6i.xlarge-class config store (~$0.19/hr) + c7g.xlarge fan-out nodes (~$0.145/hr)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Sister scenarios</h3>
+        <ul>
+          <li><code>08-l4-vs-l7-lb.html</code> &mdash; the load balancer this primitive lives inside; that page is about L4 vs L7 and connection handling, this one is about the <em>pick</em> and the <em>bucket</em>.</li>
+          <li><code>20-distributed-rate-limiter.html</code> &mdash; another per-request edge primitive; rate-limiting is admission, this is selection + assignment. Shares the &ldquo;cheap, lock-free, fail-static&rdquo; design discipline.</li>
+          <li><code>17-distributed-hash-table.html</code> / <code>18-hotspot-hashing.html</code> &mdash; the consistent-hashing / Maglev machinery the sticky-session probe builds on.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The fundamental tension:</strong> the picker must be O(1)-cheap and lock-free per request &mdash; yet the dumb O(1) answer (uniform random over the whole pool) <em>imposes</em> a connection bill on every backend proportional to the entire router fleet, ignores load, and (on the A/B side) corrupts an experiment the moment anyone edits it. Every iteration buys back one of those properties &mdash; bounded connections, load-awareness, sticky deterministic bucketing, fail-static config &mdash; without spending the microsecond budget or the lock-free invariant.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S1. Core Entities                                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s1-entities">
+    <div class="container">
+      <h2>S1. Core Entities (cite <a href="../canonicals/entities-and-data.html">entities-and-data.html</a>)</h2>
+      <p>The nouns this primitive traffics in. Minimum shape only; full schemas land where each store is introduced (C9-bis); S6 has a consolidated reference.</p>
+      <div class="table-responsive full-width">
+        <table>
+          <thead><tr><th>Entity</th><th>id</th><th>Key fields</th><th>Partition key candidate</th></tr></thead>
+          <tbody>
+            <tr><td>Pool</td><td><code>pool_id</code></td><td><code>lb_mode</code> (uniform | weighted | p2c | sticky), <code>session_key_spec</code>, <code>version</code>, member list</td><td>(small set; replicated to all pods)</td></tr>
+            <tr><td>Backend</td><td><code>backend_id</code> (<code>ip:port</code> / stable instance id)</td><td><code>pool_id</code>, <code>capacity_weight</code>, <code>zone</code>, health (<code>in</code> | <code>ejected</code>), <code>ejected_until</code></td><td><code>pool_id</code></td></tr>
+            <tr><td>Subset</td><td>(derived: <code>(pod_id, pool_id)</code>)</td><td>the &le; S backends this pod routes to &mdash; a pure function of <code>(pod_id, sorted pool membership, S)</code>; minimal-disruption under churn</td><td>(computed per pod, not stored)</td></tr>
+            <tr><td>Experiment</td><td><code>experiment_id</code></td><td><code>salt</code> (64-bit), variants <code>[{variant_id, weight}]</code>, <code>mutex_group_id</code>?, <code>enabled</code>, <code>activate_at</code>, start/end</td><td>(small set; replicated to all pods)</td></tr>
+            <tr><td>MutexGroup</td><td><code>group_id</code></td><td><code>salt</code>, ordered list of <code>experiment_id</code> + each one's range in <code>[0,1)</code> (layered allocation)</td><td>(replicated)</td></tr>
+            <tr><td>Assignment</td><td>(derived: <code>(user_id, experiment_id)</code>)</td><td>= <code>variants[ map(hash(user_id ‖ experiment_id ‖ salt)) ]</code> &mdash; never stored; recomputed per request</td><td>(pure function)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>ID scheme</strong> (cite <a href="../canonicals/identifier-schemes.html">identifier-schemes.html</a>): <code>backend_id</code> is the stable instance id from service discovery &mdash; a name we consume, not mint. <code>experiment_id</code> / <code>pool_id</code> are short control-plane-assigned ids (a monotonic int or a slug) &mdash; a coordinator is fine for ~200 experiments / a few hundred pools; uniqueness and sortability matter, forgery and clock-skew don't. The only <em>hashing</em> is internal: a uniform hash (xxHash / Maglev's hash) of <code>backend_id</code> for subset selection and sticky routing, and <code>hash(user_id ‖ experiment_id ‖ salt)</code> for bucketing &mdash; both must be fast (&lt; ~10&nbsp;ns) and well-distributed; cryptographic strength is not required (no adversary benefit from predicting a bucket beyond the salt being secret).</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S2. API / Interface Contracts                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s2-api">
+    <div class="container">
+      <h2>S2. API contracts (cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h2>
+      <p>Two surfaces: the in-process library API (called per request) and the control-plane push (config &rarr; pods). Patterns &mdash; versioning, idempotency, errors &mdash; cite the canonical; only the scenario-specific shape is inline.</p>
+
+      <div>
+        <h3>In-process API + control-plane push</h3>
+<pre class="line-numbers"><code class="language-text">// In-process (per request, in the router pod):
+pick_backend(pool_id, ctx) -> {backend_id, attempt_token}        // p99 <= 100 us ; lock-free read path
+report_outcome(attempt_token, ok | conn_refused | timeout | 5xx) // updates in-flight count + ejection counter (local)
+assign_bucket(user_id, experiment_id) -> variant_id | NOT_IN_EXP // p99 <= 20 us ; pure function of synced config
+// On NOT a known pool / experiment: return a safe default (route to a static fallback pool / NOT_IN_EXP), never error.
+
+// Control plane -> router pods (push; ~1 s convergence):
+PUT  /v1/pools/{id}        {version, lb_mode, session_key_spec, members:[{backend_id, weight, zone}], ...}
+PUT  /v1/experiments       {version, experiments:[{id, salt, variants:[{id,weight}], mutex_group, enabled, activate_at, ...}]}
+GET  /v1/config/stream     -> gRPC stream of versioned deltas ; pods also do a periodic full GET as a gap-recovery fallback
+// Backends -> control plane: register / heartbeat / advertise weight  (the service-discovery feed; consumed, not owned).
+
+Versioning:  cite api-design-patterns#versioning -- every config object carries a monotonic `version`; pods reconcile to
+             the highest seen; an `activate_at` on experiment edits makes the fleet flip variant splits at one wall-clock instant.
+Idempotency: pushes are last-writer-wins by version (cite api-design-patterns#idempotency-key style: version IS the key).
+Errors:      the in-process API NEVER throws on a hot-path call -- unknown ids degrade to safe defaults; cite api-design-patterns#errors.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Per-call SLO</h3>
+        <ul>
+          <li><code>pick_backend</code> &mdash; p99 &le; 100&nbsp;&micro;s, p999 &le; 500&nbsp;&micro;s (a few array reads + a counter compare; no allocation, no lock, no syscall).</li>
+          <li><code>assign_bucket</code> &mdash; p99 &le; 20&nbsp;&micro;s (one or two hash computations + a range lookup).</li>
+          <li>config delta applied &le; 1&nbsp;s after publish (p99); experiment <code>activate_at</code> honoured to within clock skew (&lt; ~50&nbsp;ms with NTP).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Essential Formulas                                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="formulas">
+    <div class="container">
+      <h2>Essential Formulas</h2>
+      <p>Every number on this page derives from these. Unit prices cite <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>.</p>
+      <div>
+        <h3>Hardware / latency constants</h3>
+<pre class="line-numbers"><code class="language-text">Router pod (c7g.2xlarge):  8 vCPU, 16 GB,  ~$0.29/hr -> $209/mo  (picker = <1% of its CPU; pod is TLS+L7)
+Config store (m6i.xlarge): ~$0.19/hr -> $137/mo        Fan-out node (c7g.xlarge): ~$0.145/hr -> $104/mo
+L1 cache hit:   ~1 ns       L2: ~4 ns       LLC: ~12 ns      DRAM (random): ~70-100 ns
+Branch / int op: ~0.3 ns    xxHash of 16 B: ~5-10 ns         rand()/PRNG step: ~2-3 ns
+HTTP/2 conn state on a backend: ~50-100 KB (buffers + flow-control + TLS session) ; keepalive ping: small but x N adds up
+</code></pre>
+      </div>
+      <div>
+        <h3>Workload constants</h3>
+<pre class="line-numbers"><code class="language-text">RPS_region   = 2,000,000          N_pods_region ~= 70        N_pods_global ~= 700  (10 regions)
+M_pool       = up to 5,000        churn       ~= 200 /sec     turnover     ~= 25 s during a deploy
+E_active     = ~200 experiments   variant_slots ~= 2,000      config_size ~= tens of KB
+C_target     = 64-128 conns/backend (from the router tier)
+budget       = pick_backend p99 100 us ; assign_bucket p99 20 us ; config converge 1 s
+</code></pre>
+      </div>
+      <div class="full-width">
+        <h3>Core formulas</h3>
+<pre class="line-numbers"><code class="language-text">// Connections a backend receives from the router tier:
+naive:        conns_per_backend = N_pods            (every pod connects to every backend)  -- grows with the fleet
+subsetted:    conns_per_backend ~= N_pods * S / M   (each backend is in ~ N*S/M pods' subsets)  -- tunable via S
+subset_size:  S = clamp( redundancy_floor=20 ,  ceil( C_target * N_pods / M ) ,  M )
+              // when ceil(C*N/M) < redundancy_floor (small M), you can't satisfy both -> keep the floor, accept >C
+              // on small pools (absolute conn count there is still bounded by N_pods, and small pools are cheap).
+
+// Load-imbalance tail (max load over n bins after m balls):
+uniform random:  ~ ln n / ln ln n          (a noticeably hot bin)
+power-of-2:      ~ ln ln n / ln 2          (almost flat)   -- two array reads + a compare; still O(1), << 100 us
+
+// A/B bucketing (deterministic, sticky, salted, layered):
+in_group(u, g)         = floor( hash(u ‖ g.salt) * 2^53 ) maps into one of g's experiment ranges (or "none")
+variant(u, e)          = variants[ first i where cum_weight[i] > hash(u ‖ e.id ‖ e.salt) ]   -- pure function
+// editing e WITHOUT changing salt: only users near a variant boundary move (bounded churn).
+// editing e WITH a new salt: deliberate full re-bucketing (rare; clean restart).
+
+$/month (this component) = control_plane( config_store + fan_out + storage )   // the router fleet exists for routing anyway
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S3. Back-of-Envelope                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s3-boe">
+    <div class="container">
+      <h2>S3. Back-of-Envelope &mdash; the ratios that govern every iteration</h2>
+      <p>No optimization technique appears here &mdash; subsetting, P2C, and layered bucketing are <em>named</em> as future moves, not used in any calculation below.</p>
+      <div>
+        <h3>The hot path is cheap; the dependency bill isn't</h3>
+<pre class="line-numbers"><code class="language-text">pick_backend at 2M RPS x ~5 array/cache ops x ~few ns = ~tens of ns/call -> ~0.05 core-seconds/sec across a region. Trivial.
+Even a naive O(M) weighted scan of M=5000 ~= 5000 x ~2 ns ~= 10 us/call -> 2M x 10 us = 20 core-sec/sec -> ~3 of the 70 pods. Affordable.
+=> The picker's CPU is NOT the bottleneck. What it COSTS is downstream: connections, backend overload, and corrupted experiments.
+</code></pre>
+      </div>
+      <div>
+        <h3>The connection explosion</h3>
+<pre class="line-numbers"><code class="language-text">Naive "every pod -> every backend":  conns_per_backend = N_pods.
+  Regional pool, N=70:   70 conns/backend     (tolerable)
+  GLOBAL pool, N=700:    700 conns/backend     -> ~700 x ~80 KB = ~56 MB of conn state + 700 keepalives + FD pressure
+  GLOBAL pool with only M=50 backends, N=700:  STILL 700 conns/backend  -> a tiny popular service pays the WHOLE fleet's cost.
+=> conns_per_backend = N (the router-fleet size), independent of how much traffic the backend actually gets. This is the canonical
+   case for SUBSETTING (Iteration 0): make it N*S/M and tune S so it's bounded and decoupled from N.
+</code></pre>
+      </div>
+      <div class="full-width">
+        <h3>The experiment-corruption hazard</h3>
+<pre class="line-numbers"><code class="language-text">Naive bucketing: variant = variants[ hash(u, e.id) % total_weight ].  Edit experiment e (add a variant, change weights) ->
+  total_weight changes -> the modulo lands differently -> EVERY user can flip variant -> a customer in "treatment" yesterday is in
+  "control" today -> the A/B comparison is comparing two different (mixed) populations -> the experiment's conclusion is garbage,
+  AND the user sees the UI change under them. And two experiments with the same weights correlate (always-treatment or always-control
+  in both) -> their effects are confounded.
+=> A/B "randomness" must be salted (per-experiment, per-group), boundary-stable on edits, and layered for mutual exclusion (Iteration 2).
+   It is NOT rand(); it is a deterministic function the whole fleet computes identically.
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S4. Naive Architecture                                        -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s4-naive">
+    <div class="container">
+      <h2>S4. Naive Architecture &mdash; the simplest thing that meets the FRs</h2>
+      <p>The LC #380 structure, lifted. Each router pod, per pool, holds an <em>array</em> of healthy backends + a <em>hashmap</em> backend&rarr;index; <code>pick_backend</code> returns <code>array[rand() % len]</code> (uniform); on a backend add/remove, do the O(1) array swap. For A/B, a hashmap <code>experiment_id &rarr; config</code>; <code>assign_bucket(u, e) = variants[ argmin_i cum_weight[i] &gt; hash(u, e.id) % total_weight ]</code>. The control plane pushes the full member list / full experiment config; each pod rebuilds. Every pod opens a connection to every backend in every pool it serves. Ejection = &ldquo;delete from the array&rdquo; (no probe-back &mdash; once gone, the only way back is the next control-plane push). It answers all the FRs (pick, bucket, eject, update). The numbers say where it breaks.</p>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Naive: a control plane pushes the full pool membership and experiment config to ~700 router pods; each pod holds an array+hashmap of healthy backends per pool and a hashmap of experiments; pick_backend = array[rand()%len] (uniform); assign_bucket = hash(user, exp) % total_weight; every pod opens a connection to every backend, so each backend sees N=700 connections; editing an experiment re-rolls every user.">
+          <defs>
+            <marker id="arrNs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrNd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="30" width="200" height="80" rx="8"/>
+          <text x="120" y="58" text-anchor="middle" font-weight="bold">Control plane</text>
+          <text x="120" y="76" text-anchor="middle" class="lbl">service-discovery feed</text>
+          <text x="120" y="94" text-anchor="middle" class="lbl">+ experiment editor</text>
+
+          <rect class="danger" x="290" y="20" width="430" height="280" rx="8"/>
+          <text x="505" y="46" text-anchor="middle" font-weight="bold">Router pod &times;~700 (every pod &rarr; every backend)</text>
+
+          <rect class="box" x="320" y="70" width="170" height="90" rx="6"/>
+          <text x="405" y="94" text-anchor="middle" font-weight="bold">picker (per pool)</text>
+          <text x="405" y="112" text-anchor="middle" class="lbl">array + hashmap</text>
+          <text x="405" y="130" text-anchor="middle" class="lbl">pick = array[rand()%len]</text>
+          <text x="405" y="148" text-anchor="middle" class="lbl">uniform; no eject-back</text>
+
+          <rect class="box" x="320" y="180" width="170" height="90" rx="6"/>
+          <text x="405" y="204" text-anchor="middle" font-weight="bold">bucketer</text>
+          <text x="405" y="222" text-anchor="middle" class="lbl">map exp_id &rarr; config</text>
+          <text x="405" y="240" text-anchor="middle" class="lbl">hash(u,e) % total_weight</text>
+          <text x="405" y="258" text-anchor="middle" class="lbl">edit &rArr; everyone re-rolls</text>
+
+          <rect class="box" x="520" y="120" width="170" height="80" rx="6"/>
+          <text x="605" y="148" text-anchor="middle" font-weight="bold">conn pool</text>
+          <text x="605" y="166" text-anchor="middle" class="lbl">1 conn to EVERY backend</text>
+          <text x="605" y="184" text-anchor="middle" class="lbl">in every pool</text>
+
+          <rect class="danger" x="800" y="40" width="160" height="100" rx="8"/>
+          <text x="880" y="68" text-anchor="middle" font-weight="bold">Backend pool</text>
+          <text x="880" y="86" text-anchor="middle" class="lbl">M = 5,000 (or 50)</text>
+          <text x="880" y="104" text-anchor="middle" class="lbl">each sees N = 700 conns</text>
+          <text x="880" y="122" text-anchor="middle" class="lbl">&rArr; FD / mem / CPU pressure</text>
+
+          <rect class="ok" x="800" y="170" width="160" height="90" rx="8"/>
+          <text x="880" y="198" text-anchor="middle" font-weight="bold">Clients</text>
+          <text x="880" y="216" text-anchor="middle" class="lbl">2M RPS / region</text>
+          <text x="880" y="234" text-anchor="middle" class="lbl">requests in</text>
+
+          <line x1="220" y1="70" x2="290" y2="120" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrNd)"/>
+          <circle cx="255" cy="95" r="9" fill="#fff" stroke="#94a3b8"/><text x="255" y="99" text-anchor="middle" font-size="10">1</text>
+          <line x1="960" y1="215" x2="720" y2="180" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="840" cy="197" r="9" fill="#fff" stroke="#475569"/><text x="840" y="201" text-anchor="middle" font-size="10">2</text>
+          <line x1="490" y1="115" x2="520" y2="140" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="505" cy="118" r="9" fill="#fff" stroke="#475569"/><text x="505" y="122" text-anchor="middle" font-size="10">3</text>
+          <line x1="690" y1="150" x2="800" y2="100" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="745" cy="115" r="9" fill="#fff" stroke="#475569"/><text x="745" y="119" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / config push; dashed red = (none).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Control plane &rarr; Router pod</strong> &mdash; pushes the full pool membership and the full experiment config; the pod rebuilds its arrays/maps on receipt. No deltas, no version negotiation.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Clients &rarr; Router pod</strong> &mdash; 2&nbsp;M RPS/region; per request the pod calls <code>pick_backend</code> and (if applicable) <code>assign_bucket</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>picker &rarr; conn pool</strong> &mdash; the chosen backend's connection is looked up in the pod's pool of connections.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Router pod &rarr; Backend pool</strong> &mdash; every pod holds one connection to <em>every</em> backend in <em>every</em> pool it serves &rarr; a backend receives N = (router-fleet size) connections, regardless of its traffic share.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Numbers (the gap)</h3>
+<pre class="line-numbers"><code class="language-text">Hot-path latency:
+  pick_backend  = array[rand()%len]: ~1 array read + a PRNG step ~= ~5 ns          -> p99 << 100 us  ✅
+  assign_bucket = one hash + a small scan over <= ~10 variants ~= ~20-50 ns         -> p99 << 20 us   ✅
+  -> latency is FINE in the Naive design. (It stays fine through every iteration -- the moves cost ~tens of ns more, not more.)
+
+Churn handling:
+  200 add/remove/sec x O(1) array swap ~= ~100 ns each = 20 us/sec of work          -> FINE  ✅  (this is exactly the LC trick's payoff)
+
+Connection bound (THE failure):
+  conns_per_backend = N_pods.   Global pool, N = 700:  700 conns/backend.
+    ~700 x ~80 KB conn state ~= 56 MB just for router connections; 700 keepalive timers; FD limit pressure;
+    a 50-backend "tiny popular" pool ALSO sees 700 conns/backend -> the backend pays the whole fleet's cost, not its traffic share.
+  -> connections-per-backend grows with the ROUTER FLEET, unbounded.   FAILS the "<= C ~= 64-128, independent of fleet size" NFR.
+
+Load-awareness:
+  uniform random -> max-load bin ~ ln n / ln ln n above the mean; a cold-cache fresh-deploy backend gets full share immediately
+  -> tail latency spikes + cascading overload on the unlucky backend.                FAILS the implicit "don't overload a backend" goal.
+
+A/B correctness:
+  edit any experiment -> total_weight changes -> hash % total_weight lands differently -> EVERY user can flip variant.
+  -> experiment data corrupted on every edit; user sees UI flicker; two same-weight experiments confound each other.   FAILS A/B determinism.
+
+Fail-static:
+  control plane down -> pods keep their last config (the rebuild was on push, so nothing actively breaks)... EXCEPT an ejected
+  backend can never come back (no probe loop) -> a transient blip permanently shrinks the pool until the next push.   PARTIAL FAIL.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Why it's broken (per failing NFR)</h3>
+        <ul>
+          <li><strong>Connection bound &mdash; FAILS, structurally.</strong> <code>conns_per_backend = N_pods</code> grows with the router fleet and is independent of how much traffic the backend gets; a global pool, or any small pool, is hammered by the whole fleet. This is the shape-determining failure &mdash; the only fix is to stop every pod from talking to every backend. Classified <a href="../canonicals/bottlenecks.html#connection-saturation">connection-saturation</a>.</li>
+          <li><strong>Load-awareness &mdash; FAILS.</strong> Uniform random over the pool gives a hot bin <code>~ ln n / ln ln n</code> above the mean and gives a cold/just-deployed backend instant full share &rarr; tail latency and cascading overload.</li>
+          <li><strong>A/B determinism &mdash; FAILS.</strong> <code>hash(u, e) % total_weight</code> is brittle to <em>any</em> experiment edit; the population in &ldquo;treatment&rdquo; changes under you; same-weight experiments correlate.</li>
+          <li><strong>Fail-static &mdash; PARTIAL.</strong> No probe-back loop, so a transient ejection is permanent until the next full push &mdash; a blip slowly shrinks the pool.</li>
+          <li><strong>Latency &amp; throughput &mdash; ✅.</strong> The O(1) structure is genuinely fine here, and stays fine through every iteration. The work isn't in the picker's CPU; it's in everything the picker's <em>output</em> touches.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>What the Naive design actually costs:</strong> not dollars &mdash; the picker's own footprint is ~0% of the router pod, which exists for TLS+L7 anyway. It costs <em>backend stability</em> (connection saturation overloads the very services it routes to) and <em>experiment validity</em> (every edit corrupts the data). This is an infra primitive whose value is <em>avoiding</em> those costs, not generating one. The arc below adds four properties &mdash; bounded connections, load-awareness, sticky deterministic bucketing, fail-static config &mdash; and the dollar line barely moves (a small control plane). Name that up front: the optimization target here is the <em>blast radius on dependencies</em>, not the system's infra bill.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 0                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-0">
+    <div class="container">
+      <h2>Iteration 0 &mdash; Deterministic per-pod subsetting</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1200 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 0: each router pod no longer talks to the whole pool; it computes a deterministic balanced subset of size S of the pool's backends from (pod_id, sorted membership) using a rendezvous-style hash, so every backend is in roughly N*S/M pods' subsets and connections-per-backend is decoupled from the fleet size N; a backend leaving or joining changes at most about one element of each subset, so connections are stable under churn.">
+          <defs>
+            <marker id="arr0s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr0d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="40" width="180" height="80" rx="8"/>
+          <text x="110" y="68" text-anchor="middle" font-weight="bold">Control plane</text>
+          <text x="110" y="86" text-anchor="middle" class="lbl">pushes sorted</text>
+          <text x="110" y="104" text-anchor="middle" class="lbl">pool membership</text>
+
+          <rect class="box" x="270" y="30" width="220" height="130" rx="8"/>
+          <text x="380" y="56" text-anchor="middle" font-weight="bold">Router pod A</text>
+          <rect class="accent" x="295" y="70" width="170" height="75" rx="6"/>
+          <text x="380" y="92" text-anchor="middle" font-weight="bold">subset(A) &mdash; NEW</text>
+          <text x="380" y="110" text-anchor="middle" class="lbl">S of M, deterministic</text>
+          <text x="380" y="128" text-anchor="middle" class="lbl">rendezvous hash</text>
+
+          <rect class="box" x="270" y="190" width="220" height="130" rx="8"/>
+          <text x="380" y="216" text-anchor="middle" font-weight="bold">Router pod B (... &times;700)</text>
+          <rect class="accent" x="295" y="230" width="170" height="75" rx="6"/>
+          <text x="380" y="252" text-anchor="middle" font-weight="bold">subset(B) &mdash; NEW</text>
+          <text x="380" y="270" text-anchor="middle" class="lbl">overlaps subset(A) only</text>
+          <text x="380" y="288" text-anchor="middle" class="lbl">on ~S&sup2;/M backends</text>
+
+          <rect class="cool" x="600" y="60" width="200" height="100" rx="8"/>
+          <text x="700" y="88" text-anchor="middle" font-weight="bold">Backend pool</text>
+          <text x="700" y="106" text-anchor="middle" class="lbl">M backends</text>
+          <text x="700" y="124" text-anchor="middle" class="lbl">each in ~N&middot;S/M subsets</text>
+          <text x="700" y="142" text-anchor="middle" class="lbl">conns/backend &asymp; N&middot;S/M &le; C</text>
+
+          <rect class="cool" x="600" y="200" width="200" height="90" rx="8"/>
+          <text x="700" y="228" text-anchor="middle" font-weight="bold">conns: bounded</text>
+          <text x="700" y="246" text-anchor="middle" class="lbl">N=700, M=5000, S=64</text>
+          <text x="700" y="264" text-anchor="middle" class="lbl">&rarr; ~9 conns/backend</text>
+
+          <line x1="200" y1="80" x2="270" y2="100" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr0d)"/>
+          <line x1="200" y1="80" x2="270" y2="250" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr0d)"/>
+          <circle cx="235" cy="90" r="9" fill="#fff" stroke="#94a3b8"/><text x="235" y="94" text-anchor="middle" font-size="10">1</text>
+          <line x1="465" y1="105" x2="600" y2="100" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="530" cy="98" r="9" fill="#fff" stroke="#475569"/><text x="530" y="102" text-anchor="middle" font-size="10">2</text>
+          <line x1="465" y1="265" x2="600" y2="120" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="530" cy="195" r="9" fill="#fff" stroke="#475569"/><text x="530" y="199" text-anchor="middle" font-size="10">3</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / config push; dashed red = (none).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Control plane &rarr; Router pods</strong> &mdash; pushes the pool membership in a canonical (sorted) order so every pod, given the same membership + its own <code>pod_id</code>, computes the <em>same</em> subset deterministically &mdash; no coordinator, no assignment service.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Router pod A &rarr; Backend pool</strong> &mdash; pod A connects to its subset of <code>S</code> backends only; it routes (still uniform within the subset &mdash; load-aware picking is Iteration&nbsp;1) over those <code>S</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Router pod B &rarr; Backend pool</strong> &mdash; pod B's subset overlaps A's only on the ~<code>S&sup2;/M</code> backends both hash to; across the fleet each backend lands in ~<code>N&middot;S/M</code> subsets &rarr; <code>conns/backend &asymp; N&middot;S/M</code>, which we tune via <code>S</code> to stay &le; <code>C</code> regardless of <code>N</code>.</li>
+        </ul>
+        <p><strong>Delta vs Naive:</strong> a pod no longer routes to the whole pool &mdash; it routes to a deterministic, balanced, churn-stable subset of size <code>S</code>. Connections-per-backend goes from <code>N</code> (the fleet size, unbounded) to <code>N&middot;S/M</code> (tunable). Nothing else changes &mdash; the picker within the subset is still uniform, ejection is still crude, bucketing is untouched.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>Naive's shape-determining failure is <em>connection saturation</em>: <code>conns_per_backend = N_pods</code> &mdash; a backend pays connection cost (memory, FDs, keepalive CPU) proportional to the entire router fleet, not to its traffic share, and it gets worse every time the platform adds router pods or a small pool gets popular. Classified <a href="../canonicals/bottlenecks.html#connection-saturation">connection-saturation</a> &mdash; the signal: connection count on a downstream that scales with the <em>client fleet</em>, not the workload. Per <a href="../canonicals/bottleneck-to-decisions.html#connection-saturation">bottleneck-to-decisions#connection-saturation</a>: the first move is <em>subsetting</em> &mdash; have each client talk to a bounded, deterministically-chosen, balanced subset of the backends, so the per-backend connection count is <code>N&middot;S/M</code> and you size <code>S</code> down as <code>N</code> grows. (The other levers &mdash; connection pooling, HTTP/2 multiplexing, a proxy layer &mdash; help the constant but don't change the <code>O(N)</code> shape.)</p>
+      </div>
+
+      <div>
+        <h3>Architectural decisions to revisit</h3>
+        <p>Per <a href="../canonicals/bottleneck-to-decisions.html#connection-saturation">bottleneck-to-decisions#connection-saturation</a>: the <em>client&ndash;backend topology</em> (full mesh &rarr; subsetted), the <em>subset-selection algorithm</em> (must be deterministic so pods agree without a coordinator, balanced so connection load is uniform, and minimal-disruption so a churn doesn't reshuffle every subset), and the <em>subset size</em> (a redundancy-vs-connection-budget knob). The iteration's move addresses the first two; the third becomes an explicit tunable.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Deterministic subsetting via a rendezvous (HRW) hash &mdash; chosen.</strong> For pod <code>p</code>, score each backend <code>b</code> by <code>hash(p ‖ b)</code> and take the top <code>S</code>. Every pod computes its own subset from the (sorted) membership + its <code>pod_id</code> &mdash; no coordinator. It's <em>balanced</em> (each backend is top-<code>S</code> for ~<code>N&middot;S/M</code> pods in expectation) and <em>minimal-disruption</em>: a backend leaving removes it from the ~<code>N&middot;S/M</code> subsets it was in, and each of those pods promotes the next-highest-scored backend &mdash; ~1 element changes per affected subset, not the whole subset, so connections are stable under the 200/sec churn. Cite <a href="../consistent-hashing.html">consistent-hashing.html</a> (rendezvous variant).</li>
+          <li><strong>Round-robin / index-range subsetting (pod <code>i</code> gets backends <code>[i&middot;S, (i+1)&middot;S)</code> of the sorted list) &mdash; rejected.</strong> Deterministic and balanced, but <em>not</em> minimal-disruption: insert one backend near the front and every index shifts &rarr; every pod's window slides &rarr; the whole fleet re-connects &mdash; a connection storm on every deploy. (This is the &ldquo;why consistent hashing&rdquo; argument applied to subsets.)</li>
+          <li><strong>A central subset-assignment service (the control plane computes each pod's subset and pushes it) &mdash; rejected.</strong> Works, but it's a new SPOF on the routing hot path's <em>config</em>, and it has to recompute and re-push ~700 subsets every time one backend churns &mdash; the deterministic-local computation gets the same result with zero coordination. <em>(Constraint-flip: 🔀 if subsets had to respect cross-cutting constraints the pod can't see &mdash; e.g., &ldquo;each pod's subset must span &ge; 2 zones for AZ-fault-tolerance, and zone topology is control-plane-only&rdquo; &mdash; a central computation (or pushing zone tags to pods) becomes necessary.)</em></li>
+          <li><strong>No subsetting; put a layer of aggregator proxies in front of each pool &mdash; rejected for pools in general, kept for tiny ones.</strong> Aggregators collapse <code>N</code> router connections into <code>(#aggregators)</code> connections per backend &mdash; but it's a whole extra hop, an extra fleet, and an extra failure domain. For a <em>tiny</em> pool where <code>ceil(C&middot;N/M)</code> would force <code>S</code> below the redundancy floor, &ldquo;don't subset, accept <code>N</code> connections&rdquo; is fine (the absolute count is bounded and tiny pools are cheap); an aggregator layer is the escape hatch only if even that is too much.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p>Each router pod computes its subset of a pool with a <strong>rendezvous hash</strong>: score every backend <code>b</code> in the pool by <code>h = hash(pod_id ‖ b.backend_id)</code>, take the <code>S</code> highest-scoring &mdash; that's the subset; route (uniformly, for now) over those <code>S</code>; open one connection to each. <code>S</code> is chosen as <code>S = clamp(redundancy_floor=20, ceil(C_target &middot; N_pods / M), M)</code>: at least 20 so a pod survives several backend failures in its subset; at most <code>M</code>; otherwise just big enough that <code>conns/backend = N&middot;S/M &le; C_target</code>. Worked: a global pool with <code>N=700</code> pods, <code>M=5000</code> backends, <code>C_target=64</code> &rarr; <code>ceil(64&middot;700/5000)=9</code>, below the floor, so <code>S=20</code> &rarr; <code>conns/backend = 700&middot;20/5000 = 2.8</code> &mdash; far under <code>C</code>, and <code>S=20</code> gives each pod a 20-deep set to fail over within. A bigger pool or fewer pods only makes the ratio smaller. The hot path costs nothing extra: the subset is recomputed only on a membership delta (~200/sec &times; an <code>O(M)</code> partial re-score with a small heap &asymp; tens of &micro;s, off the request path); <code>pick_backend</code> is still <code>subset_array[rand() % S]</code> &mdash; <code>S</code> small, one read, ~5&nbsp;ns. Cite <a href="../consistent-hashing.html">consistent-hashing.html</a> (rendezvous / HRW) for the algorithm.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Naive):
+  conns_per_backend   = N_pods   ->  global pool, N=700:  700 conns/backend   (FAILS "<= C ~= 64-128, fleet-independent")
+  pick_backend p99    = ~5 ns (uniform over the whole pool)                    ✅
+  load-aware?         = no (uniform)                                            (still failing)
+  A/B correctness?    = brittle to edits                                        (still failing)
+  $/month (component) = ~0 (rides on the router pods, which exist for TLS+L7)
+
+After (Iter 0 -- deterministic rendezvous-hash subsetting):
+  S                   = clamp(20, ceil(C*N/M), M)
+                      = clamp(20, ceil(64*700/5000)=9, 5000)  = 20         (small pools hit the redundancy floor)
+                      // a regional-only pool (N=70): clamp(20, ceil(64*70/5000)=1, 5000) = 20 -> conns/backend = 70*20/5000 = 0.28
+  conns_per_backend   = N_pods * S / M = 700 * 20 / 5000 = 2.8 conns/backend     -> WAY under C=64    ✅ (and decoupled from N:
+                                                                                    grow to N=2000 pods, set S=clamp(20,26,M)=26
+                                                                                    -> conns/backend = 2000*26/5000 = 10.4, still << C)
+  churn behaviour     = a backend leaves -> drops from ~N*S/M ~= 2.8 subsets -> each promotes its next-highest -> ~1 conn change/affected pod
+                        (NOT a fleet-wide re-connect; rendezvous = minimal disruption)                                ✅
+  pick_backend p99    = subset_array[rand() % S], S ~= 20: one read + a PRNG step ~= ~5 ns         -> p99 << 100 us    ✅ (unchanged)
+  subset recompute    = on a membership delta only: O(M) re-score + top-S heap ~= tens of us, OFF the request path   ✅
+  load-aware?         = STILL uniform within the subset                          (Iteration 1)
+  A/B correctness?    = STILL brittle                                            (Iteration 2)
+  $/month (component) = still ~0
+</code></pre>
+        <p><strong>NFR check:</strong> connection bound ✅ (<code>N&middot;S/M</code>, tunable, decoupled from the fleet size). <strong>Still failing:</strong> load-awareness (uniform within the subset &rarr; the &ldquo;unlucky hot backend&rdquo; tail; a cold-deploy backend gets instant full share) &mdash; Iteration&nbsp;1; A/B determinism (edit-brittle bucketing) &mdash; Iteration&nbsp;2; fail-static is still partial (no probe-back) &mdash; folded into Iteration&nbsp;1's ejection rework. Cost: unchanged at ~$0 incremental.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#hot-partition-meltdown">Correlated subset failure</a>.</strong> If a pod's <code>S=20</code> happens to be 20 backends in one rack and that rack's top-of-rack switch dies, the pod has zero healthy backends &rarr; it 503s for that pool. Defence: when zone tags are available, constrain the subset to span &ge; 2 zones (a small modification to the top-<code>S</code> selection: take the top-<code>S</code> subject to a per-zone cap); fall back to the unconstrained subset if a pool is single-zone. Blast radius: one pod, one pool, briefly; detection: a per-pod &ldquo;healthy backends in subset&rdquo; gauge hitting 0.</li>
+          <li><strong>Subset skew from a bad hash.</strong> A weak <code>hash(pod_id ‖ backend_id)</code> could make some backends top-<code>S</code> for far more than <code>N&middot;S/M</code> pods &rarr; uneven connection load. Defence: use a well-distributed non-cryptographic hash (xxHash/Murmur with the pod_id mixed in as a seed); monitor the per-backend connection-count distribution; the math assumes uniformity, so verify it.</li>
+          <li><strong>Churn-storm on a mass restart.</strong> A whole zone's backends deploying at once &rarr; many simultaneous membership deltas &rarr; many subset recomputes. The recompute is cheap (tens of &micro;s, off-path) and the rendezvous property keeps each individual change to ~1 connection &mdash; but a 1000-backend zone rolling in 25&nbsp;s is ~40 deltas/sec/pool on top of the baseline 200/sec. Defence: batch deltas (apply membership changes in ~250&nbsp;ms windows, recompute once per window); detection: subset-recompute rate.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>No new store. The pool push now carries a <em>canonical ordering</em> guarantee (members sorted by <code>backend_id</code>) and per-backend <code>zone</code> tags so pods can do zone-spanning subsets; the pod-side config keeps the subset cached and recomputes on a delta.</p>
+<pre class="line-numbers"><code class="language-text">PUT /v1/pools/{id}  { version, lb_mode, session_key_spec, members: [ {backend_id, weight, zone}, ... sorted by backend_id ] }
+// pod-side, on receipt:  subset = top_S_by( h = xxhash(pod_id, b.backend_id), members, S = clamp(20, ceil(C*N/M), M),
+//                                            zone_cap = ceil(S / max(2, #zones)) )   ; (re)open connections to (subset \ current)
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if backends were stateful (each holds a shard of data) instead of stateless</span></summary>
+        <p>Then routing isn't &ldquo;pick any healthy one&rdquo; &mdash; it's &ldquo;route to the one that owns this key,&rdquo; which is consistent hashing / Maglev, not subsetting. Subsetting still applies on top (a pod connects to a subset of the <em>ring</em>, and a key whose owner isn't in the pod's subset gets forwarded to a peer pod that has it) &mdash; but the dominant structure becomes the key&rarr;backend hash, and the &ldquo;sticky&rdquo; mode in this page's Probe section becomes the <em>default</em>. The connection bound argument is unchanged.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 1                                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-1">
+    <div class="container">
+      <h2>Iteration 1 &mdash; Weighted power-of-two-choices + outlier ejection with probe-back</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1200 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 1: within its subset the pod no longer picks uniformly; it picks two backends at random (weighted by advertised capacity), reads each one's local in-flight-request counter, and sends to the less loaded; report_outcome feeds the in-flight counter and an outlier-ejection counter; a backend with too many consecutive failures moves to an ejected side-array with an exponential ejected_until backoff, and a probe loop sends it occasional canary requests to bring it back when healthy.">
+          <defs>
+            <marker id="arr1s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arr1r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="40" width="150" height="80" rx="8"/>
+          <text x="95" y="68" text-anchor="middle" font-weight="bold">Request</text>
+          <text x="95" y="86" text-anchor="middle" class="lbl">pick_backend(pool)</text>
+
+          <rect class="accent" x="220" y="20" width="240" height="160" rx="8"/>
+          <text x="340" y="46" text-anchor="middle" font-weight="bold">picker (NEW: weighted P2C)</text>
+          <text x="340" y="68" text-anchor="middle" class="lbl">1. pick 2 from subset, ~ weight</text>
+          <text x="340" y="86" text-anchor="middle" class="lbl">2. read each in-flight counter</text>
+          <text x="340" y="104" text-anchor="middle" class="lbl">3. send to the less loaded</text>
+          <text x="340" y="122" text-anchor="middle" class="lbl">skip ejected; ~2 reads + a compare</text>
+          <text x="340" y="140" text-anchor="middle" class="lbl">still O(1), ~tens of ns</text>
+          <text x="340" y="158" text-anchor="middle" class="lbl">max-load tail: ln n/ln ln n &rarr; ln ln n</text>
+
+          <rect class="cool" x="520" y="40" width="180" height="100" rx="8"/>
+          <text x="610" y="68" text-anchor="middle" font-weight="bold">Backends (subset)</text>
+          <text x="610" y="86" text-anchor="middle" class="lbl">in-flight counter / backend</text>
+          <text x="610" y="104" text-anchor="middle" class="lbl">capacity weight (advertised)</text>
+          <text x="610" y="122" text-anchor="middle" class="lbl">conns still bounded (Iter 0)</text>
+
+          <rect class="accent" x="220" y="210" width="240" height="110" rx="8"/>
+          <text x="340" y="236" text-anchor="middle" font-weight="bold">ejection state (NEW)</text>
+          <text x="340" y="256" text-anchor="middle" class="lbl">N consec fails &rarr; eject side-array</text>
+          <text x="340" y="274" text-anchor="middle" class="lbl">ejected_until = exp backoff</text>
+          <text x="340" y="292" text-anchor="middle" class="lbl">probe loop &rarr; canary &rarr; un-eject</text>
+
+          <rect class="box" x="520" y="200" width="180" height="90" rx="8"/>
+          <text x="610" y="228" text-anchor="middle" font-weight="bold">report_outcome</text>
+          <text x="610" y="246" text-anchor="middle" class="lbl">ok / conn_refused</text>
+          <text x="610" y="264" text-anchor="middle" class="lbl">/ timeout / 5xx</text>
+
+          <line x1="170" y1="80" x2="220" y2="90" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="195" cy="83" r="9" fill="#fff" stroke="#475569"/><text x="195" y="87" text-anchor="middle" font-size="10">1</text>
+          <line x1="460" y1="90" x2="520" y2="90" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="490" cy="78" r="9" fill="#fff" stroke="#475569"/><text x="490" y="82" text-anchor="middle" font-size="10">2</text>
+          <line x1="520" y1="240" x2="460" y2="250" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="490" cy="237" r="9" fill="#fff" stroke="#94a3b8"/><text x="490" y="241" text-anchor="middle" font-size="10">3</text>
+          <line x1="340" y1="210" x2="340" y2="180" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="355" cy="195" r="9" fill="#fff" stroke="#94a3b8"/><text x="355" y="199" text-anchor="middle" font-size="10">4</text>
+          <line x1="460" y1="265" x2="610" y2="290" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arr1r)"/>
+          <circle cx="535" cy="282" r="9" fill="#fff" stroke="#dc2626"/><text x="535" y="286" text-anchor="middle" font-size="10">5</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / feedback; dashed red = probe / canary.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Request &rarr; picker</strong> &mdash; <code>pick_backend(pool, ctx)</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>picker &rarr; Backends</strong> &mdash; weighted power-of-two-choices: draw two distinct backends from the subset with probability ∝ <code>capacity_weight</code>, read each one's pod-local in-flight-request counter, route to the lower; skip any backend whose <code>ejected_until &gt; now</code>. Two array reads + a counter compare &mdash; ~tens of ns, still O(1), well inside the 100&nbsp;&micro;s budget.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Backends / response &rarr; report_outcome</strong> &mdash; on completion the caller calls <code>report_outcome(token, status)</code>; the picker decrements that backend's in-flight counter and, on a failure status, bumps its consecutive-failure count.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>report_outcome &rarr; picker</strong> &mdash; the updated counters feed the next pick (load) and the ejection decision.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>probe loop &rarr; ejected backend</strong> &mdash; a background loop sends an ejected backend a low-rate canary request; on success it clears <code>ejected_until</code> and the backend re-enters the pick set (with a brief slow-start ramp so it isn't slammed cold).</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;0:</strong> the within-subset picker changes from uniform-random to weighted power-of-two-choices; an explicit ejection side-array + exponential backoff + a probe-back loop replaces &ldquo;delete on failure, never return.&rdquo; The subset machinery, the connection bound, and the bucketing are unchanged.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>After Iteration&nbsp;0 the connections are bounded, but the picker is still uniform over the subset &mdash; so the max-loaded backend runs <code>~ ln S / ln ln S</code> above the mean (a noticeably hot one), and a backend that's just been deployed (cold cache, JIT warming, connection ramp) or is in a momentarily slow zone gets its full uniform share immediately &rarr; its latency spikes, callers retry, and the overload cascades. Classified <a href="../canonicals/bottlenecks.html#tail-latency">tail-latency</a> on the <em>backend</em> side (a long pole among otherwise-equivalent replicas), with a side of <a href="../canonicals/bottlenecks.html#cold-start">cold-start</a> (a fresh replica can't absorb full share yet). Per <a href="../canonicals/bottleneck-to-decisions.html#tail-latency">bottleneck-to-decisions#tail-latency</a>: <em>load-aware selection</em> (pick the less-loaded of a small random sample &mdash; power-of-two-choices), <em>weighting</em> (route in proportion to advertised capacity), and <em>outlier ejection with slow-start</em> (pull a bad one out, ramp a fresh one in). All three target the same bottleneck; they're one coherent move.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Weighted power-of-two-choices (P2C) + local in-flight counts + outlier ejection &mdash; chosen.</strong> P2C gets you ~all of the benefit of &ldquo;always pick the global least-loaded&rdquo; (max load <code>~ ln ln S</code> vs <code>~ ln S / ln ln S</code> for uniform) at the cost of one extra array read and a compare &mdash; no global state, no coordination, O(1). In-flight count is a good local load proxy for request-routing (it captures both slowness and queueing). Cite <a href="../canonicals/bottlenecks.html#tail-latency">bottlenecks#tail-latency</a> (P2C / "the power of two random choices").</li>
+          <li><strong>Join-shortest-queue / least-loaded over the <em>whole</em> subset &mdash; rejected.</strong> Marginally better tail than P2C, but it's <code>O(S)</code> per pick (read all <code>S</code> counters) and &mdash; worse &mdash; it <em>herds</em>: every pod, seeing the same &ldquo;least loaded&rdquo;, piles onto it together until the counters update, causing oscillation. P2C's randomness is precisely what avoids the herd.</li>
+          <li><strong>EWMA-of-latency weighting (route ∝ 1/recent_latency) &mdash; rejected as the primary signal, kept as a tiebreaker.</strong> Latency is laggy and noisy as a routing signal (it reflects load you caused several requests ago); in-flight count reacts immediately. We use in-flight as the P2C comparand and let the slower-moving latency/error EWMA influence the <em>weight</em> and the ejection threshold.</li>
+          <li><strong>Round-robin within the subset &mdash; rejected.</strong> Deterministic and cheap, but not load-aware at all &mdash; a slow backend in the rotation gets exactly its <code>1/S</code> share regardless of how slow it is, so it stays on the critical path. P2C with a load comparand routes <em>away</em> from it without ejecting it.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p><code>pick_backend</code> within the subset becomes: draw two distinct backends, each with probability ∝ its <code>capacity_weight</code> (a small alias-table over the subset makes this O(1)); read each one's pod-local in-flight-request counter (a plain integer in the subset array, incremented on pick, decremented on <code>report_outcome</code>); route to the one with the lower count (ties &rarr; the one with the better recent latency/error EWMA); increment its counter. Backends with <code>ejected_until &gt; now</code> are excluded from the draw. <strong>Outlier ejection:</strong> <code>report_outcome(token, conn_refused | timeout | 5xx)</code> increments a consecutive-failure counter; at a threshold (e.g., 5 in a row, or a 50%+ error rate over the last <code>k</code>) the backend is moved to an &ldquo;ejected&rdquo; side-list with <code>ejected_until = now + base &times; 2^(ejection_count)</code> (capped); a probe loop periodically sends an ejected backend a single canary request &mdash; on success it clears the ejection, halves the backoff toward base, and re-enters the pick set with a brief <strong>slow-start</strong> (its effective weight ramps from ~0 to full over a few seconds, so a cold replica isn't immediately slammed). All of this is pod-local (no shared state &mdash; each pod ejects based on what <em>it</em> observed; a backend bad for everyone gets ejected everywhere independently). Cost on the hot path: ~2 array reads + a compare + a counter increment &asymp; ~tens of ns &mdash; the 100&nbsp;&micro;s budget is untouched. Cite <a href="../canonicals/bottlenecks.html#tail-latency">bottlenecks#tail-latency</a> (P2C) and <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a> (outlier ejection as the local degradation move).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 0):
+  conns_per_backend  = N*S/M ~= 2.8 (global pool)  -> bounded   ✅
+  pick within subset = uniform random over S backends
+    -> max-load backend ~ ln S / ln ln S above mean ;  S=20 -> ~ ln20/ln ln20 ~= 3.0/1.10 ~= 2.7x the mean on the unlucky one
+    -> a cold-deploy backend gets full 1/S share instantly -> latency spike + retry cascade
+  ejection           = "delete on failure, never returns" (partial fail-static)
+  pick p99           = ~5 ns                                                                      ✅
+
+After (Iter 1 -- weighted P2C + ejection + probe-back + slow-start):
+  pick within subset = weighted P2C: 2 draws (alias table, O(1)) + 2 counter reads + 1 compare
+    -> max-load backend ~ ln ln S / ln 2 ;  S=20 -> ~ ln ln20 / 0.69 ~= 1.10/0.69 ~= 1.6 ... but P2C's real result is "max load
+       within a SMALL CONSTANT (~2) of the mean independent of S" -> the heavy tail collapses; the "2.7x unlucky one" goes away
+    -> a cold-deploy backend: slow-start ramps its weight 0 -> full over a few s -> never gets slammed cold       ✅
+  ejection           = N consec fails -> eject_until = base*2^count (capped); probe loop canary -> un-eject + slow-start
+    -> a transiently-bad backend self-heals; a persistently-bad one stays out with growing backoff           ✅ (fail-static fixed)
+  pick p99           = ~tens of ns (2 reads + compare + increment)                            -> p99 << 100 us  ✅ (unchanged budget)
+  conns_per_backend  = N*S/M (unchanged -- ejection doesn't change the connection set, just which we route to)   ✅
+  load-aware?        = YES                                                                                       ✅
+  A/B correctness?   = STILL brittle                                                            (Iteration 2)
+  $/month (component)= still ~0 (+ a probe-loop request rate that's a rounding error)
+</code></pre>
+        <p><strong>NFR check:</strong> the backend-side tail collapses (P2C); a cold replica ramps instead of being slammed (slow-start); fail-static is now real (probe-back replaces &ldquo;delete forever&rdquo;); connections still bounded; latency budget untouched. <strong>Still failing:</strong> A/B determinism &mdash; <code>hash(u, e) % total_weight</code> is still edit-brittle and unsalted &mdash; Iteration&nbsp;2. <strong>Still soft:</strong> the in-flight count is <em>pod-local</em> &mdash; a backend hammered by <em>other</em> pods looks idle to this one; the cross-pod-load probe in S5 addresses it. Cost: still ~$0 incremental.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#retry-storm">Ejection avalanche</a>.</strong> A shared dependency hiccups &rarr; <em>every</em> backend starts erroring &rarr; every pod ejects everyone &rarr; the subset empties &rarr; the pool is &ldquo;down&rdquo; from the router's view even though the backends are fine. Defence: a <em>panic threshold</em> &mdash; if more than, say, 50% of a subset is ejected, stop ejecting and route to all of them anyway (Envoy's exact heuristic): a fleet-wide problem isn't fixed by routing to nothing. Detection: percent-of-subset-ejected gauge.</li>
+          <li><strong>Thundering herd onto a fresh backend (mitigated, not eliminated).</strong> Slow-start ramps <em>this</em> pod's traffic to a new backend &mdash; but all ~700 pods that have it in their subset ramp simultaneously, so the backend still sees a coordinated (if gradual) onset. Defence: jitter the slow-start duration per pod; the backend's own concurrency limits + load-shedding are the backstop. Detection: new-backend p99 during the ramp window.</li>
+          <li><strong>In-flight-count drift.</strong> If a request completes without <code>report_outcome</code> being called (a bug, a panic in the caller), the counter leaks upward &rarr; that backend looks permanently busy &rarr; it's starved. Defence: a per-request timeout that force-decrements on expiry; a periodic reconciliation of the counter against the actual connection's stream count; an alert on a counter that's high with no recent picks. Detection: in-flight-count vs. actual-streams divergence.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>No new store; the in-memory picker structure grows a per-backend counter + ejection fields, and the pool config carries weights (already added in S2):</p>
+<pre class="line-numbers"><code class="language-text">// per pool, per pod (in RAM, lock-free single-writer = the pod's request threads with atomics):
+struct SubsetEntry { backend_id; weight; in_flight: atomic_u32; consec_fails: u16; ejected_until: i64; ewma_lat_us: f32; }
+SubsetEntry  subset[S];          // the routable set
+SubsetEntry  ejected[];          // moved here when ejected_until is set; probe loop scans it
+AliasTable   weight_alias;       // O(1) weighted draw over `subset`, rebuilt on a membership/weight/ejection change
+
+report_outcome(token, status):  e = subset_or_ejected[token.idx]; e.in_flight--; if status != ok: e.consec_fails++;
+                                 if e.consec_fails >= THRESH: eject(e)   // unless panic mode (>50% ejected)
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if requests were long-lived streams (gRPC streaming, WebSockets) instead of short RPCs</span></summary>
+        <p>In-flight <em>count</em> stops being a load proxy (a backend with 3 long-lived streams may be busier than one with 30 short ones) &mdash; you'd switch the P2C comparand to an <em>estimated work</em> signal (bytes/sec, CPU hint from the backend's health response) and weight by capacity headroom. Ejection has to be gentler &mdash; ejecting a backend mid-stream drops live connections &mdash; so you'd <em>drain</em> (stop sending <em>new</em> streams, let existing ones finish) before fully ejecting. Subsetting and the rendezvous machinery are unchanged.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 2                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-2">
+    <div class="container">
+      <h2>Iteration 2 &mdash; Layered, salted, mutex-aware bucketing (the experiment side)</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1200 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 2: assign_bucket changes from hash(user,exp) modulo total_weight to a layered scheme: a mutex group owns the unit interval and partitions it among its member experiments by fixed ranges keyed on the group salt; a user is in experiment e only if hash(user, group.salt) falls in e's range; within that, hash(user, e.id, e.salt) maps through e's variant ranges; editing an experiment without changing its salt only moves users near a variant boundary; editing with a new salt is a deliberate clean re-bucket; the whole computation is a pure function of the synced config so every pod agrees.">
+          <defs>
+            <marker id="arr2s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr2d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="150" width="150" height="80" rx="8"/>
+          <text x="95" y="178" text-anchor="middle" font-weight="bold">Request</text>
+          <text x="95" y="196" text-anchor="middle" class="lbl">assign_bucket(u, e)</text>
+          <text x="95" y="214" text-anchor="middle" class="lbl">user_id u</text>
+
+          <rect class="accent" x="220" y="40" width="290" height="120" rx="8"/>
+          <text x="365" y="66" text-anchor="middle" font-weight="bold">Step 1: mutex group (NEW)</text>
+          <text x="365" y="86" text-anchor="middle" class="lbl">x = hash(u ‖ group.salt) in [0,1)</text>
+          <text x="365" y="104" text-anchor="middle" class="lbl">group's interval split into expt ranges</text>
+          <text x="365" y="122" text-anchor="middle" class="lbl">x &isin; range(e) ? in e : in "none"</text>
+          <text x="365" y="140" text-anchor="middle" class="lbl">new expt carves the UNALLOCATED remainder</text>
+
+          <rect class="accent" x="220" y="200" width="290" height="120" rx="8"/>
+          <text x="365" y="226" text-anchor="middle" font-weight="bold">Step 2: variant within e (NEW)</text>
+          <text x="365" y="246" text-anchor="middle" class="lbl">y = hash(u ‖ e.id ‖ e.salt) in [0,1)</text>
+          <text x="365" y="264" text-anchor="middle" class="lbl">variant = first i: cum_weight[i] &gt; y</text>
+          <text x="365" y="282" text-anchor="middle" class="lbl">edit weights (same salt): only near-boundary users move</text>
+          <text x="365" y="300" text-anchor="middle" class="lbl">new salt: deliberate clean re-bucket (rare)</text>
+
+          <rect class="cool" x="560" y="60" width="220" height="100" rx="8"/>
+          <text x="670" y="88" text-anchor="middle" font-weight="bold">synced experiment config</text>
+          <text x="670" y="106" text-anchor="middle" class="lbl">{id, salt, variants[{id,weight}],</text>
+          <text x="670" y="124" text-anchor="middle" class="lbl">mutex_group, activate_at, enabled}</text>
+          <text x="670" y="142" text-anchor="middle" class="lbl">pure inputs &rArr; every pod agrees</text>
+
+          <rect class="ok" x="560" y="200" width="220" height="90" rx="8"/>
+          <text x="670" y="228" text-anchor="middle" font-weight="bold">analysis pipeline</text>
+          <text x="670" y="246" text-anchor="middle" class="lbl">(downstream; out of scope)</text>
+          <text x="670" y="264" text-anchor="middle" class="lbl">consumes "u got variant v"</text>
+
+          <line x1="170" y1="170" x2="220" y2="110" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="195" cy="140" r="9" fill="#fff" stroke="#475569"/><text x="195" y="144" text-anchor="middle" font-size="10">1</text>
+          <line x1="365" y1="160" x2="365" y2="200" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="380" cy="180" r="9" fill="#fff" stroke="#475569"/><text x="380" y="184" text-anchor="middle" font-size="10">2</text>
+          <line x1="510" y1="100" x2="560" y2="100" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr2d)"/>
+          <line x1="510" y1="260" x2="560" y2="120" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr2d)"/>
+          <circle cx="535" cy="105" r="9" fill="#fff" stroke="#94a3b8"/><text x="535" y="109" text-anchor="middle" font-size="10">3</text>
+          <line x1="510" y1="270" x2="560" y2="245" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr2d)"/>
+          <circle cx="535" cy="252" r="9" fill="#fff" stroke="#94a3b8"/><text x="535" y="256" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = config read / downstream; dashed red = (none).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Request &rarr; Step 1 (mutex group)</strong> &mdash; for experiment <code>e</code> in mutex group <code>g</code>: compute <code>x = hash(user_id ‖ g.salt)</code> normalized to <code>[0,1)</code>; <code>g</code> has partitioned <code>[0,1)</code> into a fixed range per member experiment; if <code>x</code> falls in <code>e</code>'s range the user is &ldquo;in&rdquo; <code>e</code>, else <code>not_in_experiment</code> (they're in some sibling, or unallocated). Adding an experiment to <code>g</code> carves a slice from the <em>unallocated</em> remainder &mdash; existing members' ranges don't move.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Step 1 &rarr; Step 2 (variant)</strong> &mdash; if the user is in <code>e</code>: <code>y = hash(user_id ‖ e.id ‖ e.salt)</code> in <code>[0,1)</code>; the variant is the first one whose cumulative weight exceeds <code>y</code>. Editing <code>e</code>'s variant weights <em>without</em> changing <code>e.salt</code> only moves users whose <code>y</code> sits near a shifted boundary &mdash; bounded churn; editing <em>with</em> a new salt is a deliberate full re-bucket (used when you want a clean restart, e.g., after a bug).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Step 1/2 &rarr; synced config</strong> &mdash; every input (<code>g.salt</code>, the range table, <code>e.id</code>, <code>e.salt</code>, the variant weights, <code>activate_at</code>) comes from the config the control plane synced to every pod &rarr; <code>assign_bucket</code> is a pure function &rarr; the whole fleet computes the same answer for the same user.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>(downstream) analysis pipeline</strong> &mdash; consumes &ldquo;user <code>u</code> was assigned variant <code>v</code> of experiment <code>e</code>&rdquo; (logged with the request); out of scope here, but the determinism above is exactly what makes its population comparison valid.</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;1:</strong> <code>assign_bucket</code> changes from a single edit-brittle <code>hash % total_weight</code> to a two-step layered scheme keyed on per-group and per-experiment salts. The backend picker is untouched.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>The A/B side still uses <code>variant = variants[hash(u, e.id) % total_weight]</code>: editing any experiment changes <code>total_weight</code> (or the range layout) &rarr; the modulo lands differently &rarr; users flip variant mid-experiment &rarr; the &ldquo;treatment&rdquo; and &ldquo;control&rdquo; populations are no longer the same cohorts, so the experiment's measured effect is confounded with the cohort change, and the user sees the UI change under them; and two experiments with the same weights correlate (a user always-treatment in both), confounding their effects too. This is a <em>correctness</em> failure of the A/B FR, not a performance one &mdash; there's no canonical-bottleneck entry for &ldquo;the math is wrong,&rdquo; but the fix is a known pattern (Google/Microsoft &ldquo;overlapping experiments&rdquo; infrastructure; Optimizely/Statsig-style layered bucketing): make assignment a salted, boundary-stable, layered function. Per the data-model lens (<a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a> &mdash; same input, same output, stable under unrelated changes): the assignment must depend only on <code>(user, experiment-or-group, salt, weights)</code> and must move the minimum number of users when any of those changes.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Layered, salted, mutex-group bucketing &mdash; chosen.</strong> A mutex group owns <code>[0,1)</code> and gives each member experiment a fixed sub-range (keyed on the group salt); within an experiment, a per-experiment salt + a cumulative-weight cut maps the user to a variant. Properties: deterministic and pod-independent (pure function of synced config); sticky-per-user (no per-user storage); salts decorrelate experiments; weight edits move only near-boundary users; mutex groups give &ldquo;at most one experiment per group per user&rdquo; with adding-an-experiment-disturbs-nobody. The industry-standard shape.</li>
+          <li><strong>Store each user's assignment in a KV store on first sight (assignment-as-data) &mdash; rejected.</strong> Perfectly sticky &mdash; but it needs a write on first sight of every user&times;experiment (billions of rows), a read on every request (a network hop in the 20&nbsp;&micro;s budget &mdash; impossible), and it doesn't actually help with edits (you'd still have to decide whether an edit re-assigns). The deterministic-function approach gets stickiness for free with zero storage and zero hops.</li>
+          <li><strong>Consistent-hash the user onto a ring of variant slots (Optimizely's older &ldquo;bucketing&rdquo;) &mdash; rejected as the primary mechanism.</strong> It's a fine way to make weight edits move few users <em>within</em> an experiment &mdash; but it doesn't compose for mutex groups (you'd need a ring per group <em>and</em> per experiment) and the simple &ldquo;split <code>[0,1)</code> by cumulative weight + a salt&rdquo; achieves the same boundary-stability for variant edits with no ring to maintain. We use the salted-interval-cut.</li>
+          <li><strong>Per-request random assignment with a sticky cookie &mdash; rejected.</strong> Pushes the determinism into a client cookie &mdash; breaks for cookieless clients, breaks on cookie clear, and can't be recomputed server-side for offline analysis. The server-side pure function is the source of truth; a cookie can <em>cache</em> it, not replace it.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p>Model experiments in <strong>mutex groups</strong> (a.k.a. layers): a group <code>g</code> has a 64-bit <code>salt</code> and partitions <code>[0,1)</code> into a fixed range per member experiment plus an unallocated remainder; the range table is part of the synced config and changes only when an experiment is added (carving from the remainder) or removed (returning its range to the remainder &mdash; existing members untouched). <code>assign_bucket(u, e)</code>: let <code>g = e.mutex_group</code> (or a degenerate group containing only <code>e</code>, owning all of <code>[0,1)</code>, if <code>e</code> is unlayered). Compute <code>x = hash64(u ‖ g.salt) / 2&sup6;&#8308;</code>; if <code>x</code> &notin; <code>range_g(e)</code> return <code>not_in_experiment</code>. Else compute <code>y = hash64(u ‖ e.id ‖ e.salt) / 2&sup6;&#8308;</code> and return <code>variants[ first i where cum_weight[i] &gt; y ]</code>. Properties: <em>deterministic</em> (pure function of synced inputs &rarr; every pod, every request, agrees &mdash; satisfies the A/B-determinism NFR); <em>sticky</em> (depends on <code>u</code>, not on time or pod &mdash; no per-user storage); <em>decorrelated</em> (different salts &rarr; a user's membership in <code>e&#8321;</code> tells you nothing about <code>e&#8322;</code>); <em>boundary-stable on weight edits</em> (changing variant weights without changing <code>e.salt</code> moves only users whose <code>y</code> lies between the old and new cumulative-weight boundaries &mdash; if you go 50/50&rarr;40/60 you move ~10% of <code>e</code>'s users, the minimum possible); <em>clean-restartable</em> (bump <code>e.salt</code> to deliberately re-bucket everyone &mdash; rare, e.g., after a bug invalidated the data). Cost: 1&ndash;2 <code>hash64</code> calls (~5&ndash;10&nbsp;ns each) + a small scan over the variant cumulative weights (&le; ~10) + a range lookup &asymp; ~20&ndash;50&nbsp;ns &mdash; far inside the 20&nbsp;&micro;s budget. The control plane validates on edit: ranges within a group are non-overlapping and sum &le; 1; variant weights within an experiment sum to 1; an edit that would re-bucket &gt; a configured fraction without a salt bump is rejected with a warning (force the operator to choose: a small intentional shift, or an explicit salt-bumped restart). Cite the &ldquo;overlapping experiments&rdquo; pattern (Google, 2010) and <a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a> for the &ldquo;stable under unrelated changes&rdquo; discipline.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 1):
+  assign_bucket  = variants[ hash(u, e.id) % total_weight ]
+    edit e (add variant / change weights / add to a group)  -> total_weight or layout changes -> EVERY user can flip variant
+    -> experiment data corrupted on every edit; UI flicker; same-weight experiments correlate.   FAILS A/B determinism.
+  assign p99     = ~20-50 ns                                                                     ✅
+  backend picker = weighted P2C + ejection                                                       ✅ (carried)
+
+After (Iter 2 -- layered salted mutex bucketing):
+  in_group?      = x = hash64(u ‖ g.salt)/2^64 ;  in e iff x in range_g(e)
+  variant        = y = hash64(u ‖ e.id ‖ e.salt)/2^64 ;  variants[ first i: cum_weight[i] > y ]
+  edit variant weights (same salt):  users moved = | {u : old_boundary < y(u) <= new_boundary} | ~= |weight_delta| * |users_in_e|
+                                     -> 50/50 -> 40/60 moves ~10% of e's users; the MINIMUM. No one outside e is touched.   ✅
+  add experiment to group g:         carves from the unallocated remainder -> existing members' ranges unchanged -> 0 users moved.  ✅
+  bump e.salt:                       deliberate full re-bucket of e only (intentional; for a clean restart).
+  two same-weight experiments:       different salts -> membership uncorrelated -> effects not confounded.                  ✅
+  fleet agreement:                   pure function of synced config -> every pod, every request, same answer.  satisfies A/B determinism NFR. ✅
+  assign p99     = 1-2 hash64 (~5-10 ns ea) + scan <= ~10 variants + a range lookup ~= ~20-50 ns   -> p99 << 20 us       ✅ (unchanged)
+  backend picker = unchanged
+  $/month        = still ~0 (the control-plane validation is a cheap check on a ~tens-of-edits/day stream)
+</code></pre>
+        <p><strong>NFR check:</strong> A/B determinism ✅ (pure function of synced config; the fleet agrees; edits move the minimum users); latency ✅ (budget untouched). Connection bound ✅, load-awareness ✅, fail-static (mostly) ✅ &mdash; carried. <strong>Still open:</strong> the config-distribution path itself &mdash; 200 backend churns/sec + experiment edits, fanned to ~700 pods within 1&nbsp;s, with a staged <code>activate_at</code> so the fleet flips a variant split atomically, and a fail-static story when the control plane is down &mdash; Iteration&nbsp;3. Cost: still ~$0 incremental.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#replica-divergence">Pod-version skew during an edit</a>.</strong> An edit propagates over ~1&nbsp;s; for that second, some pods are on the new variant split and some on the old &rarr; a user whose requests hit both sees both variants &rarr; a brief contamination of the data. Defence: the <code>activate_at</code> timestamp &mdash; the edit is published <em>ahead</em> of when it takes effect; every pod has it before <code>activate_at</code>; all pods flip at the same wall-clock instant (within NTP skew, &lt; ~50&nbsp;ms). Detection: a config-version histogram across pods; alert if not converged before <code>activate_at</code>.</li>
+          <li><strong>Salt leak / predictability.</strong> If an experiment's salt is guessable, an adversary can self-select into &ldquo;treatment&rdquo; (e.g., to get a feature early). Defence: salts are random 64-bit, generated server-side, never exposed in client-visible responses; for security-sensitive experiments, gate on server-side identity, not just the bucket. Blast radius: a few self-selectors; detection: usually not worth detecting (the experiment population is large).</li>
+          <li><strong>Over-allocation of a mutex group.</strong> Adding experiments until the group's ranges sum to 1 leaves no unallocated remainder &mdash; the next add fails. Defence: the control-plane validation rejects an add that would overflow; operators must close an old experiment (return its range) first; a per-group &ldquo;allocation budget&rdquo; dashboard. This is a feature, not a bug &mdash; it makes &ldquo;we're out of experiment slots&rdquo; explicit instead of silently shrinking everyone.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>The experiment config (introduced in S2) gets the mutex-group structure; the control plane gains validation:</p>
+<pre class="line-numbers"><code class="language-sql">CREATE TABLE mutex_groups (
+  group_id text PRIMARY KEY, salt bigint NOT NULL, version bigint NOT NULL
+);
+CREATE TABLE experiments (
+  experiment_id text PRIMARY KEY, mutex_group_id text REFERENCES mutex_groups, salt bigint NOT NULL,
+  range_lo double precision, range_hi double precision,        -- this experiment's slice of its group's [0,1); NULL+NULL = unlayered (owns all)
+  variants jsonb NOT NULL,                                     -- [{variant_id, weight}], weights sum to 1
+  enabled boolean NOT NULL, activate_at timestamptz, starts_at timestamptz, ends_at timestamptz, version bigint NOT NULL
+);
+-- control-plane validation on write:  per group, ranges non-overlapping and SUM(hi-lo) <= 1 ;  per experiment, SUM(variant weight) = 1 ;
+--   if the new variant weights would re-bucket > REBUCKET_WARN_FRACTION of users without a salt change -> reject (or require an explicit override).
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if assignment had to be by <em>account</em> or <em>device</em>, not by stable <code>user_id</code></span></summary>
+        <p>The hash key changes (<code>account_id</code> or <code>device_fingerprint</code> instead of <code>user_id</code>), and stickiness now depends on that key being stable &mdash; a device that re-installs gets a new fingerprint and re-buckets, which may be acceptable (device experiments often are) or not (then you need a stable device id, which is a whole identity sub-problem). For account-level experiments where all users in an account must get the same variant (B2B feature flags), you hash the <code>account_id</code> and ignore <code>user_id</code> &mdash; the math is identical, the key is just coarser. Nothing else changes.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 3                                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-3">
+    <div class="container">
+      <h2>Iteration 3 &mdash; Versioned-delta config distribution, staged activation, last-known-good fallback</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1220 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 3: the control plane writes config changes (pool deltas at ~200/s, experiment edits) to a versioned config store; a fan-out tier streams versioned deltas to all ~700 router pods, which keep a local cached config, apply deltas, and on a detected gap full-fetch with jitter; experiment edits carry an activate_at so all pods flip at one wall-clock instant; a new pool or experiment config is canaried to ~1% of pods first; if the control plane or fan-out is unreachable, pods keep using their last-known-good config indefinitely and the local ejection loop still handles dead backends.">
+          <defs>
+            <marker id="arr3s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arr3r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="40" width="160" height="80" rx="8"/>
+          <text x="100" y="68" text-anchor="middle" font-weight="bold">SREs / discovery</text>
+          <text x="100" y="86" text-anchor="middle" class="lbl">~200 pool churns/s</text>
+          <text x="100" y="104" text-anchor="middle" class="lbl">+ experiment edits</text>
+
+          <rect class="cool" x="220" y="40" width="180" height="80" rx="8"/>
+          <text x="310" y="64" text-anchor="middle" font-weight="bold">Config store</text>
+          <text x="310" y="82" text-anchor="middle" class="lbl">versioned; validates</text>
+          <text x="310" y="100" text-anchor="middle" class="lbl">activate_at on edits</text>
+
+          <rect class="accent" x="440" y="30" width="180" height="100" rx="8"/>
+          <text x="530" y="56" text-anchor="middle" font-weight="bold">Fan-out tier (NEW)</text>
+          <text x="530" y="74" text-anchor="middle" class="lbl">streams versioned deltas</text>
+          <text x="530" y="92" text-anchor="middle" class="lbl">~3 nodes; cheap</text>
+          <text x="530" y="110" text-anchor="middle" class="lbl">canary 1% first</text>
+
+          <rect class="box" x="700" y="20" width="220" height="150" rx="8"/>
+          <text x="810" y="46" text-anchor="middle" font-weight="bold">Router pod &times;~700</text>
+          <rect class="accent" x="720" y="60" width="180" height="95" rx="6"/>
+          <text x="810" y="82" text-anchor="middle" font-weight="bold">local config cache (NEW)</text>
+          <text x="810" y="100" text-anchor="middle" class="lbl">apply deltas; gap &rarr; full-fetch+jitter</text>
+          <text x="810" y="118" text-anchor="middle" class="lbl">flip variants at activate_at</text>
+          <text x="810" y="136" text-anchor="middle" class="lbl">CP down &rArr; keep last-known-good</text>
+
+          <rect class="cool" x="700" y="210" width="220" height="100" rx="8"/>
+          <text x="810" y="238" text-anchor="middle" font-weight="bold">picker + bucketer (Iter 0-2)</text>
+          <text x="810" y="256" text-anchor="middle" class="lbl">subset / P2C / eject / layered bucket</text>
+          <text x="810" y="274" text-anchor="middle" class="lbl">reads the local cache; never blocks on CP</text>
+          <text x="810" y="292" text-anchor="middle" class="lbl">local ejection still works offline</text>
+
+          <rect class="ok" x="980" y="100" width="180" height="90" rx="8"/>
+          <text x="1070" y="128" text-anchor="middle" font-weight="bold">Backends</text>
+          <text x="1070" y="146" text-anchor="middle" class="lbl">conns bounded</text>
+          <text x="1070" y="164" text-anchor="middle" class="lbl">(Iter 0)</text>
+
+          <line x1="180" y1="80" x2="220" y2="80" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="200" cy="68" r="9" fill="#fff" stroke="#94a3b8"/><text x="200" y="72" text-anchor="middle" font-size="10">1</text>
+          <line x1="400" y1="80" x2="440" y2="80" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="420" cy="68" r="9" fill="#fff" stroke="#94a3b8"/><text x="420" y="72" text-anchor="middle" font-size="10">2</text>
+          <line x1="620" y1="80" x2="700" y2="100" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="660" cy="82" r="9" fill="#fff" stroke="#94a3b8"/><text x="660" y="86" text-anchor="middle" font-size="10">3</text>
+          <line x1="810" y1="155" x2="810" y2="210" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="825" cy="182" r="9" fill="#fff" stroke="#475569"/><text x="825" y="186" text-anchor="middle" font-size="10">4</text>
+          <line x1="920" y1="260" x2="980" y2="150" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="950" cy="200" r="9" fill="#fff" stroke="#475569"/><text x="950" y="204" text-anchor="middle" font-size="10">5</text>
+          <line x1="700" y1="120" x2="650" y2="120" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arr3r)"/>
+          <circle cx="675" cy="110" r="9" fill="#fff" stroke="#dc2626"/><text x="675" y="114" text-anchor="middle" font-size="10">6</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path (request-time); dashed gray = async config flow; dashed red = gap-recovery full-fetch.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>SREs / discovery &rarr; Config store</strong> &mdash; pool membership churns (~200/s from rolling deploys) and experiment edits land in a versioned store; each write is validated (subset/range/weight invariants from Iter&nbsp;0&ndash;2) and gets a monotonic version; experiment edits get an <code>activate_at</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Config store &rarr; Fan-out tier</strong> &mdash; the store publishes versioned deltas to a small fan-out tier (a pub/sub or a streaming gRPC service, ~3 cheap nodes) that holds the current config and a tail of recent deltas.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Fan-out tier &rarr; Router pods</strong> &mdash; each pod holds an open stream and applies deltas to its local cache; a new pool or experiment config is rolled to ~1% of pods first (a canary cohort) and a divergence/error-rate gate (no spike in 503s, no surge in re-bucketed users) must pass before the full rollout.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>local config cache &rarr; picker + bucketer</strong> &mdash; the picker and bucketer (Iter&nbsp;0&ndash;2) read the local cache only; they never make a network call on a request and never block on the control plane.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>picker &rarr; Backends</strong> &mdash; unchanged; the local ejection loop keeps working even if the control plane is gone (a dead backend is ejected on local outcomes; a new backend just doesn't get traffic until the next config update).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Router pod &rarr; Fan-out (gap recovery)</strong> &mdash; if a pod detects a version gap (a delta is missing) or the stream drops, it full-fetches the current config &mdash; with per-pod jitter so ~700 pods don't full-fetch simultaneously on a fan-out blip (stampede avoidance).</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;2:</strong> the config path becomes versioned-delta streaming with a small fan-out tier, canary rollout, staged <code>activate_at</code>, jittered gap-recovery, and an explicit fail-static contract (control plane down &rarr; pods run on last-known-good forever). No change to the picker or bucketer logic; +~3 fan-out nodes + the config store (a small Postgres + a pub/sub).</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>After Iteration&nbsp;2 every <em>algorithm</em> is right, but the <em>distribution</em> of the config that drives them is naive: full pushes (re-send the whole pool/experiment set on every change) at 200&nbsp;churns/sec &times; ~700 pods, no version negotiation, no canary, no fail-static guarantee, and no atomic flip. Two failure shapes: (a) <a href="../canonicals/bottlenecks.html#stampede">stampede</a> &mdash; a config event (or a fan-out restart) makes all ~700 pods fetch the full config at once &rarr; a thundering herd on the control plane; (b) blackhole &mdash; the control plane down means pods either keep a stale config (acceptable!) or, worse, treat &ldquo;can't reach control plane&rdquo; as &ldquo;empty config&rdquo; and stop routing (catastrophic). Plus a correctness shape: a non-atomic experiment edit contaminates data for the ~1&nbsp;s propagation window. Per <a href="../canonicals/bottleneck-to-decisions.html#stampede">bottleneck-to-decisions#stampede</a>: <em>versioned deltas</em> (send the change, not the whole), <em>jittered gap-recovery</em> (don't all retry at once), a <em>fan-out tier</em> (absorb the read fan-out), a <em>canary</em> (a bad config can't take down the fleet), <em>staged activation</em> (flip atomically), and an explicit <em>last-known-good</em> contract (a missing control plane is fail-static, never fail-empty).</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Versioned-delta streaming via a small fan-out tier + jittered gap-recovery + canary + <code>activate_at</code> + last-known-good &mdash; chosen.</strong> Deltas keep the per-event work tiny; the fan-out tier decouples ~700 long-lived streams from the config store; jitter kills the stampede; the canary bounds a bad-config blast radius to 1%; <code>activate_at</code> makes edits atomic; last-known-good makes the control plane non-load-bearing for routing. Standard config-distribution engineering (xDS/Envoy-control-plane shape).</li>
+          <li><strong>Pods poll the config store directly every <code>T</code> &mdash; rejected.</strong> Simple, but ~700 pods polling every (say) 500&nbsp;ms is 1.4&nbsp;k QPS of full-config reads on the store, freshness is bounded by <code>T</code> (vs. ~ms for a stream), and a config-store hiccup either stalls all pods or (if you set a short timeout) triggers the very stampede you're avoiding. Streaming + a fan-out tier is strictly better at this scale.</li>
+          <li><strong>Distribute config via a CDN / edge KV (signed config blobs at <code>config.cdn/{version}</code>) &mdash; rejected as the primary, kept as a backstop.</strong> Great for the &ldquo;fail-static&rdquo; story (the CDN is independently durable, pods can always fetch <em>some</em> recent version), and zero infra to run &mdash; but CDN propagation is seconds-to-minutes, not the &le;1&nbsp;s the NFR wants for pool churn. Use the streaming path for freshness; mirror each version to the CDN as a disaster backstop a pod can fall back to if the fan-out tier is unreachable.</li>
+          <li><strong>No fan-out tier; pods stream straight from the config store &mdash; rejected.</strong> Couples ~700 long-lived streams to the store's connection budget and restart behaviour; a store failover drops all 700 at once &rarr; mass gap-recovery. The fan-out tier is a cheap shock absorber (3 nodes &asymp; $300/mo) that's worth it.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p>The control plane is a small <strong>config store</strong> (Postgres &mdash; the data is tiny and relational: pools, backends, experiments, mutex_groups, all versioned; chosen over a KV store because the validation queries are relational and the write rate &mdash; 200/s of single-row updates &mdash; is trivial for Postgres; over etcd because etcd's value-size and watch-fanout limits make it awkward at hundreds of churns/sec across hundreds of watchers) plus a <strong>fan-out tier</strong> (~3 stateless nodes streaming versioned deltas; chosen over reusing Kafka because the consumers want a <em>compacted current state</em> + a short delta tail, not a long log, and over a CDN-only approach because of the &le;1&nbsp;s freshness need &mdash; though the CDN mirror is kept as a disaster backstop). Each router pod: holds an open delta stream; applies deltas to a local in-RAM config (the picker/bucketer read this, never the network); on a version gap or a dropped stream, full-fetches with per-pod random jitter (so a fan-out restart doesn't trigger 700 simultaneous fetches); on an experiment edit, the delta carries <code>activate_at</code> and the pod stages the new variant split, flipping at that wall-clock instant (within NTP skew). Rollout safety: a new pool or experiment config is delivered to a ~1% <strong>canary cohort</strong> of pods first; an automated gate (no 503 spike, no surge in re-bucketed users vs. the predicted churn, no error-rate regression) must pass before the fan-out promotes it to the rest. Fail-static contract, stated explicitly: <em>if the control plane and the fan-out tier and the CDN backstop are all unreachable, every pod keeps routing on its last-known-good config indefinitely</em> &mdash; a pool that's a few minutes stale is fine (the local ejection loop drops dead backends; a new backend just waits for traffic), and experiments simply don't change. The picker/bucketer never throw on a hot-path call: an unknown pool routes to a static fallback pool; an unknown experiment returns <code>not_in_experiment</code>. Cite <a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a> and <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a> (cold-start of a freshly-deployed pod = full-fetch from the fan-out tier).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 2):
+  config distribution = full pushes, 200 churns/s x ~700 pods, no version negotiation, no canary, no fail-static, no atomic flip
+    -> a config event or fan-out blip -> ~700 pods full-fetch at once -> stampede on the control plane
+    -> control plane down -> risk of "empty config" -> routing stops (catastrophic)
+    -> non-atomic experiment edit -> ~1 s window where pods disagree -> brief data contamination
+  picker/bucketer     = correct (Iter 0-2)                                                       ✅
+  $/month (component) = ~0
+
+After (Iter 3 -- versioned-delta streaming + fan-out tier + canary + activate_at + last-known-good):
+  per-event work      = a delta (one backend +/-, or one experiment field) -> bytes, not the whole set -> ~negligible per event x 700 streams
+  fan-out tier        = ~3 c7g.xlarge holding the compacted current config + a delta tail; ~700 long-lived streams; trivial load
+  gap recovery        = pod detects a version gap -> full-fetch from fan-out with per-pod jitter in [0, 2 s] -> no synchronized herd
+  freshness           = delta applied within ~ms of publish; well inside the <= 1 s NFR (vs. seconds-to-minutes for a CDN-only path)
+  atomic flip         = experiment edit published with activate_at = publish_time + 5 s; every pod has it by then; all flip within NTP skew (< ~50 ms)  ✅
+  canary              = new pool/experiment config -> 1% of pods (~7) first -> gate (503s flat? re-bucketed users <= predicted? error rate flat?) -> promote
+                        -> a bad config's blast radius is ~1% for the canary window, not 100%                                            ✅
+  fail-static         = control plane + fan-out + CDN backstop all down -> pods run on last-known-good forever; local ejection still works
+                        -> routing NEVER stops because the control plane is down                                                        ✅
+  picker/bucketer     = unknown pool -> static fallback ; unknown experiment -> not_in_experiment ; never throws on the hot path           ✅
+  $/month (component) = config store (Postgres, ~$140/mo) + fan-out tier (~3 x $104 ~= $312/mo) + CDN mirror (config is KB ~= ~$0) ~= ~$450/mo
+                        -- the router fleet (~700 x $209 ~= $146k/mo) exists for routing/TLS/L7, not for this component.
+</code></pre>
+        <p><strong>NFR check:</strong> config freshness ✅ (delta streaming, ~ms; well within 1&nbsp;s); availability / fail-static ✅ (last-known-good forever; the control plane is non-load-bearing for routing); A/B determinism ✅ (atomic <code>activate_at</code> flip eliminates the propagation-window contamination); connection bound ✅, load-awareness ✅ &mdash; carried. Bottleneck budget exhausted (Naive + 4 iterations). Cost: ~$450/mo for the control plane &mdash; rounding error against the router fleet, which exists for routing regardless.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#bad-deploy">Bad config gets past the canary</a>.</strong> A config that's wrong in a way the gate doesn't measure (e.g., it routes correctly but to a sub-optimal subset) reaches the fleet. Defence: keep the previous config version on every pod; a one-command rollback re-publishes version <code>N&minus;1</code> as the latest; the canary gate's metric set is itself reviewed when a miss happens. Detection: whatever the missed symptom was &mdash; add it to the gate.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#clock-skew">Clock skew breaks <code>activate_at</code></a>.</strong> A pod with a 2-minute-skewed clock flips an experiment 2 minutes early or late &rarr; that pod's traffic is briefly on the wrong split. Defence: pods reject an <code>activate_at</code> that's in their past beyond a small tolerance (treat it as &ldquo;activate now&rdquo; and alert); rely on NTP keeping skew &lt; ~50&nbsp;ms; monitor per-pod clock offset. Detection: a clock-offset gauge; a config-version-vs-wall-clock check.</li>
+          <li><strong>Fan-out tier total loss.</strong> All ~3 fan-out nodes gone &rarr; pods can't get deltas. Defence: this is exactly what last-known-good covers &mdash; routing continues on the stale config; pods fall back to the CDN config mirror for a coarse refresh; the fan-out tier is restored from the config store (it's stateless). Blast radius: config freshness degrades from ~ms to &ldquo;frozen until recovery&rdquo;; routing is unaffected. Detection: per-pod &ldquo;config age&rdquo; gauge climbing fleet-wide.</li>
+          <li><strong>Stale-pod blackhole.</strong> One pod's stream silently wedges (it thinks it's up to date but isn't); it routes to backends that have been removed &rarr; elevated <code>conn_refused</code>. Defence: a heartbeat in the stream + a max-config-age watchdog (a pod whose config is older than <code>T</code> with no successful refresh marks itself unhealthy and is pulled from the LB); the local ejection loop also masks it (removed backends start refusing &rarr; get ejected). Detection: the per-pod config-age gauge; <code>conn_refused</code> rate by pod.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>The config store's schema is the consolidation of S2 + Iter&nbsp;0&ndash;2 (pools, backends, experiments, mutex_groups), now with the delta/version plumbing; no in-RAM picker change.</p>
+<pre class="line-numbers"><code class="language-text">// Config store (Postgres): pools, backends, experiments, mutex_groups (all from prior iterations) + a change-log:
+CREATE TABLE config_versions ( version bigint PRIMARY KEY, kind text, object_id text, op text, payload jsonb, activate_at timestamptz, created_at timestamptz );
+// Fan-out -> pod stream:  GET /v1/config/stream?since={version}  -> [ {version, kind, object_id, op, payload, activate_at}, ... heartbeats ... ]
+// Pod gap recovery:       GET /v1/config/snapshot               -> { version, pools[], experiments[], mutex_groups[] }   (compacted current state)
+// CDN backstop:           config.cdn/v1/{version}.json          (signed compacted snapshot, mirrored on every version; coarse-freshness fallback)
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if config had to be <em>strongly</em> consistent across the fleet (no version skew ever allowed)</span></summary>
+        <p>You'd need a coordinated commit: the control plane proposes a new version, every pod acks it, then the control plane signals &ldquo;activate&rdquo; (a two-phase flip) &mdash; which means a single unreachable pod blocks the change, so you'd need a quorum-with-fencing and a way to evict a non-acking pod. That's a big cost for a guarantee this workload doesn't need: a few hundred ms of pool-membership skew is harmless (the retry covers it) and experiment skew is already handled by <code>activate_at</code>'s wall-clock flip (which is &ldquo;strong enough&rdquo; &mdash; bounded by NTP skew, not by propagation). You'd only pay for true strong consistency if, say, the config carried a security policy where a stale pod is a vulnerability.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- PROBES                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="probes">
+    <div class="container">
+      <h2>Probe iterations <span style="font-weight:normal;font-size:0.7em;">(the interviewer pulls the thread &mdash; beyond the 5-Core budget)</span></h2>
+      <p>Each in a <code>&lt;details&gt;</code> block; same NFR-driven structure, one level deeper.</p>
+
+      <details>
+        <summary>Probe A &mdash; Sticky sessions (session affinity to a backend)</summary>
+        <p><strong>Need.</strong> Some pools want the same session (cart, in-progress upload, a stateful protocol) to land on the same backend &mdash; but <em>not</em> at the cost of a connection storm when backends churn. <strong>Move.</strong> Maglev hashing: build a fixed-size lookup table (e.g., 65&nbsp;537 slots) over the subset by Maglev's permutation algorithm; route by <code>table[ hash(session_key) mod table_size ]</code>. Maglev's whole point is <em>minimal disruption</em>: removing a backend reassigns only its ~<code>1/S</code> of slots, so ~<code>1/S</code> of sessions move, not all of them &mdash; vs. plain modulo-<code>S</code> (a churn re-maps everyone) and vs. ring/consistent-hash (more disruption than Maglev for the same table size, and a slower lookup). Build cost: <code>O(S &times; table_size)</code> once per membership change, off the request path; lookup: one array read, ~5&nbsp;ns. Cite <a href="../consistent-hashing.html">consistent-hashing.html</a> (Maglev) and <a href="../canonicals/bottlenecks.html#hot-partition">bottlenecks#hot-partition</a> (a hot session key is a hot partition &mdash; mitigate by allowing the table to route a known-hot key to a small set, not a single slot).</p>
+      </details>
+
+      <details>
+        <summary>Probe B &mdash; Cross-pod load awareness</summary>
+        <p><strong>Gap.</strong> P2C's in-flight count is <em>pod-local</em> &mdash; a backend being hammered by 50 <em>other</em> pods looks idle to this one, so this pod cheerfully adds to the pile. <strong>Move.</strong> Two options, used together: (1) <em>backend-reported load</em> &mdash; the backend includes a coarse load hint (queue depth, CPU%, &ldquo;please back off&rdquo; bit) in its responses / health pings; the picker folds it into the P2C comparand and the weight (Envoy's ORCA / &ldquo;load report&rdquo; mechanism); (2) <em>error feedback</em> &mdash; a backend that starts shedding (429 / 503-with-Retry-After) immediately drops in effective weight via the same EWMA that drives ejection. Don't gossip per-pod load directly (a 700-pod all-to-all gossip is its own scaling problem); let the backend, which sees <em>all</em> its load, be the aggregator. Cite <a href="../canonicals/bottlenecks.html#tail-latency">bottlenecks#tail-latency</a>.</p>
+      </details>
+
+      <details>
+        <summary>Probe C &mdash; Experiment ramp &amp; permanent holdback</summary>
+        <p><strong>Need.</strong> Roll a treatment variant 1% &rarr; 5% &rarr; 25% &rarr; 50% over days (catch problems while small) and keep a permanent ~1% holdout (measure the long-run cumulative effect of <em>all</em> shipped experiments). <strong>Move.</strong> A ramp is a sequence of weight edits with <code>activate_at</code> timestamps &mdash; and crucially, <em>boundary-stable</em> ones (Iter&nbsp;2): 1%&rarr;5% moves the 1&ndash;5% slice of users <em>into</em> treatment, no one moves out, no one in the existing 1% flips &mdash; so the early cohort's data stays valid through the ramp. The holdback is a reserved range in a top-level mutex group (&ldquo;global holdout owns <code>[0, 0.01)</code>; no experiment may allocate there&rdquo;) &mdash; those users are in <em>no</em> experiment, ever, by construction. Cite the Iter&nbsp;2 layered-bucketing mechanism.</p>
+      </details>
+
+      <details>
+        <summary>Probe D &mdash; Multi-region routing &amp; global vs regional pools</summary>
+        <p><strong>Scope.</strong> &ldquo;Which region&rdquo; is a layer above this one (GeoDNS / anycast routes the client to the nearest healthy region; the router fleet there does the within-region pick). But a backend pool can be <em>global</em> (one logical service, instances in many regions) &mdash; then the pool's members span regions, and the subset/picker should prefer <em>same-region</em> members (a cross-region hop adds ~tens of ms): the picker tags each backend with its region and, in the P2C draw, biases toward in-region (or strictly in-region with cross-region as a fallback only when no in-region backend is healthy). The config plane is per-region, but a global pool's membership is the union (synced from all regions' discovery). Cite <a href="../canonicals/bottlenecks.html#cross-region">bottlenecks#cross-region</a>; this is the boundary with #46 (multi-region active-active), which owns the &ldquo;which region&rdquo; question.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S6. Final Design                                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s6-final">
+    <div class="container">
+      <h2>S6. Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 1260 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Final: clients hit ~700 router pods globally; each pod holds a local config cache fed by versioned deltas from a fan-out tier (3 nodes) backed by a Postgres config store (fed by service discovery's ~200 churns/s and SRE experiment edits, validated, with activate_at and a 1% canary), plus a CDN config mirror as a disaster backstop; per request the pod computes a deterministic rendezvous-hash subset of the target pool, picks a backend by weighted power-of-two-choices over in-flight counts (skipping outlier-ejected ones, with a probe-back loop and slow-start), and assigns the user to an A/B variant by layered salted mutex-aware bucketing; backends see N*S/M bounded connections; the control plane being down leaves routing fully functional on last-known-good config.">
+          <defs>
+            <marker id="arrFs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrFd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arrFr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="40" width="150" height="70" rx="8"/>
+          <text x="95" y="66" text-anchor="middle" font-weight="bold">Service discovery</text>
+          <text x="95" y="84" text-anchor="middle" class="lbl">~200 churns/s</text>
+          <text x="95" y="100" text-anchor="middle" class="lbl">backend feed</text>
+
+          <rect class="ok" x="20" y="140" width="150" height="70" rx="8"/>
+          <text x="95" y="166" text-anchor="middle" font-weight="bold">SRE / exp editor</text>
+          <text x="95" y="184" text-anchor="middle" class="lbl">~tens edits/day</text>
+          <text x="95" y="200" text-anchor="middle" class="lbl">+ ramps / holdback</text>
+
+          <rect class="cool" x="210" y="80" width="170" height="100" rx="8"/>
+          <text x="295" y="106" text-anchor="middle" font-weight="bold">Config store</text>
+          <text x="295" y="124" text-anchor="middle" class="lbl">Postgres; versioned</text>
+          <text x="295" y="142" text-anchor="middle" class="lbl">validates invariants</text>
+          <text x="295" y="160" text-anchor="middle" class="lbl">activate_at; change-log</text>
+
+          <rect class="box" x="420" y="70" width="170" height="120" rx="8"/>
+          <text x="505" y="96" text-anchor="middle" font-weight="bold">Fan-out tier &times;3</text>
+          <text x="505" y="114" text-anchor="middle" class="lbl">streams versioned deltas</text>
+          <text x="505" y="132" text-anchor="middle" class="lbl">+ snapshot endpoint</text>
+          <text x="505" y="150" text-anchor="middle" class="lbl">1% canary &rarr; promote</text>
+          <text x="505" y="168" text-anchor="middle" class="lbl">~$300/mo</text>
+
+          <rect class="ok" x="420" y="210" width="170" height="70" rx="8"/>
+          <text x="505" y="236" text-anchor="middle" font-weight="bold">CDN config mirror</text>
+          <text x="505" y="254" text-anchor="middle" class="lbl">signed snapshots</text>
+          <text x="505" y="270" text-anchor="middle" class="lbl">disaster backstop</text>
+
+          <rect class="box" x="640" y="40" width="290" height="270" rx="8"/>
+          <text x="785" y="66" text-anchor="middle" font-weight="bold">Router pod &times;~700 (TLS + L7 + this primitive)</text>
+          <rect class="accent" x="660" y="80" width="250" height="60" rx="6"/>
+          <text x="785" y="102" text-anchor="middle" font-weight="bold">local config cache</text>
+          <text x="785" y="120" text-anchor="middle" class="lbl">deltas + activate_at; gap &rarr; full-fetch+jitter</text>
+          <rect class="accent" x="660" y="150" width="250" height="65" rx="6"/>
+          <text x="785" y="172" text-anchor="middle" font-weight="bold">pick_backend</text>
+          <text x="785" y="190" text-anchor="middle" class="lbl">rendezvous subset(S) &rarr; weighted P2C</text>
+          <text x="785" y="206" text-anchor="middle" class="lbl">skip ejected; probe-back; slow-start; p99 &le;100&micro;s</text>
+          <rect class="accent" x="660" y="225" width="250" height="65" rx="6"/>
+          <text x="785" y="247" text-anchor="middle" font-weight="bold">assign_bucket</text>
+          <text x="785" y="265" text-anchor="middle" class="lbl">layered salted mutex bucketing</text>
+          <text x="785" y="281" text-anchor="middle" class="lbl">pure fn of synced config; p99 &le;20&micro;s</text>
+
+          <rect class="cool" x="990" y="80" width="180" height="90" rx="8"/>
+          <text x="1080" y="106" text-anchor="middle" font-weight="bold">Backend pools</text>
+          <text x="1080" y="124" text-anchor="middle" class="lbl">M up to 5k; churn 200/s</text>
+          <text x="1080" y="142" text-anchor="middle" class="lbl">conns/backend &asymp; N&middot;S/M &le; C</text>
+          <text x="1080" y="158" text-anchor="middle" class="lbl">(decoupled from N)</text>
+
+          <rect class="ok" x="990" y="210" width="180" height="80" rx="8"/>
+          <text x="1080" y="238" text-anchor="middle" font-weight="bold">Clients</text>
+          <text x="1080" y="256" text-anchor="middle" class="lbl">2M RPS / region</text>
+          <text x="1080" y="272" text-anchor="middle" class="lbl">(GeoDNS picks region)</text>
+
+          <line x1="170" y1="80" x2="210" y2="110" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <line x1="170" y1="175" x2="210" y2="150" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="190" cy="128" r="9" fill="#fff" stroke="#94a3b8"/><text x="190" y="132" text-anchor="middle" font-size="10">1</text>
+          <line x1="380" y1="130" x2="420" y2="130" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="400" cy="118" r="9" fill="#fff" stroke="#94a3b8"/><text x="400" y="122" text-anchor="middle" font-size="10">2</text>
+          <line x1="505" y1="190" x2="505" y2="210" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="520" cy="200" r="9" fill="#fff" stroke="#94a3b8"/><text x="520" y="204" text-anchor="middle" font-size="10">3</text>
+          <line x1="590" y1="110" x2="660" y2="110" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="625" cy="98" r="9" fill="#fff" stroke="#94a3b8"/><text x="625" y="102" text-anchor="middle" font-size="10">4</text>
+          <line x1="660" y1="200" x2="595" y2="240" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arrFr)"/>
+          <circle cx="625" cy="225" r="9" fill="#fff" stroke="#dc2626"/><text x="625" y="229" text-anchor="middle" font-size="10">5</text>
+          <line x1="910" y1="185" x2="990" y2="125" stroke="#475569" marker-end="url(#arrFs)"/>
+          <circle cx="950" cy="150" r="9" fill="#fff" stroke="#475569"/><text x="950" y="154" text-anchor="middle" font-size="10">6</text>
+          <line x1="990" y1="250" x2="930" y2="200" stroke="#475569" marker-end="url(#arrFs)"/>
+          <circle cx="955" cy="230" r="9" fill="#fff" stroke="#475569"/><text x="955" y="234" text-anchor="middle" font-size="10">7</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered above) and line-style legend.</strong> <em>Solid slate = sync hot path (request-time); dashed gray = async config flow; dashed red = gap-recovery / disaster backstop.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Discovery / SRE &rarr; Config store</strong> &mdash; ~200 backend churns/s + experiment edits; each write validated (subset/range/weight invariants) and versioned; experiment edits get <code>activate_at</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Config store &rarr; Fan-out tier</strong> &mdash; publishes versioned deltas; the fan-out tier holds the compacted current config + a delta tail.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Fan-out tier &rarr; CDN mirror</strong> &mdash; every version is also written as a signed snapshot to a CDN path &mdash; a coarse-freshness disaster backstop.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Fan-out tier &rarr; Router pods</strong> &mdash; each pod streams deltas to its local cache; new pool/experiment configs canary to ~1% of pods then promote; experiment flips happen at <code>activate_at</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Router pod &rarr; Fan-out / CDN (recovery)</strong> &mdash; on a version gap or dropped stream, full-fetch the snapshot with per-pod jitter; if the fan-out tier is unreachable, fall back to the CDN mirror; if everything is unreachable, keep last-known-good config indefinitely.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Router pod &rarr; Backends</strong> &mdash; per request: rendezvous-hash subset of the pool &rarr; weighted P2C over in-flight counts &rarr; route; skip outlier-ejected backends; the probe-back loop + slow-start manage health and cold replicas. Each backend sees <code>N&middot;S/M</code> connections.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9318; <strong>Clients &rarr; Router pod</strong> &mdash; 2&nbsp;M RPS/region (GeoDNS/anycast already picked the region); per request the pod also calls <code>assign_bucket</code> for any applicable experiments.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Optimization stack (per-iteration delta)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Stage</th><th>Move</th><th>Bottleneck addressed</th><th>conns/backend</th><th>backend-load tail</th><th>A/B on edit</th><th>fail-static</th><th>$/mo (this component)</th></tr></thead>
+            <tbody>
+              <tr><td>Naive</td><td>array+hashmap; uniform <code>GetRandom</code>; every pod &rarr; every backend; <code>hash % total_weight</code></td><td>&mdash;</td><td><strong>N</strong> (grows with the fleet)</td><td>~ln S / ln ln S above mean</td><td>everyone re-rolls</td><td>partial (no probe-back)</td><td>~$0</td></tr>
+              <tr><td>+ Iter 0</td><td>deterministic rendezvous-hash subset(S) per pod</td><td>connection-saturation</td><td><strong>N&middot;S/M</strong> (tunable, decoupled from N)</td><td>~ln S / ln ln S (unchanged)</td><td>everyone re-rolls (unchanged)</td><td>partial (unchanged)</td><td>~$0</td></tr>
+              <tr><td>+ Iter 1</td><td>weighted P2C over in-flight; outlier ejection + probe-back + slow-start</td><td>tail-latency / cold-start (backend side)</td><td>N&middot;S/M (unchanged)</td><td><strong>~constant above mean</strong> (P2C)</td><td>everyone re-rolls (unchanged)</td><td><strong>real</strong> (probe-back)</td><td>~$0</td></tr>
+              <tr><td>+ Iter 2</td><td>layered, salted, mutex-aware bucketing</td><td>A/B correctness (edit-brittleness)</td><td>N&middot;S/M</td><td>~constant</td><td><strong>only near-boundary users move; sibling experiments untouched</strong></td><td>real</td><td>~$0</td></tr>
+              <tr><td>+ Iter 3</td><td>versioned-delta streaming + fan-out tier + canary + <code>activate_at</code> + last-known-good + CDN backstop</td><td>stampede / blackhole / non-atomic edit</td><td>N&middot;S/M</td><td>~constant</td><td>only near-boundary; <strong>atomic flip</strong></td><td><strong>routing never stops if CP is down</strong></td><td>~$450</td></tr>
+              <tr><td><strong>Final</strong></td><td>&mdash;</td><td>&mdash;</td><td><strong>N&middot;S/M &le; C</strong></td><td><strong>~constant</strong></td><td><strong>minimal-disruption + atomic</strong></td><td><strong>last-known-good forever</strong></td><td><strong>~$450</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Total improvement:</strong> not a dollar number &mdash; the picker rides on the router fleet, which exists for TLS+L7 regardless; the control plane added is ~$450/mo. What improved is the <em>blast radius on dependencies</em>: backends went from &ldquo;connection count = the whole router fleet&rdquo; to a bounded, tunable share; the backend-load tail collapsed; experiments went from &ldquo;corrupted on every edit&rdquo; to &ldquo;minimal-disruption and atomic&rdquo;; and a control-plane outage went from &ldquo;routing might stop&rdquo; to &ldquo;routing is unaffected.&rdquo; This is the rare arc where the optimization target is what the system <em>imposes on its neighbours</em>, not its own infra bill &mdash; and a staff designer says so up front.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel &rarr; production cousin (property trade)</h3>
+        <p>Five properties of the LC #380 array+hashmap that <em>actually</em> changed:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property</th><th>Textbook (LC #380)</th><th>Production cousin</th><th>Why the swap</th></tr></thead>
+            <tbody>
+              <tr><td>Selection rule</td><td>uniform <code>GetRandom</code> over the set</td><td>weighted power-of-two-choices over in-flight counts, skipping ejected backends</td><td>uniform leaves a hot backend <code>~ln S / ln ln S</code> above mean and slams cold replicas; P2C collapses the tail at ~one extra read</td></tr>
+              <tr><td>Set membership</td><td>the whole set (all items)</td><td>a deterministic, balanced, churn-stable <em>subset</em> of size <code>S</code> per client</td><td>full mesh makes a backend's connection count grow with the client fleet (<code>N</code>); subsetting makes it <code>N&middot;S/M</code>, tunable and fleet-independent</td></tr>
+              <tr><td>Item state</td><td>weightless, healthy by definition</td><td>capacity-weighted; health-stateful (ejected with exponential backoff, probed back, slow-started)</td><td>real backends differ in capacity and fail transiently; delete-on-failure with no return slowly shrinks the pool on a blip</td></tr>
+              <tr><td>&ldquo;Randomness&rdquo; for A/B</td><td><code>rand()</code> &mdash; non-deterministic, non-sticky</td><td><code>hash(user ‖ experiment ‖ salt)</code> mapped through layered mutex-group ranges &mdash; deterministic, sticky, decorrelated, boundary-stable on edits</td><td>an A/B assignment must be the same on every pod and stable across edits, or the experiment compares mixed cohorts; <code>rand()</code> gives neither</td></tr>
+              <tr><td>Lifecycle</td><td>purely in-process; mutations are local <code>insert</code>/<code>delete</code> calls</td><td>the set is synced fleet-wide via versioned deltas (&le; 1&nbsp;s), with canary, atomic <code>activate_at</code> flips, and a last-known-good fail-static contract</td><td>200 churns/s across ~700 pods needs delta streaming, not full pushes; a control-plane outage must not stop routing; experiment edits must flip atomically</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; consolidated schema reference</h3>
+        <p>The control-plane store (introduced piecemeal: <code>pools</code>/<code>backends</code> in Iter&nbsp;0, the in-RAM picker layout in Iter&nbsp;1, <code>experiments</code>/<code>mutex_groups</code> in Iter&nbsp;2, <code>config_versions</code> + the stream/snapshot/CDN endpoints in Iter&nbsp;3). Consolidated here &mdash; not the only place it lives.</p>
+<pre class="line-numbers"><code class="language-sql">-- Config store (Postgres -- tiny, relational, ~200 single-row writes/s; chosen over etcd (watch-fanout/value-size limits at this rate)
+--                          and over a KV store (the validation queries are relational)):
+CREATE TABLE pools       ( pool_id text PRIMARY KEY, lb_mode text, session_key_spec jsonb, version bigint );
+CREATE TABLE backends    ( backend_id text PRIMARY KEY, pool_id text REFERENCES pools, capacity_weight double precision, zone text, version bigint );
+CREATE TABLE mutex_groups( group_id text PRIMARY KEY, salt bigint, version bigint );
+CREATE TABLE experiments ( experiment_id text PRIMARY KEY, mutex_group_id text REFERENCES mutex_groups, salt bigint,
+                           range_lo double precision, range_hi double precision, variants jsonb,   -- [{variant_id, weight}], sum=1
+                           enabled boolean, activate_at timestamptz, starts_at timestamptz, ends_at timestamptz, version bigint );
+CREATE TABLE config_versions ( version bigint PRIMARY KEY, kind text, object_id text, op text, payload jsonb, activate_at timestamptz, created_at timestamptz );
+-- write-path validation: per pool, members exist & sorted on push; per group, ranges non-overlapping & SUM(hi-lo) <= 1; per experiment, SUM(weight)=1;
+--   reject a weight edit that re-buckets > REBUCKET_WARN_FRACTION of users unless e.salt also changes (force the operator's intent).
+
+-- Fan-out tier API:  GET /v1/config/stream?since={v} -> [ {version, kind, object_id, op, payload, activate_at}, heartbeats... ]
+--                    GET /v1/config/snapshot         -> { version, pools[], backends[], experiments[], mutex_groups[] }   (compacted)
+-- CDN backstop:      config.cdn/v1/{version}.json    (signed compacted snapshot; coarse-freshness fallback)
+
+-- In-RAM per pod, per pool (lock-free; request threads use atomics; the config thread swaps the alias table on a delta):
+struct SubsetEntry { backend_id; weight; zone; in_flight: atomic_u32; consec_fails: u16; ejected_until: i64; ewma_lat_us: f32; }
+SubsetEntry subset[S];  SubsetEntry ejected[];  AliasTable weight_alias;   // subset = top_S_by(xxhash(pod_id,backend_id)) with a per-zone cap
+// In-RAM per pod, experiments: { experiment_id -> {salt, range_lo, range_hi, mutex_group_id, variant_cum_weights[], activate_at} } + group salts/range-tables.
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>Config writes (pool/experiment edits) are RBAC'd + audit-logged via <code>config_versions</code>; the fan-out stream and the CDN snapshots are signed (pods verify) so a compromised CDN can't inject a malicious config; experiment salts are server-side-only. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td><code>assign_bucket</code> takes a <code>user_id</code> but stores nothing &mdash; it's a pure function; the only place &ldquo;user <code>u</code> got variant <code>v</code>&rdquo; is recorded is the request log, which the downstream analysis pipeline (out of scope) owns and TTLs. No PII in the config plane. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>The config store is the only durable state (small, relational &mdash; standard Postgres HA + backups); the fan-out tier and the pods are stateless (rebuild from the store / snapshot). RPO ≈ the store's replication lag; RTO ≈ minutes (and routing keeps working on last-known-good throughout). Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>Cold-start of a freshly-deployed router pod = full-fetch the snapshot from the fan-out tier (or the CDN) &mdash; ~tens of KB, ~ms; then stream deltas. The fan-out tier is sized for ~700 long-lived streams + a snapshot-fetch burst on a deploy; +headroom for 2&times; the router fleet. Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>This page <em>is</em> a subsetting design &mdash; the router&rarr;backend topology is subsetted (Iter&nbsp;0); separately, pods stream from a fan-out tier rather than directly from the config store (a subset of the config-distribution graph). Cite <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>The control plane is per-region (a region is a cell); a config-plane failure is contained to one region; routing in other regions is unaffected. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>Config distribution is push (the fan-out tier streams deltas to pods); the request path itself is request/response (no push to clients). Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>The router pods <em>are</em> the edge tier (this primitive lives in the edge L7 proxy); the CDN config mirror uses the edge for config distribution. Cite <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p>When the <strong>control plane / fan-out / CDN are all unreachable</strong> &rarr; every pod keeps routing on its last-known-good config indefinitely; the local outlier-ejection loop still drops dead backends; new backends just don't get traffic until config flows again; experiments don't change. When a <strong>backend fails</strong> &rarr; it's ejected locally on consecutive failures (per pod, independently), with exponential backoff and a probe-back loop; if &gt; 50% of a subset is ejected (a fleet-wide problem), the pod stops ejecting and routes to all of them anyway (don't route to nothing). When a <strong>pod's config wedges</strong> (stale beyond a watchdog threshold) &rarr; the pod marks itself unhealthy and is pulled from the load balancer; the local ejection loop also masks it (it's routing to removed backends &rarr; <code>conn_refused</code> &rarr; ejects them). When a <strong>config edit is bad</strong> &rarr; the 1% canary cohort catches it (no promotion) or a one-command rollback to version <code>N&minus;1</code>; experiment edits flip atomically at <code>activate_at</code>, so there's no half-flipped fleet. The picker/bucketer <em>never</em> throw on a hot-path call: unknown pool &rarr; static fallback pool; unknown experiment &rarr; <code>not_in_experiment</code>. The invariant: <em>routing degrades gracefully (staler, less load-aware) but never stops, and an experiment is never silently corrupted.</em> Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a> + <a href="../canonicals/failure-modes.html#stampede">#stampede</a>.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> <code>pick_backend</code> and <code>assign_bucket</code> latency p99/p999 (&rarr; the latency NFRs); per-backend connection count distribution (&rarr; the connection-bound NFR &mdash; the math assumes balance, verify it); per-pod &ldquo;healthy backends in subset&rdquo; gauge + percent-of-subset-ejected (&rarr; routing health, panic-mode trips); config age per pod + config-version histogram across pods (&rarr; the freshness + atomic-flip NFRs); re-bucketed-users-per-edit (predicted vs. actual &mdash; a canary gate signal and an A/B-integrity alarm); P2C imbalance (max-backend in-flight / mean &mdash; should stay near a small constant); ejection rate, probe-back success rate; fan-out stream connection count + snapshot-fetch rate (stampede detector).</li>
+          <li><strong>Rollout.</strong> Two rollout surfaces: (1) <em>config</em> &mdash; every new pool/experiment config canaries to ~1% of pods, an automated gate (latency flat, 503s flat, re-bucketed-users &le; predicted) must pass, then promote; a one-command rollback re-publishes the previous version. (2) <em>the picker binary</em> &mdash; standard service rollout (canary a few pods, watch the SLIs, ramp), with the picker's own metrics (latency, imbalance, ejection rate) gating it.</li>
+          <li><strong>Migration.</strong> From a Naive &ldquo;uniform over the whole pool&rdquo; picker: ship the new picker with subsetting + P2C behind a per-pool flag (still uniform over the subset = behaviourally close to before), flip pools one at a time watching connection counts and backend tails; ship the layered bucketer with a compatibility mode that reproduces the old <code>hash % total_weight</code> assignment for <em>existing</em> experiments (re-key only new ones) until each old experiment naturally ends; then drop the compat mode.</li>
+          <li><strong>Headroom.</strong> Subset size <code>S</code> carries the redundancy headroom (a pod survives losing a chunk of its subset before it has zero healthy backends &mdash; <code>S=20</code> floor); the fan-out tier is sized for ~2&times; the router fleet's streams + a deploy-time snapshot burst; the config store is wildly over-provisioned for ~200 writes/s (it's a small Postgres). Reason: router-fleet growth, region additions, and a deploy that restarts many pods at once.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text">This component's marginal cost (everything that exists BECAUSE of this primitive, not the router fleet that exists for routing anyway):
+  Config store (Postgres, m6i.xlarge HA pair):  2 x $0.19/hr x 720  = $274/mo
+  Fan-out tier (3 x c7g.xlarge):                3 x $0.145/hr x 720 = $313/mo
+  CDN config mirror (snapshots are ~tens of KB; a handful of writes/min):  ~$0-5/mo
+  TOTAL (this component)                                              ~= $590/mo  ->  ~$1k/mo (1 sig fig)   -- a rounding error.
+
+For context, the router fleet it rides on:  ~700 c7g.2xlarge x $0.29/hr x 720  ~= $146k/mo  -- but that fleet exists to terminate
+  TLS and do L7 routing; the picker+bucketer are < 1% of its CPU. Adding this primitive doesn't add a pod.
+
+Dominant cost: there isn't a meaningful one for this component -- it's a library plus a tiny control plane. The cost-shape lesson
+  (cite cost-shapes.html): an infra PRIMITIVE's value is usually in what it AVOIDS spending elsewhere -- here, the backend overload from
+  connection saturation (which would force over-provisioned backends), the corrupted experiments (which would waste the experiment program),
+  and the routing outage on a control-plane blip (which would dwarf $1k/mo). Name that: don't size this by its own bill; size it by the
+  blast radius it removes from its dependencies.
+
+Cost-vs-X knob: subset size S. Bigger S = more pod-side redundancy (a pod tolerates more backend failures in its subset) but more
+  connections per backend (closer to the C cliff and more conn memory on each backend). Smaller S = fewer connections but a pod whose
+  whole subset fails is stranded. We pick S = clamp(20, ceil(C*N/M), M): 20 is the redundancy floor; on big pools the C bound is what
+  binds. Turning S up to, say, 64 on a 5000-backend / 700-pod pool gives 9 conns/backend instead of 2.8 -- still far under C -- and a
+  64-deep failover set; we'd do that if backend-failure correlation were higher. There is no latency knob -- both calls are already ~ns.
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Real-system comparison</h3>
+        <p>The picker side is essentially <strong>Envoy's load-balancing subsystem</strong> re-derived from the LC kernel: Envoy does subsetting (its &ldquo;subset load balancer&rdquo; and the deterministic-aperture/subsetting work in the Envoy/gRPC ecosystem), power-of-two-choices (&ldquo;least request&rdquo; with a configurable choice count), outlier ejection with exponential backoff, slow-start, and a panic threshold &mdash; all the moves above, in production, at scale; the config plane is <strong>xDS</strong> (a streaming control-plane protocol &mdash; versioned, delta-capable, with ADS for ordering), which is the Iter&nbsp;3 design. The bucketing side is the <strong>Google &ldquo;overlapping experiments&rdquo; infrastructure</strong> (Tang et&nbsp;al., 2010 &mdash; layers, domains, exclusivity, salted hashing) and its commercial descendants (Optimizely, LaunchDarkly, Statsig &mdash; deterministic bucketing keyed on a user id + a per-experiment salt, with mutual-exclusion groups). Where this page diverges from any of them: it's intentionally <em>one</em> coherent component (picker + bucketer in the same edge process) because the premise put them there; in reality the LB lives in the proxy (Envoy) and the experiment SDK is a separate library (often in the application, not the proxy) &mdash; the design moves are identical, the packaging differs. And a real Envoy deployment has <em>many</em> more knobs (zone-aware routing, retry budgets, circuit breakers, hedging) &mdash; several of which are this page's probes. Sources: see <a href="../../cribs/_sources.md">cribs/_sources.md</a> for this scenario.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p>Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal.</p>
+
+      <div>
+        <h3>What if the router fleet were 10&times; &mdash; 7,000 pods globally? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>The whole point of subsetting is that this is a non-event for the backends: <code>conns/backend = N&middot;S/M</code>, and you shrink <code>S</code> as <code>N</code> grows to keep the product under <code>C</code> &mdash; at <code>N=7000</code>, <code>M=5000</code>, <code>C=64</code>, <code>S = clamp(20, ceil(64&middot;7000/5000)=90, M) = 90</code> &rarr; <code>conns/backend = 7000&middot;90/5000 = 126</code>, right at <code>C</code>; if you want margin, accept that the redundancy floor (20) on tiny pools now means tiny pools see up to 7000 conns &mdash; so put an aggregator layer in front of pools below ~<code>C&middot;floor</code> backends. The fan-out tier scales linearly (more stateless nodes for more streams) and stays a rounding error. The config store is unbothered (still ~200 writes/s &mdash; that's a property of the deploy rate, not the fleet size). Nothing structural breaks; the only new decision is &ldquo;aggregators in front of small pools.&rdquo;</p>
+      </div>
+
+      <div>
+        <h3>Why not just use Envoy + xDS and an off-the-shelf experiment SDK? <span style="font-weight:normal;font-size:0.85em;">(alt-engine)</span></h3>
+        <p>You should &mdash; and the page says so (Real-system comparison): Envoy gives you subsetting, P2C/least-request, outlier ejection, slow-start, the panic threshold, and xDS streaming config out of the box; an SDK like Statsig/Optimizely/LaunchDarkly gives you deterministic salted layered bucketing. The reason to derive it here is to <em>understand</em> what those products are doing and why each knob exists &mdash; so when Envoy's tail latency spikes you know it's a P2C-comparand or a panic-threshold question, and when an experiment's numbers look wrong you know to check whether someone edited weights without a salt bump. The one place a from-scratch build is defensible: when the picker and the bucketer genuinely must be the same hot-path component (a constraint the premise imposed) and the SDK can't run inside the proxy &mdash; but even then you'd lift Envoy's algorithms, not reinvent them. Cite <a href="../canonicals/storage-engines.html#kv-engine">storage-engines#kv-engine</a> only loosely &mdash; the config store is a small relational DB, not the interesting choice.</p>
+      </div>
+
+      <div>
+        <h3>What changes if this routes regulated traffic (PCI / HIPAA / data-residency)? <span style="font-weight:normal;font-size:0.85em;">(regulatory)</span></h3>
+        <p>The picker gains a <em>placement constraint</em> dimension: a request tagged (say) &ldquo;EU-resident&rdquo; may only be routed to backends in EU zones &mdash; so the subset is computed <em>within the allowed zone set</em> (the rendezvous top-<code>S</code> over the eligible backends only), and a pool that has no eligible backend for a request fails closed (a 451-style refusal), never falls back across the boundary. The experiment side: an experiment may be scoped to a jurisdiction (its mutex-group range only &ldquo;applies&rdquo; if the user is in-scope), and the &ldquo;user <code>u</code> got variant <code>v</code>&rdquo; log inherits the request's residency tag for the analysis pipeline. Audit: the <code>config_versions</code> change-log already gives who-changed-what-when; add who-routed-what-where sampling. What stays the same: subsetting, P2C, ejection, the bucketing math &mdash; regulation adds a filter on the candidate set and a fail-closed rule, not a new bottleneck. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</p>
+      </div>
+
+      <div>
+        <h3>The control plane is down right now &mdash; what actually happens? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Nothing visible to clients. Pods keep routing on their last-known-good config; the local outlier-ejection loop keeps dropping dead backends and probing them back, so transient backend failures still self-heal; a backend that gets <em>added</em> during the outage simply doesn't receive traffic until config flows again; experiments don't change variant splits or memberships. The only degradation is <em>freshness</em>: a backend permanently removed during the outage will be discovered &ldquo;dead&rdquo; by ejection (it starts refusing) within seconds anyway, so even that is masked. Recovery sequence: bring the fan-out tier back (stateless &mdash; it rehydrates from the config store or, if the store is also down, from the CDN snapshot); pods reconcile via the snapshot endpoint (jittered, so no stampede) and resume the delta stream. The watchdog (a pod whose config exceeds a staleness threshold marks itself unhealthy) is the backstop if a pod's stream is wedged in a way that isn't caught. Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a>.</p>
+      </div>
+
+      <div>
+        <h3>Where's the cost, and which knob moves it? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>This component costs ~$1k/mo (a small Postgres pair + ~3 fan-out nodes + a CDN mirror that's effectively free) &mdash; a rounding error against the ~$146k/mo router fleet, which exists for TLS+L7 regardless and gains no pods from this primitive. So there's no &ldquo;dominant cost&rdquo; to optimize; the relevant lever is <em>elsewhere</em>: subset size <code>S</code> is a connections-vs-redundancy knob (bigger <code>S</code> &rarr; a deeper failover set per pod, but more connections and more connection memory on each backend &mdash; and connection memory on thousands of backends is real money), and the picker's <em>quality</em> (P2C, ejection, slow-start) is what lets backends run at higher utilization safely, which is where the actual savings are &mdash; a fleet that can run at 85% instead of 65% because the tail is controlled is ~25% fewer backend machines. So the &ldquo;cost story&rdquo; for this component is: it's cheap, and its job is to make the <em>expensive</em> things (backends) cheaper by behaving well toward them. Cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> (an infra primitive's bill is small; its leverage is on its neighbours').</p>
+      </div>
+
+      <div>
+        <h3>How do you roll this out from a Naive &ldquo;uniform over the whole pool&rdquo; picker without an incident? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Picker side: ship the new picker with subsetting + P2C behind a per-pool flag; with the flag off it's uniform-over-the-whole-pool (byte-identical behaviour); flip <em>one</em> pool to subsetting and watch its backends' connection counts drop and their tail latency; ramp pool-by-pool; then flip P2C on per pool watching the imbalance metric. A bad pool flips back instantly (it's a flag). Bucketer side: the hazard is re-bucketing existing experiments &mdash; so ship the layered bucketer with a compat shim that, for any experiment created before the cutover, reproduces the old <code>hash(u, e.id) % total_weight</code> assignment exactly (so no live user moves); only <em>new</em> experiments use the layered/salted path; as old experiments end naturally, their compat entries age out; once none remain, delete the shim. Rollback trigger at any step: a backend connection-count or tail-latency regression (picker), or any re-bucketed-users signal on an existing experiment (bucketer). The migration is &ldquo;flag-flip per pool, compat-shim per old experiment&rdquo; &mdash; no big-bang.</p>
+      </div>
+
+      <div>
+        <h3>Production is slow / mis-routing right now &mdash; where do you look first? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>Decision tree off the SLI dashboard: (1) <code>pick_backend</code> p99 elevated? &mdash; almost never the picker itself (~ns); it's the <em>backend</em> the picker chose &mdash; look at per-backend tail latency and the P2C imbalance metric (is one backend hot? then check its ejection state &mdash; should it have been ejected?). (2) Elevated <code>conn_refused</code> from a pod? &mdash; that pod is routing to removed backends &rarr; check its config-age gauge (is its stream wedged? the watchdog should have pulled it &mdash; did it?). (3) Backend connection counts uneven / climbing? &mdash; subset-balance problem &rarr; check the rendezvous-hash distribution and whether <code>S</code> is sized right for the current <code>N</code>. (4) An experiment's numbers look off? &mdash; check the re-bucketed-users metric for that experiment around any recent edit (someone changed weights without a salt bump?), and the config-version histogram (did the <code>activate_at</code> flip converge, or is the fleet half-flipped?). (5) Everything stale fleet-wide? &mdash; the fan-out tier or config store is down &rarr; the degradation-contract path applies; restore the fan-out tier (stateless). Each branch maps to a What-Breaks entry and a runbook step; the &ldquo;count the re-bucketed users&rdquo; and &ldquo;config-version histogram&rdquo; instruments exist precisely so the A/B-integrity questions are a dashboard read.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S7. Key Takeaways & Related Topics                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s7-takeaways">
+    <div class="container">
+      <h2>S7. Key Takeaways</h2>
+      <ul>
+        <li><strong>A cheap O(1) hot path can still be expensive &mdash; for its dependencies.</strong> The LC #380 picker costs nanoseconds, but its <em>output</em> (uniform over the whole pool) imposes connections-proportional-to-the-whole-router-fleet on every backend, ignores load, and corrupts experiments on every edit. Optimize what the primitive imposes on its neighbours, not its own CPU.</li>
+        <li><strong>Subsetting decouples a dependency's connection count from your client-fleet size.</strong> Full mesh &rarr; <code>conns/backend = N</code> (unbounded). Deterministic, balanced, churn-stable subsetting &rarr; <code>conns/backend = N&middot;S/M</code>, and you shrink <code>S</code> as <code>N</code> grows. Use a rendezvous (HRW) hash, not index-ranges, so a churn moves ~one element of each subset, not the whole window &mdash; the same &ldquo;why consistent hashing&rdquo; argument, applied to subsets.</li>
+        <li><strong>Power-of-two-choices: ~all the benefit of &ldquo;pick the global least-loaded&rdquo; for the cost of one extra read.</strong> Uniform random over <code>S</code> backends leaves a hot one <code>~ln S / ln ln S</code> above the mean; pick two at random and take the less-loaded and the max load collapses to a small constant above the mean &mdash; without the herding that &ldquo;always pick the least-loaded&rdquo; causes. Pair it with capacity weights, outlier ejection + probe-back, and slow-start for cold replicas.</li>
+        <li><strong>&ldquo;Random&rdquo; for A/B is a deterministic function, not <code>rand()</code>.</strong> An assignment must be the same on every pod and stable across unrelated edits, or the experiment compares mixed cohorts. <code>hash(user ‖ experiment ‖ salt)</code> mapped through layered mutex-group ranges gives stickiness with zero per-user storage, decorrelated experiments, &ldquo;at most one experiment per group per user,&rdquo; minimal-disruption weight edits, and a deliberate clean-restart (bump the salt). The boundary-stability is what keeps a ramp's early cohort's data valid.</li>
+        <li><strong>An infra primitive's config plane must be fail-static, not fail-empty.</strong> Versioned deltas (not full pushes), a fan-out tier (absorb the read fan-out), jittered gap-recovery (no stampede), a 1% canary (bound a bad config's blast radius), atomic <code>activate_at</code> flips (no half-flipped fleet), and &mdash; the load-bearing one &mdash; &ldquo;control plane down &rArr; keep last-known-good forever, never treat unreachable-config as empty-config.&rdquo;</li>
+        <li><strong>Not every NALSD arc is a cost-reduction story.</strong> Here the dollar line barely moves (~$1k/mo of control plane on top of a router fleet that exists anyway). What the arc buys is bounded blast radius on dependencies, a controlled backend tail, valid experiments, and routing that survives a control-plane outage. A staff designer names the optimization target &mdash; here, &ldquo;what we impose on our neighbours&rdquo; &mdash; rather than reflexively chasing the bill.</li>
+      </ul>
+
+      <h2>Related topics</h2>
+      <div class="card-grid full-width">
+        <a href="../canonicals/bottlenecks.html#connection-saturation" class="card topic-card">
+          <h3>Bottleneck: connection saturation</h3>
+          <p>The shape-determining failure here &mdash; a dependency's connection count scaling with the client fleet, not the workload. First move: subsetting.</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#tail-latency" class="card topic-card">
+          <h3>Bottleneck: tail latency &amp; the power of two choices</h3>
+          <p>Why uniform random over replicas leaves a hot one, and how P2C (+ ejection, slow-start) collapses the tail at near-zero cost.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent hashing (rendezvous, Maglev)</h3>
+          <p>The minimal-disruption hashing behind deterministic subsetting (rendezvous/HRW) and sticky sessions (Maglev) &mdash; a churn moves ~one element, not everything.</p>
+        </a>
+        <a href="../canonicals/failure-modes.html#stampede" class="card topic-card">
+          <h3>Failure mode: stampede</h3>
+          <p>Why ~700 pods full-fetching config at once is a thundering herd, and the versioned-delta + jitter + fan-out-tier fix.</p>
+        </a>
+        <a href="20-distributed-rate-limiter.html" class="card topic-card">
+          <h3>#20 Distributed rate limiter</h3>
+          <p>The sibling per-request edge primitive &mdash; admission instead of selection; shares the &ldquo;cheap, lock-free, fail-static&rdquo; discipline.</p>
+        </a>
+        <a href="08-l4-vs-l7-lb.html" class="card topic-card">
+          <h3>#08 L4 vs L7 load balancing</h3>
+          <p>The load balancer this primitive lives inside &mdash; connection handling, L7 routing, where the picker sits in the request path.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

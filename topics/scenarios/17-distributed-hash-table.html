@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Hash Table (Chord DHT) — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Distributed Hash Table: Chord-Style Key-Value Store</h1>
+      <p class="hero-subtitle">Design a peer-to-peer key-value store where 1,000 nodes cooperate to store 10 billion keys &mdash; with O(log N) lookups and automatic key redistribution when nodes join or leave.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are building a distributed key-value store that does not rely on a central coordinator. There is no &ldquo;master&rdquo; node &mdash; every node is equal. The system must self-organize so that any node can route a lookup to the correct destination in a small number of network hops.</p>
+
+      <div>
+        <h3>Concrete Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Parameter</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Total nodes</td><td>1,000</td></tr>
+              <tr><td>Total key-value pairs</td><td>10 billion</td></tr>
+              <tr><td>Average value size</td><td>1 KB</td></tr>
+              <tr><td>Total data</td><td>10 TB</td></tr>
+              <tr><td>Node churn rate</td><td>1 join or leave per minute</td></tr>
+              <tr><td>Lookup latency target</td><td>&lt; 10 ms within a data center</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Requirements</h3>
+        <ul>
+          <li><strong>O(log N) lookups</strong> &mdash; a lookup should contact at most ~10 nodes, not all 1,000.</li>
+          <li><strong>Automatic key redistribution</strong> &mdash; when a node joins or leaves, keys move to maintain balance without any manual intervention.</li>
+          <li><strong>No central coordinator</strong> &mdash; the system must be fully decentralized.</li>
+          <li><strong>Fault tolerance</strong> &mdash; if a node crashes, its keys should still be available.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Storage &amp; Latency Estimates</h3>
+<pre class="line-numbers"><code class="language-text">Storage per node:
+  10 TB / 1,000 nodes = 10 GB per node
+  → Fits comfortably in RAM (modern servers have 64-256 GB)
+  → Even on SSD, 10 GB is trivially small
+
+Keys per node:
+  10 billion / 1,000 = 10 million keys per node
+  → Hash map with 10M entries ≈ 10M × (8B key hash + 8B pointer) = 160 MB overhead
+  → Plus 10M × 1 KB values = 10 GB. Total ≈ 10.2 GB per node.</code></pre>
+      </div>
+
+      <div>
+        <h3>Lookup &amp; Churn Estimates</h3>
+<pre class="line-numbers"><code class="language-text">Lookup hops (Chord with finger tables):
+  O(log₂ N) = log₂(1,000) ≈ 10 hops
+
+Latency per hop:
+  Same data center: ~0.5 ms RTT (network round-trip)
+
+Total lookup latency:
+  10 hops × 0.5 ms = 5 ms  ✓  (well under 10 ms target)
+
+Node churn:
+  1 node change per minute = 1 every 60 seconds
+  When a node leaves, its 10M keys (10 GB) must transfer to the successor
+  At 10 Gbps network: 10 GB / 1.25 GB/sec = 8 seconds to transfer
+  → Churn is manageable (60 sec between events, 8 sec to handle each)</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Key insight:</strong> The math tells us this is feasible. Each node stores a manageable amount of data, lookups finish in milliseconds, and the network can handle key transfers faster than new churn events arrive. The challenge is purely algorithmic: how do we route lookups efficiently without a central directory?</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Successor-Only Ring</h2>
+      <p>The simplest decentralized approach: arrange all nodes in a ring. Each node only knows its <strong>successor</strong> (the next node clockwise). To look up a key, forward the request around the ring one hop at a time until you reach the node that owns the key.</p>
+
+      <div>
+        <h3>How the Ring Works</h3>
+        <p>Both nodes and keys are hashed onto a circular identifier space [0, 2<sup>m</sup>). For SHA-1, m = 160, giving a ring of 2<sup>160</sup> positions. A key is stored on the first node whose position is equal to or follows the key&rsquo;s hash (its <strong>successor</strong>).</p>
+      </div>
+
+      <div class="full-width">
+        <!-- Chord Ring Diagram: 6 nodes on ring [0, 48) with key ownership -->
+        <svg viewBox="0 0 700 420" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowRing" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+          </defs>
+
+          <!-- Ring circle -->
+          <circle cx="220" cy="200" r="150" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="6,3"/>
+
+          <!-- Position 0 marker at top -->
+          <text x="220" y="35" text-anchor="middle" fill="#64748b" font-size="11">0</text>
+          <line x1="220" y1="40" x2="220" y2="50" stroke="#94a3b8" stroke-width="1"/>
+
+          <!-- Node 1 (near top, slightly clockwise from 0) -->
+          <!-- angle = (1/48)*360 = 7.5 deg from top. x=220+150*sin(7.5)=220+19.6, y=200-150*cos(7.5)=200-148.7 -->
+          <circle cx="240" cy="51" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="240" y="55" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">1</text>
+
+          <!-- Node 8 (angle = 8/48*360 = 60 deg) x=220+150*sin60=220+130, y=200-150*cos60=200-75 -->
+          <circle cx="350" cy="125" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="350" y="129" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">8</text>
+
+          <!-- Node 14 (angle = 14/48*360 = 105 deg) x=220+150*sin105=220+145, y=200-150*cos105=200+38.8 -->
+          <circle cx="365" cy="239" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="365" y="243" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">14</text>
+
+          <!-- Node 21 (angle = 21/48*360 = 157.5 deg) x=220+150*sin157.5=220+57.4, y=200-150*cos157.5=200+138.6 -->
+          <circle cx="277" cy="339" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="277" y="343" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">21</text>
+
+          <!-- Node 32 (angle = 32/48*360 = 240 deg) x=220+150*sin240=220-130, y=200-150*cos240=200+75 -->
+          <circle cx="90" cy="275" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="90" y="279" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">32</text>
+
+          <!-- Node 42 (angle = 42/48*360 = 315 deg) x=220+150*sin315=220-106, y=200-150*cos315=200-106 -->
+          <circle cx="114" cy="94" r="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="114" y="98" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">42</text>
+
+          <!-- Successor arrows (clockwise) -->
+          <path d="M 254,60 Q 290,70 340,113" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+          <path d="M 362,138 Q 375,175 370,225" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+          <path d="M 355,253 Q 330,300 290,332" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+          <path d="M 263,345 Q 180,360 100,290" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+          <path d="M 82,260 Q 65,190 105,108" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+          <path d="M 125,80 Q 165,45 230,45" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRing)"/>
+
+          <!-- Title -->
+          <text x="220" y="200" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">Ring [0, 48)</text>
+          <text x="220" y="216" text-anchor="middle" fill="#64748b" font-size="11">clockwise</text>
+
+          <!-- Key ownership legend -->
+          <rect x="420" y="40" width="270" height="340" rx="8" fill="#f8f9fa" stroke="#e2e8f0" stroke-width="1"/>
+          <text x="555" y="65" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Key Ownership</text>
+
+          <text x="435" y="95" fill="#334155" font-size="12">(42, 1]</text>
+          <line x1="500" y1="91" x2="530" y2="91" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="95" fill="#2563eb" font-weight="600" font-size="12">Node 1</text>
+          <text x="620" y="95" fill="#64748b" font-size="10">(wraps 0)</text>
+
+          <text x="435" y="125" fill="#334155" font-size="12">(1, 8]</text>
+          <line x1="500" y1="121" x2="530" y2="121" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="125" fill="#2563eb" font-weight="600" font-size="12">Node 8</text>
+
+          <text x="435" y="155" fill="#334155" font-size="12">(8, 14]</text>
+          <line x1="500" y1="151" x2="530" y2="151" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="155" fill="#2563eb" font-weight="600" font-size="12">Node 14</text>
+
+          <text x="435" y="185" fill="#334155" font-size="12">(14, 21]</text>
+          <line x1="500" y1="181" x2="530" y2="181" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="185" fill="#2563eb" font-weight="600" font-size="12">Node 21</text>
+
+          <text x="435" y="215" fill="#334155" font-size="12">(21, 32]</text>
+          <line x1="500" y1="211" x2="530" y2="211" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="215" fill="#2563eb" font-weight="600" font-size="12">Node 32</text>
+
+          <text x="435" y="245" fill="#334155" font-size="12">(32, 42]</text>
+          <line x1="500" y1="241" x2="530" y2="241" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+          <text x="537" y="245" fill="#2563eb" font-weight="600" font-size="12">Node 42</text>
+
+          <!-- Key 30 example -->
+          <rect x="430" y="280" width="255" height="90" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="557" y="302" text-anchor="middle" font-weight="600" fill="#1e40af" font-size="12">Example: Key at position 30</text>
+          <text x="557" y="322" text-anchor="middle" fill="#334155" font-size="12">30 is in range (21, 32]</text>
+          <text x="557" y="342" text-anchor="middle" fill="#334155" font-size="12">Stored on Node 32</text>
+
+          <!-- Key 30 dot on ring (between Node 21 and Node 32) -->
+          <!-- angle for 30: 30/48*360=225 deg. x=220+150*sin225=220-106, y=200-150*cos225=200+106 -->
+          <circle cx="114" cy="306" r="6" fill="#ef4444" stroke="#fff" stroke-width="1.5"/>
+          <text x="94" y="318" text-anchor="end" fill="#ef4444" font-size="11" font-weight="600">key 30</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Naive Lookup: Walk the Ring</h3>
+<pre class="line-numbers"><code class="language-text">Looking up key at position 30, starting at Node 1:
+
+  Step 1: Node 1 receives query for key 30.
+          Node 1's successor is Node 8.
+          30 is not in (42, 1], so forward to Node 8.
+
+  Step 2: Node 8's successor is Node 14.
+          30 is not in (1, 8], forward to Node 14.
+
+  Step 3: Node 14's successor is Node 21.
+          30 is not in (8, 14], forward to Node 21.
+
+  Step 4: Node 21's successor is Node 32.
+          30 is not in (14, 21], forward to Node 32.
+
+  Step 5: Node 32 owns range (21, 32]. Key 30 is in this range!
+          Node 32 returns the value.
+
+  Result: 4 hops. With 6 nodes this is already O(N).</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+
+      <div>
+        <h3>O(N) Lookups Are Unacceptable</h3>
+<pre class="line-numbers"><code class="language-text">With 1,000 nodes and successor-only routing:
+
+  Average hops per lookup: N/2 = 500 hops
+  Latency per hop: 0.5 ms
+  Total lookup latency: 500 × 0.5 ms = 250 ms
+
+  Compare to our target: &lt; 10 ms
+
+  This is 25× too slow.</code></pre>
+      </div>
+
+      <div>
+        <h3>Linear Scanning Wastes Network Bandwidth</h3>
+        <p>Every lookup that starts far from the target traverses hundreds of nodes. Each hop consumes network bandwidth and CPU on an intermediate node that has nothing to do with the requested key. Under load (millions of lookups per second), intermediate nodes become bottlenecks even though they are just forwarding messages.</p>
+      </div>
+
+      <div>
+        <h3>The Core Problem</h3>
+        <p>Each node only knows about its immediate neighbor. It has no way to &ldquo;skip ahead&rdquo; to a node closer to the target. We need each node to maintain a small routing table that lets it jump large distances around the ring.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Finger Tables                                    -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Chord Finger Tables</h2>
+      <p>The Chord protocol (Stoica et al., 2001) solves the O(N) problem by giving each node a <strong>finger table</strong> &mdash; a routing table with m entries (where m is the number of bits in the hash, e.g., 160 for SHA-1). Each entry lets the node jump exponentially farther around the ring.</p>
+
+      <div class="full-width">
+        <h3>Finger Table Construction</h3>
+        <p>For a node at position <em>n</em>, the i-th finger table entry (0-indexed) is:</p>
+<pre class="line-numbers"><code class="language-text">finger[i] = successor of (n + 2^i) mod 2^m
+
+For our simplified ring [0, 48) with m = 6 bits (2^6 = 64 ≈ 48):
+
+Node 1's finger table:
+  finger[0]: successor of (1 + 1)  = successor of 2  → Node 8
+  finger[1]: successor of (1 + 2)  = successor of 3  → Node 8
+  finger[2]: successor of (1 + 4)  = successor of 5  → Node 8
+  finger[3]: successor of (1 + 8)  = successor of 9  → Node 14
+  finger[4]: successor of (1 + 16) = successor of 17 → Node 21
+  finger[5]: successor of (1 + 32) = successor of 33 → Node 42
+
+Node 21's finger table:
+  finger[0]: successor of (21 + 1)  = successor of 22 → Node 32
+  finger[1]: successor of (21 + 2)  = successor of 23 → Node 32
+  finger[2]: successor of (21 + 4)  = successor of 25 → Node 32
+  finger[3]: successor of (21 + 8)  = successor of 29 → Node 32
+  finger[4]: successor of (21 + 16) = successor of 37 → Node 42
+  finger[5]: successor of (21 + 32) = successor of 5  → Node 8</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The intuition:</strong> Finger table entries point to nodes at distances 1, 2, 4, 8, 16, 32, &hellip; around the ring. This means a node can jump halfway around the ring in one hop, then a quarter, then an eighth, and so on. Each hop halves the remaining distance &mdash; exactly like binary search. That is why lookup takes O(log N) hops.</p>
+      </div>
+
+      <div>
+        <h3>Lookup with Finger Tables: Concrete Trace</h3>
+<pre class="line-numbers"><code class="language-text">Looking up key at position 30, starting at Node 1:
+
+  Step 1: Node 1 wants to find the successor of position 30.
+          Scan finger table from largest to smallest:
+            finger[5] → Node 42 at position 42.  42 > 30?
+              But 42 is past the target (in ring terms). Skip.
+            finger[4] → Node 21 at position 21.  21 < 30? Yes!
+              Node 21 is the largest finger that doesn't overshoot.
+          Forward query to Node 21.
+
+  Step 2: Node 21 wants to find successor of 30.
+          Scan finger table:
+            finger[4] → Node 42 at position 42.  Overshoots. Skip.
+            finger[3] → Node 32 at position 32.  Overshoots. Skip.
+              Wait — does 32 overshoot? 32 > 30, but Node 32 might be
+              the successor of 30. Check: Node 21's successor for range
+              (21, 32] is Node 32. Is 30 in (21, 32]? Yes!
+          Key 30 belongs to Node 32. Forward to Node 32.
+
+  Step 3: Node 32 is the owner. Return the value.
+
+  Result: 2 hops! (Down from 4 with naive routing.)
+  With 1,000 nodes: ~10 hops instead of ~500.</code></pre>
+      </div>
+
+      <div>
+        <h3>Lookup Algorithm in Pseudocode</h3>
+<pre class="line-numbers"><code class="language-python">def find_successor(node, target_id):
+    """Find the node responsible for target_id."""
+    if target_id is in range (node.id, node.successor.id]:
+        return node.successor
+
+    # Find the closest preceding finger
+    closest = closest_preceding_node(node, target_id)
+    # Recursively (or iteratively via RPC) ask that node
+    return find_successor(closest, target_id)
+
+def closest_preceding_node(node, target_id):
+    """Search finger table for the largest node that precedes target_id."""
+    for i in range(m - 1, -1, -1):  # m-1 down to 0
+        if node.finger[i].id is in range (node.id, target_id):
+            return node.finger[i]
+    return node  # fallback: no finger precedes target</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>The Stabilization Protocol</h3>
+        <p>Finger tables must stay accurate as nodes join and leave. Chord uses a <strong>stabilization protocol</strong> that runs periodically on every node (e.g., every 10 seconds):</p>
+
+<pre class="line-numbers"><code class="language-text">Node Join — Node P joins the ring at position P:
+
+  1. P contacts any existing node (a "bootstrap" node it already knows).
+  2. P asks that node: "Who is the successor of position P?"
+     → This is a standard Chord lookup: O(log N) hops → returns node S.
+  3. P sets its successor = S.
+  4. P's predecessor = S's old predecessor (call it Q).
+  5. S updates its predecessor = P.
+  6. Keys in range (Q, P] that were owned by S are transferred to P.
+
+  Key transfer:
+    10M keys × 1 KB = 10 GB per node on average.
+    But P only takes keys in its range, not all of S's keys.
+    On average, P takes 1/N of total keys = 10M keys.
+    Transfer time at 10 Gbps: 10 GB / 1.25 GB/s = 8 seconds.
+
+Periodic stabilization (every 10 seconds, on every node):
+
+  1. Ask successor: "Who is your predecessor?"
+     If successor's predecessor is a new node between me and successor,
+     update my successor to that new node.
+  2. Tell my successor: "I think I'm your predecessor."
+     Successor updates its predecessor if I'm closer.
+  3. Refresh one random finger table entry:
+     finger[i] = find_successor(node.id + 2^i)
+
+  With 1,000 nodes, each refreshing one finger every 10 seconds,
+  all finger tables converge within ~160 seconds (m = 160 entries,
+  one refreshed per cycle).</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>During stabilization, lookups may fail.</strong> If a node has just joined but its predecessor&rsquo;s finger table hasn&rsquo;t updated yet, a lookup may be routed to the wrong node. The system is <em>eventually consistent</em> &mdash; finger tables converge, but there is a window where lookups may return &ldquo;key not found&rdquo; even though the key exists. This is addressed in Iteration 2 with replication.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Replication and Fault Tolerance                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Replication and Fault Tolerance</h2>
+      <p>In Iteration 1, each key lives on exactly one node. If that node crashes, the key is gone. We need replication.</p>
+
+      <div class="full-width">
+        <h3>Successor-List Replication</h3>
+        <p>Each key is stored on its successor <strong>and the next r &minus; 1 successors</strong> in the ring. With r = 3:</p>
+      </div>
+
+      <div class="full-width">
+        <!-- Replication Diagram: Key 30 replicated to 3 successive nodes -->
+        <svg viewBox="0 0 700 200" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowRep" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- Key -->
+          <rect x="10" y="70" width="90" height="50" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>
+          <text x="55" y="92" text-anchor="middle" font-weight="600" fill="#92400e" font-size="12">Key 30</text>
+          <text x="55" y="108" text-anchor="middle" fill="#92400e" font-size="10">position 30</text>
+
+          <!-- Arrow to primary -->
+          <line x1="100" y1="95" x2="150" y2="95" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowRep)"/>
+
+          <!-- Node 32 (primary) -->
+          <rect x="155" y="60" width="120" height="70" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="215" y="85" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="13">Node 32</text>
+          <text x="215" y="103" text-anchor="middle" fill="#64748b" font-size="11">Replica 1 (primary)</text>
+          <text x="215" y="120" text-anchor="middle" fill="#64748b" font-size="10">range (21, 32]</text>
+
+          <!-- Arrow to replica 2 -->
+          <line x1="275" y1="95" x2="320" y2="95" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+          <text x="297" y="87" text-anchor="middle" fill="#16a34a" font-size="10">replicate</text>
+
+          <!-- Node 42 (replica 2) -->
+          <rect x="325" y="60" width="120" height="70" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="385" y="85" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="13">Node 42</text>
+          <text x="385" y="103" text-anchor="middle" fill="#64748b" font-size="11">Replica 2</text>
+          <text x="385" y="120" text-anchor="middle" fill="#64748b" font-size="10">successor of 32</text>
+
+          <!-- Arrow to replica 3 -->
+          <line x1="445" y1="95" x2="490" y2="95" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+          <text x="467" y="87" text-anchor="middle" fill="#16a34a" font-size="10">replicate</text>
+
+          <!-- Node 1 (replica 3) -->
+          <rect x="495" y="60" width="120" height="70" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="555" y="85" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="13">Node 1</text>
+          <text x="555" y="103" text-anchor="middle" fill="#64748b" font-size="11">Replica 3</text>
+          <text x="555" y="120" text-anchor="middle" fill="#64748b" font-size="10">wraps around ring</text>
+
+          <!-- Annotation -->
+          <rect x="155" y="150" width="460" height="35" rx="6" fill="#f8f9fa" stroke="#e2e8f0" stroke-width="1"/>
+          <text x="385" y="172" text-anchor="middle" fill="#334155" font-size="12">If Node 32 crashes, Node 42 becomes primary instantly (already has all data)</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+<pre class="line-numbers"><code class="language-text">If Node 32 crashes:
+  1. Node 21 detects its successor (32) is dead via heartbeat timeout (5 sec).
+  2. Node 21 updates its successor to Node 42 (next in successor list).
+  3. Node 42 becomes the primary for keys in range (21, 32].
+     It already has these keys (it was Replica 2). No data transfer needed!
+  4. Node 42 creates a new 3rd replica on Node 8 (its successor's successor).
+     Transfer: ~10M keys × 1 KB = 10 GB at 10 Gbps → 8 seconds.
+
+Availability during failure:
+  - Read: Any of the 3 replicas can serve reads. As long as 1 survives, data is available.
+  - Write: Writes go to the primary. If primary dies, the new primary (next successor) takes over.
+  - Simultaneous failures: To lose data, all 3 consecutive nodes must crash.
+    Probability with independent failures (1% failure rate per node):
+    0.01³ = 0.000001 = 0.0001% per key. Acceptable.</code></pre>
+      </div>
+
+      <div>
+        <h3>Read Load Balancing</h3>
+        <p>With 3 replicas per key, read requests can be sent to any replica. The client (or routing layer) can pick the closest or least-loaded replica. This triples read capacity for popular keys.</p>
+      </div>
+
+      <div>
+        <h3>Consistency Model</h3>
+<pre class="line-numbers"><code class="language-text">Write path (quorum-based):
+  1. Client sends write to primary (Node 32).
+  2. Primary writes locally and forwards to Replicas 2 and 3.
+  3. Primary waits for W acknowledgments before responding to client.
+     With W=2 (out of R=3 replicas): tolerates 1 slow/dead replica.
+
+Read path:
+  - For strong consistency: read from primary only (or use read quorum).
+  - For eventual consistency: read from any replica (faster, but may be stale).
+  - Read-repair: if a read finds stale data on a replica, update it in the background.
+
+Quorum condition for strong consistency:
+  W + R > N  →  2 + 2 > 3  →  True ✓
+  (Write quorum 2 + Read quorum 2 > Replication factor 3)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Virtual Nodes                                    -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Virtual Nodes for Load Balance</h2>
+      <p>With 1,000 physical nodes on a ring, the arc lengths between adjacent nodes vary widely. Some nodes own a large arc (many keys), others own a tiny arc. The standard deviation of load is proportional to 1/&radic;N &mdash; with N = 1,000, some nodes may have 2&ndash;3&times; more keys than average.</p>
+
+      <div>
+        <h3>The Problem</h3>
+<pre class="line-numbers"><code class="language-text">Ideal: each node stores 10M keys (10 billion / 1,000).
+Reality with 1,000 random positions on the ring:
+  - Expected max load ≈ (ln N / ln ln N) × average
+  - For N = 1,000: ≈ (6.9 / 1.9) × 10M ≈ 36M keys on the most loaded node.
+  - That's 3.6× the average — 36 GB instead of 10 GB.
+  - The least loaded node might have only 2-3M keys.</code></pre>
+      </div>
+
+      <div>
+        <h3>Solution: Virtual Nodes</h3>
+        <p>Each physical node creates V <strong>virtual nodes</strong> at different ring positions. Instead of 1,000 points on the ring, we have 1,000 &times; V points.</p>
+
+<pre class="line-numbers"><code class="language-text">With V = 100 virtual nodes per physical node:
+
+  Total ring positions: 1,000 × 100 = 100,000 virtual nodes
+
+  Each physical node "owns" 100 non-contiguous arcs on the ring.
+  The keys assigned to any of those 100 virtual nodes are stored
+  on the same physical machine.
+
+  Load balance improvement:
+    Standard deviation ∝ 1/√(N×V) = 1/√100,000 ≈ 0.3%
+    Max load ≈ average × (1 + a few percent) ≈ 10.3M keys
+    vs. without virtual nodes: up to 36M keys
+
+  Memory overhead for finger tables:
+    Each virtual node needs its own finger table.
+    100 virtual nodes × 160 entries × 8 bytes = 128 KB per physical node.
+    Negligible.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Benefit During Node Departure</h3>
+      </div>
+
+      <div class="full-width">
+        <!-- Virtual Nodes Departure Comparison Diagram -->
+        <svg viewBox="0 0 700 220" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowVN" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowRed" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+            <marker id="arrowGrn" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- Left side: Without virtual nodes -->
+          <text x="175" y="22" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Without Virtual Nodes</text>
+
+          <!-- Departing node -->
+          <rect x="20" y="55" width="100" height="50" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5,3"/>
+          <text x="70" y="77" text-anchor="middle" font-weight="600" fill="#ef4444" font-size="12">Node X</text>
+          <text x="70" y="95" text-anchor="middle" fill="#ef4444" font-size="10">10M keys (leaves)</text>
+
+          <!-- Arrow: all keys to one node -->
+          <line x1="120" y1="80" x2="175" y2="80" stroke="#ef4444" stroke-width="2" marker-end="url(#arrowRed)"/>
+          <text x="147" y="72" text-anchor="middle" fill="#ef4444" font-size="10" font-weight="600">ALL</text>
+
+          <!-- Single successor -->
+          <rect x="180" y="55" width="140" height="50" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="250" y="77" text-anchor="middle" font-weight="600" fill="#ef4444" font-size="12">Successor Y</text>
+          <text x="250" y="95" text-anchor="middle" fill="#ef4444" font-size="10">20M keys (2x load!)</text>
+
+          <!-- Warning label -->
+          <rect x="60" y="120" width="230" height="30" rx="6" fill="#fef2f2" stroke="#fca5a5" stroke-width="1"/>
+          <text x="175" y="140" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">Load spike on single node</text>
+
+          <!-- Separator -->
+          <line x1="350" y1="20" x2="350" y2="210" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4,4"/>
+
+          <!-- Right side: With virtual nodes -->
+          <text x="525" y="22" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">With 100 Virtual Nodes</text>
+
+          <!-- Departing node -->
+          <rect x="370" y="55" width="100" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="5,3"/>
+          <text x="420" y="77" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="12">Node X</text>
+          <text x="420" y="95" text-anchor="middle" fill="#16a34a" font-size="10">10M keys (leaves)</text>
+
+          <!-- Fan-out arrows -->
+          <line x1="470" y1="65" x2="520" y2="45" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGrn)"/>
+          <line x1="470" y1="75" x2="520" y2="70" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGrn)"/>
+          <line x1="470" y1="85" x2="520" y2="95" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGrn)"/>
+          <line x1="470" y1="95" x2="520" y2="120" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGrn)"/>
+
+          <!-- Multiple successors -->
+          <rect x="525" y="32" width="160" height="24" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+          <text x="605" y="49" text-anchor="middle" fill="#16a34a" font-size="10">Successor A: +100K keys</text>
+
+          <rect x="525" y="60" width="160" height="24" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+          <text x="605" y="77" text-anchor="middle" fill="#16a34a" font-size="10">Successor B: +100K keys</text>
+
+          <rect x="525" y="88" width="160" height="24" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+          <text x="605" y="105" text-anchor="middle" fill="#16a34a" font-size="10">Successor C: +100K keys</text>
+
+          <rect x="525" y="116" width="160" height="24" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+          <text x="605" y="133" text-anchor="middle" fill="#64748b" font-size="10">... 97 more successors ...</text>
+
+          <!-- Success label -->
+          <rect x="410" y="160" width="280" height="30" rx="6" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+          <text x="550" y="180" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">~1% increase per node, no spike</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+<pre class="line-numbers"><code class="language-text">Without virtual nodes:
+  When a node leaves, ALL its 10M keys go to its single successor.
+  That successor temporarily holds 20M keys (2× average) until
+  stabilization redistributes them. Spike in load on one node.
+
+With 100 virtual nodes:
+  The departing node's 10M keys are spread across 100 virtual nodes.
+  Each virtual node's keys go to a DIFFERENT successor.
+  100 different physical nodes each absorb ~100K keys (1% increase).
+  No load spike on any single node.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+      <p>Putting all iterations together, here is the complete Chord-style DHT:</p>
+
+      <div class="full-width">
+        <h3>Architecture Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Component</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Ring space</td><td>[0, 2<sup>160</sup>) using SHA-1 hashes</td></tr>
+              <tr><td>Physical nodes</td><td>1,000 servers, each with 64+ GB RAM, SSD</td></tr>
+              <tr><td>Virtual nodes</td><td>100 per physical node = 100,000 ring positions</td></tr>
+              <tr><td>Finger tables</td><td>160 entries per virtual node for O(log N) routing</td></tr>
+              <tr><td>Replication</td><td>r = 3 replicas on consecutive successors</td></tr>
+              <tr><td>Consistency</td><td>Quorum reads/writes (W=2, R=2, N=3)</td></tr>
+              <tr><td>Stabilization</td><td>Every 10 seconds: verify successor, refresh one finger</td></tr>
+              <tr><td>Failure detection</td><td>Heartbeat every 2 seconds, timeout after 3 missed = 6 sec</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Request Flow: Lookup</h3>
+        <!-- Lookup Request Flow Diagram -->
+        <svg viewBox="0 0 700 180" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowFlow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="arrowPrimary" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+          </defs>
+
+          <!-- Step 1: Client -->
+          <rect x="5" y="50" width="90" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="50" y="72" text-anchor="middle" font-weight="600" fill="#334155" font-size="12">Client</text>
+          <text x="50" y="90" text-anchor="middle" fill="#64748b" font-size="10">hash(key)</text>
+          <text x="50" y="38" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Step 1</text>
+
+          <!-- Arrow -->
+          <line x1="95" y1="78" x2="135" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowPrimary)"/>
+
+          <!-- Step 2: Any node -->
+          <rect x="140" y="50" width="100" height="55" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="190" y="72" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">Node A</text>
+          <text x="190" y="90" text-anchor="middle" fill="#64748b" font-size="10">finger table</text>
+          <text x="190" y="38" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Step 2</text>
+
+          <!-- Arrow -->
+          <line x1="240" y1="78" x2="280" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowPrimary)"/>
+
+          <!-- Step 3: Intermediate hops -->
+          <rect x="285" y="50" width="110" height="55" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="5,3"/>
+          <text x="340" y="72" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="12">~10 hops</text>
+          <text x="340" y="90" text-anchor="middle" fill="#64748b" font-size="10">O(log N) routing</text>
+          <text x="340" y="38" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Steps 3-4</text>
+
+          <!-- Arrow -->
+          <line x1="395" y1="78" x2="435" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowPrimary)"/>
+
+          <!-- Step 5: Owner node -->
+          <rect x="440" y="50" width="110" height="55" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="495" y="72" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">Node X</text>
+          <text x="495" y="90" text-anchor="middle" fill="#64748b" font-size="10">owns key P</text>
+          <text x="495" y="38" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Step 5</text>
+
+          <!-- Arrow back to client -->
+          <path d="M 495,105 L 495,140 L 50,140 L 50,105" fill="none" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGrn)"/>
+          <text x="272" y="155" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">Return value (total: ~5 ms)</text>
+
+          <!-- Latency annotations -->
+          <rect x="565" y="40" width="130" height="75" rx="6" fill="#f8f9fa" stroke="#e2e8f0" stroke-width="1"/>
+          <text x="630" y="58" text-anchor="middle" fill="#334155" font-size="11" font-weight="600">Latency</text>
+          <text x="630" y="76" text-anchor="middle" fill="#64748b" font-size="10">10 hops x 0.5 ms</text>
+          <text x="630" y="93" text-anchor="middle" fill="#2563eb" font-size="12" font-weight="700">= 5 ms total</text>
+          <text x="630" y="108" text-anchor="middle" fill="#16a34a" font-size="10">target: &lt; 10 ms</text>
+        </svg>
+      </div>
+
+      <div>
+<pre class="line-numbers"><code class="language-text">Client wants to GET key "user:12345":
+
+  1. Client hashes "user:12345" → SHA-1 → position P on the ring.
+  2. Client sends request to any known node (e.g., Node A).
+  3. Node A checks: is P in my range? If yes, return the value.
+     If no, use finger table to find closest preceding node → forward.
+  4. After O(log N) ≈ 10 hops, request reaches Node X that owns P.
+  5. Node X looks up key in its local hash map → returns value.
+
+  Total latency: 10 hops × 0.5 ms = 5 ms.</code></pre>
+      </div>
+
+      <div>
+        <h4>Optimization: Iterative Routing</h4>
+<pre class="line-numbers"><code class="language-text">Instead of each node forwarding to the next (recursive),
+each node returns the next hop's address to the CLIENT.
+The client contacts each hop directly.
+
+Advantage: if a hop fails, the client can retry with
+a different finger. No request "stuck" inside the ring.
+
+Same number of hops, but the client controls the timeout.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Performance Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Naive Ring</th><th>Final Design</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Lookup hops</td><td>O(N) = 500</td><td>O(log N) = 10</td></tr>
+              <tr><td>Lookup latency</td><td>250 ms</td><td>5 ms</td></tr>
+              <tr><td>State per node</td><td>O(1) &mdash; successor only</td><td>O(log N) &mdash; 160 entries</td></tr>
+              <tr><td>Load balance (max/avg)</td><td>3.6&times;</td><td>~1.03&times; (with virtual nodes)</td></tr>
+              <tr><td>Fault tolerance</td><td>None</td><td>Survives any 2 consecutive node failures</td></tr>
+              <tr><td>Key transfer on join/leave</td><td>10 GB to 1 node</td><td>100 KB to each of 100 nodes</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul class="full-width">
+        <li><strong>Finger tables are the key optimization.</strong> By storing O(log N) routing entries that point to exponentially increasing distances around the ring, each node can halve the remaining distance to the target on every hop &mdash; giving O(log N) lookups with O(log N) state per node.</li>
+        <li><strong>Stabilization handles churn.</strong> The periodic protocol (verify successor, refresh one finger) ensures the ring self-heals when nodes join or leave. Convergence happens within minutes, and the system remains functional (with slightly suboptimal routing) during convergence.</li>
+        <li><strong>Replication handles failure.</strong> Storing each key on r = 3 consecutive successors means any single node crash causes zero data loss and zero downtime. The successor list lets the ring route around dead nodes immediately.</li>
+        <li><strong>Virtual nodes handle load balance.</strong> Mapping each physical node to 100 ring positions reduces the max-to-average load ratio from 3.6&times; to ~1.03&times;. It also distributes key transfers across many nodes when a physical node departs.</li>
+        <li><strong>The math drove every decision.</strong> O(N) = 500 hops told us we needed finger tables. The 3.6&times; load variance told us we needed virtual nodes. The 10 GB transfer time told us churn is manageable.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>The ring-based hashing technique that underpins Chord and many distributed systems.</p>
+        </a>
+        <a href="../database-sharding.html" class="card topic-card">
+          <h3>Database Sharding</h3>
+          <p>How to partition data across nodes &mdash; hash-based, range-based, and directory-based strategies.</p>
+        </a>
+        <a href="../leader-election.html" class="card topic-card">
+          <h3>Leader Election</h3>
+          <p>Chord is leaderless, but understanding leader-based alternatives clarifies the tradeoff.</p>
+        </a>
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>Quorum-based replication, consistency models, and handling replica failures.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K6 — Parallelism Overview (the umbrella + selection home) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K6 &mdash; Parallelism Overview <span style="font-weight:400;font-size:.55em;color:#64748b;">(the umbrella + selection home)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a scalable multi-GPU serving deployment &mdash; which parallelism, at what degree, composed how, when the model (or its KV/activations) doesn&rsquo;t fit, or fits but is too slow, on the GPUs you have?</strong> This page does not implement an axis &mdash; it is the <em>umbrella + selection home</em>. The answer is a <em>constrained search</em> (D25) that first tries the <em>no-parallelism escape</em> (D36) and is bounded throughout by the NVLink-domain size (<a href="interconnect-and-collectives.html">K20</a>) &mdash; <strong>that fact, not FLOPs, decides the tuple</strong>.</p>
+      <p class="hero-meta">GPU-serving SoT &bull; the umbrella + selection home &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K7_tensor-parallelism.html">K7</a>&ndash;<a href="K11_context-parallelism.html">K11</a> / <a href="interconnect-and-collectives.html">K20</a> / <a href="quantization.html">K14</a> / <a href="K2_kv-cache.html">K2</a> / <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="K5_disaggregated-serving.html">K5</a> / <a href="gpu-fleet-autoscaling-multitenancy.html">K15</a> / <a href="fault-tolerance-multi-gpu-inference.html">K22</a> &bull; dedicated scenario: <strong>L1</strong> &bull; ~20 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER (delete when prose lands) -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span> describing what they will draw &mdash; deferred until this arc is approved. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the selection chain). Approve / redirect the arc, the Problem&rarr;Solution decomposition, deep-dive placement (<strong>D25 the spine</strong>, the N-D grid as the foundational vocabulary, <strong>D36 the no-parallelism escape</strong>), and the number/citation plan; then prose + detail SVGs are filled section by section. <em>Note: this is the umbrella page K7&ndash;K11 each open by citing &mdash; getting its grid + spine right de-risks the next five.</em>
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header (Authoring rule 8) -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Feasibility (does it fit at all)</strong> &mdash; the selection procedure assembles the minimal tuple whose per-GPU weight + KV/activation footprint fits HBM.</li>
+          <li><strong>TTFT / TPOT</strong> &mdash; TP cuts per-token latency; the procedure picks the smallest degree that meets the SLO without crossing the cliff that <em>raises</em> it (over-sharded comm).</li>
+          <li><strong>Throughput / Goodput</strong> &mdash; DP is chosen to exactly meet the aggregate-rate target; the whole tuple is optimised for goodput-per-$ under the SLO, not raw fit.</li>
+          <li><strong>$ / GPU-hours</strong> &mdash; D36 refuses to shard when quant/offload would fit on one GPU; D25 never adds an axis the binding doesn&rsquo;t demand &mdash; the minimal tuple is the cheapest one that holds the SLO.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Given a model, an SLO, a GPU type and a count, decide <em>whether to parallelize at all</em> (D36) and, if so, <em>which axes at what degrees, composed in what order</em> (D25) &mdash; bounded by the NVLink domain. It selects; the children implement.</p>
+      <ul>
+        <li><strong>Is:</strong> the N-D parallelism grid as the curriculum&rsquo;s foundational vocabulary (TP/PP/EP/DP/CP &mdash; what each splits, its collective, its fault domain, its latency-vs-throughput effect); the selection spine (which binding &rarr; which axis &rarr; the next bottleneck), asked <em>per serving phase</em> (prefill vs decode have opposite rooflines); D25 (tuple selection as a constrained search, a <em>fixed-point</em> &mdash; precision fixed first, DP depends on the KV budget the other axes leave) as the spine; D36 (the no-parallelism escape, tried first); the master constraint (the NVLink-domain size, K20); the objective = goodput per $ under the SLO, tie-broken by blast radius and gang-schedulability.</li>
+        <li><strong>Is not:</strong> any axis&rsquo;s internal mechanics &mdash; column/row-parallel + the all-reduce (<a href="K7_tensor-parallelism.html">K7</a>), the pipeline-bubble formula (<a href="K8_pipeline-parallelism.html">K8</a>), the EP all-to-all (<a href="K9_expert-parallelism.html">K9</a>), serving-replica routing (<a href="K10_data-parallelism.html">K10</a>), Ring-Attention (<a href="K11_context-parallelism.html">K11</a>); the interconnect tiers themselves (<a href="interconnect-and-collectives.html">K20</a>); the serving-phase split &amp; KV handoff itself (<a href="K5_disaggregated-serving.html">K5</a> &mdash; K6 only selects a tuple per phase); whether the tuple packs/autoscales on the real cluster (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>); training parallelism (ZeRO/FSDP gradient &amp; optimiser-state sharding &mdash; training-side). All <em>named and linked</em> in &sect;7, not covered.</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The collective-cost primitives (all-reduce / all-to-all / all-gather / ring) are <a href="K1_serving-fundamentals.html#collectives">K1</a>&rsquo;s; each axis&rsquo;s deep mechanics are <a href="K7_tensor-parallelism.html">K7</a>&ndash;<a href="K11_context-parallelism.html">K11</a>&rsquo;s; the NVLink-domain / IB-rail topology is <a href="interconnect-and-collectives.html">K20</a>&rsquo;s; the legal cut points (PP on block boundaries, TP within a block, the residual add GPU-local) are <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>/<a href="residual-networks-serving.html">K18</a>&rsquo;s; the fault domain per axis = blast radius is <a href="fault-tolerance-multi-gpu-inference.html">K22</a>&rsquo;s; the serving-phase split + KV handoff is <a href="K5_disaggregated-serving.html">K5</a>&rsquo;s (K6 only selects a tuple <em>per</em> phase); whether the chosen tuple packs &amp; autoscales is <a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>&rsquo;s. <strong>This page is the map and the selector &mdash; it never re-derives a child&rsquo;s math.</strong></div>
+    </div>
+  </section>
+
+  <!-- The page's spine: the selection chain -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Spine &mdash; the Selection Chain (stated up front, before &sect;1)</h2>
+      <p>The umbrella question resolves as a chain: <em>does the model fit on one GPU?</em> &rarr; if no, <em>what binds?</em> &rarr; the axis that resolves that binding &rarr; the new bottleneck it introduces &rarr; the next axis &mdash; all under the interconnect-topology constraint that bounds every one of them.</p>
+      <ul>
+        <li><strong>Weights don&rsquo;t fit</strong> &rarr; <strong>TP</strong> (split <em>within</em> layers) &rarr; new problem: a per-layer all-reduce on the critical path &rarr; caps at the NVLink-domain boundary (<a href="K7_tensor-parallelism.html">K7</a>) &mdash; and a <em>second, often-tighter cap</em>: TP shards KV only down to <code>n_kv_heads</code> (GQA); past that KV is <em>replicated, not split</em>, so KV-memory stops dropping while the all-reduce keeps growing.</li>
+        <li><strong>Still doesn&rsquo;t fit past one NVLink domain</strong> &rarr; <strong>PP</strong> (split <em>layers</em> across domains) &rarr; new problem: a pipeline bubble (<a href="K8_pipeline-parallelism.html">K8</a>).</li>
+        <li><strong>MoE: huge total params, tiny active</strong> &rarr; <strong>EP</strong> (spread experts) &rarr; new problem: two all-to-alls per layer (<a href="K9_expert-parallelism.html">K9</a>).</li>
+        <li><strong>Fits but throughput-bound</strong> &rarr; <strong>DP</strong> (replicate) &rarr; new problem: linear GPU cost, a private per-replica KV cache (<a href="K10_data-parallelism.html">K10</a>).</li>
+        <li><strong>One sequence exceeds all of the above</strong> (1M-token context) &rarr; <strong>CP</strong> (split the <em>sequence</em>) &rarr; new problem: ring-attention bandwidth (<a href="K11_context-parallelism.html">K11</a>).</li>
+        <li><strong>Master constraint over all of it:</strong> the NVLink-domain size &mdash; and the budget is <em>joint, not per-axis</em>: TP&rsquo;s all-reduce, EP&rsquo;s all-to-all and CP&rsquo;s ring all ride the <em>same</em> NVLink fabric in the <em>same</em> forward pass, so the cap is on their sum, not on each independently. Everything crossing the domain pays the IB tax (<a href="interconnect-and-collectives.html">K20</a>). <strong>This fact, not FLOPs, decides the tuple.</strong></li>
+      </ul>
+      <p><strong>And before the chain even starts:</strong> the <em>no-parallelism escape</em> (D36) &mdash; quantize-to-fit (<a href="quantization.html">K14</a>), KV-offload/tier (<a href="K2_kv-cache.html">K2</a>), or a smaller/distilled model &mdash; is tried <em>first</em>; you only enter the chain when its accuracy/latency cost exceeds the multi-GPU cost. The chosen <em>precision</em> is then fixed (it re-parametrises every memory threshold below &mdash; it is a search parameter, not only the escape). <strong>Co-fixed with precision: the GPU class.</strong> A real fleet is heterogeneous (H100 + H200 + spot mix); a parallelism group <em>cannot span GPU classes</em> (the slow class straggles the collective), so D25 also selects <em>which</em> class to run on, bounded by that class&rsquo;s contiguous-domain inventory &mdash; not just &ldquo;the GPU type&rdquo; as a single given.</p>
+      <p><strong>Three framings that bracket the whole chain:</strong></p>
+      <ul>
+        <li><strong>It runs per serving phase.</strong> Prefill (compute-bound, latency-driven) and decode (memory-bandwidth-bound, throughput-driven) have <em>opposite rooflines</em> &rArr; the binding evaluation and D25 run once <em>per phase</em>; colocated &rArr; one compromise tuple, disaggregated (<a href="K5_disaggregated-serving.html">K5</a>) &rArr; a different tuple per pool. K6 selects per phase; K5 owns the split. <strong>But divergence is not free:</strong> if prefill-TP &ne; decode-TP the KV is sharded <em>differently</em> on each side, so the K5 handoff is a <em>reshard/transpose, not a copy</em> &mdash; that tax feeds back into whether a per-phase-different tuple beats one compromise tuple.</li>
+        <li><strong>D25 is a fixed-point, not a one-pass pipeline.</strong> DP = target &divide; per-replica throughput, but per-replica throughput is set by the max KV-resident batch, which depends on the KV budget the TP/PP/EP/CP choices leave &mdash; so you iterate; &ldquo;max TP to <code>N_dom</code> then PP&rdquo; is the heuristic seed, not the optimum.</li>
+        <li><strong>The objective carries tie-breaks.</strong> Goodput per $ under the SLO, then &mdash; at equal goodput-per-$ &mdash; the smaller fault blast radius (<a href="fault-tolerance-multi-gpu-inference.html">K22</a>) and the tuple that actually gang-packs/autoscales on the cluster (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>).</li>
+        <li><strong>Only one axis is elastic.</strong> TP/PP/EP/CP are <em>deploy-time-rigid</em> &mdash; resharding a live TP/PP/EP/CP group is a redeploy/fault event (<a href="fault-tolerance-multi-gpu-inference.html">K22</a>/<a href="fast-model-loading-and-cold-start.html">K21</a>), not an autoscale. <strong>DP is the only axis that scales with load.</strong> So D25 is not one fixed-point over a static rate: the rigid inner tuple (TP&times;PP&times;EP&times;CP) is sized for the <em>worst-case</em> mix and held; <strong>DP is the elastic outer loop</strong> that absorbs diurnal/burst variance (<a href="K10_data-parallelism.html">K10</a>/<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 0. Decision tree (REAL — this is the arc)             -->
+  <!-- ===================================================== -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>does it fit &amp; run fast on ONE GPU? &rarr; D36 escape first (quantize / KV-offload / smaller) &rarr; if still no, fix the precision <em>and GPU class</em> then ask &mdash; <strong>per serving phase</strong> (prefill vs decode, K5; differing per-phase tuples cost a KV-reshard on the handoff) &mdash; what binds? &rarr; the axis per binding (TP/PP/EP/DP/CP), each introducing its own next bottleneck &rarr; all bounded by the NVLink domain (the master constraint &mdash; a <em>joint</em> budget over the co-resident collectives) &rarr; D25 assembles the minimal tuple as a <strong>fixed-point</strong> (the rigid TP&times;PP&times;EP&times;CP inner tuple sized for the worst-case mix; DP the elastic outer loop &mdash; not a one-pass pipeline) &rarr; objective = goodput per $ under the SLO, tie-broken by blast radius (K22) and gang-schedulability (K15)</em>. Each box is a section below; the body elaborates them in this order.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 1020" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+          <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+          path.fb { stroke:#7c3aed; stroke-width:1.6; fill:none; stroke-dasharray:7 4; marker-end:url(#p); }
+        </style>
+
+        <!-- root -->
+        <rect class="b" x="420" y="16" width="400" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Model (+KV/activations) on the GPUs you have</text>
+        <text class="s" x="620" y="58" text-anchor="middle">doesn&rsquo;t fit, or fits but too slow &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="100"/>
+
+        <!-- one-GPU decision -->
+        <rect class="bd" x="440" y="100" width="360" height="46" rx="8"/>
+        <text class="t" x="620" y="120" text-anchor="middle">Fits &amp; fast enough on ONE GPU?</text>
+        <text class="s" x="620" y="137" text-anchor="middle">the question asked before any sharding</text>
+
+        <!-- D36 escape branch (right) -->
+        <line x1="800" y1="123" x2="900" y2="123"/>
+        <text class="l" x="845" y="115">try first</text>
+        <rect class="bc" x="900" y="92" width="332" height="62" rx="8"/>
+        <text class="t" x="1066" y="113" text-anchor="middle">D36 &mdash; the no-parallelism escape</text>
+        <text class="s" x="1066" y="131" text-anchor="middle">quantize-to-fit (K14) / KV-offload (K2)</text>
+        <text class="s" x="1066" y="147" text-anchor="middle">/ smaller model &rarr; if it fits: DONE (L5)</text>
+
+        <!-- quant is also a parameter INSIDE the search (added) -->
+        <line x1="1066" y1="154" x2="1066" y2="166"/>
+        <rect class="bc" x="900" y="166" width="332" height="56" rx="8"/>
+        <text class="t" x="1066" y="186" text-anchor="middle">&hellip; and even if it doesn&rsquo;t fit on one GPU:</text>
+        <text class="s" x="1066" y="203" text-anchor="middle">quant re-parametrises D25 (shifts every</text>
+        <text class="s" x="1066" y="218" text-anchor="middle">mem threshold) &mdash; fix precision first</text>
+
+        <!-- down: still doesn't fit -->
+        <line x1="620" y1="146" x2="620" y2="176"/>
+        <text class="l" x="690" y="166">no &mdash; even after D36</text>
+
+        <rect class="bd" x="420" y="176" width="400" height="46" rx="8"/>
+        <text class="t" x="620" y="196" text-anchor="middle">PROBLEM: doesn&rsquo;t fit / too slow &mdash; what binds?</text>
+        <text class="s" x="620" y="213" text-anchor="middle">the binding picks the axis &middot; §2</text>
+
+        <!-- per-phase framing (added — left column, clear of the D36/quant boxes on the right) -->
+        <line x1="408" y1="199" x2="420" y2="199"/>
+        <text class="l" x="214" y="158" text-anchor="middle">asked per phase</text>
+        <rect class="bd" x="20" y="168" width="388" height="64" rx="8"/>
+        <text class="t" x="214" y="189" text-anchor="middle">Run the procedure PER serving phase</text>
+        <text class="s" x="214" y="207" text-anchor="middle">prefill vs decode &mdash; opposite rooflines (K5)</text>
+        <text class="s" x="214" y="223" text-anchor="middle">&rArr; a tuple per phase (KV-reshard on handoff)</text>
+
+        <line x1="620" y1="222" x2="620" y2="250"/>
+        <text class="l" x="700" y="242">what binds?</text>
+
+        <!-- five axes row -->
+        <rect class="bp" x="10" y="250" width="232" height="92" rx="8"/>
+        <text class="t" x="126" y="272" text-anchor="middle">Weight / KV / act too big</text>
+        <text class="t" x="126" y="289" text-anchor="middle">&rarr; TP (within layers)</text>
+        <text class="s" x="126" y="309" text-anchor="middle">KV&amp;act /TP (cap n_kv_heads);</text>
+        <text class="s" x="126" y="326" text-anchor="middle">next: all-reduce/layer &rarr; K7</text>
+
+        <rect class="bp" x="254" y="250" width="232" height="92" rx="8"/>
+        <text class="t" x="370" y="272" text-anchor="middle">Past one NVLink dom.</text>
+        <text class="t" x="370" y="289" text-anchor="middle">&rarr; PP (split layers)</text>
+        <text class="s" x="370" y="309" text-anchor="middle">next: pipeline</text>
+        <text class="s" x="370" y="326" text-anchor="middle">bubble &rarr; K8</text>
+
+        <rect class="bp" x="498" y="250" width="232" height="92" rx="8"/>
+        <text class="t" x="614" y="272" text-anchor="middle">MoE: big total /</text>
+        <text class="t" x="614" y="289" text-anchor="middle">small active &rarr; EP</text>
+        <text class="s" x="614" y="309" text-anchor="middle">next: 2 all-to-alls</text>
+        <text class="s" x="614" y="326" text-anchor="middle">per layer &rarr; K9</text>
+
+        <rect class="bp" x="742" y="250" width="232" height="92" rx="8"/>
+        <text class="t" x="858" y="272" text-anchor="middle">Throughput-bound</text>
+        <text class="t" x="858" y="289" text-anchor="middle">&rarr; DP (replicate)</text>
+        <text class="s" x="858" y="309" text-anchor="middle">next: linear $ +</text>
+        <text class="s" x="858" y="326" text-anchor="middle">per-replica KV &rarr; K10</text>
+
+        <rect class="bp" x="986" y="250" width="246" height="92" rx="8"/>
+        <text class="t" x="1109" y="272" text-anchor="middle">One sequence too big</text>
+        <text class="t" x="1109" y="289" text-anchor="middle">&rarr; CP (split sequence)</text>
+        <text class="s" x="1109" y="309" text-anchor="middle">next: ring-attn</text>
+        <text class="s" x="1109" y="326" text-anchor="middle">BW &rarr; K11</text>
+
+        <line x1="620" y1="250" x2="126" y2="250"/>
+        <line x1="620" y1="250" x2="370" y2="250"/>
+        <line x1="620" y1="250" x2="614" y2="250"/>
+        <line x1="620" y1="250" x2="858" y2="250"/>
+        <line x1="620" y1="250" x2="1109" y2="250"/>
+
+        <!-- master constraint band -->
+        <line x1="126" y1="342" x2="126" y2="372"/>
+        <line x1="370" y1="342" x2="370" y2="372"/>
+        <line x1="614" y1="342" x2="614" y2="372"/>
+        <line x1="858" y1="342" x2="858" y2="372"/>
+        <line x1="1109" y1="342" x2="1109" y2="372"/>
+
+        <rect class="bd" x="40" y="372" width="1160" height="60" rx="8"/>
+        <text class="t" x="620" y="396" text-anchor="middle">MASTER CONSTRAINT &mdash; the NVLink-domain size (K20)</text>
+        <text class="s" x="620" y="416" text-anchor="middle">TP/EP/CP collectives co-reside on it &mdash; the budget is JOINT, not per-axis; crossing pays the IB tax &mdash; this, not FLOPs, decides the tuple</text>
+
+        <line x1="620" y1="432" x2="620" y2="462"/>
+        <text class="l" x="710" y="452">assemble</text>
+
+        <!-- D25 -->
+        <rect class="bs" x="360" y="462" width="520" height="62" rx="8"/>
+        <text class="t" x="620" y="484" text-anchor="middle">D25 &mdash; constrained search assembles the tuple</text>
+        <text class="s" x="620" y="502" text-anchor="middle">TP&le;N_dom &rarr; PP across domains &rarr; EP for MoE &rarr; DP for thru &rarr; CP last</text>
+        <text class="s" x="620" y="518" text-anchor="middle">TP&times;PP&times;EP&times;CP rigid at deploy &middot; DP the elastic outer loop &middot; §3</text>
+
+        <line x1="620" y1="524" x2="620" y2="558"/>
+
+        <!-- objective -->
+        <rect class="bc" x="360" y="558" width="520" height="74" rx="8"/>
+        <text class="t" x="620" y="580" text-anchor="middle">Objective: goodput per $ under the SLO</text>
+        <text class="s" x="620" y="599" text-anchor="middle">tie-break: smaller blast radius (K22) + placeable as a gang (K15)</text>
+        <text class="s" x="620" y="616" text-anchor="middle">prefer the smaller tuple at equal goodput &mdash; not raw fit</text>
+
+        <!-- fixed-point feedback loop (added) -->
+        <path class="fb" d="M360,589 L120,589 L120,493 L360,493"/>
+        <text class="l" x="240" y="470" text-anchor="middle">fixed-point &mdash; re-run, not one pass:</text>
+        <text class="s" x="240" y="486" text-anchor="middle">miss goodput/$/fit &rArr; &uarr;TP or quantize</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root &rarr; one-GPU question</strong> &mdash; before any sharding, ask whether the model fits &amp; runs fast on one GPU.</li>
+        <li><span class="b">&#9313;</span> <strong>D36 escape, tried first</strong> &mdash; quantize-to-fit (K14) / KV-offload (K2) / smaller model; if it now fits, you are done (L5 lives here) and never pay inter-GPU comm. <strong>And even if it doesn&rsquo;t fit on one GPU, quant is still a parameter <em>inside</em> D25</strong> &mdash; it shifts every memory threshold, so fix the precision <em>before</em> running the search.</li>
+        <li><span class="b">&#9314;</span> <strong>Problem: what binds &mdash; asked PER serving phase</strong> &mdash; prefill (compute-bound, latency-driven) and decode (memory-bound, throughput-driven) have opposite rooflines, so the procedure runs once per phase (colocated or disaggregated, K5) &rArr; a tuple per phase, not one tuple. The <em>binding</em> (weight mem / KV-act mem / latency / throughput / one-sequence-too-big) then selects the axis.</li>
+        <li><span class="b">&#9315;</span> <strong>The five axes</strong> &mdash; TP / PP / EP / DP / CP, each resolving one binding and introducing its own next bottleneck (&rarr; K7&ndash;K11). Note TP also shards KV &amp; activation /TP &mdash; a KV/act-memory binding can be met by <em>more TP within N_dom</em> before reaching for PP/CP.</li>
+        <li><span class="b">&#9316;</span> <strong>The master constraint</strong> &mdash; the NVLink-domain size (K20) bounds every axis; TP inside it, crossing pays the IB tax &mdash; this decides the tuple, not FLOPs.</li>
+        <li><span class="b">&#9317;</span> <strong>D25 assembles the tuple as a fixed-point</strong> &mdash; the constrained search produces DP&times;TP&times;PP&times;EP&times;CP, but DP depends on the per-replica throughput, which depends on the KV budget the other axes leave: iterate. &ldquo;Max TP to N_dom then PP&rdquo; is the heuristic <em>seed</em>, not the optimum &mdash; the TP/PP boundary is itself a crossover at your batch size.</li>
+        <li><span class="b" style="color:#7c3aed;">&#8635;</span> <strong>The feedback loop</strong> &mdash; if the assembled tuple misses $/goodput, doesn&rsquo;t fit the target batch, or won&rsquo;t pack, raise TP (more KV headroom) or quantize and re-run; this is why the search is a fixed-point, not a one-pass pipeline.</li>
+        <li><span class="b">&#9318;</span> <strong>The objective</strong> &mdash; goodput per $ under the SLO, <em>tie-broken by</em> a smaller fault blast radius (K22) and gang-schedulability/packability on the real cluster (K15/D43): prefer the smaller tuple at equal goodput, not raw fit.</li>
+        <li><span class="b">&#9319;</span> <strong>The hard caps the boxes hide</strong> &mdash; (i) <em>GQA caps effective TP</em> at <code>n_kv_heads</code>: past it KV is replicated not split, so KV-memory stops dropping while comm rises (a tighter cap than N_dom). (ii) The N_dom budget is <em>joint</em>: TP&times;EP&times;CP collectives contend for the same fabric in one forward pass. (iii) A parallelism group <em>cannot span GPU classes</em> &mdash; selection picks the class too, bounded by per-class domain inventory.</li>
+        <li><span class="b">&#9320;</span> <strong>Rigid inner, elastic outer</strong> &mdash; TP/PP/EP/CP are deploy-rigid (reshard = a K21/K22 event); only DP autoscales. Size the rigid tuple for the worst-case mix; let DP absorb variance. A per-phase-different tuple additionally costs a <em>KV-reshard</em> on the K5 handoff &mdash; weigh that against one compromise tuple.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 1. Problem -->
+  <!-- ===================================================== -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <h3>The bottleneck shape</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> a frontier model&rsquo;s <em>weights</em>, or its <em>KV/activations</em>, exceed one GPU&rsquo;s HBM &mdash; or fit, but the per-token latency or aggregate throughput misses the SLO on the GPUs you actually have. &ldquo;Just add GPUs&rdquo; is not a step: <em>which</em> axis, at <em>what</em> degree, composed in <em>what</em> order, and bounded by <em>what</em>? <b>Solution (what the page builds):</b> a selection procedure &mdash; first the no-parallelism escape (D36), then the constrained search (D25) that assembles the <em>minimal</em> DP&times;TP&times;PP&times;EP&times;CP tuple that fits and meets the SLO, every degree bounded by the NVLink domain (K20).<span class="meta">number: weight bytes vs HBM capacity, and per-token decode latency vs TPOT SLO, on the trace &mdash; cites K1 §3.2 (#memory), §3.5 (#decode) &middot; canonical: gpu-inference-cost-shapes.html</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 2. Mechanism — the tokenized-prompt walkthrough (hard req 6) -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where parallelism lives &mdash; a deployment topology over the K0 forward pass, not a model change</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the K0 forward pass is identical no matter how many GPUs run it &mdash; nothing in the math says &ldquo;split here.&rdquo; <b>Solution:</b> each axis is a different <em>cut</em> of the same forward pass &mdash; <strong>TP</strong> splits the within-block matmuls (the residual add stays GPU-local); <strong>PP</strong> cuts <em>between</em> blocks (the residual-stream legal-cut, cite K0/K18); <strong>DP</strong> replicates the whole graph; <strong>EP</strong> splits the MoE experts; <strong>CP</strong> splits the sequence. Same model, a GPU-topology choice the selection procedure governs &mdash; <em>not</em> a parallelism axis built into the model.<span class="meta">cites K0/K18 (the legal cut points: PP block-boundary, TP within-block, residual add local) &middot; no number (placement fact) &middot; diagram: one K0 block annotated with where each of the five axes legally cuts</span></p>
+
+      <h3 id="walkthrough">The walkthrough on <code>&quot;I like cat, why?&quot;</code> &mdash; what each axis does to these 6 tokens</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 = <code>&quot;I like cat, why?&quot;</code> (6 tokens). <b>TP:</b> every GPU holds a column/row slice of every weight matrix; one all-reduce after attention out-proj and after the MLP down-proj recombines the slices for all 6 tokens, <em>every layer</em>. <b>PP:</b> GPU&nbsp;0 runs blocks 0..k over all 6 tokens, then ships the residual-stream activation to GPU&nbsp;1 for blocks k+1.. <b>DP:</b> replica A serves this whole request; replica B serves a different one (no interaction). <b>EP:</b> the router sends each of the 6 tokens to its top-k experts, which may sit on different GPUs (the two all-to-alls). <b>CP:</b> the 6 token positions are split across GPUs; each ring-passes its KV so every query still attends every key. Show the contrast explicitly on this one trace; numbers symbolic until D25/D36 compare options (numbers-only-at-decisions).<span class="meta">numbers: symbolic until §3 D25/D36 use the trace to compare tuples &middot; diagram: one trace, the five cuts side by side on the same K0 block</span></p>
+
+      <h3 id="what-binds">What binds, derived &mdash; the bindings, the axis each resolves, and that it is asked <em>per phase</em></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, builds on the walkthrough).</span> Sub-bulleted, each binding named in K1&rsquo;s vocabulary, its axis its answer, and the bottleneck it introduces the next link: (a) <em>weight memory</em> &gt; HBM &rarr; <strong>TP</strong> (and PP once past a domain); (b) <em>KV/activation memory</em> per GPU &gt; HBM at depth &rarr; <strong>more TP within N_dom first</strong> (TP shards KV &asymp; /n_kv_heads and activation /TP &mdash; it is a memory lever, not only a weight/latency one), then <strong>PP</strong> (and CP when one <em>sequence</em> is the cause); (c) <em>per-token latency</em> &gt; TPOT &rarr; <strong>TP</strong> lowers it (PP <em>adds</em> a bubble &mdash; the tension); (d) <em>aggregate throughput</em> &lt; target with the model already fitting &rarr; <strong>DP</strong>; plus the special case <em>one sequence&rsquo;s KV+act exceeds the TP&times;PP budget</em> &rarr; <strong>CP</strong>. This is <em>why</em> the answer is a tuple, not one axis.<span class="meta">numbers: each binding evaluated on the trace (weight bytes, per-GPU KV+act, decode latency, req/s) &mdash; cites K1 #memory #decode #roofline, K0/K18 (cut legality) &middot; forward-links D25</span></p>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (added &mdash; the binding is phase-dependent; the page must not treat &ldquo;the tuple&rdquo; as singular).</span> <b>Problem:</b> prefill is compute-bound and latency-driven (favours TP to cut TTFT); decode is memory-bandwidth-bound and throughput-driven (favours DP + a large KV-resident batch). One tuple cannot be optimal for both &mdash; a colocated tuple is a forced compromise on opposite rooflines. <b>Solution:</b> run the &sect;3 binding evaluation + D25 <em>once per serving phase</em>; in a disaggregated deployment (<a href="K5_disaggregated-serving.html">K5</a>) prefill and decode pools carry <em>different</em> tuples and autoscale independently. K6 selects the tuple per phase; K5 owns the phase split itself (rule of two &mdash; cite, don&rsquo;t re-derive disaggregation).<span class="meta">number: the prefill-optimal vs decode-optimal tuple on the trace at L1&rsquo;s separate TTFT/TPOT SLOs (they differ) &mdash; cites K5 (D35 the disaggregate-or-colocate inequality), K1 #roofline #decode &middot; forward-links D25, &sect;7 Used-by L1</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 3. System-design view -->
+  <!-- ===================================================== -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="grid">The N-D parallelism grid &mdash; the curriculum&rsquo;s foundational vocabulary (must-cover)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the grid every child page cites).</span> <b>Problem:</b> without one shared table, every K-page would re-define the axes inconsistently. <b>Solution:</b> one row per axis &mdash; <em>what it splits</em> &middot; <em>its collective</em> (cite K1&rsquo;s primitive, never re-derive) &middot; <em>its GPU fault domain</em> &middot; <em>its latency-vs-throughput effect</em>: TP (within-layer &middot; all-reduce/layer &middot; whole TP group &middot; &darr;latency &uarr;comm); PP (layers &middot; P2P &middot; a stage &middot; &uarr;throughput, bubble-taxed); EP (experts &middot; 2&times;all-to-all/layer &middot; expert shard &middot; memory-down, barrier-taxed); DP (replicas &middot; none &middot; one replica &middot; &uarr;throughput, linear cost); CP (sequence &middot; ring P2P &middot; the CP group &middot; enables long context, ring-BW-taxed). The grid <em>is</em> the vocabulary K7&ndash;K11, K20, K22 all cite.<span class="meta">no new number (definitional grid) &mdash; cites K1 #collectives (each collective&rsquo;s cost), K22 (fault domain per axis), K0/K18 (cut legality)</span></p>
+      <div class="svgph"><strong>SVG/TABLE PLACEHOLDER &mdash; the N-D grid</strong>the 5&times;4 reference grid (axis &times; {splits / collective / fault domain / lat-vs-thru}) rendered as the canonical diagram every child page links back to. Drawn after arc approval.</div>
+
+      <h3 id="d25" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D25 &mdash; parallelism-tuple selection as a constrained search (the spine)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the page&rsquo;s central question; the answer is a fixed procedure run <em>per phase</em>, not a guess &mdash; and a fixed-point, not a one-pass pipeline).</span> Given (model size, <em>chosen precision</em>, TTFT/TPOT target, GPU type, NVLink-domain size <code>N_dom</code>, target batch/arrival rate), derive the tuple by this order, each step a sub-stub:</p>
+      <ul>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(0) Precondition &mdash; fix the precision <em>and the GPU class</em> first.</b> Quant is not only D36&rsquo;s &ldquo;fits-on-1-GPU&rdquo; escape; it re-parametrises <em>every</em> memory threshold in (1)&ndash;(5). FP8 vs FP16 can cut the minimum TP 8&rarr;4 and change the whole downstream tuple &mdash; so precision&harr;tuple are co-selected, and the search runs <em>at</em> the chosen precision. On a <em>heterogeneous</em> fleet the GPU class is co-fixed here: HBM/BW differ per class so every threshold below is class-relative, and a parallelism group cannot span classes (the slow class straggles every collective) &mdash; so D25 also picks the class, bounded by that class&rsquo;s contiguous-domain inventory.<span class="meta">number: minimum TP for the frontier-MoE weights at FP16 vs FP8 on the trace (it halves) &mdash; cites K14 (the cascade), K1 #memory &middot; composes with D36</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(1) TP</b> = the smallest degree that fits weights <em>and</em> per-GPU KV/activation (TP shards both &asymp; /TP), <strong>capped at <code>N_dom</code> &mdash; and, for the KV term, at <code>n_kv_heads</code></strong>: with GQA, TP&gt;<code>n_kv_heads</code> <em>replicates</em> KV instead of splitting it, so KV-memory plateaus while the all-reduce keeps growing (the binding may then force PP/CP even though raw weight-fit said &ldquo;more TP&rdquo;). Beyond <code>N_dom</code> the per-layer all-reduce crosses IB &rarr; latency collapse (cite K7/D26). &ldquo;Max TP to <code>N_dom</code> then PP&rdquo; is the heuristic <em>seed</em>: at the target batch the all-reduce cost can exceed the PP bubble <em>before</em> <code>N_dom</code>, so the TP/PP boundary is itself a crossover (cite K7/D37, K8 bubble).<span class="meta">number: TP for the frontier-MoE weights+KV on the trace vs N_dom; the batch at which per-layer all-reduce &gt; PP bubble &mdash; cites K7, K8, K1 #memory #collectives, K20 (N_dom)</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(2) PP</b> = if still over, <code>&lceil;layer-memory / domain-memory&rceil;</code> across domains.<span class="meta">number: PP stages = model bytes / per-domain budget on the trace &mdash; cites K8, K20</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(3) EP</b> for MoE = the largest degree keeping the all-to-all <em>inside</em> <code>N_dom</code> (cite K9).<span class="meta">number: EP that keeps dispatch/combine intra-domain on the trace &mdash; cites K9, K20</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(4) DP</b> = throughput target &divide; per-replica throughput (the outer, linear axis) &mdash; <strong>but per-replica throughput is <em>not</em> an input</strong>: it is set by the max KV-resident batch = <code>(HBM &minus; weight_shard &minus; activation) / KV_per_seq</code>, which depends on the TP/PP/EP/CP chosen in (1)&ndash;(3),(5). Hence the procedure is a <strong>fixed-point</strong>, not a one-pass pipeline. <strong>DP is also the <em>only elastic</em> axis</strong>: (1)&ndash;(3),(5) are deploy-rigid (resharding a live group is a K21/K22 event), so size them for the <em>worst-case</em> mix and let DP be the outer loop that autoscales with the live rate (cite K10, K15) &mdash; the rigid tuple is chosen once, DP tracks the curve.<span class="meta">number: per-replica goodput as a function of the KV budget the tuple leaves, on the trace &mdash; cites K10, K2 (#kv-budget &rarr; max batch), K1 #throughput #decode</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(5) CP</b> only if one sequence&rsquo;s KV + activation exceeds the TP&times;PP per-GPU budget.<span class="meta">number: the context length at which CP becomes mandatory on the trace &mdash; cites K11, K18 (activation footprint)</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(6) Iterate (the feedback loop).</b> If the assembled tuple misses goodput/$ , the target batch doesn&rsquo;t fit, or it won&rsquo;t gang-pack on the cluster: raise TP (buys KV headroom &rarr; bigger batch &rarr; more per-replica goodput &rarr; fewer DP replicas), or drop precision (back to (0)), and re-run. Converge on the minimal tuple, then stop.<span class="meta">number: one iteration on the trace where +1 TP step shrinks DP enough to lower $/mo &mdash; cites K2 (KV budget), K1 #cost &middot; composes with (0)/(4)</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>The objective.</b> Worked end-to-end on a frontier MoE (the L1 instantiation), <em>per phase</em>; the target is <strong>goodput per dollar under the SLO</strong>, not raw fit, <strong>tie-broken by a smaller fault blast radius (K22) and gang-schedulability/packability on the real cluster (K15/D43)</strong> &mdash; at equal goodput-per-$, prefer the smaller-blast-radius, placeable tuple (e.g. trade a TP step for a DP step). When the per-phase tuples <em>differ</em> (prefill-TP &ne; decode-TP), charge the <strong>KV-reshard/transpose on the K5 handoff</strong> (not a copy) against the divergence &mdash; a per-phase split only wins when its goodput gain exceeds that reshard tax plus K5&rsquo;s transport cost. The minimal such tuple wins.<span class="meta">number: the full DP&times;TP&times;PP&times;EP&times;CP tuple per phase + its $/mo and blast radius (GPUs lost per fault) on the trace at L1&rsquo;s constraints &mdash; cites K1 #cost, K22 (blast radius per axis), K15/D43 (gang-packing) &middot; real: DeepSeek-V3 (DP&times;TP&times;EP frontier-MoE tuple)</span></li>
+      </ul>
+
+      <h3 id="d36" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D36 &mdash; the no-parallelism escape hatch (tried <em>before</em> the chain)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (reflexive sharding is the top staff-level mistake).</span> <b>Problem:</b> engineers shard a model that would fit on one GPU at FP8 &mdash; paying inter-GPU comm, blast radius and complexity for nothing. <b>Solution:</b> the procedure must first try the <em>non-parallelism</em> branch &mdash; quantize-to-fit (K14: FP8/INT4 cuts weight bytes 2&ndash;4&times; &rarr; may fit on one GPU), KV-offload/tier (K2), or a smaller/distilled model &mdash; and parallelize only when their accuracy/latency cost exceeds the multi-GPU cost. <b>Crossover (both directions):</b> parallelize <em>iff</em> <code>quality_loss(quant to fit) &gt; SLO_floor</code> <strong>or</strong> <code>single_GPU_latency(at that quant) &gt; TTFT/TPOT_SLO</code>; else <em>do not shard</em>. The L5 cost-optimised fleet lives entirely on this branch.<span class="meta">number: does a 70B fit one 80&nbsp;GB GPU at FP8/INT4, and is its single-GPU decode latency under the SLO, on the trace &mdash; cites K14 (the quant cascade), K2 (KV-offload escape), K1 #memory #decode &middot; real: TensorRT-LLM FP8 single-GPU 70B, vLLM AWQ + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> Each knob &mdash; the parallelize-at-all decision (D36), the per-axis degree (TP, PP, EP, DP, CP), and the assembly order (D25) &mdash; stated with its chosen value, the reason, and the cliff on <em>each</em> side. The <strong>master cliff</strong> shared by all of them is the NVLink-domain size <code>N_dom</code> (K20): under it, comm hides; over it, every crossing collective collapses latency.<span class="meta">numbers: the crossover per knob (composes with D25 / D36 above) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 4. Alternatives -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Single axis maxed (pure TP)</b> &mdash; disq: TP caps at <code>N_dom</code>; beyond it the per-layer all-reduce crosses IB and latency collapses (cross-link K7/D26); <em>wins</em> only when the model fits within one domain at the needed TP. (b) <b>Pure DP (replicate only)</b> &mdash; disq: fails the moment the model doesn&rsquo;t fit one replica; <em>wins</em> when it fits and you are purely throughput-bound (the resilience-friendliest axis, K10/K22). (c) <b>No-parallelism + aggressive quant (D36)</b> &mdash; disq: when quant accuracy loss &gt; SLO floor or single-GPU latency &gt; SLO; <em>wins</em> for small / cost-optimised fleets (L5). (d) <b>Training-style tuple (ZeRO/FSDP)</b> &mdash; disq: optimises gradient/optimiser-state sharding, which serving has none of (stateless, no backward) &mdash; structurally the wrong tool. (e) <b>One tuple for both phases (no per-phase split)</b> &mdash; disq: when prefill and decode SLOs are both tight, a single compromise tuple misses one (the prefill-optimal degree starves decode goodput and vice-versa); <em>wins</em> only for small / loose-SLO single-pool deployments where the disaggregation overhead (K5/D35) exceeds the compromise cost. (f) <b>One-pass D25 (no fixed-point iteration)</b> &mdash; disq: ignores that DP depends on the KV budget the other axes leave &rarr; over-provisions DP or under-uses HBM; <em>never</em> strictly wins, only &ldquo;close enough&rdquo; when the model is tiny relative to HBM. (g) <b>Push TP past <code>n_kv_heads</code> for the KV win</b> &mdash; disq: with GQA, TP&gt;<code>n_kv_heads</code> replicates KV so the memory win stops while the all-reduce cost keeps rising; <em>never</em> wins for the KV binding (use PP/CP instead), only when the binding is pure weight-fit and latency has headroom. (h) <b>Size the rigid tuple for the mean mix (no elastic-DP headroom)</b> &mdash; disq: TP/PP/EP/CP can&rsquo;t reshard on the diurnal timescale, so a mean-sized rigid tuple SLO-violates at the peak; <em>wins</em> only when the mix is near-constant (<code>Var(&rho;)</code> &asymp; 0). Each: when it actually wins.<span class="meta">number: the constraint value that disqualifies each (N_dom for (a); single-replica fit for (b); SLO floor for (c); the TTFT/TPOT pair that breaks the compromise tuple for (e)) &mdash; cites K7/D26, K10, K14, K5/D35 &middot; contrast scenario L1 (the worked tuple, disaggregated) vs L5 (the D36 branch)</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 5. Failure modes -->
+  <!-- ===================================================== -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>The tuple choice <em>is</em> the blast-radius choice</b> &mdash; a TP group is all-or-nothing, a PP stage takes its in-flight microbatches, an EP shard fails its tokens, a DP replica is the smallest domain (cite K22, gpu-failure-modes.html); a tuple that lets <em>any</em> axis cross <code>N_dom</code> &rarr; interconnect saturation (the per-layer all-reduce / EP all-to-all over IB &mdash; llm-bottlenecks.html); <b>over-sharding</b> &rarr; comm-bound collapse (more GPUs, less goodput); a mis-derived DP ratio &rarr; idle GPUs (cost shape); reflexive sharding past D36 &rarr; paying blast radius + comm for a model that fit on one GPU. GPU-specific blast radius per axis.<span class="meta">cites llm/canonicals/gpu-failure-modes.html (per-axis blast radius), llm/canonicals/llm-bottlenecks.html (interconnect saturation), K22 (the fault-domain derivation) &middot; <b>ACTION: seed/extend these canonical entries in this same change (G0.2 / living-canonical discipline)</b></span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 6. Real systems -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> Megatron-LM (TP + PP + sequence-parallel composition), DeepSpeed-Inference (PP + TP serving), vLLM (TP/PP serving deployment), TensorRT-LLM (FP8 single-GPU 70B &mdash; the D36 evidence), NVIDIA Dynamo (multi-axis disaggregated serving), DeepSeek-V3 (the worked DP&times;TP&times;EP frontier-MoE tuple &mdash; D25 evidence). Each: which selection decision it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 7. Used by & cross-references -->
+  <!-- ===================================================== -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> (dedicated home &mdash; the worked parallelism-tuple selection, D25); <a href="../scenarios/L3-long-context-serving.html">L3</a> (CP forced into the tuple by context length, D25); <a href="../scenarios/L6-embedding-retrieval-service.html">L6</a> (DP + any-TP for an encoder fleet); <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (lives on the D36 no-parallelism branch). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html#collectives">K1</a> &mdash; the collective-cost primitives every axis&rsquo;s cost is quoted from (never re-derived here).</li>
+        <li><a href="K7_tensor-parallelism.html">K7</a> / <a href="K8_pipeline-parallelism.html">K8</a> / <a href="K9_expert-parallelism.html">K9</a> / <a href="K10_data-parallelism.html">K10</a> / <a href="K11_context-parallelism.html">K11</a> &mdash; the children; each axis&rsquo;s deep mechanics. K6 is the map and never re-derives a child&rsquo;s math; each child opens by citing this page&rsquo;s grid + spine.</li>
+        <li><a href="interconnect-and-collectives.html">K20</a> &mdash; the NVLink-domain / IB-rail topology = the master constraint bounding the whole search.</li>
+        <li><a href="K5_disaggregated-serving.html">K5</a> &mdash; the serving-phase split. K6 runs the selection <em>per phase</em> (prefill vs decode have opposite rooflines &rArr; different tuples); K5 owns the phase split + KV handoff itself (rule of two &mdash; K6 cites, never re-derives disaggregation; D35 is the disaggregate-or-colocate inequality).</li>
+        <li><a href="quantization.html">K14</a> / <a href="K2_kv-cache.html">K2</a> &mdash; the quantize-instead / KV-offload-instead escapes (D36) <em>and</em> the precision that re-parametrises every threshold <em>inside</em> D25 (precision is fixed before the search, step (0)); K2 also supplies the per-GPU KV-budget &rarr; max-batch term that makes step (4) a fixed-point.</li>
+        <li><a href="gpu-fleet-autoscaling-multitenancy.html">K15</a> &mdash; the tuple is a gang-scheduled placement unit; D43 (heterogeneous-fleet bin-packing / fragmentation) is the schedulability tie-break in the objective. K6 picks the tuple; K15 owns whether it packs &amp; autoscales.</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="residual-networks-serving.html">K18</a> &mdash; the residual stream &rarr; legal cut points (PP on block boundaries, TP within a block).</li>
+        <li><a href="fault-tolerance-multi-gpu-inference.html">K22</a> &mdash; fault domain per axis = blast radius; DP is the resilience-friendliest axis; the blast-radius tie-break in the objective.</li>
+        <li><strong>Out of scope (named, not covered):</strong> training parallelism (ZeRO/FSDP gradient &amp; optimiser-state sharding &mdash; training-side); each axis&rsquo;s internal mechanics (delegated to the K7&ndash;K11 children &mdash; this page selects, it does not implement).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sync vs Async Communication — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- 1. Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Scenario #5: Sync vs Async Communication</h1>
+      <p class="hero-subtitle">An e-commerce order pipeline that works fine under normal load &mdash; until a payment provider has a bad day and takes your entire site down with it. The fix: decouple with async messaging.</p>
+      <p class="hero-meta">~15 min read</p>
+    </div>
+  </section>
+
+  <!-- 2. The Scenario -->
+  <section class="section dense-columns">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are designing the order processing pipeline for an e-commerce platform. When a customer places an order, the system must perform five steps in sequence:</p>
+
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Operation</th>
+              <th>Latency</th>
+              <th>Dependency</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Create Order</td>
+              <td>10 ms (local DB write)</td>
+              <td>None</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Process Payment</td>
+              <td>2&ndash;5 sec (external Stripe/PayPal API)</td>
+              <td>Order must exist</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>Reserve Inventory</td>
+              <td>100 ms (internal service)</td>
+              <td>Payment must succeed</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Schedule Shipping</td>
+              <td>500 ms (external shipping API)</td>
+              <td>Inventory reserved</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Send Confirmation Email</td>
+              <td>200 ms (SMTP relay)</td>
+              <td>Shipping scheduled</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="full-width"><strong>Traffic:</strong> 1,000 orders/min at peak (e.g., flash sale). That is roughly <strong>17 orders per second</strong>.</p>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Key observation:</strong> Step 2 (payment) dominates latency. It is an external API you do not control, and its latency can swing wildly&mdash;from 2 seconds on a good day to 30+ seconds when the provider is degraded.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. BOE Math -->
+  <section class="section section-alt dense-columns">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Normal Conditions</h3>
+        <pre class="line-numbers"><code class="language-text">End-to-end latency (synchronous):
+  Create order:    10 ms
+  Payment:       2000 ms  (best case)
+  Inventory:      100 ms
+  Shipping:       500 ms
+  Email:          200 ms
+  ─────────────────────
+  Total:        ~2810 ms  ≈ 3 seconds
+
+Orders per second:          17 orders/sec
+Thread hold time:           3 sec per order
+Concurrent threads needed:  17 × 3 = 51 threads
+
+Typical thread pool size:   200 threads
+Utilization:                51 / 200 = 25.5%   ← Looks fine!</code></pre>
+        <p>At 25% utilization, the synchronous approach seems perfectly viable. The thread pool has plenty of headroom. So why worry?</p>
+      </div>
+
+      <div>
+        <h3>Degraded Conditions (Payment API Slow)</h3>
+        <pre class="line-numbers"><code class="language-text">Payment API latency spikes to 30 seconds (not unusual during outages).
+
+End-to-end latency:
+  Create order:     10 ms
+  Payment:       30000 ms  (10x slower)
+  Inventory:       100 ms
+  Shipping:        500 ms
+  Email:           200 ms
+  ─────────────────────
+  Total:        ~30810 ms  ≈ 31 seconds
+
+Concurrent threads needed:  17 × 31 = 527 threads
+
+Thread pool size:           200 threads
+Utilization:                527 / 200 = 263%   ← OVERLOADED
+
+Requests queuing up:        527 - 200 = 327 requests waiting
+Queue grows at:             17/sec - (200/31) = ~10.5 requests/sec
+Time to exhaust queue:      Within seconds</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The cascade:</strong> The thread pool is exhausted. New orders queue up. Users see timeouts after 30+ seconds. But here is the real disaster: the order API typically shares a server (and thread pool) with other endpoints&mdash;product pages, search, cart. When the order thread pool fills up, <em>every endpoint on the server</em> becomes unresponsive. The <strong>entire site goes down</strong> because of a slow payment provider.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Naive Design -->
+  <section class="section dense-columns">
+    <div class="container">
+      <h2>Naive Design: Synchronous Chain</h2>
+      <p>The simplest implementation: each step makes a synchronous REST call to the next service and waits for the response before proceeding.</p>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python"># Naive synchronous order processing
+def place_order(request):
+    # Step 1: Create order in DB
+    order = db.insert("orders", {
+        "user_id": request.user_id,
+        "items": request.items,
+        "status": "created"
+    })
+
+    # Step 2: Process payment (BLOCKS for 2-30 seconds!)
+    payment = payment_api.charge(
+        amount=order.total,
+        card_token=request.card_token
+    )  # ← Thread sits idle here, waiting for Stripe
+
+    if not payment.success:
+        db.update("orders", order.id, {"status": "payment_failed"})
+        return Response(400, "Payment failed")
+
+    # Step 3: Reserve inventory (blocks 100ms)
+    inventory = inventory_service.reserve(order.items)
+
+    # Step 4: Schedule shipping (blocks 500ms)
+    shipping = shipping_api.create_shipment(order.id, request.address)
+
+    # Step 5: Send confirmation email (blocks 200ms)
+    email_service.send_confirmation(request.email, order.id)
+
+    db.update("orders", order.id, {"status": "completed"})
+    return Response(200, {"order_id": order.id})</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Architecture Diagram</h3>
+        <svg viewBox="0 0 880 120" style="width:100%;max-width:880px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-sync" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#64748b"/></marker>
+          </defs>
+          <!-- User -->
+          <rect x="10" y="30" width="70" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="45" y="55" text-anchor="middle" fill="#334155" font-weight="600">User</text>
+          <!-- Arrow -->
+          <line x1="80" y1="50" x2="120" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-sync)"/>
+          <!-- Order API -->
+          <rect x="122" y="30" width="110" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="177" y="55" text-anchor="middle" fill="#334155" font-weight="600">Order API</text>
+          <text x="177" y="88" text-anchor="middle" fill="#64748b" font-size="11">10 ms</text>
+          <!-- Arrow -->
+          <line x1="232" y1="50" x2="272" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-sync)"/>
+          <!-- Payment API -->
+          <rect x="274" y="30" width="120" height="40" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="334" y="55" text-anchor="middle" fill="#334155" font-weight="600">Payment API</text>
+          <text x="334" y="88" text-anchor="middle" fill="#ef4444" font-weight="600" font-size="11">2 &#x2013; 30 sec</text>
+          <!-- Arrow -->
+          <line x1="394" y1="50" x2="434" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-sync)"/>
+          <!-- Inventory -->
+          <rect x="436" y="30" width="110" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="491" y="55" text-anchor="middle" fill="#334155" font-weight="600">Inventory</text>
+          <text x="491" y="88" text-anchor="middle" fill="#64748b" font-size="11">100 ms</text>
+          <!-- Arrow -->
+          <line x1="546" y1="50" x2="586" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-sync)"/>
+          <!-- Shipping API -->
+          <rect x="588" y="30" width="110" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="643" y="55" text-anchor="middle" fill="#334155" font-weight="600">Shipping API</text>
+          <text x="643" y="88" text-anchor="middle" fill="#64748b" font-size="11">500 ms</text>
+          <!-- Arrow -->
+          <line x1="698" y1="50" x2="738" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-sync)"/>
+          <!-- Email Service -->
+          <rect x="740" y="30" width="120" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="800" y="55" text-anchor="middle" fill="#334155" font-weight="600">Email Service</text>
+          <text x="800" y="88" text-anchor="middle" fill="#64748b" font-size="11">200 ms</text>
+          <!-- Thread blocked bar -->
+          <line x1="122" y1="14" x2="860" y2="14" stroke="#ef4444" stroke-width="2" stroke-dasharray="6,3"/>
+          <text x="491" y="10" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">Thread blocked for entire duration (3 &#x2013; 31 seconds)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>What Is Wrong With This?</h3>
+        <ol>
+          <li><strong>Tight coupling:</strong> If any downstream service is slow or down, the order API is directly affected. The slowest service dictates overall latency.</li>
+          <li><strong>Resource waste:</strong> The thread is blocked for 3&ndash;31 seconds doing nothing&mdash;just waiting for network responses.</li>
+          <li><strong>No partial progress:</strong> If shipping fails after payment succeeded, you have a payment with no shipment. Recovering requires manual intervention.</li>
+          <li><strong>Blast radius:</strong> Thread pool exhaustion affects all endpoints, not just orders.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5. What Breaks -->
+  <section class="section section-alt dense-columns">
+    <div class="container">
+      <h2>What Breaks (With Numbers)</h2>
+
+      <div class="full-width">
+        <h3>Failure Timeline</h3>
+        <p>Here is exactly what happens when the payment API degrades, minute by minute:</p>
+
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Payment Latency</th>
+                <th>Threads in Use</th>
+                <th>Thread Pool (200)</th>
+                <th>User Experience</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>T+0</td>
+                <td>2 sec (normal)</td>
+                <td>51</td>
+                <td>25% used</td>
+                <td>Normal</td>
+              </tr>
+              <tr>
+                <td>T+1 min</td>
+                <td>10 sec (degrading)</td>
+                <td>187</td>
+                <td>93% used</td>
+                <td>Slightly slower</td>
+              </tr>
+              <tr>
+                <td>T+2 min</td>
+                <td>20 sec</td>
+                <td>357</td>
+                <td>100% &mdash; SATURATED</td>
+                <td>Timeouts begin</td>
+              </tr>
+              <tr>
+                <td>T+3 min</td>
+                <td>30 sec</td>
+                <td>527 needed, 200 available</td>
+                <td>100% + queue overflow</td>
+                <td>Product pages down</td>
+              </tr>
+              <tr>
+                <td>T+5 min</td>
+                <td>30 sec (still degraded)</td>
+                <td>All blocked</td>
+                <td>Connection refused</td>
+                <td>Entire site unreachable</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The key insight:</strong> A slow dependency is often worse than a failed dependency. If payment returned an error in 100ms, you could show an error message quickly and release the thread. But a 30-second hang holds the thread hostage, consuming resources while providing no value.</p>
+      </div>
+
+      <div>
+        <h3>Partial Failure Problem</h3>
+        <p>Even when things are fast, the synchronous chain has a partial-failure problem:</p>
+        <pre class="line-numbers"><code class="language-text">Step 1: Create order      ✓  (order exists in DB)
+Step 2: Process payment   ✓  (card charged $150)
+Step 3: Reserve inventory ✗  (out of stock!)
+
+Now what?
+  - Customer was charged $150
+  - No inventory reserved
+  - No shipping scheduled
+  - Manual intervention needed to issue refund
+  - At 17 orders/sec, even 0.1% partial failures = 1 failure/min = 61/hour</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Iteration 1 -->
+  <section class="section dense-columns">
+    <div class="container">
+      <h2>Iteration 1: Make It Async</h2>
+      <p>The core idea: instead of the order API doing everything synchronously, it does the <strong>minimum necessary work</strong> and returns immediately. Everything else happens asynchronously via a message queue.</p>
+
+      <div class="full-width">
+        <h3>New Architecture</h3>
+        <svg viewBox="0 0 760 420" style="width:100%;max-width:760px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-async" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#64748b"/></marker>
+            <marker id="arrow-async-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#2563eb"/></marker>
+          </defs>
+          <!-- User -->
+          <rect x="20" y="20" width="80" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="60" y="45" text-anchor="middle" fill="#334155" font-weight="600">User</text>
+          <!-- Arrow to Order API -->
+          <line x1="100" y1="40" x2="160" y2="40" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-async)"/>
+          <!-- Order API -->
+          <rect x="162" y="15" width="140" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="232" y="36" text-anchor="middle" fill="#334155" font-weight="600">Order API</text>
+          <text x="232" y="52" text-anchor="middle" fill="#64748b" font-size="11">DB write + publish</text>
+          <!-- Return arrow -->
+          <line x1="302" y1="40" x2="362" y2="40" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-async)"/>
+          <rect x="364" y="22" width="150" height="36" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="439" y="45" text-anchor="middle" fill="#16a34a" font-weight="600">202 Accepted (50ms)</text>
+          <!-- Arrow down to queue -->
+          <line x1="232" y1="65" x2="232" y2="110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-async-blue)"/>
+          <text x="260" y="92" fill="#2563eb" font-size="11" font-style="italic">order.created</text>
+          <!-- Message Queue -->
+          <rect x="147" y="112" width="170" height="44" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="232" y="133" text-anchor="middle" fill="#334155" font-weight="600">Message Queue</text>
+          <text x="232" y="149" text-anchor="middle" fill="#64748b" font-size="11">Kafka / RabbitMQ</text>
+          <!-- Fan-out lines -->
+          <line x1="182" y1="156" x2="120" y2="205" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-async)"/>
+          <line x1="232" y1="156" x2="340" y2="205" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-async)"/>
+          <line x1="282" y1="156" x2="560" y2="205" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-async)"/>
+          <!-- Payment Worker -->
+          <rect x="40" y="207" width="160" height="44" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="120" y="228" text-anchor="middle" fill="#334155" font-weight="600">Payment Worker</text>
+          <text x="120" y="244" text-anchor="middle" fill="#64748b" font-size="11">calls Stripe/PayPal</text>
+          <!-- Inventory Worker (2nd tier) -->
+          <rect x="260" y="207" width="160" height="44" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="340" y="228" text-anchor="middle" fill="#334155" font-weight="600">Inventory Worker</text>
+          <text x="340" y="244" text-anchor="middle" fill="#64748b" font-size="11">reserves stock</text>
+          <!-- Email Worker -->
+          <rect x="480" y="207" width="160" height="44" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="560" y="228" text-anchor="middle" fill="#334155" font-weight="600">Email Worker</text>
+          <text x="560" y="244" text-anchor="middle" fill="#64748b" font-size="11">sends confirmation</text>
+          <!-- Payment publishes -->
+          <line x1="120" y1="251" x2="120" y2="300" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-async-blue)"/>
+          <text x="145" y="282" fill="#2563eb" font-size="11" font-style="italic">payment.succeeded</text>
+          <!-- Inventory publishes -->
+          <line x1="340" y1="251" x2="340" y2="300" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-async-blue)"/>
+          <text x="370" y="282" fill="#2563eb" font-size="11" font-style="italic">inventory.reserved</text>
+          <!-- 2nd tier workers -->
+          <rect x="40" y="302" width="160" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="120" y="323" text-anchor="middle" fill="#334155" font-weight="600">Inventory Worker</text>
+          <text x="120" y="339" text-anchor="middle" fill="#64748b" font-size="11">triggered by payment</text>
+          <rect x="260" y="302" width="160" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="340" y="323" text-anchor="middle" fill="#334155" font-weight="600">Shipping Worker</text>
+          <text x="340" y="339" text-anchor="middle" fill="#64748b" font-size="11">creates shipping label</text>
+          <!-- Legend -->
+          <rect x="520" y="300" width="220" height="100" rx="8" fill="#f8f9fa" stroke="#e2e8f0" stroke-width="1"/>
+          <text x="535" y="320" fill="#334155" font-weight="600" font-size="12">Legend</text>
+          <line x1="535" y1="338" x2="570" y2="338" stroke="#16a34a" stroke-width="2"/>
+          <text x="578" y="342" fill="#64748b" font-size="11">Sync (user waits)</text>
+          <line x1="535" y1="358" x2="570" y2="358" stroke="#2563eb" stroke-width="2"/>
+          <text x="578" y="362" fill="#64748b" font-size="11">Async event</text>
+          <line x1="535" y1="378" x2="570" y2="378" stroke="#64748b" stroke-width="2"/>
+          <text x="578" y="382" fill="#64748b" font-size="11">Queue fan-out</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>How It Works Step by Step</h3>
+        <ol>
+          <li><strong>Order API</strong> writes the order to the database with status <code>"pending"</code> and publishes an <code>order.created</code> event to the message queue. Returns <code>202 Accepted</code> to the user in ~50ms.</li>
+          <li><strong>Payment Worker</strong> picks up the <code>order.created</code> event, calls the payment API, and publishes <code>payment.succeeded</code> or <code>payment.failed</code>.</li>
+          <li><strong>Inventory Worker</strong> picks up <code>payment.succeeded</code>, reserves inventory, publishes <code>inventory.reserved</code>.</li>
+          <li><strong>Shipping Worker</strong> picks up <code>inventory.reserved</code>, calls the shipping API, publishes <code>shipping.scheduled</code>.</li>
+          <li><strong>Email Worker</strong> picks up <code>shipping.scheduled</code>, sends the confirmation email.</li>
+        </ol>
+      </div>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python"># Async order processing - Order API (fast path)
+def place_order(request):
+    # Step 1: Create order in DB (10ms)
+    order = db.insert("orders", {
+        "user_id": request.user_id,
+        "items": request.items,
+        "status": "pending",
+        "idempotency_key": request.idempotency_key
+    })
+
+    # Step 2: Publish event to queue (5ms)
+    queue.publish("order.created", {
+        "order_id": order.id,
+        "user_id": request.user_id,
+        "items": request.items,
+        "card_token": request.card_token,
+        "address": request.address,
+        "email": request.email
+    })
+
+    # Return immediately - user does NOT wait for payment
+    return Response(202, {
+        "order_id": order.id,
+        "status": "pending",
+        "message": "Order received. You will be notified when confirmed."
+    })
+
+
+# Payment Worker (runs independently)
+def handle_order_created(event):
+    order_id = event["order_id"]
+
+    try:
+        payment = payment_api.charge(
+            amount=calculate_total(event["items"]),
+            card_token=event["card_token"]
+        )
+        db.update("orders", order_id, {"status": "payment_succeeded"})
+        queue.publish("payment.succeeded", {
+            "order_id": order_id,
+            "payment_id": payment.id,
+            "items": event["items"],
+            "address": event["address"],
+            "email": event["email"]
+        })
+    except PaymentError as e:
+        db.update("orders", order_id, {"status": "payment_failed"})
+        queue.publish("payment.failed", {
+            "order_id": order_id,
+            "reason": str(e)
+        })</code></pre>
+      </div>
+
+      <div>
+        <h3>Why This Is Better: The Numbers</h3>
+        <pre class="line-numbers"><code class="language-text">User-facing latency:
+  Before (sync):  2810 ms best case, 30810 ms degraded
+  After (async):    50 ms always (DB write + queue publish)
+
+Thread hold time:
+  Before (sync):  3 sec best, 31 sec degraded
+  After (async):  50 ms always
+
+Threads needed at 17 orders/sec:
+  Before (sync):  51 threads (normal), 527 threads (degraded)
+  After (async):  17 × 0.05 = ~1 thread
+
+Impact of payment API degradation:
+  Before (sync):  Entire site goes down
+  After (async):  Queue grows. Users still browse, add to cart, place orders.
+                  Orders just take longer to confirm.</code></pre>
+      </div>
+
+      <div>
+        <h3>Queue Depth During Degradation</h3>
+        <pre class="line-numbers"><code class="language-text">Normal: Payment API processes at ~5 orders/sec (2s each)
+        Queue production:   17/sec
+        Queue consumption:   5/sec
+        Net queue growth:   12/sec
+
+After 5 minutes of degradation:
+        Queue depth: 12 × 300 = 3,600 items
+        Memory per item: ~1 KB (JSON payload)
+        Total queue memory: 3,600 × 1 KB = 3.6 MB  ← trivial for Kafka/RabbitMQ
+
+Recovery time after payment API returns to normal:
+        Backlog: 3,600 items
+        Processing rate: 5/sec (even at normal 2s payment time)
+        Drain time: 3,600 / 5 = 720 sec = 12 minutes
+
+        With consumer scaling (10 workers × 5/sec = 50/sec):
+        Drain time: 3,600 / 50 = 72 seconds  ← much better</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The queue acts as a shock absorber.</strong> Traffic spikes and downstream slowdowns are absorbed by the queue growing. Nothing crashes. Nothing times out. The system degrades gracefully: orders take longer to process, but the website stays up and users can keep shopping.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. Iteration 2 -->
+  <section class="section section-alt dense-columns">
+    <div class="container">
+      <h2>Iteration 2: Idempotency, Retries, and Compensation</h2>
+      <p>The async design solves the performance and coupling problems, but introduces new challenges. Distributed systems are messy: messages can be delivered more than once, workers can crash mid-processing, and partial failures still happen.</p>
+
+      <div class="full-width">
+        <h3>Problem 1: Duplicate Messages</h3>
+        <p>If a payment worker processes a message, calls Stripe, and then crashes before acknowledging the message, the queue will redeliver it. Without protection, the customer gets charged twice.</p>
+
+        <pre class="line-numbers"><code class="language-python"># Idempotent payment processing
+def handle_order_created(event):
+    order_id = event["order_id"]
+    idempotency_key = f"payment-{order_id}"
+
+    # Check if already processed
+    existing = db.query(
+        "SELECT status FROM orders WHERE id = ? AND status != 'pending'",
+        [order_id]
+    )
+    if existing:
+        return  # Already processed, skip
+
+    try:
+        # Stripe accepts idempotency keys natively
+        payment = payment_api.charge(
+            amount=calculate_total(event["items"]),
+            card_token=event["card_token"],
+            idempotency_key=idempotency_key  # Stripe deduplicates
+        )
+        db.update("orders", order_id, {
+            "status": "payment_succeeded",
+            "payment_id": payment.id
+        })
+        queue.publish("payment.succeeded", {"order_id": order_id, ...})
+    except PaymentError as e:
+        db.update("orders", order_id, {"status": "payment_failed"})
+        queue.publish("payment.failed", {"order_id": order_id, ...})</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Idempotency key rule:</strong> Every operation that can be retried must have an idempotency key derived from the input (e.g., <code>payment-{order_id}</code>). If the same key is seen twice, the operation is a no-op. This makes at-least-once delivery safe.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Problem 2: Partial Failures Need Compensation</h3>
+        <p>What if payment succeeds but inventory reservation fails (item went out of stock between order placement and reservation)? You need <strong>compensating actions</strong>&mdash;the distributed equivalent of a database rollback.</p>
+
+        <svg viewBox="0 0 740 300" style="width:100%;max-width:740px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-comp" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#64748b"/></marker>
+            <marker id="arrow-comp-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#ef4444"/></marker>
+            <marker id="arrow-comp-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#16a34a"/></marker>
+          </defs>
+          <!-- Happy path label -->
+          <text x="20" y="20" fill="#16a34a" font-weight="700" font-size="12">Happy Path</text>
+          <!-- Happy path boxes -->
+          <rect x="20" y="30" width="120" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="80" y="52" text-anchor="middle" fill="#334155" font-size="11">order.created</text>
+          <line x1="140" y1="47" x2="162" y2="47" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-comp-green)"/>
+          <rect x="164" y="30" width="140" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="234" y="52" text-anchor="middle" fill="#334155" font-size="11">payment.succeeded</text>
+          <line x1="304" y1="47" x2="326" y2="47" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-comp-green)"/>
+          <rect x="328" y="30" width="140" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="398" y="52" text-anchor="middle" fill="#334155" font-size="11">inventory.reserved</text>
+          <line x1="468" y1="47" x2="490" y2="47" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-comp-green)"/>
+          <rect x="492" y="30" width="140" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="562" y="52" text-anchor="middle" fill="#334155" font-size="11">shipping.scheduled</text>
+          <line x1="632" y1="47" x2="654" y2="47" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-comp-green)"/>
+          <rect x="656" y="30" width="70" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="691" y="52" text-anchor="middle" fill="#334155" font-size="11">email.sent</text>
+
+          <!-- Failure path label -->
+          <text x="20" y="100" fill="#ef4444" font-weight="700" font-size="12">Failure at Inventory Step</text>
+          <!-- Failure path boxes -->
+          <rect x="20" y="110" width="120" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="80" y="132" text-anchor="middle" fill="#334155" font-size="11">order.created</text>
+          <line x1="140" y1="127" x2="162" y2="127" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-comp-green)"/>
+          <rect x="164" y="110" width="140" height="34" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="234" y="132" text-anchor="middle" fill="#334155" font-size="11">payment.succeeded</text>
+          <line x1="304" y1="127" x2="326" y2="127" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-comp-red)"/>
+          <rect x="328" y="110" width="140" height="34" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="398" y="132" text-anchor="middle" fill="#ef4444" font-weight="600" font-size="11">inventory.failed</text>
+
+          <!-- Compensation arrow down -->
+          <line x1="398" y1="144" x2="398" y2="175" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-comp-red)"/>
+
+          <!-- Compensation box -->
+          <rect x="328" y="177" width="140" height="34" rx="8" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+          <text x="398" y="199" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">Compensation</text>
+
+          <!-- Fan out to refund and notification -->
+          <line x1="350" y1="211" x2="200" y2="250" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-comp)"/>
+          <line x1="440" y1="211" x2="560" y2="250" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-comp)"/>
+
+          <!-- Refund Worker -->
+          <rect x="100" y="252" width="200" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="200" y="268" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">Refund Worker</text>
+          <text x="200" y="283" text-anchor="middle" fill="#64748b" font-size="10">calls Stripe refund API</text>
+
+          <!-- Notification Worker -->
+          <rect x="460" y="252" width="220" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="268" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">Notification Worker</text>
+          <text x="570" y="283" text-anchor="middle" fill="#64748b" font-size="10">emails &quot;sorry, out of stock&quot;</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python"># Inventory worker with compensation
+def handle_payment_succeeded(event):
+    order_id = event["order_id"]
+
+    try:
+        reservation = inventory_service.reserve(event["items"])
+        db.update("orders", order_id, {"status": "inventory_reserved"})
+        queue.publish("inventory.reserved", {
+            "order_id": order_id,
+            "reservation_id": reservation.id,
+            ...
+        })
+    except OutOfStockError:
+        # Compensate: refund the payment
+        db.update("orders", order_id, {"status": "inventory_failed"})
+        queue.publish("refund.requested", {
+            "order_id": order_id,
+            "payment_id": event["payment_id"],
+            "reason": "out_of_stock"
+        })
+        queue.publish("notification.send", {
+            "order_id": order_id,
+            "email": event["email"],
+            "template": "out_of_stock"
+        })</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 3: Poison Messages</h3>
+        <p>Some messages may never succeed no matter how many times you retry&mdash;a corrupt payload, a bug in the handler, an invalid card token. Without a safety valve, the worker retries forever and blocks the queue.</p>
+
+        <pre class="line-numbers"><code class="language-text">Retry policy:
+  Attempt 1:  immediate
+  Attempt 2:  after 1 sec   (exponential backoff)
+  Attempt 3:  after 4 sec
+  Attempt 4:  after 16 sec
+  Attempt 5:  GIVE UP → move to Dead Letter Queue (DLQ)
+
+DLQ processing:
+  - Alert on-call engineer
+  - Store full event payload for debugging
+  - Provide a "replay" button in admin dashboard
+  - Daily report: "14 orders failed permanently today"</code></pre>
+      </div>
+
+      <div>
+        <h3>Order Status Tracking</h3>
+        <p>Since the user got a <code>202 Accepted</code> immediately, they need a way to check order status. Each worker updates the order status in the database as it processes:</p>
+
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Set By</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>pending</code></td>
+                <td>Order API</td>
+                <td>Order created, waiting for payment</td>
+              </tr>
+              <tr>
+                <td><code>payment_processing</code></td>
+                <td>Payment Worker</td>
+                <td>Payment API called, waiting for response</td>
+              </tr>
+              <tr>
+                <td><code>payment_succeeded</code></td>
+                <td>Payment Worker</td>
+                <td>Card charged successfully</td>
+              </tr>
+              <tr>
+                <td><code>payment_failed</code></td>
+                <td>Payment Worker</td>
+                <td>Card declined or payment error</td>
+              </tr>
+              <tr>
+                <td><code>inventory_reserved</code></td>
+                <td>Inventory Worker</td>
+                <td>Items reserved in warehouse</td>
+              </tr>
+              <tr>
+                <td><code>shipping_scheduled</code></td>
+                <td>Shipping Worker</td>
+                <td>Shipping label created</td>
+              </tr>
+              <tr>
+                <td><code>confirmed</code></td>
+                <td>Email Worker</td>
+                <td>Confirmation email sent, order complete</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The frontend polls <code>GET /orders/{id}/status</code> every few seconds, or you use WebSockets/SSE for real-time updates.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Iteration 3: Hybrid approach -->
+  <section class="section dense-columns">
+    <div class="container">
+      <h2>Iteration 3: Hybrid Sync + Async</h2>
+      <p>There is one problem with fully async: the user does not know if their payment was declined until later. For many e-commerce flows, the user <em>needs</em> immediate feedback on payment. They are sitting on the checkout page waiting.</p>
+
+      <div class="full-width">
+        <h3>The Hybrid Approach</h3>
+        <p>Make payment synchronous (user waits for it), but everything after payment is async. This gives the user immediate feedback on the critical step while still decoupling the rest of the pipeline.</p>
+
+        <pre class="line-numbers"><code class="language-python"># Hybrid: sync payment, async everything else
+def place_order(request):
+    # Step 1: Create order (10ms)
+    order = db.insert("orders", {
+        "user_id": request.user_id,
+        "items": request.items,
+        "status": "pending"
+    })
+
+    # Step 2: Payment - SYNCHRONOUS (user waits)
+    try:
+        payment = payment_api.charge(
+            amount=order.total,
+            card_token=request.card_token,
+            timeout=10  # 10-second timeout, don't wait forever
+        )
+    except TimeoutError:
+        db.update("orders", order.id, {"status": "payment_timeout"})
+        return Response(202, {
+            "order_id": order.id,
+            "status": "payment_pending",
+            "message": "Payment is being processed. We will email you."
+        })
+    except PaymentDeclined:
+        db.update("orders", order.id, {"status": "payment_failed"})
+        return Response(400, {"error": "Card declined. Please try another card."})
+
+    # Payment succeeded - everything else is async
+    db.update("orders", order.id, {
+        "status": "payment_succeeded",
+        "payment_id": payment.id
+    })
+
+    # Publish for async processing
+    queue.publish("payment.succeeded", {
+        "order_id": order.id,
+        "payment_id": payment.id,
+        "items": request.items,
+        "address": request.address,
+        "email": request.email
+    })
+
+    # User sees success immediately
+    return Response(200, {
+        "order_id": order.id,
+        "status": "confirmed",
+        "message": "Payment processed! Your order is being prepared."
+    })</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Comparing All Three Approaches</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Property</th>
+                <th>Fully Sync</th>
+                <th>Fully Async</th>
+                <th>Hybrid</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>User-facing latency</td>
+                <td>3&ndash;31 sec</td>
+                <td>50 ms</td>
+                <td>2&ndash;10 sec</td>
+              </tr>
+              <tr>
+                <td>Payment feedback</td>
+                <td>Immediate</td>
+                <td>Delayed (minutes)</td>
+                <td>Immediate</td>
+              </tr>
+              <tr>
+                <td>Blast radius of slow payment</td>
+                <td>Entire site down</td>
+                <td>Queue grows, site fine</td>
+                <td>Checkout slower, site fine</td>
+              </tr>
+              <tr>
+                <td>Threads held per order</td>
+                <td>1 for 3&ndash;31 sec</td>
+                <td>1 for 50 ms</td>
+                <td>1 for 2&ndash;10 sec</td>
+              </tr>
+              <tr>
+                <td>Complexity</td>
+                <td>Low</td>
+                <td>High</td>
+                <td>Medium</td>
+              </tr>
+              <tr>
+                <td>Partial failure handling</td>
+                <td>Manual</td>
+                <td>Compensating actions</td>
+                <td>Compensating actions</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The hybrid approach is the most common in production.</strong> Amazon, Shopify, and most e-commerce platforms use synchronous payment (user needs to know if the card works) and asynchronous fulfillment (inventory, shipping, email happen in the background).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. Final Design -->
+  <section class="section section-alt dense-columns">
+    <div class="container">
+      <h2>Final Design</h2>
+      <p>Putting it all together: the hybrid async architecture with idempotency, compensation, dead letter queues, and status tracking.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 780 540" style="width:100%;max-width:780px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-final" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#64748b"/></marker>
+            <marker id="arrow-final-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#2563eb"/></marker>
+            <marker id="arrow-final-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#ef4444"/></marker>
+          </defs>
+          <!-- Load Balancer -->
+          <rect x="290" y="10" width="200" height="44" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="390" y="37" text-anchor="middle" fill="#334155" font-weight="600">Load Balancer</text>
+          <!-- Arrow -->
+          <line x1="390" y1="54" x2="390" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <!-- Order API -->
+          <rect x="290" y="82" width="200" height="56" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="390" y="105" text-anchor="middle" fill="#334155" font-weight="600">Order API</text>
+          <text x="390" y="122" text-anchor="middle" fill="#64748b" font-size="11">(sync payment) Returns 200/400</text>
+          <!-- Arrow down -->
+          <line x1="390" y1="138" x2="390" y2="170" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-final-blue)"/>
+          <text x="510" y="160" fill="#2563eb" font-size="11" font-style="italic">publishes &quot;payment.succeeded&quot;</text>
+          <!-- Message Queue -->
+          <rect x="290" y="172" width="200" height="50" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="390" y="194" text-anchor="middle" fill="#334155" font-weight="600">Message Queue</text>
+          <text x="390" y="212" text-anchor="middle" fill="#64748b" font-size="11">Kafka / RabbitMQ</text>
+          <!-- Fan-out lines to 3 workers -->
+          <line x1="330" y1="222" x2="140" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="390" y1="222" x2="390" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="450" y1="222" x2="640" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <!-- Inventory Worker -->
+          <rect x="50" y="272" width="180" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="140" y="294" text-anchor="middle" fill="#334155" font-weight="600">Inventory Worker</text>
+          <text x="140" y="312" text-anchor="middle" fill="#64748b" font-size="11">(100 ms)</text>
+          <!-- Shipping Worker -->
+          <rect x="300" y="272" width="180" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="390" y="294" text-anchor="middle" fill="#334155" font-weight="600">Shipping Worker</text>
+          <text x="390" y="312" text-anchor="middle" fill="#64748b" font-size="11">(500 ms)</text>
+          <!-- Email Worker -->
+          <rect x="550" y="272" width="180" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="640" y="294" text-anchor="middle" fill="#334155" font-weight="600">Email Worker</text>
+          <text x="640" y="312" text-anchor="middle" fill="#64748b" font-size="11">(200 ms)</text>
+          <!-- Failure annotations -->
+          <line x1="140" y1="322" x2="140" y2="356" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-final-red)"/>
+          <text x="140" y="372" text-anchor="middle" fill="#ef4444" font-size="11">On failure:</text>
+          <text x="140" y="388" text-anchor="middle" fill="#ef4444" font-size="10">refund event + cancel order</text>
+          <line x1="390" y1="322" x2="390" y2="356" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-final-red)"/>
+          <text x="390" y="372" text-anchor="middle" fill="#ef4444" font-size="11">On failure:</text>
+          <text x="390" y="388" text-anchor="middle" fill="#ef4444" font-size="10">alert ops + manual retry</text>
+          <!-- Dead Letter Queue -->
+          <rect x="250" y="420" width="200" height="50" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="350" y="442" text-anchor="middle" fill="#334155" font-weight="600">Dead Letter Queue</text>
+          <text x="350" y="458" text-anchor="middle" fill="#64748b" font-size="11">failed after 5 retries</text>
+          <!-- Arrow to Admin -->
+          <line x1="450" y1="445" x2="510" y2="445" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <!-- Admin Dashboard -->
+          <rect x="512" y="420" width="200" height="50" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="612" y="442" text-anchor="middle" fill="#334155" font-weight="600">Admin Dashboard</text>
+          <text x="612" y="458" text-anchor="middle" fill="#64748b" font-size="11">manual review + replay</text>
+          <!-- DLQ connection lines from workers -->
+          <line x1="140" y1="390" x2="280" y2="425" stroke="#ef4444" stroke-width="1" stroke-dasharray="4,3"/>
+          <line x1="390" y1="390" x2="350" y2="420" stroke="#ef4444" stroke-width="1" stroke-dasharray="4,3"/>
+          <!-- Label at top -->
+          <text x="390" y="530" text-anchor="middle" fill="#64748b" font-size="12" font-style="italic">Hybrid Architecture: sync payment, async fulfillment, with DLQ safety net</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Final Numbers</h3>
+        <pre class="line-numbers"><code class="language-text">Normal operation:
+  User latency:           2-5 sec (payment) + 50ms overhead = ~2-5 sec
+  Order confirmation:     Background in ~800ms after payment
+  Throughput:             17 orders/sec, easily handled
+  Queue depth:            Near zero (consumers keep up)
+
+Payment API degraded (30s):
+  User latency:           10 sec timeout → "payment pending" response
+  Queue depth:            Grows at ~12/sec
+  Site health:            100% operational (product pages, search, cart unaffected)
+  Recovery:               Queue drains in ~72 sec with 10 workers
+
+Payment API down:
+  User experience:        "Payment is processing" after timeout
+  Circuit breaker:        Opens after 5 failures, fast-fails for 30 sec
+  Queue:                  Messages accumulate, processed when API recovers
+  No data loss:           All orders in DB + queue, nothing dropped</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9. Key Takeaways -->
+  <section class="section dense-columns">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ol class="full-width">
+        <li><strong>Synchronous for operations where the user needs an immediate answer</strong> (payment declined? try another card). Async for everything else (inventory, shipping, email).</li>
+        <li><strong>Async decouples failure domains.</strong> A slow payment provider does not take down product pages. A crashed email service does not block shipping. Each service fails independently.</li>
+        <li><strong>Calculate queue growth rate</strong> to ensure your queue can handle degraded periods. At 12 messages/sec growth, a 5-minute outage produces only 3.6 MB of backlog&mdash;trivial for any modern message broker.</li>
+        <li><strong>Always plan compensating actions for partial failures.</strong> If step 3 fails after step 2 succeeded, you need an automated way to undo step 2 (refund the payment).</li>
+        <li><strong>Idempotency keys are non-negotiable</strong> in async systems. Messages will be delivered more than once. Every handler must be safe to run multiple times with the same input.</li>
+        <li><strong>A slow dependency is worse than a dead dependency.</strong> Dead services fail fast (connection refused in milliseconds). Slow services hold threads for seconds or minutes. Use timeouts and circuit breakers to convert slow failures into fast failures.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- 10. Related Topics -->
+  <section class="section section-alt dense-columns">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Topic</th>
+              <th>Relevance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><a href="../message-queues.html">Message Queues</a></td>
+              <td>Deep dive on Kafka, RabbitMQ, delivery guarantees, consumer groups, and partition ordering.</td>
+            </tr>
+            <tr>
+              <td><a href="../circuit-breakers.html">Circuit Breakers</a></td>
+              <td>How to protect against slow dependencies. The Closed &rarr; Open &rarr; Half-Open state machine.</td>
+            </tr>
+            <tr>
+              <td><a href="../distributed-transactions.html">Distributed Transactions</a></td>
+              <td>The Saga pattern (choreography vs orchestration), 2PC, and the outbox pattern for reliable event publishing.</td>
+            </tr>
+            <tr>
+              <td><a href="../microservices.html">Microservices</a></td>
+              <td>Service boundaries, inter-service communication patterns, and why async messaging is the backbone of microservice architectures.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Interview Scenarios &mdash; NALSD Walkthrough</p>
+    </div>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+</body>
+</html>

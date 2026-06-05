@@ -1,0 +1,1416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Job Scheduler — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="../leetcode.md">LeetCode coverage</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Design a Distributed Job Scheduler</h1>
+      <p class="hero-subtitle">10 million jobs per day, exactly-once execution, sub-30-second accuracy, and high availability &mdash; from a single polling loop to a lease-based, multi-scheduler architecture with Redis priority queues.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~20 min read &bull; LC #621 (Task Scheduler) / min-heap-by-next-fire-time + delay queue</p>
+    </div>
+  </section>
+
+  <!-- LC kernel banner -->
+  <section class="section section-alt dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>LC kernel.</strong> A <em>min-heap keyed by next-fire-time</em> &mdash; the same priority-queue at the heart of "Task Scheduler" (LC #621) and "Meeting Rooms II" (LC #253): keep a heap of <code>(next_fire_time, job)</code>; pop the minimum, run it; for a recurring job, recompute its next fire and push it back; sleep until the new head's time, or until a new shorter-delay job arrives (a <em>delay queue</em> / <em>timing wheel</em>). On one machine that's O(log&nbsp;n) per fire and "what's due now" is the heap top &mdash; O(1) peek. <strong>Three properties that break at millions of jobs / thousands of executions/sec:</strong> (1) <em>the heap is in RAM and the process is reliable</em> &mdash; a real scheduler crashes mid-run, so the heap must be a <em>cache</em> over a durable store, and a job a worker was running when it crashed must be detected (lease expiry) and re-dispatched; (2) <em>one heap, one consumer</em> &mdash; millions of pending jobs don't fit one process's heap and thousands of fires/sec exceed one process's throughput, so the timing structure becomes a <em>sharded, time-bucketed durable index</em> ("what's due in the next second" = scan one small bucket, not the whole heap) and many workers pull from it; (3) <em>a function call</em> &mdash; "run the job" is <code>fn()</code> in the LC version; in production it's an <em>at-least-once execution with a fencing token</em> handed to an idempotent worker, because exactly-once across a network is a fiction (a worker can finish and die before acking). The C8 production cousin replaces the bare in-RAM min-heap with: a durable job store with an indexed <code>next_fire_time</code> (the heap is a hint), <code>SELECT ... FOR UPDATE SKIP LOCKED</code> (or a Redis sorted-set delay queue) for many-worker pull, a lease + fence-token execution contract, and a standby scheduler so the cron-evaluator + lease-reaper aren't a SPOF. <span style="font-weight:normal;">(This is the canonical "task scheduler" scenario; the generic task queue it builds on is <a href="09-task-queue.html">#9</a>, and the exactly-once machinery is <a href="14-exactly-once.html">#14</a>.)</span></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are building the job scheduling infrastructure for a large SaaS platform. Customers create scheduled tasks that must execute reliably: sending emails at a future time, generating reports on a schedule, running data pipelines every hour, or triggering webhooks at precise moments.</p>
+
+      <div class="full-width">
+        <h3>System class</h3>
+        <p><strong>Class: infra primitive / automation pipeline</strong> &mdash; see <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>. It is an internal building block other services depend on (the "cron + delay-queue" the rest of the platform calls), with an automation-pipeline flavour: a stream of time-triggered events flows through it to a worker pool. The class fixes the FR vocabulary &mdash; <em>operations</em> (schedule / cancel / pause / update a job; execute via a worker pool) plus <em>semantics</em> (delivery guarantee, fire-time accuracy, fairness) &mdash; and puts these NFRs at the centre: scheduling accuracy (fire-time skew), execution-delivery guarantee, availability of the trigger path, and fairness across tenants. It is <em>not</em> a workflow engine (no DAGs / job dependencies &mdash; that's Airflow/Temporal-class, out of scope) and <em>not</em> the worker fleet that runs the jobs (that's the task queue, <a href="09-task-queue.html">#9</a>).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Functional requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <ul>
+          <li><strong>Schedule a recurring (cron) job.</strong> Accept <code>(cron_expr, timezone, priority, payload_ref, tenant)</code>; the system fires it on every matching wall-clock instant until cancelled/paused.</li>
+          <li><strong>Schedule a one-shot delayed job.</strong> Accept <code>(fire_at, priority, payload_ref, tenant)</code>; the system fires it once at <code>fire_at</code>.</li>
+          <li><strong>Cancel / pause / update a job.</strong> By <code>job_id</code> &mdash; cancel removes it; pause stops it firing without deleting it; update changes the schedule/payload/priority (next fire recomputed).</li>
+          <li><strong>Execute via a worker pool with leases.</strong> A worker leases a due job, runs the payload, renews the lease while running, releases (or fails) it; a crashed worker's lease expires and the job is re-dispatched.</li>
+          <li><strong>Deliver each scheduled execution at-least-once with a fencing token.</strong> Every fire is handed to a worker with a monotonically-increasing <code>fence_token</code> (the <code>execution_id</code>); the worker presents it on every side-effecting call; downstream rejects a stale token. (Exactly-once-effect = at-least-once delivery + idempotent worker keyed on the token; see <a href="14-exactly-once.html">#14</a>.)</li>
+          <li><strong>Fairness across tenants.</strong> No single tenant's burst of jobs can starve another tenant's due P0/P1 jobs.</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> the jobs' own logic (the worker code is the caller's; we trigger and lease, we don't define what runs); workflow DAGs / job dependencies ("run B after A completes" &mdash; that's a workflow engine, Airflow/Temporal/Cadence-class, a different system); the result store (job output goes wherever the worker writes it; we keep an execution-history audit row, not the payload output); the worker fleet's own autoscaling (the task queue, <a href="09-task-queue.html">#9</a>, owns that). <strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) job count &asymp; ~5&nbsp;M one-shot pending + ~1&nbsp;M cron schedules; execution rate ~116/sec average, ~1,000/sec peak (batch hour) &mdash; if it's 100&times; this, the single Redis + single Postgres assumption breaks (see Pushbacks); (2) max acceptable fire-time skew is <strong>30&nbsp;s</strong> (so a poll-based design is borderline OK; a 1-s SLA would force an event-driven queue from the start); (3) at-least-once + idempotency is acceptable for most jobs &mdash; the rare "must run exactly once" job (a billing run) gets the fence token + a downstream dedupe table (see Pushbacks); (4) max job duration is <strong>minutes</strong>, not hours &mdash; the 60-s lease + 20-s renewal assumes this; an hours-long ETL needs a much longer lease and aggressive renewal (see Assumptions callout); (5) NTP keeps clock drift between schedulers and Postgres under ~1&nbsp;s &mdash; lease expiry is clock-dependent.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarification ledger (C1)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Question asked</th><th>Answer assumed</th><th>Why it matters</th></tr></thead>
+            <tbody>
+              <tr><td>Exactly-once <em>required</em>, or at-least-once + idempotency?</td><td>At-least-once + idempotency for the bulk; fence token + downstream dedupe for the &lt;1% billing-class jobs.</td><td>Determines whether the worker contract is "idempotent, may see a fire twice" or a full 2-phase commit per fire. We pick the former; it's cheap and covers everything except money movement.</td></tr>
+              <tr><td>Max acceptable fire-time skew &mdash; seconds or minutes?</td><td>30&nbsp;s.</td><td>30&nbsp;s lets a 5-s DB poll be acceptable in the Naive design (worst-case ~5&nbsp;s late). A 1-s SLA would make the Redis delay-queue (Iter&nbsp;2) mandatory, not an optimization.</td></tr>
+              <tr><td>How long can a job run?</td><td>Minutes (P95 &lt; 60&nbsp;s; tail &lt; 5&nbsp;min).</td><td>Sets the lease duration (60&nbsp;s) and renewal interval (20&nbsp;s). Hours-long jobs would need a multi-hour lease and would change the crash-detection window.</td></tr>
+              <tr><td>Multi-region?</td><td>Single region; one Postgres primary + standby, one Redis with Sentinel.</td><td>Active-active scheduling would need fences spanning regions (or region-pinned jobs) &mdash; explicitly out of scope; named in Pushbacks.</td></tr>
+              <tr><td>Who calls this?</td><td>Internal services (and a thin customer-facing API in front).</td><td>It's an infra primitive &mdash; the API is small (POST/GET/DELETE a job), the contract (idempotent submit, fence token on execute) is the product.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Requirements</h3>
+        <ul>
+          <li><strong>Volume:</strong> 10,000,000 jobs per day (~116 jobs/sec average).</li>
+          <li><strong>Job types:</strong>
+            <ul>
+              <li><em>One-time delayed jobs:</em> "Run this at 2026-03-21 14:30:00 UTC" (5M/day).</li>
+              <li><em>Recurring cron jobs:</em> "Run every 15 minutes" or "Run at 9am daily" (1M cron schedules generating 5M executions/day).</li>
+            </ul>
+          </li>
+          <li><strong>Priority levels:</strong> P0 (critical, run immediately when due), P1 (high), P2 (normal), P3 (low, can be delayed up to 5 minutes).</li>
+          <li><strong>Exactly-once execution:</strong> A job must not run twice. Running a job zero times (missing it) is also unacceptable for P0/P1.</li>
+          <li><strong>Scheduling accuracy:</strong> Jobs must execute within 30 seconds of their scheduled time.</li>
+          <li><strong>Availability:</strong> 99.9% (8.7 hours downtime per year max).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Job Metadata</h3>
+        <pre class="line-numbers"><code class="language-text">Job record (~500 bytes):
+  job_id:          UUID (16 bytes)
+  type:            "one-time" | "cron" (1 byte)
+  schedule:        ISO timestamp or cron expression (50 bytes)
+  priority:        0-3 (1 byte)
+  payload_ref:     S3 URL or inline JSON (200 bytes)
+  status:          "pending" | "running" | "completed" | "failed" (1 byte)
+  claimed_by:      scheduler instance ID (16 bytes)
+  lease_expires:   timestamp (8 bytes)
+  execution_id:    UUID for deduplication (16 bytes)
+  retry_count:     integer (4 bytes)
+  created_at:      timestamp (8 bytes)
+  updated_at:      timestamp (8 bytes)
+  + indexes and padding: ~170 bytes</code></pre>
+      </div>
+
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Jobs per day</td><td>10,000,000</td></tr>
+            <tr><td>Jobs per second (average)</td><td>~116</td></tr>
+            <tr><td>Jobs per second (peak, batch hour)</td><td>~1,000</td></tr>
+            <tr><td>One-time jobs per day</td><td>5,000,000</td></tr>
+            <tr><td>Cron schedules</td><td>1,000,000</td></tr>
+            <tr><td>Cron-generated executions per day</td><td>5,000,000</td></tr>
+            <tr><td>Job metadata size</td><td>~500 bytes</td></tr>
+            <tr><td>Daily metadata storage</td><td>10M &times; 500B = 5GB</td></tr>
+            <tr><td>30-day retention</td><td>150GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="full-width">
+        <h3>API sketch (C9; cite <a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a> + <a href="../canonicals/api-design-patterns.html#concurrency">#concurrency</a>)</h3>
+        <p>The control-plane API is small &mdash; this is an infra primitive, the contract is the product. REST (the callers are heterogeneous internal services; gRPC would be reasonable too &mdash; cite <a href="../canonicals/api-design-patterns.html#rest-vs-grpc">#rest-vs-grpc</a>):</p>
+<pre class="line-numbers"><code class="language-text">POST   /v1/jobs                          # create a job (one-shot or cron)
+  Idempotency-Key: &lt;client UUID&gt;          # re-submitting the same key returns the SAME job_id (cite #idempotency)
+  body: { kind: "cron"|"one_shot",
+          schedule: "*/15 * * * *" | "2026-03-21T14:30:00Z", timezone: "UTC",
+          priority: 0..3, payload_ref: "s3://...", tenant: "acme" }
+  -> 201 { job_id, next_fire_time }
+
+GET    /v1/jobs/{id}                      # status: state, next_fire_time, last_execution {at, status, fence_token}
+DELETE /v1/jobs/{id}                      # cancel; idempotent (404 -> already gone is fine)
+PATCH  /v1/jobs/{id}                      # pause/resume/update; If-Match: &lt;version&gt; for optimistic concurrency (cite #concurrency)
+GET    /v1/jobs?tenant=acme&amp;state=pending&amp;cursor=...   # cursor pagination (cite #pagination)
+
+# Worker-facing (internal): leases, not REST resources --
+LEASE  next due job  ->  { job_id, payload_ref, fence_token (= execution_id, monotone per job), lease_expires_at }
+RENEW  (job_id, fence_token)  ->  extends lease_expires_at      # called every ~20s while running
+RELEASE(job_id, fence_token, outcome: done|failed)             # rejected if fence_token is stale
+# every side-effecting downstream call carries fence_token; downstream keeps a (job_id -> max fence_token) dedupe row for billing-class jobs (see #14).
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Storage</h3>
+        <pre class="line-numbers"><code class="language-text">Active jobs (pending + running):
+  At any moment, ~1 hour of jobs are "active" (pending or running).
+  10M jobs/day / 24 hours ≈ 417K jobs/hour
+  417K × 500 bytes = 208MB of active job metadata
+
+Total storage (30-day retention):
+  10M × 500B × 30 days = 150GB
+
+This fits comfortably on a single PostgreSQL instance with:
+  - 500GB SSD storage
+  - 32GB RAM (most active job metadata fits in the buffer pool)
+  - Read throughput: PostgreSQL handles 10K+ queries/sec easily
+  - Write throughput: 116 inserts/sec + 116 status updates/sec = 232 writes/sec
+    (well within PostgreSQL's capability of 10K+ writes/sec on SSD)</code></pre>
+      </div>
+
+      <div>
+        <h3>Throughput</h3>
+        <pre class="line-numbers"><code class="language-text">Average: 116 jobs/sec → one scheduler can handle this trivially.
+
+Peak hour (batch processing, start of business):
+  Up to 10× average = 1,000 jobs/sec
+  Still manageable for a single well-optimized process.
+
+But: a single scheduler is a single point of failure.
+  If it crashes, no jobs run until it restarts.
+  99.9% availability requires redundancy.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cron Evaluation</h3>
+        <pre class="line-numbers"><code class="language-text">1,000,000 cron schedules must be evaluated periodically.
+
+Every minute, check which cron schedules are due:
+  1M cron expressions × ~1μs per evaluation = 1 second
+  A single thread handles this in 1 second. No parallelism needed.
+
+Each due cron job generates a "one-time" job instance:
+  If average cron fires 5×/day: 5M / (24 × 60) ≈ 3,472 cron triggers/minute
+  That's ~58 job insertions/sec from cron alone — trivial.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Single Scheduler with Database Polling</h2>
+      <p>The simplest possible approach: one scheduler process that polls the database for due jobs.</p>
+
+      <div>
+        <h3>Database Schema</h3>
+        <pre class="line-numbers"><code class="language-sql">CREATE TABLE jobs (
+    job_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_type        VARCHAR(10) NOT NULL,  -- 'one-time' or 'cron'
+    scheduled_time  TIMESTAMP NOT NULL,
+    priority        SMALLINT NOT NULL DEFAULT 2,  -- 0=critical, 3=low
+    payload         JSONB,
+    status          VARCHAR(10) NOT NULL DEFAULT 'pending',
+    retry_count     SMALLINT DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT now(),
+    updated_at      TIMESTAMP DEFAULT now()
+);
+
+CREATE INDEX idx_jobs_pending ON jobs (scheduled_time, priority)
+    WHERE status = 'pending';</code></pre>
+      </div>
+
+      <div>
+        <h3>Scheduler Loop</h3>
+        <pre class="line-numbers"><code class="language-python">import time
+import psycopg2
+
+def scheduler_loop():
+    while True:
+        # Poll for due jobs, ordered by priority then scheduled time
+        jobs = db.execute("""
+            SELECT * FROM jobs
+            WHERE status = 'pending'
+              AND scheduled_time <= now()
+            ORDER BY priority ASC, scheduled_time ASC
+            LIMIT 100
+        """)
+
+        for job in jobs:
+            # Mark as running
+            db.execute("""
+                UPDATE jobs SET status = 'running', updated_at = now()
+                WHERE job_id = %s AND status = 'pending'
+            """, (job.job_id,))
+
+            # Dispatch to a worker
+            worker_pool.submit(execute_job, job)
+
+        # Sleep before next poll
+        time.sleep(5)  # poll every 5 seconds</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What This Gets Right</h3>
+        <ul>
+          <li>Extremely simple to understand and implement.</li>
+          <li>PostgreSQL handles the storage, indexing, and ordering.</li>
+          <li>At 116 jobs/sec with batch size 100, the scheduler polls ~1.2 times per second. PostgreSQL handles this without breaking a sweat.</li>
+          <li>The partial index on <code>(scheduled_time, priority) WHERE status = 'pending'</code> keeps the poll query fast even with millions of historical rows.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4) &mdash; the store</h3>
+        <ul>
+          <li><strong>A SQL table with an indexed <code>next_fire_time</code> (Postgres) &mdash; chosen for the Naive design.</strong> The schedule is a durable record that survives a crash (the LC heap doesn't); a B-tree index on <code>next_fire_time WHERE status='pending'</code> makes "what's due now" a range scan, not a full-heap rebuild (cite <a href="../canonicals/storage-engines.html#btree">storage-engines#btree</a>); and Postgres' <code>SELECT ... FOR UPDATE SKIP LOCKED</code> (Iter&nbsp;1) gives multi-worker pull for free. The cost: poll latency = poll interval, and a poll query even when nothing's due &mdash; both fixed in Iter&nbsp;2 with a Redis delay queue layered <em>over</em> Postgres (Postgres stays the system of record).</li>
+          <li><strong>Redis sorted-set as a delay queue (score = fire-time epoch) &mdash; rejected as the <em>only</em> store, adopted as a layer in Iter&nbsp;2.</strong> O(log&nbsp;n) <code>ZADD</code>/<code>ZPOPMIN</code>, ~100&nbsp;k ops/sec, near-zero dispatch latency (cite <a href="../canonicals/storage-engines.html#kv-engine">storage-engines#kv-engine</a>) &mdash; perfect as the <em>timing index</em>, but on its own it's a single point of data loss (a Redis crash drops the queue) and has no audit trail; you want the durable record in Postgres and the fast queue in Redis.</li>
+          <li><strong>A dedicated timer service (Cassandra-backed time-bucket rows) &mdash; rejected at this scale, the answer at 100&times;.</strong> Partition the schedule by a time bucket (<code>(bucket_minute, job_id)</code>): "what's due in minute M" = read one partition. Scales horizontally to billions of timers (cite <a href="../canonicals/sharding-strategies.html#range">sharding-strategies#range</a>) &mdash; this is what Uber's Cherami / a "distributed delay queue" does &mdash; but it's overkill for 5&nbsp;M pending jobs (a single Postgres index handles that), and Cassandra's lack of <code>SKIP LOCKED</code> means you re-implement leasing with lightweight transactions (slower) or per-bucket ownership. Named in Pushbacks as the 100&times; move.</li>
+          <li><strong>Kafka with delayed delivery &mdash; rejected.</strong> Kafka has no native "deliver at time T" &mdash; you'd bucket into per-delay topics and shuttle messages forward, which is a worse version of the Cassandra-bucket approach with a log's append-only constraints. Kafka is the right tool for the <em>execution stream</em> downstream of the scheduler, not the timing index.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Concrete technology (C10) &mdash; the durable store</h3>
+        <p><strong>Postgres 16</strong> for the job store: the working set (~208&nbsp;MB of active jobs &mdash; see BOE) fits the buffer pool; the partial B-tree index on <code>next_fire_time WHERE status='pending'</code> serves the only hot query; <code>SELECT ... FOR UPDATE SKIP LOCKED</code> (Postgres 9.5+) is exactly the leasing primitive; <code>synchronous_commit=on</code> with one sync standby (Iter&nbsp;3) for RPO&nbsp;=&nbsp;0 on the schedule. Versus competitors: <em>MySQL 8</em> &mdash; also has <code>SKIP LOCKED</code> (8.0+), would work; Postgres preferred for partial indexes + <code>jsonb</code> payload-ref + richer <code>EXPLAIN</code>; <em>DynamoDB</em> &mdash; rejected: no <code>SKIP LOCKED</code> equivalent (you'd poll-and-conditional-update, hot-key risk on the GSI of due jobs), 5&ndash;10&times; unit cost at 300&nbsp;writes/sec sustained; <em>CockroachDB</em> &mdash; rejected: distributed-SQL overhead buys nothing at 150&nbsp;GB / single-region; revisit only if multi-region. Operability: managed (RDS/Cloud SQL) so failover + PITR are operator-button, not a project; observability via <code>pg_stat_statements</code> (the poll query), <code>pg_stat_activity</code> (lock waits), autovacuum lag on the high-churn <code>jobs</code> table (status updates churn rows &mdash; tune <code>autovacuum_vacuum_scale_factor</code> down for this table). Cite <a href="../canonicals/storage-engines.html#btree">storage-engines#btree</a>, <a href="../canonicals/replication-decisions.html#single-sync">replication-decisions#single-sync</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks (C5 &mdash; the Naive design; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h2>
+      <p class="full-width">The Naive single-poller hits four failure modes &mdash; named against the canonical catalog, with the scenario-specific blast radius inline. Problem&nbsp;1 is <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a> (the sole scheduler <em>is</em> the leader, with no failover); Problem&nbsp;2 is the at-least-once-without-a-fence hazard (cf. <a href="../canonicals/failure-modes.html#poison-message">#poison-message</a> for the retry side and <a href="14-exactly-once.html">#14</a> for the fix); Problem&nbsp;3 is a throughput/latency cliff (<a href="../canonicals/bottlenecks.html#backlog-growth">bottlenecks#backlog-growth</a> &mdash; due jobs pile up faster than one poller drains them); Problem&nbsp;4 is a durability gap in the cron-fan-out path.</p>
+
+      <div>
+        <h3>Problem 1: Single Point of Failure</h3>
+        <p>If the scheduler process crashes, <em>all</em> jobs stop executing until someone manually restarts it. With a 99.9% availability target (8.7 hours downtime per year max), relying on a single process is unacceptable.</p>
+        <pre class="line-numbers"><code class="language-text">Failure scenarios:
+  - Process OOM killed: all in-flight jobs lost, queue stalls
+  - Host machine reboots: 2-5 minutes to come back online
+  - Deployment: even a rolling deploy takes 30-60 seconds of downtime
+  - Bug causes crash loop: jobs pile up until manual intervention
+
+Impact: during any outage, jobs accumulate. A 5-minute outage means
+  116 jobs/sec × 300 sec = 34,800 jobs are late.
+  P0 (critical) jobs like fraud alerts or SLA-bound webhooks are missed.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 2: No Double-Execution Prevention</h3>
+        <p>The naive design has a race condition. Consider this scenario:</p>
+        <pre class="line-numbers"><code class="language-text">1. Scheduler reads job #42 (status = 'pending')
+2. Scheduler starts executing job #42
+3. Scheduler crashes mid-execution
+4. Scheduler restarts
+5. Scheduler reads job #42 again — status is still 'pending'
+   (the UPDATE to 'running' and the crash happened in sequence,
+    but if the crash occurred before the UPDATE committed, the
+    job is still 'pending')
+6. Scheduler executes job #42 again → DUPLICATE EXECUTION
+
+Even worse: if we had two scheduler instances (for availability),
+both could read the same 'pending' job simultaneously:
+  Scheduler A: SELECT → gets job #42
+  Scheduler B: SELECT → also gets job #42 (before A's UPDATE commits)
+  Both execute job #42 → DUPLICATE EXECUTION</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 3: Polling Latency</h3>
+        <pre class="line-numbers"><code class="language-text">Poll interval: 5 seconds
+Worst-case scheduling delay: up to 5 seconds after the job is due.
+
+For a job scheduled at 14:30:00:
+  Best case: poll happens at 14:30:00 → delay = 0s
+  Worst case: poll happened at 14:29:56, next poll at 14:30:01 → delay = 1s
+  Average delay: 2.5 seconds
+
+This is within the 30-second target, but:
+  - During a peak spike of 1,000 jobs/sec with batch size 100,
+    the scheduler needs 10 polls per second. With 5-second intervals,
+    it can only do 0.2 polls/sec → jobs back up.
+  - Reducing the interval to 100ms "fixes" this but hammers the DB
+    with 10 queries/sec even when no jobs are due.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 4: Cron Jobs Are Mixed with One-Time Jobs</h3>
+        <p>The naive design treats cron jobs by re-inserting the next execution after each run. But if the scheduler crashes between "execute the cron job" and "insert the next execution," that cron schedule is lost forever &mdash; it will never fire again.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Multiple Schedulers with Lease-Based Locking     -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Multiple Schedulers with Lease-Based Locking</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck (cite <a href="../canonicals/bottlenecks.html#coordinator-bottleneck">bottlenecks#coordinator-bottleneck</a>)</h3>
+        <p>The Naive design's shape-determining failure is the <em>single coordinator</em>: one process is the only thing that fires jobs (loss = total outage &mdash; a 5-min outage = 116&times;300 &asymp; 34,800 late jobs, including P0/P1 misses, failing the 99.9% target), and it has no safe way to hand a job to itself-after-a-restart without re-running it. Per <a href="../canonicals/bottleneck-to-decisions.html#coordinator-bottleneck">bottleneck-to-decisions#coordinator-bottleneck</a>, the first move for a single-coordinator bottleneck is: <em>run several, make the shared state arbitrate ownership</em> &mdash; here, multiple scheduler instances that compete for due jobs via row-level locks on the Postgres <code>jobs</code> table, each claim time-boxed by a lease so a crashed claimant's jobs are reclaimable. This is the <a href="../canonicals/access-patterns.html#write-heavy-uniform">write-heavy-uniform</a> pattern on the lease columns (every claim is an <code>UPDATE</code>; every renewal is an <code>UPDATE</code>). It closes Problems&nbsp;1 and&nbsp;2 together &mdash; availability (any surviving scheduler keeps firing) and double-execution (the lock serializes the claim; the fence token guards the worker-after-lease-expiry case).</p>
+      </div>
+
+      <p>We solve the single-point-of-failure and double-execution problems simultaneously by running multiple scheduler instances that compete for jobs using row-level locking with leases.</p>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; ownership &amp; dispatch</h3>
+        <ul>
+          <li><strong>Leases (time-boxed claims) with a fencing token &mdash; chosen.</strong> A lease (<code>claimed_by</code> + <code>lease_expires</code>) is self-healing: a crashed scheduler's lease just expires; no liveness gossip needed, no membership protocol. The fence token (<code>execution_id</code>, monotone per job &mdash; bumped on every re-claim) covers the gap a bare lease doesn't: a worker that's <em>still running</em> after its scheduler's lease expired and got re-claimed by another scheduler &mdash; the worker presents its stale token on the next side-effecting call and is rejected (cite <a href="14-exactly-once.html">#14</a> for the fencing-token machinery; we don't re-derive it). This is the standard distributed-lease pattern (ZooKeeper/etcd leases, Chubby, DynamoDB lock client).</li>
+          <li><strong>Heartbeats (workers ping a registry; a reaper notices a missed heartbeat) &mdash; rejected as the primary mechanism.</strong> Equivalent in spirit but needs a separate liveness store and a tunable "how many missed beats = dead" &mdash; more moving parts than "the lease column has a timestamp; if it's in the past, it's free." We <em>do</em> use the same idea internally as the lease-renewal loop (a renewal that fails &asymp; a missed heartbeat), but the source of truth is the lease timestamp in Postgres, queried with <code>WHERE lease_expires &lt; now()</code>.</li>
+          <li><strong>Push dispatch (a dispatcher hands jobs to specific workers) &mdash; rejected.</strong> A dispatcher that assigns due jobs to chosen workers is itself a single coordinator (the thing we're trying to eliminate) and needs to track worker liveness/load. <strong>Pull (workers/schedulers poll for due jobs and claim what they find)</strong> &mdash; chosen &mdash; needs no central assignment: <code>SKIP LOCKED</code> is the arbiter, and a slow/dead consumer simply doesn't claim anything (cite <a href="03-push-vs-pull.html">#3 push-vs-pull</a>). The trade is poll latency, which Iter&nbsp;2 erases with the Redis delay queue while keeping pull.</li>
+          <li><strong>Cron expansion: materialize-the-next-N-fires vs compute-on-demand &mdash; deferred to Iter&nbsp;2/3.</strong> Two ways to turn a cron schedule into concrete fires: (a) compute the next fire on demand each tick (one row per <code>cron_schedules</code> entry; a cron-evaluator loop computes <code>croniter(expr, last_fired).next()</code>); (b) materialize the next N fires as concrete <code>jobs</code> rows ahead of time (the schedule becomes N pending one-shots; refilled in batches). (a) is less storage and simpler; (b) makes a cron job indistinguishable from a one-shot to the dispatch path (uniform handling) and survives a long cron-evaluator outage (the next N fires are already in the queue). We use (a) with a leader-elected evaluator (Iter&nbsp;3); a 100&times;-scale variant would switch to (b) to take the evaluator off the critical path. <em>(Constraint-flip: 🔀 if the finest cron granularity were sub-minute or the schedules were millions of "every 5 seconds" jobs, (b) materialization + a time-bucketed index becomes mandatory &mdash; the per-tick evaluator can't keep up.)</em></li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>The Lease Mechanism</h3>
+        <p>A "lease" is a time-limited claim on a job. A scheduler claims a job by writing its own ID and a lease expiration time into the job row. If the scheduler crashes, the lease eventually expires, and another scheduler can reclaim the job.</p>
+
+        <pre class="line-numbers"><code class="language-sql">-- Updated schema with lease fields
+ALTER TABLE jobs ADD COLUMN claimed_by     VARCHAR(64);
+ALTER TABLE jobs ADD COLUMN lease_expires   TIMESTAMP;
+ALTER TABLE jobs ADD COLUMN execution_id    UUID;</code></pre>
+
+        <pre class="line-numbers"><code class="language-python">import uuid
+
+LEASE_DURATION = 60  # seconds
+SCHEDULER_ID = f"scheduler-{uuid.uuid4().hex[:8]}"
+
+def claim_jobs(batch_size=100):
+    """Atomically claim a batch of due jobs using UPDATE ... RETURNING"""
+    execution_batch_id = uuid.uuid4()
+    rows = db.execute("""
+        UPDATE jobs
+        SET status = 'running',
+            claimed_by = %s,
+            lease_expires = now() + interval '%s seconds',
+            execution_id = %s,
+            updated_at = now()
+        WHERE job_id IN (
+            SELECT job_id FROM jobs
+            WHERE status = 'pending'
+              AND scheduled_time <= now()
+            ORDER BY priority ASC, scheduled_time ASC
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED  -- critical: skip rows locked by others
+        )
+        RETURNING *
+    """, (SCHEDULER_ID, LEASE_DURATION, execution_batch_id, batch_size))
+    return rows</code></pre>
+      </div>
+
+      <div>
+        <h3>Why FOR UPDATE SKIP LOCKED Is Critical</h3>
+        <p>The <code>FOR UPDATE SKIP LOCKED</code> clause is the key to making multiple schedulers work without conflicts:</p>
+        <ul>
+          <li><code>FOR UPDATE</code> locks the selected rows, preventing other transactions from modifying them.</li>
+          <li><code>SKIP LOCKED</code> tells PostgreSQL: "if a row is already locked by another transaction, do not wait for it &mdash; skip it and return the next available row."</li>
+          <li>Result: Scheduler A and Scheduler B can run the same query simultaneously. A gets rows 1-100, B gets rows 101-200. No overlap, no waiting, no deadlocks.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Exactly-Once Execution with Execution IDs</h3>
+        <p>The lease prevents two schedulers from simultaneously claiming the same job. But what about this scenario?</p>
+        <pre class="line-numbers"><code class="language-text">1. Scheduler A claims job #42, execution_id = "abc-123"
+2. Scheduler A dispatches job #42 to Worker W1
+3. Scheduler A's lease renewal fails (network partition)
+4. Lease expires after 60 seconds
+5. Scheduler B reclaims job #42, execution_id = "def-456"
+6. Scheduler B dispatches job #42 to Worker W2
+7. Now W1 and W2 are both running job #42!
+
+Solution: Workers check the execution_id before performing side effects.
+
+Worker W1 starts, checks: is execution_id still "abc-123"?
+  → If yes, proceed (it still owns the job)
+  → If no (it's now "def-456"), abort immediately
+
+This is called a "fencing token" — the execution_id acts as proof
+of ownership. Any operation that modifies external state (sending an
+email, writing to a database, calling an API) must first verify the
+execution_id matches.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Lease Renewal and Expiry</h3>
+        <pre class="line-numbers"><code class="language-python">def execute_job_with_lease(job):
+    """Execute a job while periodically renewing its lease"""
+    # Start a background thread to renew the lease every 20 seconds
+    lease_renewer = LeaseRenewer(job.job_id, SCHEDULER_ID, interval=20)
+    lease_renewer.start()
+
+    try:
+        # Execute the actual job
+        result = worker_pool.submit(job.payload)
+        result.get(timeout=LEASE_DURATION - 10)  # timeout before lease expires
+
+        # Mark as completed
+        db.execute("""
+            UPDATE jobs SET status = 'completed', updated_at = now()
+            WHERE job_id = %s AND claimed_by = %s
+        """, (job.job_id, SCHEDULER_ID))
+
+    except Exception as e:
+        # Mark as failed, allow retry
+        db.execute("""
+            UPDATE jobs
+            SET status = CASE WHEN retry_count < 3 THEN 'pending' ELSE 'failed' END,
+                claimed_by = NULL,
+                lease_expires = NULL,
+                retry_count = retry_count + 1,
+                updated_at = now()
+            WHERE job_id = %s AND claimed_by = %s
+        """, (job.job_id, SCHEDULER_ID))
+
+    finally:
+        lease_renewer.stop()
+
+
+def reclaim_expired_leases():
+    """Periodically reclaim jobs whose leases have expired (scheduler crashed)"""
+    db.execute("""
+        UPDATE jobs
+        SET status = 'pending',
+            claimed_by = NULL,
+            lease_expires = NULL,
+            updated_at = now()
+        WHERE status = 'running'
+          AND lease_expires < now()
+    """)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Architecture with 3 Schedulers</h3>
+        <svg viewBox="0 0 700 380" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-it1" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,3.5 L0,7 Z" fill="#64748b"/>
+            </marker>
+          </defs>
+          <!-- Scheduler boxes -->
+          <rect x="60" y="10" width="140" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="35" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler A</text>
+          <text x="130" y="52" text-anchor="middle" fill="#64748b" font-size="11">polls independently</text>
+
+          <rect x="280" y="10" width="140" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="35" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler B</text>
+          <text x="350" y="52" text-anchor="middle" fill="#64748b" font-size="11">polls independently</text>
+
+          <rect x="500" y="10" width="140" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="35" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler C</text>
+          <text x="570" y="52" text-anchor="middle" fill="#64748b" font-size="11">polls independently</text>
+
+          <!-- Arrows from schedulers to DB -->
+          <line x1="130" y1="70" x2="350" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+          <line x1="350" y1="70" x2="350" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+          <line x1="570" y1="70" x2="350" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+
+          <!-- Label on arrows -->
+          <text x="350" y="112" text-anchor="middle" fill="#334155" font-size="11" font-weight="bold">FOR UPDATE SKIP LOCKED</text>
+
+          <!-- PostgreSQL box -->
+          <rect x="210" y="140" width="280" height="70" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="165" text-anchor="middle" fill="#334155" font-weight="bold">PostgreSQL</text>
+          <text x="350" y="182" text-anchor="middle" fill="#64748b" font-size="11">jobs table (with leases)</text>
+          <text x="350" y="198" text-anchor="middle" fill="#64748b" font-size="11">claimed_by + lease_expires + execution_id</text>
+
+          <!-- Arrows from DB to workers -->
+          <line x1="280" y1="210" x2="130" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+          <line x1="350" y1="210" x2="350" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+          <line x1="420" y1="210" x2="570" y2="270" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-it1)"/>
+
+          <!-- Worker pool boxes -->
+          <rect x="60" y="270" width="140" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="295" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 1</text>
+          <text x="130" y="310" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <rect x="280" y="270" width="140" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="295" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 2</text>
+          <text x="350" y="310" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <rect x="500" y="270" width="140" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="295" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 3</text>
+          <text x="570" y="310" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <!-- Annotations -->
+          <text x="350" y="348" text-anchor="middle" fill="#334155" font-size="12">SKIP LOCKED ensures no job is claimed by two schedulers.</text>
+          <text x="350" y="365" text-anchor="middle" fill="#334155" font-size="12">Leases ensure crashed schedulers' jobs are reclaimed. Execution IDs provide fencing.</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#lease-expiry-storm">Lease-expiry storm</a> &mdash; THE one.</strong> If a scheduler dies (or GCs / network-blips) holding many leases, all of them expire at roughly the same instant, and every surviving scheduler's reclaim loop sees a flood of <code>status='running' AND lease_expires &lt; now()</code> rows and re-dispatches them in a thundering wave &mdash; a spike of duplicate-ish executions (the workers from the dead scheduler may still be alive) and a load spike on the worker fleet. Defence: stagger lease durations (jitter the 60&nbsp;s by &plusmn;10&nbsp;s) so they don't all expire together; cap the reclaim batch size per loop (re-dispatch at most N/sec, drain the backlog); the fence token makes the duplicate executions safe (the dead scheduler's workers present a stale token). Blast radius: one scheduler's worth of in-flight jobs (~batch&times;workers &asymp; a few hundred), delayed by up to one lease duration; detection: a spike in <code>reclaim_count</code> + <code>fence_token_rejected</code>.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#poison-message">Poison job</a> &mdash; a job whose payload crashes its worker every time.</strong> Worker dies → lease expires → re-dispatched → worker dies → ... a crash-loop that consumes a worker slot forever and never makes progress (and at-least-once means it keeps getting retried). Defence: the <code>retry_count</code> cap (3, already in the schema) routes it to <code>status='failed'</code> &mdash; a dead-letter state for human review; exponential backoff between retries so a poison job doesn't hot-loop; alert on the <code>failed</code> rate. Blast radius: one worker slot until the retry cap trips (~3 attempts); detection: <code>retry_count&ge;2</code> gauge + the <code>failed</code>-state rate.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#clock-skew">Clock skew</a> between a scheduler and Postgres.</strong> Lease expiry compares a scheduler-written <code>lease_expires</code> against Postgres' <code>now()</code> &mdash; if a scheduler's clock is fast, its leases look expired early (jobs reclaimed while still running → duplicates); slow, and crashed-scheduler jobs sit stuck longer. Defence: write <code>lease_expires = now() + interval '60 s'</code> using the <em>database</em>'s clock (never the scheduler's), so all comparisons are against a single clock; NTP on all hosts with drift alarms &lt;1&nbsp;s as defence-in-depth. Blast radius: bounded by the drift (seconds of early/late reclaim); detection: NTP offset metric per host.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#lock-contention">SKIP-LOCKED contention</a> at higher scale.</strong> With many schedulers polling the same hot range of due rows, the <code>FOR UPDATE SKIP LOCKED</code> scan has to skip more and more locked rows before finding a free one &mdash; wasted index scanning; at extreme scale the partial index on due rows becomes a hot page. Defence (now): keep the scheduler count small (3) and batch size modest (100), so the hot range is small; (at 100&times;): shard the due-jobs index by a hash of <code>job_id mod K</code> so scheduler <em>i</em> only scans shard <em>i</em> (cite <a href="../canonicals/bottleneck-to-decisions.html#lock-contention">bottleneck-to-decisions#lock-contention</a>, <a href="../canonicals/sharding-strategies.html#hash">sharding-strategies#hash</a>) &mdash; or move the timing index to Redis (Iter&nbsp;2) where <code>ZPOPMIN</code> is atomic and lock-free. Blast radius: poll latency creep; detection: poll-query p99 + index-scan rows-examined.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Redis Priority Queue                             -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Replace Polling with a Redis Priority Queue</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck (cite <a href="../canonicals/bottlenecks.html#lock-contention">bottlenecks#lock-contention</a> + <a href="../canonicals/access-patterns.html#bursty">access-patterns#bursty</a>)</h3>
+        <p>Iter&nbsp;1's shape-determining failure is the <em>poll loop</em>: scheduling latency = the poll interval (2.5&nbsp;s average at a 5-s interval &mdash; OK against the 30-s SLA but wasteful), and during the batch-hour burst of ~1,000&nbsp;jobs/sec the scheduler needs ~10 polls/sec of batch-100 just to keep up &mdash; at a 5-s interval it does 0.2 polls/sec, so due jobs back up (the <a href="../canonicals/access-patterns.html#bursty">bursty</a> access pattern the DB poll can't track). Shrinking the interval to 100&nbsp;ms "fixes" the burst but hammers Postgres with empty polls when idle and worsens the <code>SKIP LOCKED</code> contention from the previous What-Breaks. Per <a href="../canonicals/bottleneck-to-decisions.html#lock-contention">bottleneck-to-decisions#lock-contention</a> the move when a hot-row poll is the bottleneck is: replace the periodic scan with an <em>event-driven, lock-free dequeue</em> &mdash; a Redis sorted-set delay queue keyed by fire-time, layered <em>over</em> Postgres (Postgres stays the durable record + audit; Redis is the timing index, rebuildable from Postgres). <code>ZPOPMIN</code> is atomic, so no <code>FOR UPDATE</code>; the dequeue loop is continuous, so latency is near-zero; idle = a cheap <code>BZPOPMIN</code> block, not a query.</p>
+      </div>
+
+      <p>Database polling works but has two drawbacks: (1) it adds latency equal to the poll interval, and (2) it generates unnecessary database load when no jobs are due. A Redis sorted set gives us an event-driven alternative.</p>
+
+      <div class="full-width">
+        <h3>Redis Sorted Set as a Scheduling Queue</h3>
+        <p>A Redis sorted set stores members with associated scores. Members are sorted by score. We use the <strong>scheduled timestamp</strong> (as a Unix epoch) for the score. The member with the lowest score is the next job to execute.</p>
+
+        <pre class="line-numbers"><code class="language-python"># Enqueue a job: score = scheduled_time as Unix timestamp
+def enqueue_job(job_id, scheduled_time, priority):
+    # Encode priority into the score: multiply timestamp by 10, add priority
+    # This ensures P0 jobs at the same time are dequeued before P3 jobs.
+    score = scheduled_time.timestamp() * 10 + priority
+    redis.zadd("job_queue", {job_id: score})
+
+# Dequeue the next due job (atomic pop)
+def dequeue_next_job():
+    now_score = time.time() * 10 + 9  # 9 = higher than any priority
+    # ZPOPMIN atomically removes and returns the member with lowest score
+    result = redis.zpopmin("job_queue")
+    if result:
+        job_id, score = result[0]
+        if score <= now_score:
+            return job_id
+        else:
+            # Job is not due yet — put it back
+            redis.zadd("job_queue", {job_id: score})
+            return None
+    return None</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Why Redis Sorted Sets Are Better Than DB Polling</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Aspect</th><th>DB Polling</th><th>Redis Sorted Set</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Dequeue complexity</td>
+                <td>O(log N) for index scan + row lock</td>
+                <td>O(log N) for ZPOPMIN</td>
+              </tr>
+              <tr>
+                <td>Latency</td>
+                <td>Up to poll_interval (5 seconds)</td>
+                <td>Near-zero (continuous pop loop)</td>
+              </tr>
+              <tr>
+                <td>Load when idle</td>
+                <td>1 query every poll_interval (wasted)</td>
+                <td>BRPOP or tight loop with sleep(0.01)</td>
+              </tr>
+              <tr>
+                <td>Throughput</td>
+                <td>~10K dequeues/sec (limited by row locking)</td>
+                <td>~100K ops/sec (Redis single-threaded)</td>
+              </tr>
+              <tr>
+                <td>Atomicity</td>
+                <td>Requires FOR UPDATE SKIP LOCKED</td>
+                <td>ZPOPMIN is inherently atomic</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>The Complete Dequeue Loop</h3>
+        <pre class="line-numbers"><code class="language-python">def scheduler_loop():
+    """Continuously dequeue and execute due jobs"""
+    while True:
+        # Atomically pop the job with the lowest score (earliest due time)
+        results = redis.zrangebyscore(
+            "job_queue",
+            min=0,
+            max=time.time() * 10 + 9,  # all jobs due now or earlier
+            start=0,
+            num=1,          # just one at a time
+            withscores=True
+        )
+
+        if not results:
+            time.sleep(0.1)  # no jobs due — sleep 100ms to avoid busy-wait
+            continue
+
+        job_id, score = results[0]
+
+        # Atomically remove it (only if it's still there — another scheduler
+        # may have grabbed it between our ZRANGEBYSCORE and ZREM)
+        removed = redis.zrem("job_queue", job_id)
+        if removed == 0:
+            continue  # Another scheduler got it first — try again
+
+        # We now own this job. Fetch metadata from PostgreSQL.
+        job = db.execute("SELECT * FROM jobs WHERE job_id = %s", (job_id,))
+
+        # Claim with lease in PostgreSQL (for crash recovery)
+        claimed = db.execute("""
+            UPDATE jobs
+            SET status = 'running',
+                claimed_by = %s,
+                lease_expires = now() + interval '60 seconds',
+                execution_id = gen_random_uuid()
+            WHERE job_id = %s AND status = 'pending'
+            RETURNING execution_id
+        """, (SCHEDULER_ID, job_id))
+
+        if not claimed:
+            continue  # Job was already claimed or cancelled
+
+        # Execute the job
+        execute_job_with_lease(job, claimed.execution_id)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Handling Cron Jobs Separately</h3>
+        <p>Cron jobs need a dedicated evaluation process that runs independently of the job dispatch loop.</p>
+
+        <pre class="line-numbers"><code class="language-python">def cron_evaluator():
+    """Runs every 60 seconds. Evaluates all cron schedules and enqueues due jobs."""
+    while True:
+        start = time.time()
+
+        # Fetch all active cron schedules
+        cron_schedules = db.execute("""
+            SELECT cron_id, cron_expression, last_fired_at
+            FROM cron_schedules
+            WHERE active = true
+        """)
+
+        enqueued = 0
+        for schedule in cron_schedules:
+            next_fire = croniter(schedule.cron_expression,
+                                 schedule.last_fired_at).get_next()
+            if next_fire <= time.time():
+                # Create a one-time job instance for this cron execution
+                job_id = uuid.uuid4()
+                db.execute("""
+                    INSERT INTO jobs (job_id, job_type, scheduled_time, priority,
+                                     payload, status)
+                    VALUES (%s, 'cron', %s, %s, %s, 'pending')
+                """, (job_id, next_fire, schedule.priority, schedule.payload))
+
+                # Enqueue in Redis
+                enqueue_job(job_id, next_fire, schedule.priority)
+
+                # Update last_fired_at to prevent re-evaluation
+                db.execute("""
+                    UPDATE cron_schedules SET last_fired_at = %s
+                    WHERE cron_id = %s
+                """, (next_fire, schedule.cron_id))
+
+                enqueued += 1
+
+        elapsed = time.time() - start
+        print(f"Cron evaluation: {len(cron_schedules)} schedules, "
+              f"{enqueued} enqueued, {elapsed:.2f}s")
+
+        # Sleep until the next minute boundary
+        sleep_time = 60 - (time.time() % 60)
+        time.sleep(sleep_time)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cron Evaluation Performance</h3>
+        <pre class="line-numbers"><code class="language-text">1,000,000 cron schedules evaluated every 60 seconds:
+  Per-schedule evaluation: ~1μs (parse cron, compare to now())
+  Total: 1M × 1μs = 1 second
+
+  This is single-threaded work. A modern CPU handles it easily.
+
+Schedules that fire:
+  5M cron executions / day ÷ 1,440 minutes = ~3,472 jobs enqueued per minute
+  = ~58 Redis ZADD ops + 58 DB INSERTs per second
+  Trivial for both Redis and PostgreSQL.</code></pre>
+      </div>
+
+      <div>
+        <h3>Concrete technology (C10) &mdash; the delay queue</h3>
+        <p><strong>Redis 7</strong> (single instance + Redis Sentinel for failover) for the timing index: the sorted-set ops (<code>ZADD</code>, <code>ZRANGEBYSCORE</code>, <code>BZPOPMIN</code>) are O(log&nbsp;n) and the instance does ~100&nbsp;k ops/sec &mdash; ~290&nbsp;ops/sec here is &lt;0.3% of headroom; persistence: AOF with <code>everysec</code> fsync (a crash loses &le;1&nbsp;s of <code>ZADD</code>s, which Postgres re-supplies on recovery &mdash; the sorted set is a cache); <code>maxmemory</code> with <code>noeviction</code> (never evict a pending job &mdash; a full queue is a hard failure to alarm on, not silently drop). Key shape: a single sorted set <code>sched:queue</code> with member = <code>job_id</code>, score = <code>fire_at_epoch &times; 10 + priority</code> (priority packed into the low digit so P0 wins ties at the same instant); plus per-tenant counters for the fairness controller (Iter&nbsp;3-area). Versus competitors: <em>RabbitMQ delayed-message plugin</em> &mdash; rejected: it holds delayed messages in an Erlang timer that doesn't survive a broker restart cleanly and doesn't give you "peek the next 1,000 due" cheaply; <em>Memcached</em> &mdash; no sorted set, no atomic pop, dead on arrival; <em>a dedicated timer service (Cassandra time-buckets)</em> &mdash; the 100&times; answer, overkill here (see Naive's C4). <em>(Why not just Postgres' <code>LISTEN/NOTIFY</code> to push due jobs instead of Redis? It works for low rates but <code>NOTIFY</code> payloads are tiny, there's no priority ordering, and a slow listener drops notifications &mdash; the sorted set is the durable-enough, ordered, peekable structure we want.)</em> Operability: managed (ElastiCache/MemoryStore) so Sentinel/failover is operator-button; observability via Redis <code>SLOWLOG</code>, keyspace notifications (for queue-depth alarms), <code>INFO</code> memory/ops; known hazard &mdash; the AOF rewrite fork can OOM on a memory-tight box, so size for 2&times; the dataset. Cite <a href="../canonicals/storage-engines.html#kv-engine">storage-engines#kv-engine</a>, <a href="../technologies/redis.html">redis</a>, and the SoT <a href="../message-queues.html">message-queues</a>.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#black-hole-node">Redis lost &mdash; the timing index evaporates</a>.</strong> If Redis crashes and the AOF tail is behind, the sorted set is gone &mdash; due jobs stop firing until it's rebuilt. Defence: Sentinel fails over to a replica (1&ndash;2&nbsp;s); on promotion (or if the replica is stale too) the scheduler rebuilds the sorted set from Postgres &mdash; <code>SELECT job_id, scheduled_time, priority FROM jobs WHERE status='pending'</code> &rarr; bulk <code>ZADD</code> (5&nbsp;M rows &asymp; a few seconds of <code>ZADD</code> pipelining); during the rebuild, the Iter-1 DB-poll path is the fallback (slower, but jobs still fire). Postgres is the source of truth precisely so this is a rebuild, not a data loss. Blast radius: a few seconds of "scheduling via the slow path"; detection: Redis-up health check + rebuild-in-progress flag.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#stampede">Midnight thundering herd</a> &mdash; 1&nbsp;M cron jobs all <code>* 0 * * *</code>.</strong> Tenants overwhelmingly schedule "daily at midnight" / "hourly on the hour," so at 00:00:00 the cron evaluator enqueues a huge batch and every scheduler's <code>ZRANGEBYSCORE 0 now</code> returns thousands at once &mdash; a spike that swamps the worker fleet and Postgres' status-update rate (cite <a href="../canonicals/bottlenecks.html#stampede">bottlenecks#stampede</a> and the herd cousins <a href="26-cascading-failure.html">#26</a> / <a href="27-thundering-herd.html">#27</a>). Defence: <em>smear</em> &mdash; for low-priority (P3, "delayed up to 5&nbsp;min") cron jobs, when materializing the fire, add a deterministic jitter <code>hash(job_id) mod 300</code> seconds, so 1&nbsp;M midnight jobs spread over a 5-min window (~3,300/sec instead of a 1&nbsp;M instantaneous spike); P0/P1 fire on time (they're a small fraction). Plus the worker pool's own backpressure (a bounded queue; shed P3 first &mdash; cite <a href="13-backpressure.html">#13</a>). Blast radius without the smear: a multi-minute backlog + a Postgres write spike at every round hour; detection: <code>ZCARD sched:queue</code> spike + worker-queue-depth gauge.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#poison-message">Lost-update race between <code>ZRANGEBYSCORE</code> and <code>ZREM</code></a>.</strong> Two schedulers both see <code>job_id=j</code> at the head; both try to claim it &mdash; the loser of the <code>ZREM</code> (returns 0) just moves on, and the loser of the Postgres <code>UPDATE ... WHERE status='pending'</code> (returns 0 rows) also moves on. Safe by construction (both checks are atomic), but if a scheduler crashes <em>between</em> the successful <code>ZREM</code> and the Postgres claim, the job is out of Redis but still <code>pending</code> in Postgres &mdash; orphaned. Defence: the lease-reaper's scan is widened to <code>status='pending' AND scheduled_time &lt; now() - interval '5 min'</code> (a pending job whose fire-time has long passed and that isn't in Redis &mdash; re-<code>ZADD</code> it); this is the same reaper, one more clause. Blast radius: a handful of jobs delayed by the reaper interval; detection: count of "re-enqueued orphaned pending" per reaper run.</li>
+        </ul>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if the fire-time SLA were 1&nbsp;s instead of 30&nbsp;s</span></summary>
+        <ul>
+          <li>The Iter-1 DB-poll path stops being a viable fallback (a 5-s poll blows a 1-s SLA) &mdash; Redis becomes load-bearing, so it needs a hot-standby that's caught up enough to fail over within the budget, and the rebuild-from-Postgres path needs to be fast enough or pre-warmed.</li>
+          <li>The midnight-smear window for P3 jobs shrinks (or P3-with-a-5-min-grace stops existing as a tier) &mdash; less herd-smoothing headroom.</li>
+          <li>Clock-skew tolerance tightens: NTP drift now eats a meaningful fraction of the 1-s budget.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Partition Tolerance                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Leader Election, Fairness, and Partition Handling</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck (cite <a href="../canonicals/bottlenecks.html#hot-partition">bottlenecks#hot-partition</a> + <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a>)</h3>
+        <p>Iter&nbsp;2 has good dispatch availability (any scheduler pops from Redis) but two residual problems. (1) <em>Singleton operations are running N times.</em> The cron evaluator and the lease-reaper aren't idempotent-by-construction: 3 schedulers each evaluating 1&nbsp;M cron schedules = 3&times; the work and 3 duplicate <code>jobs</code> rows per firing (the <code>last_fired_at</code> guard catches most, but it's a race); 3 reapers fighting over the same expired rows. One scheduler must own those &mdash; the standard answer is leader election (cite <a href="../canonicals/bottleneck-to-decisions.html#coordinator-bottleneck">bottleneck-to-decisions#coordinator-bottleneck</a>). (2) <em>A noisy tenant starves others</em> &mdash; the FR "fairness across tenants" isn't met: one tenant scheduling a million 1-second jobs floods the Redis queue head; <code>ZPOPMIN</code> hands those to every worker, and another tenant's due P0 sits behind them &mdash; a <a href="../canonicals/bottlenecks.html#hot-partition">hot-partition</a> on the shared queue. The move: a leader-elected cron-evaluator + lease-reaper (etcd lease) <em>and</em> a per-tenant fairness gate on dequeue (weighted fair queuing across tenants).</p>
+      </div>
+
+      <p>With 3 schedulers all competing for jobs via ZPOPMIN, we have good availability. But some operations should only be performed by <em>one</em> scheduler at a time to avoid conflicts: specifically, the cron evaluation loop and the lease expiry reclamation loop. And no single tenant should be able to monopolize the worker fleet.</p>
+
+      <div>
+        <h3>Why Leader Election for Cron Evaluation</h3>
+        <p>If all 3 schedulers run the cron evaluator simultaneously, each cron schedule is evaluated 3 times. This causes 3 duplicate job insertions for every cron firing. We need exactly one scheduler to be the "cron leader."</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4) &mdash; leader election &amp; fairness</h3>
+        <ul>
+          <li><strong>etcd lease (or ZooKeeper ephemeral node) for leadership &mdash; chosen.</strong> A short-TTL lease + a watch gives "exactly one leader, fast failover" with a battle-tested consensus core; the leader's TTL (15&nbsp;s) bounds how long the cron evaluator pauses on a leader crash. Versus a <em>Postgres advisory lock</em> (<code>pg_try_advisory_lock(key)</code>) &mdash; tempting (no new infra; the lock auto-releases when the session ends) and a fine choice if you want to avoid running etcd, but failover detection is "the TCP session dropped," which is murkier under a network partition than a lease TTL, and it couples leadership to a single Postgres connection's liveness. Versus <em>Redlock</em> (the Redis-based lock) &mdash; rejected: Redlock's safety under partitions is contested, and we already need a fence token (<code>execution_id</code>) for the data path, so we don't want a second, weaker lock for the control path. We'd accept the Postgres-advisory-lock variant if "no etcd" were a hard constraint; etcd is the cleaner answer when it's available.</li>
+          <li><strong>Per-tenant weighted fair queuing on dequeue &mdash; chosen for fairness.</strong> Instead of one global <code>ZPOPMIN</code>, the dispatch loop round-robins (weighted by tenant tier) across per-tenant due-sets: each tenant gets its own sorted set <code>sched:queue:{tenant}</code> (or a single set tagged by tenant with a per-tenant in-flight counter), and the scheduler dequeues at most <code>cap(tenant)</code> in-flight per tenant before moving on &mdash; a flooding tenant fills its own quota and waits, others flow. Versus <em>per-tenant rate limiting at submit time</em> &mdash; complementary, not a substitute (cite <a href="20-distributed-rate-limiter.html">#20</a>): a token-bucket on <code>POST /v1/jobs</code> per tenant stops the <em>creation</em> flood; the dequeue gate handles a tenant that legitimately has a million already-scheduled jobs all coming due at once. Versus <em>priority-only (no tenant dimension)</em> &mdash; rejected: priority is across-tenant; a tenant could schedule a million P0 jobs and still starve everyone. You need both axes: priority within a tenant, fair share across tenants.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Using etcd for Leader Election</h3>
+        <pre class="line-numbers"><code class="language-python">import etcd3
+
+etcd_client = etcd3.client()
+
+def run_as_leader(task_name, task_function):
+    """Run task_function only while this instance holds the leader lease"""
+    lease = etcd_client.lease(ttl=15)  # 15-second lease
+
+    # Try to become leader by creating a key with our lease
+    # put_if_absent: only succeeds if the key doesn't exist
+    success, _ = etcd_client.transaction(
+        compare=[etcd_client.transactions.create(f"/leader/{task_name}") == 0],
+        success=[etcd_client.transactions.put(
+            f"/leader/{task_name}",
+            SCHEDULER_ID,
+            lease=lease
+        )],
+        failure=[]
+    )
+
+    if success:
+        print(f"Became leader for {task_name}")
+        # Renew lease in background (keeps leadership)
+        lease_keeper = lease.keepalive()
+        try:
+            task_function()  # Run the task
+        finally:
+            lease.revoke()   # Release leadership on shutdown
+    else:
+        print(f"Another scheduler is leader for {task_name}. Standing by.")
+        # Watch for leader key deletion (leader crashed)
+        events_iterator, cancel = etcd_client.watch(f"/leader/{task_name}")
+        for event in events_iterator:
+            if isinstance(event, etcd3.events.DeleteEvent):
+                print("Leader lost. Attempting to become leader...")
+                cancel()
+                run_as_leader(task_name, task_function)  # retry</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Partition Handling</h3>
+        <svg viewBox="0 0 700 320" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-part" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,3.5 L0,7 Z" fill="#64748b"/>
+            </marker>
+          </defs>
+
+          <!-- Group 1 background -->
+          <rect x="10" y="5" width="260" height="300" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="1" stroke-dasharray="6,3"/>
+          <text x="140" y="25" text-anchor="middle" fill="#2563eb" font-size="11" font-weight="bold">Group 1 (reachable)</text>
+
+          <!-- Group 2 background -->
+          <rect x="430" y="5" width="260" height="300" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1" stroke-dasharray="6,3"/>
+          <text x="560" y="25" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="bold">Group 2 (partitioned from etcd)</text>
+
+          <!-- Partition line -->
+          <line x1="350" y1="5" x2="350" y2="305" stroke="#ef4444" stroke-width="2.5" stroke-dasharray="8,4"/>
+          <text x="350" y="158" text-anchor="middle" fill="#ef4444" font-weight="bold" font-size="12" transform="rotate(-90, 350, 158)">NETWORK PARTITION</text>
+
+          <!-- Scheduler A (leader) -->
+          <rect x="50" y="40" width="180" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="140" y="60" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler A (leader)</text>
+          <text x="140" y="78" text-anchor="middle" fill="#16a34a" font-size="11">cron eval + job dispatch</text>
+
+          <!-- etcd -->
+          <rect x="50" y="110" width="180" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="140" y="135" text-anchor="middle" fill="#334155" font-weight="bold">etcd cluster</text>
+          <line x1="140" y1="90" x2="140" y2="110" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-part)"/>
+          <text x="195" y="103" fill="#16a34a" font-size="10">lease OK</text>
+
+          <!-- Redis -->
+          <rect x="50" y="170" width="180" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="140" y="195" text-anchor="middle" fill="#334155" font-weight="bold">Redis</text>
+
+          <!-- PostgreSQL -->
+          <rect x="50" y="230" width="180" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="140" y="255" text-anchor="middle" fill="#334155" font-weight="bold">PostgreSQL</text>
+
+          <!-- Scheduler B -->
+          <rect x="470" y="40" width="180" height="50" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="560" y="60" text-anchor="middle" fill="#ef4444" font-weight="bold">Scheduler B</text>
+          <text x="560" y="78" text-anchor="middle" fill="#64748b" font-size="11">job dispatch only</text>
+
+          <!-- Scheduler C -->
+          <rect x="470" y="110" width="180" height="50" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="560" y="130" text-anchor="middle" fill="#ef4444" font-weight="bold">Scheduler C</text>
+          <text x="560" y="148" text-anchor="middle" fill="#64748b" font-size="11">job dispatch only</text>
+
+          <!-- Crossed-out etcd connection -->
+          <line x1="470" y1="90" x2="380" y2="130" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4,3"/>
+          <text x="430" y="103" fill="#ef4444" font-size="10" font-weight="bold">X</text>
+
+          <!-- Redis connection from group 2 -->
+          <line x1="470" y1="152" x2="270" y2="188" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-part)"/>
+          <text x="390" y="190" fill="#16a34a" font-size="10">Redis reachable</text>
+
+          <!-- Annotations -->
+          <text x="560" y="200" text-anchor="middle" fill="#334155" font-size="11">B &amp; C cannot become leader</text>
+          <text x="560" y="216" text-anchor="middle" fill="#334155" font-size="11">but CAN still dequeue and</text>
+          <text x="560" y="232" text-anchor="middle" fill="#334155" font-size="11">execute jobs from Redis</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Failure Recovery Timeline</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Failure</th><th>Detection Time</th><th>Recovery</th><th>Impact</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Scheduler crash</td>
+                <td>Immediate (other schedulers unaffected)</td>
+                <td>Leases expire in 60s; jobs reclaimed</td>
+                <td>In-flight jobs delayed by up to 60s</td>
+              </tr>
+              <tr>
+                <td>Redis crash</td>
+                <td>1-2s (health check)</td>
+                <td>Failover to Redis replica (if using Redis Sentinel)</td>
+                <td>Sorted set is lost; must rebuild from PostgreSQL</td>
+              </tr>
+              <tr>
+                <td>PostgreSQL crash</td>
+                <td>5-10s</td>
+                <td>Failover to standby (if using streaming replication)</td>
+                <td>New jobs cannot be created; existing jobs in Redis continue</td>
+              </tr>
+              <tr>
+                <td>etcd partition</td>
+                <td>15s (lease TTL expires)</td>
+                <td>New leader elected in healthy partition</td>
+                <td>Cron evaluation paused for up to 15 + 60 seconds</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#leader-loss">Leader loss / split-brain on the cron evaluator</a>.</strong> A leader that's network-partitioned-but-alive still <em>thinks</em> it's leader until its etcd lease expires; a new leader is elected in the majority partition; for a window both may run the evaluator. Defence: the <code>last_fired_at</code> guard per cron schedule (an <code>UPDATE ... WHERE last_fired_at &lt; next_fire</code> &mdash; the loser of the race no-ops); the evaluator does nothing irreversible (it inserts <code>pending</code> jobs; a dup insert is caught by the same guard or de-duped by an idempotency key on the materialized fire). Blast radius: at most one cron tick's worth of duplicate <code>pending</code> rows for the window (~15&nbsp;s of lease TTL), all guarded; detection: the etcd leader-change event + a "cron eval ran twice in one minute" alarm. (This is the canonical leader-loss mode &mdash; the fix is "the singleton operation must be idempotent anyway"; the lease just makes the overlap rare.)</li>
+          <li><strong><a href="../canonicals/failure-modes.html#bad-deploy">Bad deploy of the scheduler</a> &mdash; a crash-looping new version.</strong> A rolling deploy of a broken scheduler binary takes all schedulers down one by one; the leader role flaps; due jobs stop firing. Defence: deploy one scheduler at a time, health-gated (it must successfully claim+complete a canary job before the next instance rolls); keep N&minus;1 on the old version until the new one is proven; instant rollback (it's stateless &mdash; the durable state is in Postgres + Redis + etcd). Blast radius without the gate: a full scheduling outage until rollback (minutes); with it: one instance's worth of capacity during the canary. Detection: the deploy pipeline's canary-job check + the standing "0 schedulers firing" alarm.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#hot-partition-meltdown">Fairness-gate evasion &mdash; a tenant spreads a flood across many tenant IDs</a>.</strong> If "tenant" is the only fairness key, a tenant that controls many sub-accounts can multiply its fair share. Defence: the fairness key is the <em>billing account</em> (the unit you actually want to be fair across), not the API-key; a per-account submit-rate limit (cite <a href="20-distributed-rate-limiter.html">#20</a>) on top; alert on a single account's queue-depth share &gt; X%. Blast radius: temporary unfairness until the rate limit/quota kicks in; detection: per-account queue-depth-share gauge.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#network-partition">Postgres&harr;Redis disagreement under partition</a>.</strong> If a scheduler can reach Redis but not Postgres, it can <code>ZREM</code> a job but not write the claim &mdash; the orphan case (covered by the widened reaper, above). If it can reach Postgres but not Redis, it can fall back to the Iter-1 DB-poll path. Defence: the fallback hierarchy is explicit (Redis dequeue &rarr; DB poll &rarr; if neither, this scheduler is useless and should be shed by the LB / restart); the orphan-reaper closes the gap. Degradation contract for the final design: see below.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture Overview</h3>
+        <svg viewBox="0 0 700 620" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-final" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,3.5 L0,7 Z" fill="#64748b"/>
+            </marker>
+          </defs>
+
+          <!-- etcd cluster -->
+          <rect x="170" y="5" width="360" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="27" text-anchor="middle" fill="#334155" font-weight="bold">etcd cluster (3 nodes)</text>
+          <text x="350" y="44" text-anchor="middle" fill="#64748b" font-size="11">Leader election for cron evaluator</text>
+
+          <!-- Leader lease arrow -->
+          <line x1="350" y1="55" x2="350" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <text x="395" y="72" fill="#64748b" font-size="10">leader lease</text>
+
+          <!-- Scheduler A (leader) -->
+          <rect x="40" y="80" width="180" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="100" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler A (leader)</text>
+          <text x="130" y="118" text-anchor="middle" fill="#334155" font-size="11">Cron evaluator</text>
+          <text x="130" y="133" text-anchor="middle" fill="#334155" font-size="11">Job dispatch</text>
+          <text x="130" y="148" text-anchor="middle" fill="#334155" font-size="11">Lease reclaim</text>
+
+          <!-- Scheduler B (follower) -->
+          <rect x="260" y="80" width="180" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="100" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler B (follower)</text>
+          <text x="350" y="120" text-anchor="middle" fill="#334155" font-size="11">Job dispatch</text>
+          <text x="350" y="135" text-anchor="middle" fill="#334155" font-size="11">Lease reclaim</text>
+
+          <!-- Scheduler C (follower) -->
+          <rect x="480" y="80" width="180" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="100" text-anchor="middle" fill="#2563eb" font-weight="bold">Scheduler C (follower)</text>
+          <text x="570" y="120" text-anchor="middle" fill="#334155" font-size="11">Job dispatch</text>
+          <text x="570" y="135" text-anchor="middle" fill="#334155" font-size="11">Lease reclaim</text>
+
+          <!-- Arrows from schedulers to Redis -->
+          <line x1="130" y1="170" x2="350" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="350" y1="170" x2="350" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="570" y1="170" x2="350" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+
+          <!-- ZPOPMIN label -->
+          <text x="350" y="208" text-anchor="middle" fill="#334155" font-size="11" font-weight="bold">ZPOPMIN (competing consumers)</text>
+
+          <!-- Redis -->
+          <rect x="210" y="230" width="280" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+          <text x="350" y="252" text-anchor="middle" fill="#92400e" font-weight="bold">Redis (sorted set)</text>
+          <text x="350" y="270" text-anchor="middle" fill="#92400e" font-size="11">"job_queue" &mdash; score = time x 10 + priority</text>
+          <text x="350" y="288" text-anchor="middle" fill="#64748b" font-size="11">Capacity: 100K ops/s | Current: ~290 ops/s</text>
+          <text x="350" y="302" text-anchor="middle" fill="#64748b" font-size="11">Sentinel for failover</text>
+
+          <!-- Arrows from Redis to Worker Pools -->
+          <line x1="280" y1="310" x2="130" y2="370" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="350" y1="310" x2="350" y2="370" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="420" y1="310" x2="570" y2="370" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+
+          <!-- Worker Pools -->
+          <rect x="50" y="370" width="160" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="393" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 1</text>
+          <text x="130" y="410" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <rect x="270" y="370" width="160" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="393" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 2</text>
+          <text x="350" y="410" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <rect x="490" y="370" width="160" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="393" text-anchor="middle" fill="#334155" font-weight="bold">Worker Pool 3</text>
+          <text x="570" y="410" text-anchor="middle" fill="#64748b" font-size="11">20 threads</text>
+
+          <!-- Arrows from Workers to PostgreSQL -->
+          <line x1="130" y1="420" x2="350" y2="480" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="350" y1="420" x2="350" y2="480" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <line x1="570" y1="420" x2="350" y2="480" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+
+          <!-- execution_id check label -->
+          <text x="350" y="458" text-anchor="middle" fill="#334155" font-size="11" font-weight="bold">execution_id check (fencing token)</text>
+
+          <!-- PostgreSQL -->
+          <rect x="210" y="480" width="280" height="85" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="502" text-anchor="middle" fill="#334155" font-weight="bold">PostgreSQL</text>
+          <text x="350" y="520" text-anchor="middle" fill="#64748b" font-size="11">jobs table + cron_schedules + execution history</text>
+          <text x="350" y="538" text-anchor="middle" fill="#64748b" font-size="11">Storage: 150GB | Write load: ~300/sec</text>
+          <text x="350" y="554" text-anchor="middle" fill="#64748b" font-size="11">1 primary + 1 standby</text>
+
+          <!-- Annotations at bottom -->
+          <text x="350" y="590" text-anchor="middle" fill="#334155" font-size="12">All 3 schedulers compete for jobs. Leader runs cron evaluation exclusively.</text>
+          <text x="350" y="608" text-anchor="middle" fill="#334155" font-size="12">Redis provides near-zero dispatch latency. PostgreSQL provides durability and audit.</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Configuration Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Component</th><th>Count</th><th>Purpose</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Scheduler instances</td><td>3</td><td>Redundancy; 1 leader + 2 followers</td></tr>
+              <tr><td>Worker threads per scheduler</td><td>20</td><td>60 total workers; handles 1K jobs/sec peak</td></tr>
+              <tr><td>Redis instance</td><td>1 (with Sentinel for failover)</td><td>Sorted set queue; ~290 ops/sec load (116 ZADD + 116 ZRANGEBYSCORE polls + 58 cron)</td></tr>
+              <tr><td>PostgreSQL</td><td>1 primary + 1 standby</td><td>Job metadata, cron schedules, audit log</td></tr>
+              <tr><td>etcd cluster</td><td>3 nodes</td><td>Leader election with 15s lease TTL</td></tr>
+              <tr><td>Lease duration</td><td>60 seconds</td><td>Balance between fast reclaim and false positives</td></tr>
+              <tr><td>Cron evaluation frequency</td><td>Every 60 seconds</td><td>Matches the finest granularity of cron (1 minute)</td></tr>
+              <tr><td>Max retries per job</td><td>3</td><td>Exhausted retries &rarr; "failed" status &rarr; dead letter review</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>End-to-End Flow: One-Time Job</h3>
+        <pre class="line-numbers"><code class="language-text">1. API server receives: "Send welcome email to user-42 at 14:30:00"
+2. API writes to PostgreSQL:
+     INSERT INTO jobs (job_id='j-001', scheduled_time='14:30:00',
+                       priority=2, payload='{"email": "welcome", "user": 42}',
+                       status='pending')
+3. API enqueues in Redis:
+     ZADD job_queue 17110980002 j-001  (score = 1711098000 × 10 + 2)
+
+4. At 14:30:00, Scheduler B's dequeue loop runs:
+     ZRANGEBYSCORE job_queue 0 <current_score> LIMIT 0 1
+     → returns ("j-001", 17110980002)
+     ZREM job_queue j-001  → returns 1 (success, we own it)
+
+5. Scheduler B claims in PostgreSQL:
+     UPDATE jobs SET status='running', claimed_by='scheduler-B',
+            lease_expires=now()+60s, execution_id='exec-abc'
+     WHERE job_id='j-001' AND status='pending'
+
+6. Worker thread sends the email:
+     - Check: is execution_id still 'exec-abc'? Yes → proceed.
+     - Call email API: send_welcome_email(user=42)
+     - Email sent successfully.
+
+7. Scheduler B marks complete:
+     UPDATE jobs SET status='completed' WHERE job_id='j-001'
+
+Total time from scheduled_time to execution: < 1 second.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel &rarr; production cousin (property trade)</h3>
+        <p>The artifact that distinguishes "memorised that the heap gets replaced" from "understood what bottleneck forces it." The properties of the LC #621-style min-heap-keyed-by-next-fire-time that <em>actually</em> changed on the way to a sharded, durable, lease-based scheduler:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property</th><th>Textbook (LC &mdash; in-RAM min-heap of next-fire-times)</th><th>Production cousin (distributed job scheduler)</th><th>Why the swap</th></tr></thead>
+            <tbody>
+              <tr><td>Durability</td><td>the heap is in RAM; a crash loses every pending job</td><td>a durable store (Postgres <code>jobs</code> table) is the system of record; the heap / Redis sorted set is a <em>cache</em> rebuilt from it</td><td>schedulers crash; a "send the invoice on the 1st" job cannot evaporate on a process restart</td></tr>
+              <tr><td>Timing structure</td><td>a binary heap &mdash; "what's due now" is the heap top, but it lives in one process</td><td>a B-tree-indexed <code>next_fire_time</code> (Iter&nbsp;1) then a Redis sorted-set delay queue / time-bucketed index (Iter&nbsp;2): "what's due in the next second" = scan one small bucket / <code>ZRANGEBYSCORE</code>, O(bucket) not O(whole heap)</td><td>millions of pending jobs don't fit one heap; many workers must pull concurrently; a flat heap is single-consumer</td></tr>
+              <tr><td>Placement / scale</td><td>one heap, one consumer thread</td><td>3 schedulers competing via <code>SKIP LOCKED</code> / <code>ZPOPMIN</code> (sharded by <code>job_id mod K</code> at 100&times;); cron-evaluator + lease-reaper leader-elected so they run once</td><td>thousands of fires/sec exceed one process's throughput; a single consumer is a SPOF</td></tr>
+              <tr><td>Execution semantics</td><td><code>fn()</code> &mdash; a synchronous, exactly-once function call</td><td>an at-least-once lease handed to an idempotent worker, with a monotone fence token (<code>execution_id</code>) presented on every side-effecting call; downstream dedupes on it for billing-class jobs</td><td>"run the job" crosses a network &mdash; a worker can finish and die before acking; exactly-once-delivery is a fiction, exactly-once-<em>effect</em> = at-least-once + idempotency + fence</td></tr>
+              <tr><td>Fault model</td><td>assumes a reliable single process; no crash story</td><td>lease expiry detects a crashed worker; the reaper re-dispatches; a standby/peer scheduler keeps firing; etcd-leased singleton roles fail over in ~15&nbsp;s</td><td>workers and schedulers crash, partition, GC-pause &mdash; the design must detect and recover, not assume liveness</td></tr>
+              <tr><td>Fairness</td><td>none &mdash; the heap is global, first-by-time</td><td>per-tenant (per-billing-account) weighted fair queuing on dequeue + per-account submit rate limit</td><td>a multi-tenant primitive: one tenant's million 1-second jobs must not starve another tenant's due P0</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; consolidated schema reference</h3>
+        <p>Each schema was introduced at the iteration that created it (Naive: the <code>jobs</code> table + partial index; Iter&nbsp;1: the lease columns <code>claimed_by</code>/<code>lease_expires</code>/<code>execution_id</code> + the <code>cron_schedules</code> table; Iter&nbsp;2: the Redis <code>sched:queue</code> sorted set; Iter&nbsp;3: the etcd leader keyspace + per-tenant fairness state). Consolidated here for reference &mdash; this is <em>not</em> the only place they live.</p>
+<pre class="line-numbers"><code class="language-sql">-- Postgres (system of record) --
+CREATE TABLE jobs (
+  job_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant          TEXT NOT NULL,                       -- billing account (the fairness key)
+  job_type        VARCHAR(10) NOT NULL,                -- 'one-time' | 'cron'  (cron rows are materialized fires)
+  schedule        TEXT,                                -- ISO timestamp (one-shot) or cron expr (kept for audit)
+  next_fire_time  TIMESTAMPTZ NOT NULL,                -- a.k.a. scheduled_time
+  priority        SMALLINT NOT NULL DEFAULT 2,         -- 0=critical .. 3=low
+  payload_ref     TEXT,                                -- s3:// URL or inline jsonb
+  status          VARCHAR(10) NOT NULL DEFAULT 'pending',  -- pending | running | completed | failed | paused
+  claimed_by      TEXT,                                -- scheduler instance id holding the lease
+  lease_expires   TIMESTAMPTZ,                         -- set via DB clock: now() + interval '60 s' (jittered)
+  execution_id    UUID,                                -- the fence token; bumped on every (re-)claim
+  retry_count     SMALLINT NOT NULL DEFAULT 0,
+  idempotency_key TEXT,                                -- from POST /v1/jobs; UNIQUE per (tenant, idempotency_key)
+  created_at      TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+CREATE INDEX idx_jobs_due   ON jobs (next_fire_time, priority) WHERE status = 'pending';   -- the only hot query
+CREATE INDEX idx_jobs_reaper ON jobs (lease_expires)            WHERE status = 'running';   -- expired-lease scan
+CREATE UNIQUE INDEX idx_jobs_idem ON jobs (tenant, idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- at 100x scale: add a shard column  shard SMALLINT GENERATED ALWAYS AS (hashint8(job_id::text::int8) % 16) STORED
+--                and  idx_jobs_due  becomes  (shard, next_fire_time, priority) WHERE status='pending'  -- scheduler i scans shard i
+
+CREATE TABLE cron_schedules (
+  cron_id UUID PRIMARY KEY, tenant TEXT NOT NULL, cron_expression TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'UTC',
+  priority SMALLINT NOT NULL DEFAULT 2, payload_ref TEXT, active BOOLEAN NOT NULL DEFAULT true,
+  last_fired_at TIMESTAMPTZ);                          -- the leader-election overlap guard: UPDATE ... WHERE last_fired_at &lt; next_fire
+
+CREATE TABLE executions (                              -- audit only (not the job output)
+  execution_id UUID PRIMARY KEY, job_id UUID NOT NULL, attempt SMALLINT NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ, outcome TEXT, claimed_by TEXT);
+CREATE INDEX idx_exec_job ON executions (job_id, started_at DESC);
+
+-- Redis 7 (timing index; AOF everysec; maxmemory-policy noeviction) --
+ZADD sched:queue  <fire_at_epoch*10 + priority>  <job_id>     -- the delay queue; ZRANGEBYSCORE / ZPOPMIN to dispatch
+ZADD sched:queue:{tenant}  ...                                -- per-tenant sets for weighted-fair dequeue (alt to one tagged set)
+HASH inflight:{tenant} -> count                               -- per-tenant in-flight counter; cap before dequeuing more
+-- rebuilt from Postgres on a Redis failover: SELECT job_id,next_fire_time,priority FROM jobs WHERE status='pending' -> pipelined ZADD
+
+-- etcd (singleton-role control plane) --
+/leader/cron_evaluator  -> {holder, lease}      -- 15-s TTL; the cron-evaluator runs only while held
+/leader/lease_reaper    -> {holder, lease}      -- 15-s TTL; the expired-lease reclaim loop runs only while held
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>mTLS on the control-plane API and scheduler&harr;worker&harr;Postgres&harr;Redis&harr;etcd links; the job API is authenticated (tenant identity from the caller's cert/token) and authorized (a tenant can only see/modify its own jobs); the fence token (<code>execution_id</code>) is a capability &mdash; a worker presenting a stale one is rejected by downstreams (so a leaked/replayed token from a re-claimed job can't do harm); operator actions (pause-all, quota change, drain) are RBAC'd + audit-logged. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>The scheduler stores job <em>metadata</em> (schedule, priority, tenant, timestamps, a payload <em>reference</em>) &mdash; not the payload itself, not job output. The payload-ref may point at tenant data, so it's treated as tenant-owned: erasure of a tenant cascades to its <code>jobs</code> + <code>cron_schedules</code> + <code>executions</code> rows (a <code>DELETE WHERE tenant=?</code>); the <code>executions</code> audit log is aged out at the standard retention (30&nbsp;d) so it's not an indefinite metadata trail. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>Durable state is small: Postgres (the <code>jobs</code> + <code>cron_schedules</code> + <code>executions</code> tables, ~150&nbsp;GB, sync standby + PITR) is the only thing whose loss matters; Redis (the timing index) and etcd (the leader keys) are rebuildable. RPO&nbsp;=&nbsp;0 on the schedule (sync standby acks before commit); RTO &asymp; ~10&nbsp;s (Postgres failover) + a few seconds (Redis rebuild from Postgres). A whole-region loss: out of scope (single region by assumption) &mdash; a multi-region design would region-pin jobs and need cross-region fences (named in Pushbacks). Quarterly DR drill: fail over Postgres, kill Redis, watch the rebuild + the DB-poll fallback hold. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>Schedulers autoscale on dispatch-loop latency + Redis queue depth (add a 4th scheduler if the burst-hour backlog grows); +50% headroom on schedulers (a rolling deploy must not drop firing capacity below demand). Workers (the task queue, <a href="09-task-queue.html">#9</a>) autoscale on their own queue depth; the scheduler's job is to feed them with backpressure (shed P3 when the worker queue is deep). Postgres + Redis are massively over-provisioned at this scale (the burst is ~1,000&nbsp;ops/sec; both do 10&ndash;100&times; that) &mdash; the real capacity question only appears at 100&times; (see Pushbacks). Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>N/A at this scale &mdash; 3 schedulers all talk to the one Postgres + one Redis; there's no fanout-to-many-shards problem. At 100&times; (sharded due-index, multiple Redis), scheduler <em>i</em> would own shard <em>i</em> &mdash; that's the subsetting move; named in Pushbacks. Cite <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>N/A here (single region, single fleet). The natural cell boundary if it grew is <em>per-tenant-shard</em> or <em>per-region</em>: a cell = a (Postgres shard + Redis + scheduler-set) slice; a cell loss = those tenants' jobs pause, others unaffected. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>N/A in the user-facing sense &mdash; users poll <code>GET /v1/jobs/{id}</code> or register a webhook for state changes; this is batch/automation, not real-time. Internally the scheduler&harr;worker lease path and the etcd lease/watch are push. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>N/A &mdash; single internal datacenter; no CDN/POP tier; nothing user-facing-latency-sensitive enough to warrant edge presence.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p>When a <strong>scheduler dies</strong> &rarr; its leases expire (jittered, ~60&nbsp;s); a surviving scheduler's reaper re-dispatches its in-flight jobs (rate-capped to avoid a <a href="../canonicals/failure-modes.html#lease-expiry-storm">lease-expiry storm</a>); dispatch continues uninterrupted on the survivors; if it held a singleton role (cron-evaluator / reaper), etcd elects a new leader in ~15&nbsp;s. When <strong>Redis is lost</strong> &rarr; Sentinel fails over (1&ndash;2&nbsp;s); if the replica is stale, the schedulers rebuild <code>sched:queue</code> from Postgres (a few seconds) and run on the Iter-1 DB-poll fallback meanwhile &mdash; jobs still fire, just on the slower path. When <strong>Postgres is lost</strong> &rarr; failover to the sync standby (~10&nbsp;s); new submissions fail (the API returns 503, the client retries) but jobs already in Redis keep firing; on recovery the orphan-reaper reconciles. When the <strong>cron evaluator overlaps</strong> (leader split-brain) &rarr; the <code>last_fired_at</code> guard makes the dup a no-op. When the <strong>worker fleet backs up</strong> (more due jobs than workers can drain) &rarr; the scheduler sheds/delays P3 first (with a reason &mdash; never silent), keeps P0/P1 flowing; for P3 cron jobs the midnight-smear already spread the herd. When a <strong>tenant floods</strong> &rarr; the per-account dequeue cap + submit rate-limit confine it to its fair share; others flow. When a <strong>job is poison</strong> (crashes its worker every time) &rarr; the <code>retry_count</code> cap (3, with backoff) routes it to <code>failed</code> for human review. The system <em>never</em> silently drops a scheduled job (a full Redis = alarm, not eviction; the durable record is in Postgres), <em>never</em> fires a P0/P1 zero times within the 30-s SLA absent a multi-component outage, and <em>never</em> double-executes an <em>effect</em> for a fence-aware (billing-class) job. Cite <a href="../canonicals/failure-modes.html#lease-expiry-storm">failure-modes#lease-expiry-storm</a> + <a href="../canonicals/failure-modes.html#leader-loss">#leader-loss</a> + <a href="../canonicals/failure-modes.html#backlog-overflow">#backlog-overflow</a> + <a href="../canonicals/failure-modes.html#poison-message">#poison-message</a>.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> <em>Fire-time skew</em> &mdash; the headline: <code>actual_fire_time &minus; scheduled_time</code>, p50/p99, alarm if p99 &gt; 30&nbsp;s; broken down by priority (P0/P1 separately &mdash; the SLA tiers). <em>Late-job count</em> &mdash; jobs whose <code>scheduled_time</code> has passed and that aren't <code>running</code>/<code>completed</code> (the backlog gauge); split by priority. <em>Lease health</em> &mdash; <code>reclaim_count</code>/min (a spike = a scheduler died), <code>fence_token_rejected</code>/min (workers running after re-claim &mdash; expected during a reclaim, alarming otherwise), reaper-batch size. <em>Queue depth</em> &mdash; <code>ZCARD sched:queue</code> (the herd gauge), per-tenant share of it (the fairness gauge), <code>idx_jobs_due</code> rows-examined per poll (the <code>SKIP LOCKED</code>-contention gauge). <em>Cron evaluator</em> &mdash; eval duration (should be ~1&nbsp;s), "ran twice in a minute" alarm (leader split-brain), enqueued-per-tick. <em>Dead letter</em> &mdash; <code>failed</code>-state rate, <code>retry_count&ge;2</code> gauge (poison jobs). <em>Availability</em> &mdash; "0 schedulers firing in the last N&nbsp;s" (the standing page), leader-change rate, Redis/Postgres failover events. <em>Worker feed</em> &mdash; worker-queue depth + shed-by-priority rate.</li>
+          <li><strong>Rollout.</strong> Schedulers are stateless &mdash; deploy one instance at a time, health-gated: the new instance must successfully claim+complete a synthetic canary job before the next rolls; keep N&minus;1 on the old version until the new one is proven; instant rollback (the durable state is external). Schema migrations on <code>jobs</code> are additive-then-backfill-then-switch (add the nullable column, deploy code that writes it, backfill, add the index <code>CONCURRENTLY</code>, then make it <code>NOT NULL</code>) so a high-churn table is never locked. Redis/etcd are managed &mdash; failover is operator-button. Rollback triggers: a fire-time-skew p99 regression, a <code>fence_token_rejected</code> spike not explained by a reclaim, a rise in the <code>failed</code> rate, or a canary-job failure.</li>
+          <li><strong>Migration (single-cron-box &rarr; distributed scheduler).</strong> Most teams start with one box running <code>cron</code> (or a Quartz/APScheduler process). Phase 1: stand up the distributed scheduler in <em>shadow</em> &mdash; it reads the same schedule definitions, computes what it <em>would</em> fire, logs it, but doesn't dispatch; diff against the old box's actual fires for a week (chase down timezone/DST edge cases &mdash; the usual culprit). Phase 2: cut over per-job-class &mdash; move the low-risk, idempotent jobs (report generation, cache warming) to the new system first; watch a week; then the rest; the old box keeps running the not-yet-migrated jobs. Phase 3: the old box runs nothing &mdash; decommission it, but keep its config in version control as a fallback for a month. The risk is entirely Phase 1's diff (and the fact that <code>cron</code> "fires once per matching minute on this host's clock" while the distributed scheduler fires "once globally" &mdash; double-firing during overlap is the thing the fence token + idempotent workers exist to make safe). Cite <a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a>.</li>
+          <li><strong>Headroom.</strong> +50% on scheduler instances (a rolling deploy + a host failure must not drop firing capacity below burst-hour demand &mdash; ~1,000&nbsp;jobs/sec); Redis sized for 2&times; the dataset (AOF-rewrite fork) and ~10&times; the burst ops/sec; Postgres' <code>jobs</code>-table autovacuum tuned aggressively (status updates churn rows) and sized for ~10&times; the write rate; etcd at 5 nodes across AZs (lease + leader-key write rate &times;3). Reason: a deploy during a host failure during the batch hour is a Tuesday; the scheduler must not be the thing that falls over when the fleet most needs jobs fired.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text">This is a control-plane / coordination service -- the bill is small, dominated by the durable store. (cost-shapes: a "database-heavy" shape, but tiny.)
+  Schedulers:     3 x c7i.xlarge      x ~$0.18/hr x 720  ~= ~$390/mo
+  Postgres:       1 primary + 1 standby (db.r6g.xlarge-ish), 200 GB SSD, PITR  ~= ~$1,000/mo
+  Redis:          1 + Sentinel (cache.r6g.large-ish)                            ~= ~$300/mo
+  etcd:           3-5 small nodes (t4g.medium)                                  ~= ~$150/mo
+  Worker fleet:   NOT counted here -- it's the task queue (#9); the scheduler just feeds it.
+  ------------------------------------------------------------------------------------------
+  TOTAL  ~= ~$1,900/mo  ~= ~$23k/yr  -- a rounding error vs whatever the workers cost.
+
+Naive (one scheduler box + one Postgres, no Redis/etcd): ~$700/mo. So the whole arc TRIPLES the bill (~$700 -> ~$1,900/mo)
+  -- and that "tripling" buys: 99.9% availability (was a SPOF), no double-execution (was a race), &lt;1 s dispatch latency (was 5 s),
+  durable cron (was lose-on-crash), and tenant fairness. On a primitive other teams build on, $1,200/mo extra for "it actually works
+  under failure" is the easiest yes in the building. Dominant cost: Postgres (~50% of the bill) -- it's the durable store and the audit log.
+
+Cost-vs-latency knob: the REDIS DELAY QUEUE (~$300/mo) takes dispatch latency from ~5 s (the DB poll) to ~0 s. Drop it and run DB-poll-only
+  for ~$300/mo less -- fine if the 30-s SLA is comfortable and the burst hour is mild; keep it the moment the burst-hour backlog or the
+  SKIP-LOCKED contention shows up. A second knob: the SYNC STANDBY (~half the Postgres cost) buys RPO=0 + ~10-s failover; an async standby
+  is cheaper but loses the last few writes on failover -- for "send the invoice on the 1st" you want the sync one.
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p>Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal. If a question can't be answered in 3&ndash;6 sentences from the text above, the page is missing a probe.</p>
+
+      <div>
+        <h3>What if there were 100&times; the jobs &mdash; 500&nbsp;M one-shot pending, 100&nbsp;M cron schedules, ~100&nbsp;k executions/sec? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>Three things move. (1) The <em>due-jobs index</em> is now a hot partition &mdash; shard the <code>jobs</code> table by <code>job_id mod K</code> (K&nbsp;=&nbsp;16+), give scheduler <em>i</em> shard <em>i</em>, so the <code>SKIP LOCKED</code> scan and the partial index aren't shared (cite <a href="../canonicals/sharding-strategies.html#hash">sharding-strategies#hash</a>); the Redis sorted set splits the same way (<code>sched:queue:{shard}</code>) &mdash; or you graduate to a dedicated timer service: a Cassandra-backed time-bucketed index (<code>(bucket_minute, job_id)</code>), "what's due this minute" = read one partition, scales to billions of timers (cite <a href="../canonicals/sharding-strategies.html#range">sharding-strategies#range</a> &mdash; the Naive C4 named this). (2) The <em>cron evaluator</em> can't scan 100&nbsp;M schedules every tick from one leader &mdash; switch to <em>materialize-the-next-N-fires</em> (the Iter-1 C4's option (b)): a cron schedule becomes N pending one-shots, refilled in batches by a sharded, parallel refiller &mdash; the per-tick critical path goes away. (3) Postgres at ~100&nbsp;k writes/sec needs sharding anyway, or you move the system-of-record to Cassandra/ScyllaDB and keep Postgres only for the small <code>cron_schedules</code> definitions. The bottleneck shifts from "coordinator" (long since solved with leases + cells) to "the timing-index partition" &mdash; which is a <a href="../canonicals/bottlenecks.html#hot-partition">hot-partition</a> problem, solved by sharding the time/key dimension. The +50% scheduler headroom is unaffected; what grows is the store fleet.</p>
+      </div>
+
+      <div>
+        <h3>Why at-least-once + idempotency rather than true exactly-once? <span style="font-weight:normal;font-size:0.85em;">(semantics)</span></h3>
+        <p>Because exactly-once <em>delivery</em> across a network is provably impossible &mdash; the worker can finish the side effect and die before acking, and the scheduler has no way to tell "done but un-acked" from "never ran" (the FLP / two-generals problem). So you choose: at-least-once delivery (a fire may be handed to a worker twice) + an idempotent worker (keyed on the fence token, the second run is a no-op) = exactly-once <em>effect</em>, which is what anyone actually wants. The fence token (<code>execution_id</code>, monotone per job) is the linchpin: every side-effecting downstream call carries it; for ordinary jobs (send an email, warm a cache) re-doing the call is harmless; for the rare job where it isn't, the downstream keeps a <code>(job_id &rarr; max fence_token)</code> row and rejects a stale token &mdash; a tiny dedupe table, not a distributed transaction. Cite <a href="14-exactly-once.html">#14</a> for the full machinery; this page leans on it rather than re-deriving it. The alternative &mdash; a 2-phase commit between the scheduler and every worker on every fire &mdash; is slower, fragile (a stuck participant blocks), and unnecessary for 99% of jobs.</p>
+      </div>
+
+      <div>
+        <h3>What changes if a job MUST run exactly once &mdash; it's a billing run that charges customers? <span style="font-weight:normal;font-size:0.85em;">(semantics / regulatory-ish)</span></h3>
+        <p>The scheduling side is unchanged &mdash; you still get at-least-once delivery with a fence token. What changes is the <em>worker contract</em>: the billing worker must be idempotent on the fence token, and the thing it talks to (the ledger / payment processor) must dedupe on an idempotency key derived from <code>(job_id, execution_id)</code> &mdash; a charge with a seen key is a no-op that returns the original result (cite <a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a>, <a href="14-exactly-once.html">#14</a>). Concretely: the billing worker, before charging, writes a <code>(idem_key, status=pending)</code> row in its own DB in the same transaction as reading "what to charge"; charges; updates to <code>done</code> with the result; a re-delivery finds the row and returns the recorded result instead of charging again. The scheduler also bumps this job's priority to P0 (it must fire within the SLA) and might mark it <code>no_smear</code> (don't jitter its fire-time). The cost: the billing worker is more complex (a dedupe table, a careful transaction) &mdash; but that complexity lives in the one worker that needs it, not in the scheduler, which stays a dumb at-least-once trigger.</p>
+      </div>
+
+      <div>
+        <h3>The scheduler dies at exactly 00:00:00 &mdash; right when the midnight cron herd is due. What happens? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Two cases. (1) A <em>non-leader</em> scheduler dies &mdash; the other two keep dequeuing from Redis; its in-flight jobs' leases expire (~60&nbsp;s, jittered) and the reaper (running on the leader) re-dispatches them, rate-capped; net effect: ~one scheduler's worth of in-flight jobs delayed up to a minute. (2) The <em>leader</em> dies &mdash; on top of the above, the cron-evaluator stops; etcd elects a new leader in ~15&nbsp;s; the new leader's first eval picks up where <code>last_fired_at</code> left off, so the midnight herd is enqueued ~15&nbsp;s late &mdash; within the 30-s SLA for P0/P1, and the P3 herd was smeared over 5&nbsp;min anyway so ~15&nbsp;s of lateness is noise. The danger isn't the herd itself (the smear + worker backpressure handle it); it's a <em>crash-loop</em> (a bad deploy taking all schedulers down repeatedly) &mdash; which is why deploys are one-at-a-time and health-gated, and why "0 schedulers firing" is a standing page. If the worst happens (all schedulers down for minutes), nothing is lost &mdash; the durable record is in Postgres; the queue refills from it on recovery; jobs fire late, not never. Cite <a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a> + <a href="../canonicals/failure-modes.html#leader-loss">#leader-loss</a>.</p>
+      </div>
+
+      <div>
+        <h3>The midnight thundering herd &mdash; 1&nbsp;M jobs all scheduled for 00:00:00. How do you not fall over? <span style="font-weight:normal;font-size:0.85em;">(failure / load)</span></h3>
+        <p>Three layers. (1) <em>Smear at materialization</em>: when the cron evaluator turns a "<code>0 0 * * *</code>" schedule into a concrete fire, for P2/P3 jobs it adds a deterministic jitter <code>hash(job_id) mod jitter_window</code> (300&nbsp;s for P3, ~30&nbsp;s for P2), so 1&nbsp;M midnight jobs land spread over 5&nbsp;min &mdash; ~3,300/sec instead of a 1&nbsp;M instantaneous spike; P0/P1 fire on time (they're a small fraction). (2) <em>Worker backpressure</em>: the dispatch loop checks the worker fleet's queue depth and stops dequeuing (or sheds P3) when it's deep &mdash; the herd waits in Redis (durable, ordered), it doesn't crater the workers (cite <a href="13-backpressure.html">#13</a>, <a href="../canonicals/failure-modes.html#backlog-overflow">failure-modes#backlog-overflow</a>). (3) <em>Postgres write-spike absorption</em>: the status updates from the herd are batched (mark 100 jobs <code>running</code> in one statement), and the <code>jobs</code> table is autovacuum-tuned for the churn. The herd cousins <a href="27-thundering-herd.html">#27</a> (cache stampede) and <a href="26-cascading-failure.html">#26</a> (the downstream meltdown) cover the same shape from the read and cascade angles. Without the smear, every round hour is a multi-minute backlog + a Postgres write spike &mdash; with it, the herd is just "slightly elevated for 5 minutes."</p>
+      </div>
+
+      <div>
+        <h3>Where's the cost &mdash; what dominates the bill, and what's the cost-vs-latency knob? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>The scheduler itself is ~$1,900/mo &mdash; Postgres is ~half of it (the durable store + audit log), then Redis, schedulers, etcd; the worker fleet (the thing that costs real money) isn't part of this system (it's the task queue, <a href="09-task-queue.html">#9</a>). So "the bill" of a job-scheduler is a rounding error; what you're really buying with the iterations isn't lower cost &mdash; it's <em>correctness under failure</em> (the Naive one-box version is ~$700/mo and is a SPOF with a double-execution race). The one cost-vs-latency knob worth naming: the <em>Redis delay queue</em> (~$300/mo) buys ~5&nbsp;s &rarr; ~0&nbsp;s dispatch latency; you'd drop it only if the 30-s SLA is comfortable and the burst hour is mild. A second: the <em>sync standby</em> (~half the Postgres cost) buys RPO&nbsp;=&nbsp;0; an async standby is cheaper but loses the last few writes on failover &mdash; not acceptable for billing-class jobs. Cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a>.</p>
+      </div>
+
+      <div>
+        <h3>How do you migrate from a single <code>cron</code> box to the distributed scheduler without double-firing or dropping jobs? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Phase 1 &mdash; <em>shadow</em>: the distributed scheduler reads the same schedule definitions and logs what it <em>would</em> fire, but dispatches nothing; diff against the old box's actual fires for a week (the divergences are almost always timezone/DST edge cases &mdash; the old box used the host's local time, the new one uses explicit per-job timezones). Phase 2 &mdash; <em>cut over per job-class</em>: move the low-risk, idempotent jobs first (report generation, cache warming, webhook pings); the old box stops running those, the new system starts; watch a week; proceed class by class; the riskiest (billing) last, after its worker's dedupe table is in place. During any overlap, double-firing is <em>safe</em> &mdash; that's exactly what the fence token + idempotent workers exist for. Phase 3 &mdash; the old box runs nothing; decommission it but keep its crontab in version control as a fallback for a month. Rollback at any phase: move a job-class back to the old box (its config is still there). The risk is concentrated in Phase 1's diff; if it matches for a week, the cutover is boring. Cite <a href="../canonicals/api-design-patterns.html#idempotency">api-design-patterns#idempotency</a>.</p>
+      </div>
+
+      <div>
+        <h3>A job didn't fire (or fired twice) &mdash; where do you look? <span style="font-weight:normal;font-size:0.85em;">(monitoring / debug)</span></h3>
+        <p><em>Didn't fire</em>: pull the <code>jobs</code> row by <code>job_id</code> &mdash; what's <code>status</code>? <code>pending</code> with <code>next_fire_time</code> in the past &rarr; it's stuck in the queue: is it in Redis (<code>ZSCORE sched:queue job_id</code>)? If not, the orphan case &mdash; check the orphan-reaper's last run (it should re-<code>ZADD</code> it). If it's in Redis but old &rarr; the dispatch loop isn't draining: check per-tenant fairness gate (is this tenant's in-flight cap pinned by a flood?), worker-queue depth (backpressure shedding P3?), and the "0 schedulers firing" gauge. <code>paused</code> &rarr; someone paused it. <code>failed</code> &rarr; it hit the retry cap &mdash; check <code>executions</code> for the crash reason (poison job). <em>Fired twice</em>: check <code>executions</code> for two rows with different <code>execution_id</code> &mdash; that's a re-dispatch after a lease expiry (a scheduler died, or a clock-skew false-expiry, or a network blip during renewal); correlate with <code>reclaim_count</code> and NTP-offset spikes around that timestamp; the <em>effect</em> should still be once if the worker honored the fence token (check <code>fence_token_rejected</code> on the downstream &mdash; it should show the stale-token rejection). If the effect happened twice, the worker isn't idempotent &mdash; that's a worker bug, not a scheduler bug, but the scheduler's job is to make it survivable, so file it. Each path maps to a specific What-Breaks entry + a runbook line; the "decompose by status, then by which stage" discipline is so this is a lookup, not a guess.</p>
+      </div>
+
+      <div>
+        <h3>A tenant schedules a million 1-second jobs &mdash; fairness, abuse, what happens? <span style="font-weight:normal;font-size:0.85em;">(adversary / abuse)</span></h3>
+        <p>Three gates. (1) <em>Submit-side rate limit</em> (cite <a href="20-distributed-rate-limiter.html">#20</a>): a per-billing-account token bucket on <code>POST /v1/jobs</code> caps the <em>creation</em> rate &mdash; a million-job burst is throttled to a sane rate (or returns 429), so the flood never fully lands. (2) <em>Dequeue fairness</em>: even if a tenant legitimately has a million already-scheduled jobs all coming due, the weighted-fair dequeue gives them at most <code>cap(tenant)</code> in-flight at a time &mdash; their jobs fire at their fair share's rate, everyone else flows; their backlog grows (in their queue, visibly), but it doesn't touch another tenant's due P0. (3) <em>Quota</em>: a per-account ceiling on total pending jobs (and on cron schedules) &mdash; past it, new submissions are rejected with "you have N pending; cancel some or raise your quota." Abuse signals: a single account's queue-depth share &gt; X%, its submit-429 rate, its <code>failed</code>-rate (a million jobs that all crash = a poison flood &mdash; the retry cap + backoff confine it). The fairness key is the <em>billing account</em>, not the API-key, so a tenant can't multiply its share by spawning sub-accounts. Cite <a href="../canonicals/failure-modes.html#hot-partition-meltdown">failure-modes#hot-partition-meltdown</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">1. Lease-based locking prevents double execution</h3>
+        <p>Leases are the standard mechanism for distributed resource ownership. The scheduler writes its ID and an expiration time into the job row. If it crashes, the lease expires, and another scheduler reclaims the job. The execution_id (fencing token) provides a second layer of protection for workers that may still be running after a lease expires.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">2. Redis sorted sets are better than database polling</h3>
+        <p>ZPOPMIN is atomic and O(log N), giving near-zero scheduling latency. Database polling requires periodic queries that waste resources when idle and add latency equal to the poll interval when busy. Use the database for durable storage and Redis for the scheduling queue.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">3. Separate cron evaluation from job dispatch</h3>
+        <p>Cron schedule evaluation is a distinct concern: it runs on a fixed interval, scans all schedules, and generates one-time job instances. Job dispatch is event-driven: it dequeues and executes individual jobs. Mixing them creates complexity. Separating them lets you scale and reason about each independently.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">4. Multiple schedulers with leader election give high availability</h3>
+        <p>Three scheduler instances give us fault tolerance. Leader election (via etcd) ensures singleton operations like cron evaluation run on exactly one instance. Competing consumers (via ZPOPMIN) let all instances participate in job dispatch without coordination overhead.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">5. Exactly-once is at-least-once + idempotency + a fence token &mdash; don't try to do better</h3>
+        <p>Exactly-once <em>delivery</em> across a network is impossible (a worker can finish and die before acking). So the scheduler delivers at-least-once, hands the worker a monotone fence token (<code>execution_id</code>), and the worker is idempotent on it; downstreams that touch money dedupe on it. The complexity lives in the one worker that needs it &mdash; the scheduler stays a dumb trigger. See <a href="14-exactly-once.html">#14</a>; cite it, don't re-derive it.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">6. The midnight herd is a stampede &mdash; smear it at materialization</h3>
+        <p>Tenants overwhelmingly schedule "daily at midnight" / "hourly on the hour," so every round hour is a thundering herd. For low-priority cron jobs, add a deterministic jitter (<code>hash(job_id) mod jitter_window</code>) when materializing the fire &mdash; 1&nbsp;M midnight jobs spread over 5&nbsp;min instead of a 1&nbsp;M instantaneous spike. Pair with worker-fleet backpressure (shed P3 first) and batched status updates. See <a href="27-thundering-herd.html">#27</a>.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">7. A multi-tenant primitive needs fairness on TWO axes</h3>
+        <p>Priority is across-tenant; fairness is per-tenant. Without the tenant axis, a tenant scheduling a million P0 jobs starves everyone. Without the priority axis, a tenant's P3 batch delays its own P0. You need both: weighted-fair dequeue across <em>billing accounts</em> (not API keys &mdash; sub-accounts evade) plus a per-account submit rate limit (see <a href="20-distributed-rate-limiter.html">#20</a>). The cost of a job-scheduler is a rounding error; what the iterations buy is correctness under failure and isolation under abuse, not a lower bill.</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.25rem; border-radius: var(--radius); margin-top: 2rem;">
+        <h3 style="margin-bottom: 0.75rem;">Assumptions and When They Break</h3>
+        <ul>
+          <li><strong>116 jobs/sec fits in a single Redis + single PostgreSQL:</strong> If job volume grows 100&times; to 11,600 jobs/sec, you need to shard the Redis sorted set by priority level or time bucket, and use a PostgreSQL read replica for metadata lookups.</li>
+          <li><strong>Jobs are independent:</strong> If jobs have dependencies (job B must run after job A completes), you need a DAG scheduler &mdash; a fundamentally different architecture (topological sort, dependency tracking, event-driven execution).</li>
+          <li><strong>60-second lease is appropriate:</strong> If jobs run for hours (e.g., ETL pipelines), the lease must be much longer, and lease renewal becomes critical. If jobs run for milliseconds, a 60-second lease means crashed jobs are "stuck" for a full minute.</li>
+          <li><strong>Clock synchronization:</strong> Lease expiry depends on clocks. If clocks drift between schedulers and PostgreSQL, leases may expire early or late. Use NTP and keep drift under 1 second.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="09-task-queue.html" class="card topic-card">
+          <h3>#9 Task Queue</h3>
+          <p>The generic worker-pool task queue this builds on &mdash; a scheduler is a task queue + a timer. Visibility timeouts, retries, dead-letter queues, worker autoscaling.</p>
+        </a>
+        <a href="14-exactly-once.html" class="card topic-card">
+          <h3>#14 Exactly-Once</h3>
+          <p>The fencing-token / idempotency-key machinery this page cites rather than re-derives: at-least-once delivery + idempotent consumer = exactly-once effect.</p>
+        </a>
+        <a href="27-thundering-herd.html" class="card topic-card">
+          <h3>#27 Thundering Herd</h3>
+          <p>The midnight-cron-herd cousin from the read/cache angle &mdash; stampede control, request collapsing, jittered expiry. (#26 covers the cascade angle.)</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#coordinator-bottleneck" class="card topic-card">
+          <h3>Bottleneck: coordinator-bottleneck</h3>
+          <p>Iteration 1's target: one process is the only thing firing jobs and is a SPOF. First move: many schedulers competing via row-level locks + leases.</p>
+        </a>
+        <a href="../leader-election.html" class="card topic-card">
+          <h3>Leader Election</h3>
+          <p>Iteration 3's tool: etcd/ZooKeeper leases for the singleton cron-evaluator + lease-reaper. Raft, lease-based leadership, split-brain prevention.</p>
+        </a>
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>The execution stream downstream of the scheduler &mdash; Kafka topics, consumer groups, dead-letter queues for the <code>failed</code> jobs.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>The 100&times;-scale move: sharding the due-jobs index / the Redis delay queue by <code>job_id mod K</code> so each scheduler owns a shard.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-Stage Pipelining for GEMM on Hopper &mdash; SMEM, Stages, and the Reuse Tradeoff</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.86rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    .iter-head { background:linear-gradient(90deg,#eff6ff,#f8fafc); border-left:6px solid #2563eb;
+      border-radius:8px; padding:.6rem 1rem; margin:1.5rem 0 .6rem; }
+    .iter-head h2 { margin:0; }
+    .iter-head .iter-meta { font-size:.85rem; color:#475569; margin-top:.25rem; }
+    .pick { background:#dcfce7; padding:.05rem .3rem; border-radius:3px; }
+    .reject { color:#991b1b; font-weight:700; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+    .diagram-cap { font-size:.85rem; color:#475569; margin:.2rem 0 1rem; text-align:center; }
+  </style>
+</head>
+<body>
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">distributed_kv_cache</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Multi-Stage Pipelining for GEMM on Hopper</h1>
+      <p class="hero-subtitle">Why a tiled matrix-multiply (GEMM) streams its inputs through <strong>SMEM</strong> (shared memory) in a circular ring of <em>stages</em>, how stage count hides load latency, and the fixed-<strong>SMEM</strong> tradeoff that pulls you back toward memory-bound. Grounded on the <strong>H100</strong> (8&times;H100 SXM5, Llama-3-70B serving fleet).</p>
+      <p class="hero-meta">Acronyms used here &mdash; <strong>SM</strong> Streaming Multiprocessor &middot; <strong>SMEM</strong> shared memory (the per-SM scratchpad) &middot; <strong>CTA</strong> Cooperative Thread Array (a thread block, runs on one SM) &middot; <strong>MMA</strong> Matrix-Multiply-Accumulate (the tensor-core instruction) &middot; <strong>TMA</strong> Tensor Memory Accelerator (Hopper&rsquo;s async bulk-copy engine) &middot; <strong>HBM</strong> High-Bandwidth Memory (off-chip GPU DRAM) &middot; <strong>GEMM</strong> General Matrix Multiply &middot; <strong>AI</strong> Arithmetic Intensity (FLOP per byte read from HBM).</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="s-exec">1.&nbsp;The execution model: SM, CTA, warp</h2>
+
+      <p><strong>TL;DR.</strong> Before any pipelining: a GPU runs a kernel as a <em>grid</em> of <strong>CTA</strong>s; CUDA places each CTA onto one <strong>SM</strong>, and the SM runs its threads in <em>warps</em> of 32 driven by warp schedulers. Two rules from this model drive everything later on this page &mdash; <strong>CTAs that fit run in parallel, the rest run in waves</strong>, and <strong>warps interleave to hide latency</strong>.</p>
+
+      <h4>The hierarchy: grid &rarr; CTA &rarr; warp &rarr; thread</h4>
+      <ul>
+        <li><strong>SM (Streaming Multiprocessor)</strong> &mdash; the GPU&rsquo;s physical compute cluster; an H100 has <strong>132</strong>. Each SM owns its 256&nbsp;KB register file, 228&nbsp;KB <strong>SMEM</strong>, and <strong>4 warp schedulers</strong>.</li>
+        <li><strong>CTA (Cooperative Thread Array = thread block)</strong> &mdash; the unit CUDA schedules onto <em>one</em> SM. Once placed it stays there until it finishes (<strong>no migration</strong>), and its registers + SMEM are reserved for its whole life.</li>
+        <li><strong>warp</strong> &mdash; 32 threads, the hardware&rsquo;s scheduling <em>and</em> execution granularity. All 32 share one program counter and run in <strong>lockstep</strong> (<strong>SIMT</strong> &mdash; Single-Instruction, Multiple-Threads); divergent branches execute under a mask.</li>
+        <li>A warp is assigned to one of the SM&rsquo;s 4 warp schedulers for its <strong>entire life</strong> and never migrates to another.</li>
+      </ul>
+
+      <h4>CTAs that fit run in parallel; the rest run in waves</h4>
+      <ul>
+        <li>How many CTAs are co-resident on an SM is the <strong>occupancy</strong>, capped by registers, SMEM, and hard slot limits (H100: &le;&nbsp;64 warps and &le;&nbsp;32 CTAs per SM).</li>
+        <li><strong>CTAs that fit</strong> launch and run truly in parallel across all 132 SMs.</li>
+        <li><strong>CTAs that don&rsquo;t fit are serialized into waves</strong> &mdash; a waiting CTA launches only when a resident one retires and frees its slot + resources.</li>
+      </ul>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A grid of 10 CTAs maps onto a GPU whose SMs each hold 2 CTAs. Eight CTAs fit and run in parallel as wave 1; the remaining two wait and launch as wave 2 only when a resident CTA retires. There is no ordering guarantee across CTAs.">
+        <style>
+          .et{font-size:14px;font-weight:700;fill:#0f172a;}
+          .es{font-size:11px;fill:#475569;}
+          .gc{fill:#e2e8f0;stroke:#64748b;stroke-width:1.1;}
+          .gcl{font-size:9.5px;font-weight:700;fill:#334155;}
+          .smb{fill:#fff;stroke:#334155;stroke-width:1.3;}
+          .sml{font-size:10px;font-weight:700;fill:#334155;}
+          .w1{fill:#bbf7d0;stroke:#16a34a;stroke-width:1;}
+          .w2{fill:#e5e7eb;stroke:#9ca3af;stroke-width:1;}
+          .cl{font-size:9.5px;font-weight:700;fill:#0f172a;}
+          .wb1{fill:none;stroke:#16a34a;stroke-width:1.3;stroke-dasharray:5 3;}
+          .wb2{fill:none;stroke:#9ca3af;stroke-width:1.3;stroke-dasharray:5 3;}
+          .ar{stroke:#94a3b8;stroke-width:1.6;fill:none;marker-end:url(#exa);}
+        </style>
+        <defs><marker id="exa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>
+
+        <text class="et" x="20" y="50">Grid &mdash; 10 CTAs</text>
+        <!-- 2x5 grid -->
+        <rect class="gc" x="20" y="70" width="34" height="34" rx="3"/><text class="gcl" x="37" y="91" text-anchor="middle">C0</text>
+        <rect class="gc" x="58" y="70" width="34" height="34" rx="3"/><text class="gcl" x="75" y="91" text-anchor="middle">C1</text>
+        <rect class="gc" x="96" y="70" width="34" height="34" rx="3"/><text class="gcl" x="113" y="91" text-anchor="middle">C2</text>
+        <rect class="gc" x="134" y="70" width="34" height="34" rx="3"/><text class="gcl" x="151" y="91" text-anchor="middle">C3</text>
+        <rect class="gc" x="172" y="70" width="34" height="34" rx="3"/><text class="gcl" x="189" y="91" text-anchor="middle">C4</text>
+        <rect class="gc" x="20" y="110" width="34" height="34" rx="3"/><text class="gcl" x="37" y="131" text-anchor="middle">C5</text>
+        <rect class="gc" x="58" y="110" width="34" height="34" rx="3"/><text class="gcl" x="75" y="131" text-anchor="middle">C6</text>
+        <rect class="gc" x="96" y="110" width="34" height="34" rx="3"/><text class="gcl" x="113" y="131" text-anchor="middle">C7</text>
+        <rect class="gc" x="134" y="110" width="34" height="34" rx="3"/><text class="gcl" x="151" y="131" text-anchor="middle">C8</text>
+        <rect class="gc" x="172" y="110" width="34" height="34" rx="3"/><text class="gcl" x="189" y="131" text-anchor="middle">C9</text>
+
+        <path class="ar" d="M230,107 H300"/>
+        <text class="es" x="265" y="98" text-anchor="middle">place</text>
+
+        <text class="et" x="320" y="40">GPU &mdash; 2 CTAs fit per SM (occupancy)</text>
+        <!-- wave 1 -->
+        <rect class="wb1" x="320" y="55" width="500" height="195"/>
+        <text class="es" x="330" y="74">Wave 1 &mdash; 8 CTAs co-resident, truly parallel</text>
+        <!-- 4 SMs -->
+        <g>
+          <rect class="smb" x="334" y="86" width="110" height="150" rx="5"/><text class="sml" x="389" y="104" text-anchor="middle">SM 0</text>
+          <rect class="w1" x="348" y="112" width="82" height="48" rx="3"/><text class="cl" x="389" y="140" text-anchor="middle">C0</text>
+          <rect class="w1" x="348" y="170" width="82" height="48" rx="3"/><text class="cl" x="389" y="198" text-anchor="middle">C1</text>
+
+          <rect class="smb" x="454" y="86" width="110" height="150" rx="5"/><text class="sml" x="509" y="104" text-anchor="middle">SM 1</text>
+          <rect class="w1" x="468" y="112" width="82" height="48" rx="3"/><text class="cl" x="509" y="140" text-anchor="middle">C2</text>
+          <rect class="w1" x="468" y="170" width="82" height="48" rx="3"/><text class="cl" x="509" y="198" text-anchor="middle">C3</text>
+
+          <rect class="smb" x="574" y="86" width="110" height="150" rx="5"/><text class="sml" x="629" y="104" text-anchor="middle">SM 2</text>
+          <rect class="w1" x="588" y="112" width="82" height="48" rx="3"/><text class="cl" x="629" y="140" text-anchor="middle">C4</text>
+          <rect class="w1" x="588" y="170" width="82" height="48" rx="3"/><text class="cl" x="629" y="198" text-anchor="middle">C5</text>
+
+          <rect class="smb" x="694" y="86" width="110" height="150" rx="5"/><text class="sml" x="749" y="104" text-anchor="middle">SM 3</text>
+          <rect class="w1" x="708" y="112" width="82" height="48" rx="3"/><text class="cl" x="749" y="140" text-anchor="middle">C6</text>
+          <rect class="w1" x="708" y="170" width="82" height="48" rx="3"/><text class="cl" x="749" y="198" text-anchor="middle">C7</text>
+        </g>
+
+        <path class="ar" d="M828,150 H872"/>
+        <text class="es" x="850" y="142" text-anchor="middle">retire</text>
+
+        <!-- wave 2 -->
+        <rect class="wb2" x="880" y="55" width="280" height="195"/>
+        <text class="es" x="890" y="74">Wave 2 &mdash; wait for a free slot</text>
+        <rect class="w2" x="912" y="112" width="100" height="48" rx="3"/><text class="cl" x="962" y="140" text-anchor="middle">C8</text>
+        <rect class="w2" x="912" y="170" width="100" height="48" rx="3"/><text class="cl" x="962" y="198" text-anchor="middle">C9</text>
+        <text class="es" x="1040" y="140">launch only when</text>
+        <text class="es" x="1040" y="156">a wave-1 CTA</text>
+        <text class="es" x="1040" y="172">retires &amp; frees</text>
+        <text class="es" x="1040" y="188">its SM slot</text>
+
+        <text class="es" x="320" y="275">No ordering guarantee across CTAs &mdash; wave-2 CTAs may not have started while wave 1 runs, so a barrier spanning all CTAs would wait forever.</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 1 &mdash; CTAs that fit (occupancy) run in parallel as a wave; overflow CTAs serialize into later waves as resident CTAs retire.</p>
+
+      <h4>Warp scheduling = interleaving, to hide latency</h4>
+      <ul>
+        <li>Each warp scheduler holds a pool of warps and issues <strong>one instruction per cycle from whichever warp is ready</strong>; the next cycle it may pick a different warp.</li>
+        <li>That interleaving <em>is</em> the latency-hiding mechanism: when a warp stalls on an <strong>HBM</strong> load (hundreds of ns), the scheduler issues from another ready warp instead of idling. Same principle as the multi-stage buffers in &sect;4 &mdash; overlap a stall with useful work &mdash; but at <em>thread</em> granularity.</li>
+        <li><strong>Misconception to drop:</strong> warps do <em>not</em> run one-to-completion-then-next. They interleave instruction-by-instruction; &ldquo;warp 0 finishes before warp 1 starts&rdquo; is only the degenerate single-warp / no-stall case, not the model.</li>
+        <li>Two real parallelisms underneath: the 4 warp schedulers issue <strong>in parallel</strong>, and within a warp all 32 threads are <strong>lockstep-parallel</strong>.</li>
+      </ul>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Inside one SM, four warp schedulers issue in parallel. Zooming into one scheduler, it issues one instruction per cycle from whichever warp is ready. When Warp A issues a memory load and stalls, the scheduler fills the gap by issuing instructions from Warp B and Warp C, then resumes A when its data arrives. Warps interleave at instruction granularity rather than running one to completion.">
+        <style>
+          .it{font-size:14px;font-weight:700;fill:#0f172a;}
+          .is{font-size:11px;fill:#475569;}
+          .sc{fill:#eff6ff;stroke:#2563eb;stroke-width:1.2;}
+          .scl{font-size:10.5px;font-weight:700;fill:#1d4ed8;}
+          .wa{fill:#bfdbfe;stroke:#2563eb;stroke-width:1;}
+          .wb{fill:#bbf7d0;stroke:#16a34a;stroke-width:1;}
+          .wc{fill:#fde68a;stroke:#d97706;stroke-width:1;}
+          .cl2{font-size:11px;font-weight:700;fill:#0f172a;}
+          .brk{stroke:#dc2626;stroke-width:1.4;fill:none;}
+          .brl{font-size:10.5px;font-weight:700;fill:#b91c1c;}
+        </style>
+
+        <text class="it" x="20" y="34">One SM &mdash; 4 warp schedulers issue in parallel</text>
+        <rect class="sc" x="20" y="46" width="170" height="34" rx="5"/><text class="scl" x="105" y="68" text-anchor="middle">warp scheduler 0</text>
+        <rect class="sc" x="200" y="46" width="170" height="34" rx="5"/><text class="scl" x="285" y="68" text-anchor="middle">warp scheduler 1</text>
+        <rect class="sc" x="380" y="46" width="170" height="34" rx="5"/><text class="scl" x="465" y="68" text-anchor="middle">warp scheduler 2</text>
+        <rect class="sc" x="560" y="46" width="170" height="34" rx="5"/><text class="scl" x="645" y="68" text-anchor="middle">warp scheduler 3</text>
+
+        <text class="is" x="20" y="118">Zoom into scheduler 0 &mdash; one instruction issued per cycle, from whichever warp is ready:</text>
+
+        <!-- bracket over stalled region (cells 3..7) -->
+        <path class="brk" d="M308,150 V142 H758 V150"/>
+        <text class="brl" x="533" y="136" text-anchor="middle">Warp A stalled on its HBM load &mdash; gap filled by B &amp; C</text>
+
+        <!-- issue lane: 12 cycles, x = 30 + i*92, w=88, y=158 h=36 -->
+        <rect class="wa" x="30"  y="158" width="88" height="36" rx="3"/><text class="cl2" x="74"  y="181" text-anchor="middle">A</text>
+        <rect class="wa" x="122" y="158" width="88" height="36" rx="3"/><text class="cl2" x="166" y="181" text-anchor="middle">A</text>
+        <rect class="wa" x="214" y="158" width="88" height="36" rx="3"/><text class="cl2" x="258" y="181" text-anchor="middle">A&middot;LD</text>
+        <rect class="wb" x="306" y="158" width="88" height="36" rx="3"/><text class="cl2" x="350" y="181" text-anchor="middle">B</text>
+        <rect class="wc" x="398" y="158" width="88" height="36" rx="3"/><text class="cl2" x="442" y="181" text-anchor="middle">C</text>
+        <rect class="wb" x="490" y="158" width="88" height="36" rx="3"/><text class="cl2" x="534" y="181" text-anchor="middle">B</text>
+        <rect class="wc" x="582" y="158" width="88" height="36" rx="3"/><text class="cl2" x="626" y="181" text-anchor="middle">C</text>
+        <rect class="wb" x="674" y="158" width="88" height="36" rx="3"/><text class="cl2" x="718" y="181" text-anchor="middle">B</text>
+        <rect class="wa" x="766" y="158" width="88" height="36" rx="3"/><text class="cl2" x="810" y="181" text-anchor="middle">A</text>
+        <rect class="wc" x="858" y="158" width="88" height="36" rx="3"/><text class="cl2" x="902" y="181" text-anchor="middle">C</text>
+        <rect class="wb" x="950" y="158" width="88" height="36" rx="3"/><text class="cl2" x="994" y="181" text-anchor="middle">B</text>
+        <rect class="wa" x="1042" y="158" width="88" height="36" rx="3"/><text class="cl2" x="1086" y="181" text-anchor="middle">A</text>
+
+        <line x1="30" y1="208" x2="1130" y2="208" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#iax)"/>
+        <defs><marker id="iax" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>
+        <text class="is" x="580" y="226" text-anchor="middle">cycles &rarr;</text>
+
+        <!-- legend -->
+        <rect class="wa" x="30"  y="244" width="16" height="12"/><text class="is" x="52"  y="254">Warp A (issues a load &middot; LD, then stalls)</text>
+        <rect class="wb" x="330" y="244" width="16" height="12"/><text class="is" x="352" y="254">Warp B</text>
+        <rect class="wc" x="450" y="244" width="16" height="12"/><text class="is" x="472" y="254">Warp C</text>
+        <text class="is" x="30" y="278">Warps interleave at instruction granularity (not run-to-completion). Within a warp, all 32 threads run lockstep; a warp never leaves its scheduler.</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 2 &mdash; A warp scheduler issues one instruction/cycle from whichever warp is ready; a stalled warp&rsquo;s gap is filled by other warps. This thread-level latency hiding is the same idea as the multi-stage buffers later on the page.</p>
+
+      <h4>Between CTAs: parallel but <em>unsynchronized</em></h4>
+      <ul>
+        <li>Different CTAs make progress concurrently but with <strong>no ordering guarantee</strong> &mdash; CTA 0 may start or finish before or after CTA 1.</li>
+        <li>CUDA <strong>forbids inter-CTA synchronization by default</strong>, for two reasons:
+          <ol>
+            <li>The grid may launch more CTAs than fit on-chip &rarr; later waves haven&rsquo;t started while earlier ones run &rarr; a barrier across <em>all</em> CTAs waits forever.</li>
+            <li>Even within one wave there is no ordering guarantee between CTAs.</li>
+          </ol>
+        </li>
+        <li><strong>The portability trap this kills:</strong> a kernel with hand-rolled inter-CTA sync might &ldquo;work&rdquo; on an H100 (all CTAs co-resident, barrier succeeds) yet <strong>deadlock on a smaller RTX 4060</strong> (CTAs run in waves, the barrier waits on CTAs that never launched). Making inter-CTA sync impossible by default eliminates this entire bug class &mdash; the kind that passes testing on a big GPU and fails mysteriously in production on a small one.</li>
+        <li><strong>Opt-in exception:</strong> Cooperative Groups <code>grid.sync()</code> &mdash; but it requires a launch that <em>guarantees</em> all CTAs are co-resident (an occupancy-limited launch), precisely so the wave deadlock can&rsquo;t happen.</li>
+      </ul>
+
+      <div class="ref-box"><strong>Why this section is first.</strong> <em>Occupancy</em> &mdash; how many warps/CTAs sit on an SM &mdash; is set by the same registers + SMEM budget that &sect;4&rsquo;s 192&nbsp;KB stage configuration collapses to 1 CTA/SM. So the SMEM you spend on pipeline stages directly throttles how many warps the scheduler has to hide latency with. &ldquo;Warps interleave to hide stalls&rdquo; (here) and &ldquo;buffers stage ahead to hide loads&rdquo; (&sect;3) are the same idea at two levels of the machine.</div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="s1">2.&nbsp;The problem: tiles want to be big, SMEM is small</h2>
+
+      <p><strong>TL;DR.</strong> A GEMM tile should be as large as possible &mdash; reuse grows with tile size &mdash; but the operand tiles don&rsquo;t fit in <strong>SMEM</strong>, so you stream them through in chunks. Streaming introduces a load-to-use latency that has to be hidden.</p>
+
+      <h4>Why large tiles &mdash; reuse</h4>
+      <ul>
+        <li><strong>Dimensions, defined first.</strong> <code>M</code> = rows of the output tile, <code>N</code> = its columns, <code>K</code> = the shared <em>contraction</em> dimension that is summed over (the inner index of the matrix product). The operands are <code>A</code> (left, the row source), <code>B</code> (right, the column source), and the output <code>C = A&middot;B</code>. To compute one output tile <code>C[M&times;N]</code> you read an <code>A</code>-strip <code>[M&times;K]</code> and a <code>B</code>-strip <code>[K&times;N]</code> from <strong>HBM</strong>.</li>
+        <li>Each <code>A</code>-row is reused <code>N</code> times (once per output column); each <code>B</code>-column is reused <code>M</code> times. So the tile&rsquo;s arithmetic intensity is <code>AI = 2&middot;M&middot;N&middot;K / (2&middot;(M&middot;K + K&middot;N)) = M&middot;N / (M+N)</code> &mdash; it <em>grows</em> with tile size.</li>
+        <li><strong>Small tile &rarr; small <code>AI</code> &rarr; the same operand strips get re-read from <strong>HBM</strong> for neighbouring output tiles &rarr; memory-bound.</strong> A 128&times;128 tile reuses each byte 64&times; (<code>16384/256</code>); a 64&times;128 tile only 42.7&times; (<code>8192/192</code>).</li>
+      </ul>
+
+      <h4>Why you can&rsquo;t just load the whole tile</h4>
+      <ul>
+        <li>The contraction dimension <code>K</code> (for a Llama-3-70B feed-forward layer, <code>K = d_model = 8192</code>, where <code>d_model</code> is the model&rsquo;s hidden/embedding width &mdash; the vector length carried between layers) is far too long to stage whole. You slice it into <code>K_chunk</code> (a contiguous slice of the <code>K</code> axis, e.g. 64 elements) and walk the <code>K</code>-loop. <em>This is the <strong>GEMM</strong> case &mdash; feed-forward and QKV/O (Query / Key / Value / Output) projections; attention stages a different axis, covered in &sect;5.</em></li>
+        <li>While the tensor cores are doing the <strong>MMA</strong> on the chunk in buffer <em>i</em>, you must not overwrite that buffer &mdash; but you <em>can</em> stream the next chunk into a different buffer. That is the whole idea.</li>
+      </ul>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GEMM tiling: output tile C is M by N, fed by an A-strip M by K and a B-strip K by N. Each A row is reused N times, each B column M times, so arithmetic intensity equals M N over M plus N. The K dimension is chunked into K_chunk slices walked one at a time.">
+        <style>
+          .lbl  { font-size:14px; font-weight:700; fill:#0f172a; }
+          .sub  { font-size:11.5px; fill:#475569; }
+          .mono { font-family:'JetBrains Mono',monospace; font-size:12px; fill:#0f172a; }
+          .matA { fill:#dbeafe; stroke:#2563eb; stroke-width:1.6; }
+          .matB { fill:#dcfce7; stroke:#16a34a; stroke-width:1.6; }
+          .matC { fill:#fef3c7; stroke:#d97706; stroke-width:1.6; }
+          .chunk { fill:none; stroke:#1e293b; stroke-width:1; stroke-dasharray:4 3; }
+          .dim  { stroke:#64748b; stroke-width:1; }
+        </style>
+
+        <!-- B strip (top): K x N -->
+        <rect class="matB" x="430" y="40" width="300" height="90"/>
+        <text class="lbl" x="580" y="90" text-anchor="middle">B-strip</text>
+        <text class="mono" x="580" y="108" text-anchor="middle">[K &times; N]</text>
+        <text class="sub" x="580" y="30" text-anchor="middle">N (output cols)</text>
+        <!-- K_chunk slices on B (horizontal bands) -->
+        <line class="chunk" x1="430" y1="70" x2="730" y2="70"/>
+        <line class="chunk" x1="430" y1="100" x2="730" y2="100"/>
+
+        <!-- A strip (left): M x K -->
+        <rect class="matA" x="150" y="170" width="220" height="150"/>
+        <text class="lbl" x="260" y="240" text-anchor="middle">A-strip</text>
+        <text class="mono" x="260" y="258" text-anchor="middle">[M &times; K]</text>
+        <text class="sub" x="120" y="245" text-anchor="middle" transform="rotate(-90 120 245)">M (output rows)</text>
+        <!-- K_chunk slices on A (vertical bands) -->
+        <line class="chunk" x1="223" y1="170" x2="223" y2="320"/>
+        <line class="chunk" x1="296" y1="170" x2="296" y2="320"/>
+        <text class="sub" x="260" y="160" text-anchor="middle">K = d_model (chunked &rarr;)</text>
+
+        <!-- C tile (output): M x N -->
+        <rect class="matC" x="430" y="170" width="300" height="150"/>
+        <text class="lbl" x="580" y="238" text-anchor="middle">C output tile</text>
+        <text class="mono" x="580" y="256" text-anchor="middle">[M &times; N]</text>
+
+        <!-- reuse callout -->
+        <rect x="800" y="120" width="350" height="150" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+        <text class="lbl" x="820" y="148">Reuse = arithmetic intensity</text>
+        <text class="mono" x="820" y="174">AI = M&middot;N / (M+N)</text>
+        <text class="sub" x="820" y="198">128&times;128 &rarr; 16384/256 = <tspan font-weight="700">64&times;</tspan> reuse</text>
+        <text class="sub" x="820" y="218">&nbsp;64&times;128 &rarr; &nbsp;8192/192 = <tspan font-weight="700">42.7&times;</tspan> reuse</text>
+        <text class="sub" x="820" y="244">bigger tile &rarr; each HBM byte does</text>
+        <text class="sub" x="820" y="260">more FLOPs &rarr; compute-bound</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 3 &mdash; One output tile is fed by two operand strips. Reuse (hence <code>AI</code>) grows with tile size; <code>K</code> is sliced into <code>K_chunk</code> bands streamed one at a time.</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="s2">3.&nbsp;The mechanism: multi-stage pipelining</h2>
+
+      <p><strong>TL;DR.</strong> Keep a <strong>ring</strong> of <code>n</code> <strong>SMEM</strong> buffers (&ldquo;stages&rdquo;). <em>(A ring = circular buffer: the <code>n</code> stage-buffers are reused cyclically &mdash; <code>buffer = stage mod n</code> &mdash; so once the MMA drains buffer <em>i</em> it is freed and the next load wraps back into it. &ldquo;The ring fills&rdquo; later means all <code>n</code> buffers are loaded-but-not-yet-drained, so the next load has nowhere to land and must wait.)</em> The <strong>TMA</strong> engine streams future <code>K_chunk</code>s into free buffers while the tensor cores grind the current one. With enough stages, the <strong>MMA</strong> lane runs back-to-back with no bubbles &mdash; the load-to-use latency is fully hidden. This is exactly the <code>Stages</code> parameter in CUTLASS (NVIDIA&rsquo;s open-source CUDA C++ template library for GEMM kernels); on Hopper the copy engine is <strong>TMA</strong> + <code>mbarrier</code> (a shared-memory barrier object the TMA signals on completion; older Ampere did it with <code>cp.async</code>, the async global&rarr;shared copy instruction).</p>
+
+      <h4>The key fact that makes it work</h4>
+      <ul>
+        <li>A single load has high <em>latency</em> (~400&ndash;600&nbsp;ns to first byte) but the memory system can keep <em>many</em> loads <strong>in flight at once</strong>. So loads overlap each other &mdash; they are not serialized.</li>
+        <li>A buffer is occupied from the moment its load is <em>issued</em> until its <strong>MMA</strong> <em>completes</em> &mdash; that is <code>(load_latency + compute_time)</code> of wall-clock. To feed the tensor cores a new chunk every <code>compute_time</code> you need enough buffers to cover that whole window.</li>
+      </ul>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three pipeline timelines. With 1 buffer the tensor-core lane has large idle bubbles between computes because load and compute strictly alternate. With 2 buffers loads overlap two-deep and the bubble shrinks to a small residual gap. With 3 buffers loads overlap three-deep and the tensor-core lane runs back-to-back with no bubbles, fully hiding the load latency.">
+        <style>
+          .ttl   { font-size:15px; font-weight:700; fill:#0f172a; }
+          .axl   { font-size:11px; fill:#64748b; }
+          .stg   { font-size:11px; fill:#475569; }
+          .load  { fill:#dbeafe; stroke:#2563eb; stroke-width:1.4; }
+          .comp  { fill:#dcfce7; stroke:#16a34a; stroke-width:1.4; }
+          .busy  { fill:#16a34a; }
+          .idle  { fill:#fecaca; stroke:#dc2626; stroke-width:1; }
+          .bx    { font-size:11px; font-weight:700; fill:#0f172a; }
+          .occl  { font-size:11px; font-weight:700; fill:#0f172a; }
+          .vary  { font-size:10.5px; fill:#b91c1c; font-weight:700; }
+          .good  { font-size:10.5px; fill:#15803d; font-weight:700; }
+        </style>
+
+        <!-- ===== Panel 1: 1 buffer ===== -->
+        <text class="ttl" x="20" y="32">1 buffer &mdash; serial: load and compute alternate</text>
+        <!-- stage rows: t->x : x = 220 + t*48 -->
+        <!-- S0: load t0-3, comp t3-5 -->
+        <rect class="load" x="220" y="46" width="144" height="22" rx="3"/><text class="bx" x="292" y="61" text-anchor="middle">load 0</text>
+        <rect class="comp" x="364" y="46" width="96" height="22" rx="3"/><text class="bx" x="412" y="61" text-anchor="middle">MMA 0</text>
+        <!-- S1: load t5-8, comp t8-10 -->
+        <rect class="load" x="460" y="74" width="144" height="22" rx="3"/><text class="bx" x="532" y="89" text-anchor="middle">load 1</text>
+        <rect class="comp" x="604" y="74" width="96" height="22" rx="3"/><text class="bx" x="652" y="89" text-anchor="middle">MMA 1</text>
+        <!-- S2: load t10-13, comp t13-15 -->
+        <rect class="load" x="700" y="102" width="144" height="22" rx="3"/><text class="bx" x="772" y="117" text-anchor="middle">load 2</text>
+        <rect class="comp" x="844" y="102" width="96" height="22" rx="3"/><text class="bx" x="892" y="117" text-anchor="middle">MMA 2</text>
+        <!-- tensor-core occupancy lane -->
+        <text class="occl" x="20" y="148">Tensor cores</text>
+        <rect class="idle" x="220" y="136" width="144" height="18"/>
+        <rect class="busy" x="364" y="136" width="96" height="18"/>
+        <rect class="idle" x="460" y="136" width="144" height="18"/>
+        <rect class="busy" x="604" y="136" width="96" height="18"/>
+        <rect class="idle" x="700" y="136" width="144" height="18"/>
+        <rect class="busy" x="844" y="136" width="96" height="18"/>
+        <text class="vary" x="950" y="149">&larr; busy only ~40% of the time</text>
+
+        <!-- ===== Panel 2: 2 buffers ===== -->
+        <text class="ttl" x="20" y="246">2 buffers &mdash; loads overlap 2-deep: small residual bubble</text>
+        <!-- S0 load t0-3 comp t3-5 -->
+        <rect class="load" x="220" y="260" width="144" height="22" rx="3"/><text class="bx" x="292" y="275" text-anchor="middle">load 0</text>
+        <rect class="comp" x="364" y="260" width="96" height="22" rx="3"/><text class="bx" x="412" y="275" text-anchor="middle">MMA 0</text>
+        <!-- S1 load t2-5 (x316-460) comp t5-7 -->
+        <rect class="load" x="316" y="288" width="144" height="22" rx="3"/><text class="bx" x="388" y="303" text-anchor="middle">load 1</text>
+        <rect class="comp" x="460" y="288" width="96" height="22" rx="3"/><text class="bx" x="508" y="303" text-anchor="middle">MMA 1</text>
+        <!-- S2 load t5-8 (x460-604) comp t8-10 -->
+        <rect class="load" x="460" y="316" width="144" height="22" rx="3"/><text class="bx" x="532" y="331" text-anchor="middle">load 2</text>
+        <rect class="comp" x="604" y="316" width="96" height="22" rx="3"/><text class="bx" x="652" y="331" text-anchor="middle">MMA 2</text>
+        <!-- tensor lane: busy t3-7 (364-556), idle t7-8 (556-604), busy t8-10 (604-700) -->
+        <text class="occl" x="20" y="362">Tensor cores</text>
+        <rect class="busy" x="364" y="350" width="192" height="18"/>
+        <rect class="idle" x="556" y="350" width="48" height="18"/>
+        <rect class="busy" x="604" y="350" width="96" height="18"/>
+        <text class="vary" x="715" y="363">&larr; one residual bubble per cycle (load &gt; compute)</text>
+
+        <!-- ===== Panel 3: 3 buffers ===== -->
+        <text class="ttl" x="20" y="460">3 buffers &mdash; loads overlap 3-deep: tensor cores never idle</text>
+        <!-- S0 load t0-3 comp t3-5 -->
+        <rect class="load" x="220" y="474" width="144" height="22" rx="3"/><text class="bx" x="292" y="489" text-anchor="middle">load 0</text>
+        <rect class="comp" x="364" y="474" width="96" height="22" rx="3"/><text class="bx" x="412" y="489" text-anchor="middle">MMA 0</text>
+        <!-- S1 load t2-5 (x316-460) comp t5-7 -->
+        <rect class="load" x="316" y="502" width="144" height="22" rx="3"/><text class="bx" x="388" y="517" text-anchor="middle">load 1</text>
+        <rect class="comp" x="460" y="502" width="96" height="22" rx="3"/><text class="bx" x="508" y="517" text-anchor="middle">MMA 1</text>
+        <!-- S2 load t4-7 (x412-556) comp t7-9 -->
+        <rect class="load" x="412" y="530" width="144" height="22" rx="3"/><text class="bx" x="484" y="545" text-anchor="middle">load 2</text>
+        <rect class="comp" x="556" y="530" width="96" height="22" rx="3"/><text class="bx" x="604" y="545" text-anchor="middle">MMA 2</text>
+        <!-- S3 load t6-9 (x508-652) comp t9-11 -->
+        <rect class="load" x="508" y="558" width="144" height="22" rx="3"/><text class="bx" x="580" y="573" text-anchor="middle">load 3</text>
+        <rect class="comp" x="652" y="558" width="96" height="22" rx="3"/><text class="bx" x="700" y="573" text-anchor="middle">MMA 3</text>
+        <!-- tensor lane: busy t3-11 contiguous (364-748) -->
+        <text class="occl" x="20" y="606">Tensor cores</text>
+        <rect class="busy" x="364" y="594" width="384" height="18"/>
+        <text class="good" x="760" y="607">&larr; back-to-back, 100% busy: compute-bound</text>
+
+        <!-- time axis -->
+        <line x1="220" y1="650" x2="1000" y2="650" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#tarrow)"/>
+        <defs><marker id="tarrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>
+        <text class="axl" x="610" y="670" text-anchor="middle">time &rarr;</text>
+        <!-- legend -->
+        <rect class="load" x="220" y="678" width="16" height="12"/><text class="axl" x="242" y="688">TMA load (HBM &rarr; SMEM)</text>
+        <rect class="comp" x="470" y="678" width="16" height="12"/><text class="axl" x="492" y="688">MMA on a staged chunk</text>
+        <rect class="idle" x="690" y="678" width="16" height="12"/><text class="axl" x="712" y="688">tensor cores idle (bubble)</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 4 &mdash; Same workload, 1 vs 2 vs 3 buffers (load latency &asymp; 1.5&times; compute). More stages &rarr; more loads in flight &rarr; the tensor-core lane closes its bubbles. Once back-to-back, you are compute-bound and extra stages buy nothing.</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="s3">4.&nbsp;The tradeoff: stages vs tile size, under a fixed SMEM budget</h2>
+
+      <p><strong>TL;DR.</strong> More stages hide more latency &mdash; but <strong>SMEM</strong> is fixed at 228&nbsp;KB/SM on the H100. Buying more stages out of that fixed budget forces a <em>smaller tile</em>, which lowers reuse and drags you back toward memory-bound. The sweet spot is the fewest stages that fully hide the latency.</p>
+
+      <h4>How many stages? The rule of thumb</h4>
+      <div class="formula-box">n_buffers = ceil(load_latency / compute_time_per_tile) + 1     # +1 for safety / latency jitter
+
+H100 sanity check:
+  compute_per_tile (128&times;128&times;64 MMA) = 2&middot;128&middot;128&middot;64 = 2.1 MFLOP
+                                  &asymp; 2.1e6 / 7.5e12 (per-SM tensor-core rate) &asymp; 280 ns
+  load_latency (HBM &rarr; SMEM)               &asymp; 450&ndash;600 ns
+  n_buffers = ceil(500/280) + 1 = 2 + 1 = 3        &rarr; 3&ndash;6 stages typical for Hopper GEMM</div>
+
+      <h4>The SMEM math (BF16 &mdash; bfloat16, 2 bytes/element)</h4>
+      <p>Per stage you hold one <code>A</code>-chunk and one <code>B</code>-chunk. The tile one <strong>CTA</strong> computes is <code>BLOCK_M &times; BLOCK_N</code> &mdash; the concrete chosen values of <code>M</code> and <code>N</code> for a single CTA&rsquo;s output tile (here 128&times;128): <code>bytes/stage = (BLOCK_M&middot;K_chunk + K_chunk&middot;BLOCK_N) &middot; 2</code>.</p>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SMEM budget bars against the 228 KB per-SM ceiling. Three buffers at a 128 by 128 tile use 96 KB and leave room for a second CTA. Six buffers at the same tile use 192 KB, which forces occupancy down to one CTA per SM. Dropping to a 64 by 128 tile fits six buffers in 144 KB but halves the B-operand reuse, pushing toward memory-bound.">
+        <style>
+          .blbl { font-size:12.5px; fill:#0f172a; }
+          .bsub { font-size:11px; fill:#475569; }
+          .bnum { font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:700; fill:#0f172a; }
+          .ceil { stroke:#dc2626; stroke-width:1.6; stroke-dasharray:5 4; }
+          .bgood { fill:#bbf7d0; stroke:#16a34a; stroke-width:1.4; }
+          .bwarn { fill:#fde68a; stroke:#d97706; stroke-width:1.4; }
+          .bbad  { fill:#fecaca; stroke:#dc2626; stroke-width:1.4; }
+        </style>
+        <!-- scale: 240 KB across 760px from x=250; px/KB = 3.1667 -->
+        <!-- ceiling 228 KB -> x = 250 + 228*3.1667 = 972 -->
+        <line class="ceil" x1="972" y1="30" x2="972" y2="280"/>
+        <text class="bnum" x="972" y="24" text-anchor="middle">228 KB &mdash; H100 SMEM/SM ceiling</text>
+        <line x1="250" y1="30" x2="250" y2="280" stroke="#cbd5e1" stroke-width="1"/>
+
+        <!-- Bar A: 3 buf @128x128 = 96 KB -> width 96*3.1667=304 -->
+        <rect class="bgood" x="250" y="50" width="304" height="40"/>
+        <text class="blbl" x="40" y="66">3 stages &middot; 128&times;128</text>
+        <text class="bsub" x="40" y="82">tile reuse 64&times;</text>
+        <text class="bnum" x="566" y="75">96 KB &mdash; fits 2 CTAs/SM (good occupancy)</text>
+
+        <!-- Bar B: 6 buf @128x128 = 192 KB -> width 192*3.1667=608 -->
+        <rect class="bwarn" x="250" y="110" width="608" height="40"/>
+        <text class="blbl" x="40" y="126">6 stages &middot; 128&times;128</text>
+        <text class="bsub" x="40" y="142">tile reuse 64&times;</text>
+        <text class="bnum" x="870" y="135">192 KB &mdash; occupancy collapses to 1 CTA/SM</text>
+
+        <!-- Bar C: 6 buf @64x128 = 144 KB -> width 144*3.1667=456 -->
+        <rect class="bbad" x="250" y="170" width="456" height="40"/>
+        <text class="blbl" x="40" y="186">6 stages &middot; 64&times;128</text>
+        <text class="bsub" x="40" y="202">tile reuse 42.7&times; &darr;</text>
+        <text class="bnum" x="718" y="195">144 KB &mdash; fits, but reuse dropped &rarr; memory-bound</text>
+
+        <text class="bsub" x="250" y="250">bytes/stage = (BLOCK_M&middot;K_chunk + K_chunk&middot;BLOCK_N)&middot;2&nbsp;&nbsp;&middot;&nbsp;&nbsp;K_chunk = 64</text>
+        <text class="bsub" x="250" y="268">128&times;128: (128&middot;64 + 64&middot;128)&middot;2 = 32 KB/stage&nbsp;&nbsp;&middot;&nbsp;&nbsp;64&times;128: (64&middot;64 + 64&middot;128)&middot;2 = 24 KB/stage</text>
+        <text class="bsub" x="250" y="296">accumulator C lives in the 256 KB/SM register file &mdash; a separate budget, not counted against the 228 KB SMEM above</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 5 &mdash; The fixed 228&nbsp;KB <strong>SMEM</strong> ceiling is the budget you spend on stages &times; tile. Stages buy latency-hiding; spending too many forces a smaller tile (reuse &darr;) or kills occupancy.</p>
+
+      <table class="sheet">
+        <thead><tr><th>Config</th><th>bytes/stage</th><th>total SMEM</th><th>tile reuse (<code>AI</code>)</th><th>verdict</th></tr></thead>
+        <tbody>
+          <tr><td>128&times;128, 3 stages</td><td class="n">32 KB</td><td class="n">96 KB</td><td class="n">64&times;</td><td><span class="pick">fits, 2 CTAs/SM</span> &mdash; healthy</td></tr>
+          <tr><td>128&times;128, 6 stages</td><td class="n">32 KB</td><td class="n">192 KB</td><td class="n">64&times;</td><td>eats almost all SMEM &rarr; <strong>occupancy 1 CTA/SM</strong>, no margin for the <em>epilogue</em> (the kernel&rsquo;s final write-out phase &mdash; apply scale/bias, store <code>C</code> to <strong>HBM</strong>)</td></tr>
+          <tr><td>64&times;128, 6 stages</td><td class="n">24 KB</td><td class="n">144 KB</td><td class="n">42.7&times;</td><td><span class="reject">memory-bound</span> &mdash; bought stages by halving M-reuse</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Why the 192&nbsp;KB row fails &mdash; occupancy, not the accumulator</h4>
+      <ul>
+        <li>It is <em>not</em> that the output accumulator gets crowded out of <strong>SMEM</strong> &mdash; the accumulator lives in <strong>registers</strong>. A 128&times;128 FP32 (32-bit float) accumulator is 16&nbsp;384 floats spread across the <strong>CTA</strong>&rsquo;s threads, held in the 256&nbsp;KB/SM register file (a budget separate from the 228&nbsp;KB SMEM), and the epilogue reuses the freed input SMEM.</li>
+        <li><strong>The real cost is occupancy.</strong> <code>228 KB / 192 KB &rarr; 1</code> &mdash; only one <strong>CTA</strong> resides per <strong>SM</strong>. With a second CTA resident the warp scheduler hides a stalled CTA by running the other&rsquo;s warps (&sect;1); at occupancy 1 that escape hatch is gone, and any pipeline stall surfaces directly as idle tensor cores &mdash; plus there is no margin left for the epilogue or other SMEM users.</li>
+        <li><strong>Net:</strong> &ldquo;192&nbsp;KB is too much&rdquo; is right, but the mechanism is occupancy collapse, not accumulator spill.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section section-alt">
+    <div class="container">
+      <div class="iter-head">
+        <h2 id="s4">5.&nbsp;Where the stages live: GEMM vs attention</h2>
+        <p class="iter-meta">The <code>K_chunk</code> picture above is the <strong>GEMM</strong> (feed-forward, QKV/O projections). Attention pipelines over a different axis, and the head dimension is a compile-time constant, not a streamed loop.</p>
+      </div>
+
+      <p><strong>Attention symbols, defined first.</strong> <code>Q</code>, <code>K</code>, <code>V</code> are the query / key / value matrices, each shaped <code>[s &times; d_head]</code> &mdash; where <code>s</code> = sequence length (number of tokens) and <code>d_head</code> = per-head width <code>= d_model &divide; n_heads</code> (<code>n_heads</code> = the number of attention heads). <code>K&#7488;</code> is <code>K</code> transposed; <code>P = softmax(Q&middot;K&#7488;)</code> is the attention-probability matrix; the attention output is <code>P&middot;V</code>.</p>
+
+      <p><strong>TL;DR.</strong> In a plain GEMM the contraction dim is <code>d_model = 8192</code> &mdash; long, so it&rsquo;s sliced into <code>K_chunk</code> and the multistage ring walks the <strong>K-loop</strong>. In attention&rsquo;s <code>Q&middot;K&#7488;</code> the contraction dim is <code>d_head</code> &mdash; small (64&ndash;256), held <em>whole</em> as a kernel template constant. What flash attention actually streams over is the <strong>KV sequence length</strong> (the <code>P&middot;V</code> contraction), via the online-softmax block loop.</p>
+
+      <div class="two-col">
+        <div>
+          <h4>GEMM (feed-forward, projections) &mdash; most of prefill FLOP</h4>
+          <ul>
+            <li>Contracts over <code>K = d_model = 8192</code> &rarr; long &rarr; <strong>chunked</strong> into <code>K_chunk</code>.</li>
+            <li>The multistage ring buffers successive <code>K_chunk</code>s (the picture in &sect;3).</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Attention <code>Q&middot;K&#7488;</code> then <code>P&middot;V</code></h4>
+          <ul>
+            <li><code>Q&middot;K&#7488;</code> contracts over <code>d_head</code> &mdash; <strong>small, not chunked</strong>; the kernel is templated on <code>HEAD_DIM &isin; {64,128,256}</code> and holds it whole.</li>
+            <li>The streamed axis is the <strong>KV sequence</strong> (the <code>P&middot;V</code> contraction over context length): the online-softmax loop marches <code>BLOCK_N</code> down the keys/values &mdash; that&rsquo;s where the stages live.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: GEMM contracts over the long d_model dimension, chunked into K_chunk slices streamed by the multistage ring. Right: attention Q times K-transpose contracts over the small d_head dimension held whole, while the streamed axis is the long KV sequence marched in BLOCK_N tiles by the online-softmax loop.">
+        <style>
+          .pt   { font-size:14px; font-weight:700; fill:#0f172a; }
+          .ps   { font-size:11px; fill:#475569; }
+          .pm   { font-family:'JetBrains Mono',monospace; font-size:11.5px; fill:#0f172a; }
+          .mA   { fill:#dbeafe; stroke:#2563eb; stroke-width:1.5; }
+          .mB   { fill:#dcfce7; stroke:#16a34a; stroke-width:1.5; }
+          .mQ   { fill:#ede9fe; stroke:#7c3aed; stroke-width:1.5; }
+          .mK   { fill:#ffe4e6; stroke:#e11d48; stroke-width:1.5; }
+          .slc  { stroke:#1e293b; stroke-width:0.9; stroke-dasharray:4 3; }
+          .strm { stroke:#d97706; stroke-width:2; marker-end:url(#sa); }
+        </style>
+        <defs><marker id="sa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+
+        <!-- divider -->
+        <line x1="590" y1="20" x2="590" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+
+        <!-- LEFT: GEMM -->
+        <text class="pt" x="40" y="40">GEMM &mdash; chunk the long K = d_model</text>
+        <rect class="mA" x="60" y="70" width="300" height="80"/>
+        <text class="pm" x="210" y="115" text-anchor="middle">A  [M &times; d_model]</text>
+        <!-- vertical K_chunk slices -->
+        <line class="slc" x1="120" y1="70" x2="120" y2="150"/>
+        <line class="slc" x1="180" y1="70" x2="180" y2="150"/>
+        <line class="slc" x1="240" y1="70" x2="240" y2="150"/>
+        <line class="slc" x1="300" y1="70" x2="300" y2="150"/>
+        <text class="ps" x="210" y="166" text-anchor="middle">K = 8192, sliced into K_chunk (&rarr; streamed)</text>
+        <line class="strm" x1="60" y1="190" x2="360" y2="190"/>
+        <text class="ps" x="210" y="210" text-anchor="middle">multistage ring walks the K-loop</text>
+        <text class="pm" x="210" y="250" text-anchor="middle">stage axis = K_chunk</text>
+
+        <!-- RIGHT: Attention -->
+        <text class="pt" x="620" y="40">Attention &mdash; d_head whole, stream the sequence</text>
+        <!-- Q -->
+        <rect class="mQ" x="640" y="70" width="70" height="120"/>
+        <text class="pm" x="675" y="135" text-anchor="middle" transform="rotate(-90 675 135)">Q [s &times; d_head]</text>
+        <!-- K^T -->
+        <rect class="mK" x="730" y="70" width="240" height="60"/>
+        <text class="pm" x="850" y="105" text-anchor="middle">K&#7488; [d_head &times; s]</text>
+        <text class="ps" x="850" y="55" text-anchor="middle">d_head &isin; {64,128,192,256} &mdash; held whole</text>
+        <!-- BLOCK_N slices over sequence on K^T -->
+        <line class="slc" x1="790" y1="70" x2="790" y2="130"/>
+        <line class="slc" x1="850" y1="70" x2="850" y2="130"/>
+        <line class="slc" x1="910" y1="70" x2="910" y2="130"/>
+        <line class="strm" x1="730" y1="160" x2="970" y2="160"/>
+        <text class="ps" x="850" y="180" text-anchor="middle">online-softmax loop marches BLOCK_N down the KV sequence</text>
+        <text class="pm" x="800" y="250" text-anchor="middle">stage axis = KV sequence (the P&middot;V contraction)</text>
+        <text class="ps" x="800" y="272" text-anchor="middle">128 in your sketch = d_head for Llama-3-70B (64 heads &times; 128 = 8192), not a universal value</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 6 &mdash; The <code>K_chunk</code> staging of &sect;3 is the GEMM. Attention holds <code>d_head</code> whole and stages over the KV sequence instead.</p>
+
+      <div class="ref-box"><strong>On <code>d_head</code>.</strong> It is model-dependent, not fixed at 128: 64 (GPT-2/BERT), <strong>128</strong> (Llama&nbsp;2/3, Mistral, GPT-3 &mdash; the de-facto standard for large LLMs), 192 (DeepSeek MLA &mdash; Multi-head Latent Attention: 128 no-RoPE + 64 RoPE &mdash; RoPE = rotary position embedding &mdash; on the QK term), up to ~256 (about the practical ceiling, where the Q/K SMEM tiles start to force a split). The 128 in the sketches is the value for <em>this</em> fleet&rsquo;s Llama-3-70B (<code>64 heads &times; 128 = d_model 8192</code>). The structural claim &mdash; &ldquo;<code>d_head</code> is the un-chunked inner dim; the sequence is the streamed axis&rdquo; &mdash; holds for any of these values.</div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="s6">6.&nbsp;Payoff: the steady weight trickle, and the limit on fused decode prefetch</h2>
+
+      <p><strong>TL;DR.</strong> Multi-stage pipelining is exactly <em>why</em> a compute-bound prefill streams its weights as a smooth, low-rate flow instead of a burst &mdash; and the leftover <strong>SMEM</strong>/occupancy headroom from &sect;4 is precisely what decides whether a <em>fused</em> kernel can also prefetch decode KV onto the same <strong>SM</strong>s (the Option-A question in the design-choice doc).</p>
+
+      <ul>
+        <li><strong>Why prefill streams at ~124 GB/s, steadily.</strong> A prefill <strong>GEMM</strong> at <code>AI &asymp; 8000</code> only needs <code>989 TFLOP/s &divide; 8000 &asymp; 124 GB/s</code> of <strong>HBM</strong> to keep the tensor cores fed (<code>989 TFLOP/s</code> = the H100&rsquo;s peak BF16 tensor-core throughput). The multistage ring is what turns the weight load into that continuous trickle that stays one step ahead of the <strong>MMA</strong> &mdash; not a load-then-idle burst. The gap to 3.35&nbsp;TB/s (&asymp; 96% of <strong>HBM</strong> bandwidth) is spare.</li>
+        <li><strong>Why that matters for fusing decode prefetch.</strong> Decode is memory-bound and would love that 96% spare bandwidth. But to co-run it in one kernel you must <em>stage</em> decode KV in the same <strong>SMEM</strong>. If the prefill GEMM already wants 6 stages &times; a big tile and has pinned occupancy to 1 <strong>CTA</strong>/<strong>SM</strong> (&sect;4), there is no SMEM left &mdash; so you fall back to spatial <strong>SM</strong>-partitioning instead of true fusion.</li>
+        <li><strong>So this analysis is the binding constraint on Option A.</strong> &ldquo;Run a little prefill on the decode pool, hidden under the memory-bound tick&rdquo; is bandwidth-feasible by a wide margin &mdash; but it is <strong>SMEM-bound</strong>. &sect;7 proves the bandwidth feasibility and pins down exactly when the SMEM fits; &sect;8 names the three ways to actually share the GPU.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="s7">7.&nbsp;Can prefill &amp; decode run in one kernel? Feasibility</h2>
+
+      <p><strong>TL;DR.</strong> Two separate questions. <strong>(a) Is there room?</strong> &mdash; mostly <em>no</em> if both run their max-tile &ldquo;fast&rdquo; configs, because a fast prefill kernel alone grabs almost the whole 228&nbsp;KB <strong>SMEM</strong>; it fits only if you re-budget the prefill tile/stages, use a small head dim, or move to bigger-SMEM hardware. <strong>(b) Is it worth it?</strong> &mdash; <em>yes</em>: prefill is compute-bound and leaves ~94% of <strong>HBM</strong> bandwidth idle, so the memory-bound decode load hides in that idle bandwidth with multiple-&times; headroom. The limiter is (a), not bandwidth.</p>
+
+      <h3 id="s7a">7a.&nbsp;Is the shared memory enough? &mdash; usually not, for the <em>fast</em> configs</h3>
+      <ul>
+        <li><strong>Why a fast prefill kernel eats the budget.</strong> To feed the <strong>MMA</strong> units it wants a big tile <em>and</em> a deep stage ring (&sect;3&ndash;&sect;4). A 128&times;128, <code>d_head</code>=128, 3-stage flash-attention prefill CTA costs <code>32&nbsp;KB (Q) + 3&times;64&nbsp;KB (K,V ring) = 224&nbsp;KB</code> &mdash; almost the entire 228&nbsp;KB <strong>SMEM</strong>/<strong>SM</strong>. (A <em>stage</em> here is one slot of the &sect;3 multistage ring &mdash; one in-flight <code>(K,V)</code> sequence block (a <code>BLOCK_N</code> tile of keys+values, §5), <strong>not</strong> an algorithm phase and <em>not</em> QK&#7488;/softmax/PV. &ldquo;3 stages&rdquo; = 3 KV blocks buffered, so the <strong>MMA</strong> on block <em>i</em> overlaps the <strong>TMA</strong> load of blocks <em>i</em>+1 and <em>i</em>+2; each stage = one K block (128&middot;128&middot;2 = 32&nbsp;KB) + one V block (32&nbsp;KB) = 64&nbsp;KB.) A decode <strong>KV</strong> stage is ~32&nbsp;KB. <code>224 + 32 = 256 &gt; 228</code> &rarr; <strong>they don&rsquo;t co-reside.</strong> So yes, the claim is true for max-tile kernels.</li>
+        <li><strong>When it <em>is</em> enough:</strong>
+          <ol>
+            <li><strong>Re-budget the prefill ring</strong> &mdash; drop prefill to 2 stages (160&nbsp;KB) + a 1-stage decode tile (32&nbsp;KB) = <strong>192&nbsp;KB</strong>, fits with ~36&nbsp;KB to spare. Cost: prefill gives up one stage of latency hiding (fine if it is comfortably compute-bound).</li>
+            <li><strong>Small head dim</strong> &mdash; at <code>d_head</code>=64 a 3-stage prefill CTA is ~112&nbsp;KB; + decode ~16&nbsp;KB = <strong>128&nbsp;KB</strong>, fits easily.</li>
+            <li><strong>Shallow decode staging</strong> &mdash; decode&rsquo;s query is 1 token (tiny); if you stage few KV blocks, its SMEM footprint is small and slots into prefill&rsquo;s slack.</li>
+            <li><strong>Bigger-SMEM hardware</strong> &mdash; Blackwell raises per-SM SMEM <em>and</em> adds 2-SM thread-block clusters with <strong>DSMEM</strong> (Distributed Shared Memory) reachable by TMA multicast, ~doubling the staging pool so both fast configs fit. This is the &ldquo;may change in the future&rdquo; the original note hand-waved.</li>
+          </ol>
+        </li>
+        <li><strong>Net:</strong> fusing in one CTA needs a deliberate SMEM <em>re-budget</em> (trade prefill tile/stages) or newer hardware &mdash; it is not free.</li>
+      </ul>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stacked SMEM bars against the 228 KB ceiling. A fast 3-stage prefill kernel plus a decode stage totals 256 KB and overflows. A 2-stage prefill plus decode is 192 KB and fits. A small-head-dim prefill plus decode is 128 KB and fits easily.">
+        <style>
+          .fl{font-size:12px;fill:#0f172a;}
+          .fs{font-size:10.5px;fill:#475569;}
+          .fn{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;fill:#0f172a;}
+          .pf{fill:#bbf7d0;stroke:#16a34a;stroke-width:1.2;}
+          .dc{fill:#bfdbfe;stroke:#2563eb;stroke-width:1.2;}
+          .ov{fill:#fecaca;stroke:#dc2626;stroke-width:1.2;}
+          .cl{stroke:#dc2626;stroke-width:1.6;stroke-dasharray:5 4;}
+          .seg{font-size:10px;font-weight:700;fill:#0f172a;}
+        </style>
+        <!-- scale: px/KB = 760/256 = 2.969 ; x0=300 ; ceiling 228 -> 300+228*2.969=977 -->
+        <line class="cl" x1="977" y1="30" x2="977" y2="230"/>
+        <text class="fn" x="977" y="24" text-anchor="middle">228 KB &mdash; SMEM/SM ceiling</text>
+
+        <!-- Bar 1: prefill fast 224 + decode 32 = 256 (overflow) -->
+        <text class="fl" x="20" y="58">prefill <tspan font-weight="700">fast</tspan> (3-stage, 128&sup2;)</text>
+        <text class="fs" x="20" y="74">+ decode stage</text>
+        <rect class="pf" x="300" y="46" width="665" height="38"/><text class="seg" x="632" y="70" text-anchor="middle">prefill 224 KB</text>
+        <rect class="dc" x="965" y="46" width="95" height="38"/>
+        <rect class="ov" x="977" y="46" width="83" height="38"/>
+        <text class="seg" x="1012" y="40" text-anchor="middle" fill="#b91c1c">overflow</text>
+        <text class="fn" x="300" y="104" fill="#b91c1c">256 KB &gt; 228 &mdash; does NOT fit</text>
+
+        <!-- Bar 2: prefill 2-stage 160 + decode 32 = 192 (fits) -->
+        <text class="fl" x="20" y="138">prefill 2-stage (128&sup2;)</text>
+        <text class="fs" x="20" y="154">+ decode stage</text>
+        <rect class="pf" x="300" y="126" width="475" height="38"/><text class="seg" x="537" y="150" text-anchor="middle">prefill 160 KB</text>
+        <rect class="dc" x="775" y="126" width="95" height="38"/><text class="seg" x="822" y="150" text-anchor="middle">dec 32</text>
+        <text class="fn" x="884" y="150" fill="#15803d">192 KB &mdash; fits (36 KB margin)</text>
+
+        <!-- Bar 3: prefill d64 112 + decode 16 = 128 (fits) -->
+        <text class="fl" x="20" y="208">prefill (d_head=64)</text>
+        <text class="fs" x="20" y="224">+ decode stage</text>
+        <rect class="pf" x="300" y="196" width="333" height="38"/><text class="seg" x="466" y="220" text-anchor="middle">prefill 112 KB</text>
+        <rect class="dc" x="633" y="196" width="48" height="38"/>
+        <text class="fn" x="694" y="220" fill="#15803d">128 KB &mdash; fits easily</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 7 &mdash; The SMEM collision. Two fast kernels overflow 228&nbsp;KB; fusion needs a re-budget (fewer prefill stages, smaller head dim) or Blackwell-class SMEM.</p>
+
+      <h3 id="s7b">7b.&nbsp;Can the decode load hide under the prefill compute?</h3>
+      <ul>
+        <li><strong>Disjoint hardware units.</strong> Prefill bottlenecks the <strong>tensor-core / MMA</strong> pipe; a decode KV read bottlenecks the <em>memory</em> pipe (load/store units + <strong>TMA</strong> + the HBM controller). On Hopper, TMA async copies proceed <em>independently</em> of the MMA units (the very &sect;3 mechanism) &mdash; so the load genuinely runs in the shadow of the compute.</li>
+        <li><strong>The roofline gap that makes it free.</strong> (The <em>roofline model</em> plots achievable FLOP/s against arithmetic intensity <code>AI</code>: below the <em>ridge</em> intensity <code>AI*</code> &mdash; where the HBM-bandwidth ceiling and the compute ceiling meet &mdash; you are memory-bound; above it, compute-bound.) Prefill is compute-bound, so it leaves almost all of HBM idle; decode is memory-bound, so it leaves most of the tensor cores idle. Co-running them reclaims <em>both</em> idle resources at once &mdash; that is the efficiency win, not just &ldquo;it fits.&rdquo;</li>
+      </ul>
+
+      <div class="formula-box">Symbols (defined here, before use):
+  T_chunk = tokens in one prefill chunk (they share one weight read)   BW = bandwidth
+  MFU     = Model FLOPs Utilization = achieved &divide; peak tensor FLOP/s
+  batch   = decode batch size (concurrent requests)   ctx = per-request context length (tokens)
+  8       = GPUs in the tensor-parallel group (8&times;H100)   70e9 = Llama-3-70B parameter count
+
+Per H100 &mdash; peak 989 TFLOP/s, HBM 3.35 TB/s; ridge AI* = 989e12 / 3.35e12 &asymp; 295 FLOP/byte
+
+Prefill is compute-bound:
+  GEMM arithmetic intensity = T_chunk  (each weight byte feeds all T_chunk tokens, so AI &asymp; T_chunk)
+  T_chunk = 2048  &rarr;  AI = 2048  &Gt;  295            &rarr; tensor cores are the bottleneck
+  achieved FLOP/s at MFU 40% = 0.40 &times; 989e12 &asymp; 396e12
+  HBM used = 396e12 / 2048 &asymp; 193 GB/s  =  5.8% of 3.35 TB/s
+  &rarr;  ~94% of HBM bandwidth sits idle during prefill
+
+Does the decode KV stream fit in that idle BW, within the prefill time?
+  prefill-chunk time (T_chunk=2048) = 2&middot;70e9&middot;2048 / 8 / 396e12     &asymp; 90 ms
+  idle HBM bandwidth          = 3.35 TB/s &minus; 193 GB/s              &asymp; 3.16 TB/s
+  bytes movable in the shadow = 3.16e12 &times; 0.090                  &asymp; 284 GB
+
+  decode KV working set / GPU (batch=128, ctx=8192, 40 KB/tok/GPU) = 42 GB
+
+  284 GB  &Gt;  42 GB    &rarr;  ~6.8&times; headroom    &rarr;  POSSIBLE
+  (and decode alone leaves 3.35e12 &times; 128 / 989e12 &asymp; 43% &rarr; 57% of tensor cores idle &mdash; the waste fusion reclaims)</div>
+
+      <div class="ref-box"><strong>Which pipe is the real limiter?</strong> The formula above is the <strong>HBM</strong> pipe. But the decode load touches three shared resources &mdash; only the last binds:
+        <ul>
+          <li><strong>HBM bandwidth</strong> (HBM&rarr;SMEM via <strong>TMA</strong>) &mdash; ~94% idle under prefill (above). <strong>&checkmark; hides.</strong></li>
+          <li><strong>SMEM <em>bandwidth</em></strong> (writing the KV into shared memory) &mdash; per-SM SMEM BW &asymp; 31&nbsp;TB/s &divide; 132 &asymp; <strong>235&nbsp;GB/s</strong>; the decode write is the per-SM share of the idle HBM rate, &asymp; 3.16&nbsp;TB/s &divide; 132 &asymp; 24&nbsp;GB/s = <strong>~10%</strong> of SMEM BW &mdash; and on Hopper the TMA write uses a dedicated async path that does not stall the MMA&rsquo;s SMEM operand reads. <strong>&checkmark; hides.</strong></li>
+          <li><strong>SMEM <em>capacity</em></strong> (a free buffer to land in) &mdash; a buffer must be unused for the TMA to target, which is exactly the &sect;7a budget. <strong>&#10007; the binding constraint.</strong></li>
+        </ul>
+        So the shared-memory <em>bandwidth</em> pipe hides the decode load fine; it is shared-memory <em>capacity</em> (&sect;7a) that limits fusion, not bandwidth.</div>
+
+      <div class="warn-box"><strong>&ldquo;Won&rsquo;t SMEM fill up if compute can&rsquo;t drain it fast enough?&rdquo; &mdash; right question, and it splits by stream.</strong> &ldquo;Compute too slow to drain its loads&rdquo; <em>is</em> the definition of <strong>compute-bound</strong> &mdash; which is <strong>prefill</strong>, not decode. The fused kernel carries two data streams with opposite producer&ndash;consumer balance:
+        <ul>
+          <li><strong>Prefill&rsquo;s own loads (compute-bound &mdash; the slow-consumer case).</strong> The <strong>MMA</strong> is the slow consumer, so the TMA loads <em>do</em> outrun it: the prefill ring fills, the TMA then <strong>throttles</strong> (waits for a free buffer), and HBM goes ~idle. This is not a bug &mdash; it is the compute-bound steady state, and it is <em>exactly why ~94% of HBM bandwidth is free</em>. So &ldquo;SMEM fills, HBM can&rsquo;t load more&rdquo; is true for prefill, and it is the precondition the overlap exploits.</li>
+          <li><strong>The decode KV we hide (memory-bound &mdash; the fast-consumer case).</strong> This stream is drained by <em>decode&rsquo;s</em> MMA, not prefill&rsquo;s. Decode attention is <strong>~1&ndash;2 FLOP/byte</strong>, so draining KV at the idle-HBM rate (3.16&nbsp;TB/s) needs only <code>~2 &times; 3.16e12 &asymp; 6 TFLOP/s</code> = <strong>~0.6%</strong> of the 989&nbsp;TFLOP/s tensor cores. The consumer easily outpaces the feed, so <em>this</em> ring does <strong>not</strong> back up.</li>
+        </ul>
+        The 42&nbsp;GB is <strong>never stored</strong> in SMEM &mdash; it <strong>streams through</strong> a ring of a few 32&nbsp;KB buffers (HBM &rarr; SMEM &rarr; MMA &rarr; evict). By Little&rsquo;s law, saturating HBM needs only <code>BW &times; latency = (3.35e12 &divide; 132) &times; 500e-9 &asymp; 12.7&nbsp;KB</code> in flight per SM (~one buffer). <strong>So SMEM capacity binds &mdash; but as &ldquo;is there room for decode&rsquo;s small ring once prefill&rsquo;s ring has already filled ~224&nbsp;KB&rdquo; (&sect;7a), not as a slow-drain stall.</strong></div>
+
+      <div class="ref-box"><strong>Little&rsquo;s law, quickly.</strong> A queuing-theory result: in any stable system the average number of items <em>in flight</em> equals throughput &times; time-in-system, <code>L = &lambda; &middot; W</code> &mdash; where <code>L</code> = items in the system at once, <code>&lambda;</code> (lambda) = arrival rate / throughput (items per second), <code>W</code> = time each item spends in the system (its latency). The memory form (the <em>bandwidth-delay product</em>) maps these to <code>L</code> = bytes in flight, <code>&lambda;</code> = bandwidth, <code>W</code> = access latency: to run a pipe at bandwidth <code>BW</code> when each access takes <code>latency</code> to complete its round trip, you must keep <code>BW &times; latency</code> bytes <strong>outstanding at once</strong> &mdash; fewer in flight and the pipe idles waiting, so sustained throughput falls below <code>BW</code>.
+        <ul>
+          <li><strong>Analogy:</strong> a checkout that scans 1 item/sec, but each shopper takes 30&nbsp;s to walk up (latency). To keep the cashier never idle you need ~30 shoppers already in flight; fewer and it waits.</li>
+          <li><strong>Here:</strong> <code>BW</code> = per-SM HBM share &asymp; 25&nbsp;GB/s, <code>latency</code> &asymp; 500&nbsp;ns &rarr; <code>25e9 &times; 500e-9 &asymp; 12.7&nbsp;KB</code> must be outstanding to saturate HBM &mdash; about one 32&nbsp;KB buffer.</li>
+          <li>This is <em>why</em> the multistage ring (&sect;3) and many resident warps (&sect;1) exist: both are just ways to hold <code>BW &times; latency</code> requests in flight so the pipe never starves.</li>
+        </ul>
+      </div>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipe-utilization bars for three scenarios. Prefill-only saturates the tensor-core pipe but uses about 6 percent of HBM bandwidth. Decode-only saturates HBM bandwidth but uses about 43 percent of the tensor cores. Fused approaches full utilization of both pipes, reclaiming each scenario's idle resource.">
+        <style>
+          .ut{font-size:13px;font-weight:700;fill:#0f172a;}
+          .us{font-size:11px;fill:#475569;}
+          .axt{font-size:10.5px;fill:#64748b;}
+          .mma{fill:#3b82f6;stroke:#1d4ed8;stroke-width:1;}
+          .hbm{fill:#f59e0b;stroke:#b45309;stroke-width:1;}
+          .val{font-size:11px;font-weight:700;fill:#0f172a;}
+          .grp{font-size:12px;font-weight:700;fill:#0f172a;}
+        </style>
+        <!-- axis: baseline y=290, 100% at y=60 (230px) -->
+        <line x1="130" y1="60" x2="130" y2="290" stroke="#94a3b8" stroke-width="1.2"/>
+        <line x1="130" y1="290" x2="1120" y2="290" stroke="#94a3b8" stroke-width="1.2"/>
+        <line x1="130" y1="60" x2="1120" y2="60" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4 3"/>
+        <text class="axt" x="122" y="64" text-anchor="end">100%</text>
+        <text class="axt" x="122" y="294" text-anchor="end">0%</text>
+        <text class="us" x="40" y="175" transform="rotate(-90 40 175)" text-anchor="middle">pipe utilization (illustrative)</text>
+
+        <!-- Prefill-only -->
+        <rect class="mma" x="240" y="71"  width="70" height="219"/><text class="val" x="275" y="65"  text-anchor="middle">~95%</text>
+        <rect class="hbm" x="326" y="276" width="70" height="14"/><text class="val" x="361" y="270" text-anchor="middle">~6%</text>
+        <text class="grp" x="318" y="312" text-anchor="middle">Prefill only</text>
+        <text class="us"  x="318" y="328" text-anchor="middle">compute-bound &rarr; HBM idle</text>
+
+        <!-- Decode-only -->
+        <rect class="mma" x="560" y="191" width="70" height="99"/><text class="val" x="595" y="185" text-anchor="middle">~43%</text>
+        <rect class="hbm" x="646" y="71"  width="70" height="219"/><text class="val" x="681" y="65"  text-anchor="middle">~100%</text>
+        <text class="grp" x="638" y="312" text-anchor="middle">Decode only</text>
+        <text class="us"  x="638" y="328" text-anchor="middle">memory-bound &rarr; cores idle</text>
+
+        <!-- Fused -->
+        <rect class="mma" x="880" y="71"  width="70" height="219"/><text class="val" x="915" y="65"  text-anchor="middle">~95%</text>
+        <rect class="hbm" x="966" y="71"  width="70" height="219"/><text class="val" x="1001" y="65" text-anchor="middle">~95%</text>
+        <text class="grp" x="958" y="312" text-anchor="middle">Fused (overlap)</text>
+        <text class="us"  x="958" y="328" text-anchor="middle">both pipes near-full</text>
+
+        <!-- legend -->
+        <rect class="mma" x="240" y="36" width="14" height="12"/><text class="axt" x="260" y="46">tensor-core / MMA pipe</text>
+        <rect class="hbm" x="470" y="36" width="14" height="12"/><text class="axt" x="490" y="46">HBM bandwidth pipe</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 8 &mdash; Prefill and decode bottleneck on opposite pipes; fusing them reclaims each one&rsquo;s idle resource (illustrative utilizations, per the formula above).</p>
+
+      <h4>Closing the proof &mdash; does the SMEM capacity fit?</h4>
+
+      <p>The bandwidth and time are free (above) &mdash; but per the three-pipe split, the binding resource is SMEM <em>capacity</em>. So the proof only closes if decode&rsquo;s ring fits beside prefill&rsquo;s in one SM&rsquo;s 228&nbsp;KB. It does &mdash; <em>if</em> prefill cedes one pipeline stage (or uses a small head dim, or runs on Blackwell). At prefill&rsquo;s max config there is no room. So the overlap is possible, but not free.</p>
+
+      <p><strong>What is a &ldquo;prefill ring&rdquo; / &ldquo;decode ring&rdquo;?</strong> A computation&rsquo;s <em>ring</em> is the set of <code>n</code> SMEM stage-buffers it cycles through to stream operands from HBM &mdash; one operand block per buffer, the next loaded ahead while the MMA consumes the current one (&sect;3). The <strong>prefill ring</strong> holds prefill&rsquo;s streamed blocks (its flash-attention K,V sequence tiles, or its GEMM <code>K_chunk</code>s); the <strong>decode ring</strong> holds decode&rsquo;s streamed KV blocks. They are physically distinct SMEM regions, so a fused kernel must carve <em>both</em> out of the same per-SM 228&nbsp;KB &mdash; the budget fight below.</p>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Space view of the two rings inside one SM's SMEM. The prefill ring is three SMEM slots arranged in a circle: one being filled by TMA (head), one loaded and waiting, one being drained by the MMA (tail); dashed arrows show slots reused cyclically. The decode ring is two slots in the same pattern. Both rings occupy the same 228 KB SMEM. This is the space view of the same buffers the timeline in Fig 4 shows over time.">
+        <style>
+          .rt{font-size:14px;font-weight:700;fill:#0f172a;}
+          .rs{font-size:11px;fill:#475569;}
+          .rc{font-size:12px;font-weight:700;fill:#334155;}
+          .rsub{font-size:9.5px;fill:#475569;}
+          .ring{fill:none;stroke:#cbd5e1;stroke-width:1.4;stroke-dasharray:5 4;}
+          .head{fill:#dbeafe;stroke:#2563eb;stroke-width:1.5;}
+          .wait{fill:#f1f5f9;stroke:#94a3b8;stroke-width:1.3;}
+          .tail{fill:#dcfce7;stroke:#16a34a;stroke-width:1.5;}
+          .cyc{fill:none;stroke:#64748b;stroke-width:1.4;stroke-dasharray:4 3;marker-end:url(#rg);}
+          .sl{font-size:11px;font-weight:700;fill:#0f172a;}
+        </style>
+        <defs><marker id="rg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker></defs>
+
+        <text class="rt" x="40" y="34">One SM&rsquo;s 228&nbsp;KB SMEM &mdash; two rings share it (the <tspan font-style="italic">space</tspan> view of Fig&nbsp;4&rsquo;s buffers)</text>
+
+        <!-- ===== Prefill ring (3 slots) ===== -->
+        <text class="rt" x="320" y="74" text-anchor="middle">prefill ring &middot; 3 stages</text>
+        <circle class="ring" cx="320" cy="200" r="95"/>
+        <path class="cyc" d="M372,112 Q468,150 412,214"/>
+        <path class="cyc" d="M360,256 Q320,300 282,256"/>
+        <path class="cyc" d="M248,214 Q172,150 268,112"/>
+        <rect class="head" x="270" y="77"  width="100" height="38" rx="4"/><text class="sl" x="320" y="93" text-anchor="middle">slot 0</text><text class="rsub" x="320" y="108" text-anchor="middle">TMA filling (head)</text>
+        <rect class="wait" x="352" y="219" width="100" height="38" rx="4"/><text class="sl" x="402" y="235" text-anchor="middle">slot 1</text><text class="rsub" x="402" y="250" text-anchor="middle">loaded, waiting</text>
+        <rect class="tail" x="188" y="219" width="100" height="38" rx="4"/><text class="sl" x="238" y="235" text-anchor="middle">slot 2</text><text class="rsub" x="238" y="250" text-anchor="middle">MMA draining (tail)</text>
+        <text class="rc" x="320" y="196" text-anchor="middle">K,V block</text>
+        <text class="rsub" x="320" y="212" text-anchor="middle">~64 KB each</text>
+
+        <!-- ===== Decode ring (2 slots) ===== -->
+        <text class="rt" x="820" y="74" text-anchor="middle">decode ring &middot; 2 stages</text>
+        <circle class="ring" cx="820" cy="200" r="78"/>
+        <path class="cyc" d="M858,135 Q930,200 858,265"/>
+        <path class="cyc" d="M782,265 Q710,200 782,135"/>
+        <rect class="head" x="770" y="112" width="100" height="38" rx="4"/><text class="sl" x="820" y="128" text-anchor="middle">slot 0</text><text class="rsub" x="820" y="143" text-anchor="middle">TMA filling (head)</text>
+        <rect class="tail" x="770" y="250" width="100" height="38" rx="4"/><text class="sl" x="820" y="266" text-anchor="middle">slot 1</text><text class="rsub" x="820" y="281" text-anchor="middle">MMA draining (tail)</text>
+        <text class="rsub" x="820" y="204" text-anchor="middle">KV block ~32 KB each</text>
+
+        <!-- legend -->
+        <rect class="head" x="120" y="320" width="16" height="13"/><text class="rs" x="142" y="331">filled by TMA (head)</text>
+        <rect class="wait" x="330" y="320" width="16" height="13"/><text class="rs" x="352" y="331">loaded, waiting</text>
+        <rect class="tail" x="500" y="320" width="16" height="13"/><text class="rs" x="522" y="331">drained by MMA (tail)</text>
+        <line x1="730" y1="327" x2="766" y2="327" class="cyc"/><text class="rs" x="774" y="331">cyclic reuse (the &ldquo;freed&rdquo; wrap in your sketch)</text>
+        <text class="rs" x="120" y="362">Each box in Fig&nbsp;4&rsquo;s <tspan font-weight="700">load</tspan> lane = one use of a slot here; once the MMA drains a slot it is freed and the next load wraps into it (<tspan font-family="monospace">slot = stage mod n</tspan>).</text>
+        <text class="rs" x="120" y="382">Fused, both rings come out of the same 228&nbsp;KB &mdash; prefill 3&times;64&nbsp;KB (+32&nbsp;KB Q) vs decode 2&times;32&nbsp;KB &mdash; the budget table below.</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 9 &mdash; The two rings in <em>space</em>: physical SMEM slots reused in a circle (head = TMA fills, tail = MMA drains). Fig&nbsp;4 is the same buffers in <em>time</em>.</p>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The prefill ring's three physical slots shown over time. Each row is one slot. Slot 0 loads stage 0 then runs its MMA then is freed and reused to load stage 3; slot 1 handles stages 1 and 4; slot 2 handles stages 2 and 5. So slot j handles stages j, j+3, j+6 and so on. At any instant the three slots hold three consecutive stages in flight, with TMA loading ahead while the MMA drains behind.">
+        <style>
+          .tt{font-size:14px;font-weight:700;fill:#0f172a;}
+          .ts{font-size:11px;fill:#475569;}
+          .tlab{font-size:11px;font-weight:700;fill:#334155;}
+          .tld{fill:#dbeafe;stroke:#2563eb;stroke-width:1.3;}
+          .tmm{fill:#dcfce7;stroke:#16a34a;stroke-width:1.3;}
+          .tbx{font-size:10.5px;font-weight:700;fill:#0f172a;}
+          .wrp{fill:none;stroke:#d97706;stroke-width:1.6;stroke-dasharray:4 3;marker-end:url(#tw);}
+          .wlb{font-size:10px;font-weight:700;fill:#b45309;}
+        </style>
+        <defs><marker id="tw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+
+        <text class="tt" x="20" y="28">prefill ring in time &mdash; 3 physical slots, each reused every 3 stages (<tspan font-family="monospace">stage mod 3</tspan>)</text>
+
+        <!-- wrap arc on slot 0 -->
+        <path class="wrp" d="M442,78 Q484,50 520,78"/>
+        <text class="wlb" x="484" y="44" text-anchor="middle">slot 0 freed &rarr; reused for stage 3</text>
+
+        <!-- slot 0 row (y=80) : load s0 t0-3, MMA s0 t3-5, load s3 t6-9, MMA s3 t9-11 -->
+        <text class="tlab" x="20" y="99">slot 0</text>
+        <rect class="tld" x="110" y="80" width="204" height="30" rx="3"/><text class="tbx" x="212" y="100" text-anchor="middle">load s0</text>
+        <rect class="tmm" x="314" y="80" width="136" height="30" rx="3"/><text class="tbx" x="382" y="100" text-anchor="middle">MMA s0</text>
+        <rect class="tld" x="518" y="80" width="204" height="30" rx="3"/><text class="tbx" x="620" y="100" text-anchor="middle">load s3</text>
+        <rect class="tmm" x="722" y="80" width="136" height="30" rx="3"/><text class="tbx" x="790" y="100" text-anchor="middle">MMA s3</text>
+
+        <!-- slot 1 row (y=150) : load s1 t2-5, MMA s1 t5-7, load s4 t8-11, MMA s4 t11-13 -->
+        <text class="tlab" x="20" y="169">slot 1</text>
+        <rect class="tld" x="246" y="150" width="204" height="30" rx="3"/><text class="tbx" x="348" y="170" text-anchor="middle">load s1</text>
+        <rect class="tmm" x="450" y="150" width="136" height="30" rx="3"/><text class="tbx" x="518" y="170" text-anchor="middle">MMA s1</text>
+        <rect class="tld" x="654" y="150" width="204" height="30" rx="3"/><text class="tbx" x="756" y="170" text-anchor="middle">load s4</text>
+        <rect class="tmm" x="858" y="150" width="136" height="30" rx="3"/><text class="tbx" x="926" y="170" text-anchor="middle">MMA s4</text>
+
+        <!-- slot 2 row (y=220) : load s2 t4-7, MMA s2 t7-9, load s5 t10-13, MMA s5 t13-15 -->
+        <text class="tlab" x="20" y="239">slot 2</text>
+        <rect class="tld" x="382" y="220" width="204" height="30" rx="3"/><text class="tbx" x="484" y="240" text-anchor="middle">load s2</text>
+        <rect class="tmm" x="586" y="220" width="136" height="30" rx="3"/><text class="tbx" x="654" y="240" text-anchor="middle">MMA s2</text>
+        <rect class="tld" x="790" y="220" width="204" height="30" rx="3"/><text class="tbx" x="892" y="240" text-anchor="middle">load s5</text>
+        <rect class="tmm" x="994" y="220" width="136" height="30" rx="3"/><text class="tbx" x="1062" y="240" text-anchor="middle">MMA s5</text>
+
+        <!-- time axis -->
+        <line x1="110" y1="270" x2="1130" y2="270" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#tw)"/>
+        <text class="ts" x="620" y="288" text-anchor="middle">time &rarr;</text>
+
+        <!-- legend + notes -->
+        <rect class="tld" x="110" y="304" width="16" height="13"/><text class="ts" x="132" y="315">TMA load (HBM &rarr; slot)</text>
+        <rect class="tmm" x="320" y="304" width="16" height="13"/><text class="ts" x="342" y="315">MMA drains the slot</text>
+        <text class="ts" x="120" y="340">Slot <tspan font-style="italic">j</tspan> handles stages <tspan font-style="italic">j</tspan>, <tspan font-style="italic">j</tspan>+3, <tspan font-style="italic">j</tspan>+6 &hellip; &mdash; at any instant the 3 slots hold 3 consecutive stages in flight (TMA loads ahead, MMA drains behind).</text>
+        <text class="ts" x="120" y="360">This is Fig&nbsp;9&rsquo;s ring <em>unrolled in time</em> (cf. your sketch / Fig&nbsp;4): rows = the physical slots; the orange wrap = a slot freed and reused.</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 10 &mdash; The prefill ring in <em>time</em>: each physical slot is reused every <code>n</code> stages (<code>stage mod 3</code>). Decode&rsquo;s 2-slot ring is the same with period 2.</p>
+
+      <div class="ref-box"><strong>Everything here is per-SM.</strong> SMEM is a <strong>per-SM</strong> resource (228&nbsp;KB); a <strong>CTA</strong>&rsquo;s ring is allocated from the SM it runs on, and any co-resident CTAs <em>share</em> that one 228&nbsp;KB. So every buffer count and KB figure on this page &mdash; the 224&nbsp;KB prefill ring, the 12.7&nbsp;KB Little&rsquo;s-law number, the budget below &mdash; is <strong>per SM</strong>. (&ldquo;96&nbsp;KB ring &rarr; 2 CTAs/SM&rdquo; in &sect;4 is exactly this: <code>2 &times; 96 = 192 &le; 228</code>.)</div>
+
+      <ul>
+        <li><strong>How small can decode&rsquo;s ring be?</strong> Little&rsquo;s law (&sect;7b) says only ~12.7&nbsp;KB need be in flight per SM to saturate HBM. Double-buffered (one block draining while the next loads), that is a 2-stage ring &asymp; <strong>32&ndash;64&nbsp;KB</strong> (a decode K+V block is 16&ndash;32&nbsp;KB at <code>d_head</code>=128, <code>BLOCK_N</code>=64).</li>
+        <li><strong>Does it fit beside prefill?</strong> The budget is <code>decode ring + prefill ring &le; 228&nbsp;KB</code> per SM &mdash; the &sect;7a / Fig&nbsp;7 collision, now with decode&rsquo;s ring actually sized:</li>
+      </ul>
+
+      <table class="sheet">
+        <thead><tr><th>Prefill ring</th><th>prefill SMEM</th><th>+ decode ring</th><th>total / 228 KB</th><th>fits?</th></tr></thead>
+        <tbody>
+          <tr><td>3-stage, 128&sup2; (max)</td><td class="n">224 KB</td><td class="n">+64 KB</td><td class="n">288 KB</td><td><span class="reject">&#10007; no room</span></td></tr>
+          <tr><td>2-stage, 128&sup2;</td><td class="n">160 KB</td><td class="n">+64 KB</td><td class="n">224 KB</td><td><span class="pick">&checkmark; fits</span> (4 KB margin)</td></tr>
+          <tr><td>3-stage, <code>d_head</code>=64</td><td class="n">112 KB</td><td class="n">+32 KB</td><td class="n">144 KB</td><td><span class="pick">&checkmark; fits</span> (84 KB margin)</td></tr>
+        </tbody>
+      </table>
+
+      <ul>
+        <li><strong>The cost of making room.</strong> Dropping prefill 3&rarr;2 stages spends &sect;4&rsquo;s &ldquo;+1&rdquo; jitter-safety stage: prefill keeps the bare minimum (2) to hide its load latency, so it stays compute-bound but with less margin against load-latency jitter &mdash; a small but real tax. On Blackwell (bigger SMEM + 2-SM <strong>DSMEM</strong> clusters) the tax vanishes.</li>
+      </ul>
+
+      <div class="warn-box"><strong>Verdict.</strong> The overlap is bandwidth-free (&sect;7b) <em>and</em> capacity-feasible (here) &mdash; but only with a deliberate re-budget that cedes prefill&rsquo;s safety stage (or a small head dim, or Blackwell). At prefill&rsquo;s max 3-stage config it does <strong>not</strong> fit. So &ldquo;provably possible&rdquo; = <strong>yes, contingent on that trade</strong> &mdash; it is not free.</div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="s8">8.&nbsp;The co-execution taxonomy &mdash; three ways to share the GPU</h2>
+
+      <p><strong>TL;DR.</strong> Once you accept prefill and decode want to run together, there are exactly three structural ways to place them on the hardware &mdash; split <strong>SM</strong>s, split <strong>CTA</strong>s, or split <em>warps</em> &mdash; trading rising implementation complexity for tighter, more dynamic overlap.</p>
+
+      <table class="sheet">
+        <thead><tr><th>Scheme</th><th>What runs where</th><th>Overlap quality</th><th>Real systems</th></tr></thead>
+        <tbody>
+          <tr><td><strong>1 &middot; Different kernels, split SMs</strong></td><td class="c">prefill kernel owns SM set A; decode kernel owns SM set B</td><td>spatial, <strong>static</strong> &mdash; &ldquo;just parallel&rdquo;</td><td>MPS (Multi-Process Service), CUDA stream priority, Hopper green contexts</td></tr>
+          <tr><td><strong>2 &middot; Same kernel, split CTAs</strong></td><td class="c">one kernel; each CTA is tagged prefill <em>or</em> decode, scattered across all SMs</td><td><strong>dynamic</strong> load-balance across the whole GPU</td><td>POD-Attention</td></tr>
+          <tr><td><strong>3 &middot; One CTA, split warps</strong></td><td class="c">within a CTA: producer warps load decode KV, consumer warps run prefill MMA, sharing the SMEM ring</td><td>tightest &mdash; <strong>true intra-SM overlap</strong></td><td>FA3 (FlashAttention-3) warp-spec, NanoFlow; Sarathi chunked-prefill (batch-level cousin)</td></tr>
+        </tbody>
+      </table>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three placement schemes. Scheme 1 splits the SMs: half run a prefill kernel, half a decode kernel, a static spatial partition. Scheme 2 uses one kernel whose CTAs are tagged prefill or decode and scattered across all SMs, dynamically scheduled. Scheme 3 zooms into one SM where, inside a single CTA, producer warps load decode KV and consumer warps run prefill MMA, sharing the SMEM ring for true overlap.">
+        <style>
+          .xt{font-size:13.5px;font-weight:700;fill:#0f172a;}
+          .xs{font-size:10.5px;fill:#475569;}
+          .xn{font-size:10px;font-weight:700;fill:#334155;}
+          .sP{fill:#bbf7d0;stroke:#16a34a;stroke-width:1.1;}
+          .sD{fill:#bfdbfe;stroke:#2563eb;stroke-width:1.1;}
+          .smbx{fill:#fff;stroke:#334155;stroke-width:1.4;}
+          .smem{fill:#fef3c7;stroke:#d97706;stroke-width:1.4;}
+          .wP{fill:#bbf7d0;stroke:#16a34a;stroke-width:1;}
+          .wD{fill:#fde68a;stroke:#d97706;stroke-width:1;}
+          .xar{stroke:#64748b;stroke-width:1.4;fill:none;marker-end:url(#xa);}
+        </style>
+        <defs><marker id="xa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker></defs>
+
+        <line x1="395" y1="30" x2="395" y2="400" stroke="#cbd5e1" stroke-width="1"/>
+        <line x1="775" y1="30" x2="775" y2="400" stroke="#cbd5e1" stroke-width="1"/>
+
+        <!-- ===== Panel 1: split SMs ===== -->
+        <text class="xt" x="20" y="46">1 &middot; Different kernels &rarr; split SMs</text>
+        <text class="xs" x="20" y="64">each kernel owns a disjoint SM set</text>
+        <!-- 4x4 SM grid: left 2 cols green (prefill), right 2 cols blue (decode) -->
+        <!-- cols x=60,96,132,168 ; rows y=90,126,162,198 ; sq 30 -->
+        <g>
+          <rect class="sP" x="60"  y="90"  width="30" height="30" rx="3"/><rect class="sP" x="96"  y="90"  width="30" height="30" rx="3"/><rect class="sD" x="132" y="90"  width="30" height="30" rx="3"/><rect class="sD" x="168" y="90"  width="30" height="30" rx="3"/>
+          <rect class="sP" x="60"  y="126" width="30" height="30" rx="3"/><rect class="sP" x="96"  y="126" width="30" height="30" rx="3"/><rect class="sD" x="132" y="126" width="30" height="30" rx="3"/><rect class="sD" x="168" y="126" width="30" height="30" rx="3"/>
+          <rect class="sP" x="60"  y="162" width="30" height="30" rx="3"/><rect class="sP" x="96"  y="162" width="30" height="30" rx="3"/><rect class="sD" x="132" y="162" width="30" height="30" rx="3"/><rect class="sD" x="168" y="162" width="30" height="30" rx="3"/>
+          <rect class="sP" x="60"  y="198" width="30" height="30" rx="3"/><rect class="sP" x="96"  y="198" width="30" height="30" rx="3"/><rect class="sD" x="132" y="198" width="30" height="30" rx="3"/><rect class="sD" x="168" y="198" width="30" height="30" rx="3"/>
+        </g>
+        <text class="xn" x="93"  y="252" text-anchor="middle">Prefill kernel</text>
+        <text class="xn" x="165" y="252" text-anchor="middle">Decode kernel</text>
+        <text class="xs" x="20" y="300">MPS / green contexts.</text>
+        <text class="xs" x="20" y="318">Static split can&rsquo;t follow the live P/D</text>
+        <text class="xs" x="20" y="336">balance; whoever finishes first idles</text>
+        <text class="xs" x="20" y="354">its SMs &mdash; &ldquo;just parallel.&rdquo;</text>
+
+        <!-- ===== Panel 2: split CTAs ===== -->
+        <text class="xt" x="415" y="46">2 &middot; Same kernel &rarr; split CTAs</text>
+        <text class="xs" x="415" y="64">one kernel; CTAs tagged P or D, scattered</text>
+        <!-- checkerboard P/D -->
+        <g>
+          <rect class="sP" x="450" y="90"  width="30" height="30" rx="3"/><rect class="sD" x="486" y="90"  width="30" height="30" rx="3"/><rect class="sP" x="522" y="90"  width="30" height="30" rx="3"/><rect class="sD" x="558" y="90"  width="30" height="30" rx="3"/>
+          <rect class="sD" x="450" y="126" width="30" height="30" rx="3"/><rect class="sP" x="486" y="126" width="30" height="30" rx="3"/><rect class="sD" x="522" y="126" width="30" height="30" rx="3"/><rect class="sP" x="558" y="126" width="30" height="30" rx="3"/>
+          <rect class="sP" x="450" y="162" width="30" height="30" rx="3"/><rect class="sD" x="486" y="162" width="30" height="30" rx="3"/><rect class="sP" x="522" y="162" width="30" height="30" rx="3"/><rect class="sD" x="558" y="162" width="30" height="30" rx="3"/>
+          <rect class="sD" x="450" y="198" width="30" height="30" rx="3"/><rect class="sP" x="486" y="198" width="30" height="30" rx="3"/><rect class="sD" x="522" y="198" width="30" height="30" rx="3"/><rect class="sP" x="558" y="198" width="30" height="30" rx="3"/>
+        </g>
+        <rect class="sP" x="450" y="250" width="14" height="14"/><text class="xn" x="470" y="262">prefill CTA</text>
+        <rect class="sD" x="560" y="250" width="14" height="14"/><text class="xn" x="580" y="262">decode CTA</text>
+        <text class="xs" x="415" y="300">POD-Attention.</text>
+        <text class="xs" x="415" y="318">The GPU scheduler load-balances P and</text>
+        <text class="xs" x="415" y="336">D CTAs across <tspan font-weight="700">all</tspan> SMs &mdash; dynamic, no</text>
+        <text class="xs" x="415" y="354">static boundary to strand SMs.</text>
+
+        <!-- ===== Panel 3: split warps ===== -->
+        <text class="xt" x="795" y="46">3 &middot; One CTA &rarr; split warps</text>
+        <text class="xs" x="795" y="64">warp specialization inside one SM</text>
+        <rect class="smbx" x="800" y="80" width="360" height="170" rx="6"/>
+        <text class="xn" x="980" y="98" text-anchor="middle">one SM &middot; one CTA</text>
+        <!-- consumer warps (prefill MMA) left -->
+        <rect class="wP" x="818" y="112" width="92" height="28" rx="3"/><text class="xn" x="864" y="131" text-anchor="middle">MMA warp</text>
+        <rect class="wP" x="818" y="148" width="92" height="28" rx="3"/><text class="xn" x="864" y="167" text-anchor="middle">MMA warp</text>
+        <rect class="wP" x="818" y="184" width="92" height="28" rx="3"/><text class="xn" x="864" y="203" text-anchor="middle">MMA warp</text>
+        <text class="xs" x="864" y="230" text-anchor="middle">prefill (consumer)</text>
+        <!-- SMEM ring center -->
+        <rect class="smem" x="945" y="120" width="70" height="92" rx="5"/><text class="xn" x="980" y="160" text-anchor="middle">SMEM</text><text class="xn" x="980" y="174" text-anchor="middle">ring</text>
+        <!-- producer warps (decode KV load) right -->
+        <rect class="wD" x="1050" y="112" width="92" height="28" rx="3"/><text class="xn" x="1096" y="131" text-anchor="middle">load warp</text>
+        <rect class="wD" x="1050" y="148" width="92" height="28" rx="3"/><text class="xn" x="1096" y="167" text-anchor="middle">load warp</text>
+        <rect class="wD" x="1050" y="184" width="92" height="28" rx="3"/><text class="xn" x="1096" y="203" text-anchor="middle">load warp</text>
+        <text class="xs" x="1096" y="230" text-anchor="middle">decode KV (producer)</text>
+        <!-- arrows: producers -> SMEM -> consumers -->
+        <path class="xar" d="M1048,162 H1017"/>
+        <path class="xar" d="M943,162 H912"/>
+        <text class="xs" x="795" y="300">FA3 warp-spec / NanoFlow.</text>
+        <text class="xs" x="795" y="318">Producers (TMA) fill the ring with decode</text>
+        <text class="xs" x="795" y="336">KV while consumers run prefill MMA &mdash; true</text>
+        <text class="xs" x="795" y="354">overlap on one SM, but <tspan font-weight="700">SMEM-bound</tspan> (&sect;7a).</text>
+        <text class="xs" x="795" y="380">Sarathi chunked-prefill is the batch-level</text>
+        <text class="xs" x="795" y="398">cousin: piggybacks decode tokens into the prefill pass.</text>
+      </svg>
+      </div>
+      <p class="diagram-cap">Fig 11 &mdash; Split SMs (static spatial) &rarr; split CTAs (dynamic, whole-GPU) &rarr; split warps (true intra-SM overlap). Complexity rises left&ndash;to&ndash;right; so does overlap quality.</p>
+
+      <h4>Reading the three</h4>
+      <ul>
+        <li><strong>1 &middot; Split SMs (different kernels).</strong> Give prefill <em>k</em> SMs and decode <em>132&minus;k</em> via MPS, stream priority, or Hopper green contexts. Simplest, but the boundary is <strong>static</strong>: it can&rsquo;t track the instantaneous prefill/decode mix, and whichever side drains first leaves its SMs idle. As you noted &mdash; this is barely different from just running them in parallel.</li>
+        <li><strong>2 &middot; Split CTAs (same kernel).</strong> One persistent/fused kernel launches CTAs, each tagged prefill or decode; the hardware scheduler interleaves them across <em>all</em> SMs, so load is balanced GPU-wide with no stranded partition. This is the level <strong>POD-Attention</strong> operates at &mdash; SM-resource-aware fusion of prefill and decode attention.</li>
+        <li><strong>3 &middot; Split warps (one CTA).</strong> The tightest form: inside a single CTA, <em>producer</em> warps issue <strong>TMA</strong> loads of decode KV while <em>consumer</em> warps run the prefill MMA, sharing one SMEM ring &mdash; exactly the producer/consumer warp specialization of <strong>FlashAttention-3</strong>, and the intra-device overlap of <strong>NanoFlow</strong>. It achieves the genuine overlap proven in &sect;7b, but is the hardest to write and is the one gated by the SMEM budget of &sect;7a. <strong>Sarathi-Serve</strong>&rsquo;s chunked-prefill is the batch-level relative &mdash; it merges decode tokens into the prefill batch so one kernel pass covers both.</li>
+      </ul>
+
+      <div class="warn-box"><strong>Cross-reference.</strong> This page is the concrete &ldquo;why the fused kernel is SMEM-bound&rdquo; evidence behind <a href="DESIGN_CHOICE_CHANGE.md">DESIGN_CHOICE_CHANGE.md</a> &sect;3 Option A and &sect;4&rsquo;s roofline-overlap argument. &sect;7a says <em>when</em> the fusion fits; &sect;7b proves the overlap is worth it; &sect;8 is the menu of how to wire it.</div>
+    </div>
+  </section>
+
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+</body>
+</html>

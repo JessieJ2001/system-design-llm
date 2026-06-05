@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K13 — Speculative Decoding — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K13 &mdash; Speculative Decoding <span style="font-weight:400;font-size:.55em;color:#64748b;">(break the one-token barrier, losslessly)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable, lossless</em> decode accelerator &mdash; when generating one token costs a full HBM weight-load (arithmetic intensity &asymp; 1, the worst roofline) &mdash; by verifying many <em>drafted</em> tokens in a single target forward without changing the model&rsquo;s output distribution, and turning it <em>off</em> the moment the batch makes decode compute-bound?</strong> This page derives the rejection-sampling losslessness proof and the acceptance-rate speedup, then D11 (why it helps at batch 4 and hurts at batch 256).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; a <a href="K1_serving-fundamentals.html#decode">K1</a>/<a href="K4_continuous-batching-and-scheduling.html">K4</a> consumer (memory-BW-bound decode + continuous batching) &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K4_continuous-batching-and-scheduling.html">K4</a> / <a href="K2_kv-cache.html">K2</a> &bull; <strong>acceptance math &amp; losslessness derived here</strong> (self-contained, no external cite) &bull; dedicated scenario: <strong>L8</strong> &bull; contrast: <strong>L1</strong> &bull; ~18 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the speculation chain). Approve / redirect the arc, the <strong>rejection-sampling losslessness derivation</strong>, deep-dive placement (<strong>D11 speculation under continuous batching &mdash; co-host with K4</strong>), the <strong>rule-11 draft-mechanism spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>TPOT / ITL (primary)</strong> &mdash; a memory-bound target forward commits up to <code>E&asymp;1/(1&minus;&alpha;)</code> accepted tokens instead of 1 &rArr; fewer weight-load-bound steps per generated token.</li>
+          <li><strong>Throughput (tokens/s, small batch)</strong> &mdash; the same single weight-load yields multiple tokens while decode is memory-bound.</li>
+          <li><strong>Goodput</strong> &mdash; only while decode is memory-bound; <strong>explicitly does NOT help &mdash; and net-<em>hurts</em> &mdash; once the batch makes decode compute-bound</strong> (the D11 caveat, stated up front so the SLI claim is honest).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> A cheap draft proposes <code>K</code> tokens; the target verifies all <code>K+1</code> in one batched forward (= one decode step&rsquo;s HBM cost); rejection sampling accepts the longest correct prefix and resamples on the first mismatch &rArr; the output distribution is <em>exactly</em> the target&rsquo;s (lossless); speedup is <code>E&asymp;1/(1&minus;&alpha;)</code>; it auto-off when the batch is compute-bound.</p>
+      <ul>
+        <li><strong>Is:</strong> the rejection-sampling <em>correctness proof</em> (why it is lossless, not &ldquo;approximately&rdquo;) + the <code>E=(1&minus;&alpha;<sup>K+1</sup>)/(1&minus;&alpha;)</code> speedup derivation, both <em>self-contained</em>; D11 (speculation under continuous batching &mdash; why it helps at batch 4 and hurts at batch 256; co-host <a href="K4_continuous-batching-and-scheduling.html#d11">K4</a>); the draft-mechanism rule-11 spectrum (n-gram &rarr; Medusa &rarr; draft model &rarr; EAGLE-2).</li>
+        <li><strong>Is not:</strong> the memory-BW-bound decode roofline &amp; ridge <code>B*</code> (<a href="K1_serving-fundamentals.html#roofline">K1</a> owns it &mdash; cite, never re-derive); the continuous-batching scheduler &amp; per-step batch budget (<a href="K4_continuous-batching-and-scheduling.html">K4</a> &mdash; D11 co-host); <em>training</em> the draft / EAGLE / Medusa heads (training-side); the draft model&rsquo;s own parallelism (it is small &mdash; <a href="K6_parallelism-overview.html">K6</a> only if ever needed); <strong>non-lossless &ldquo;approximate&rdquo; speculation</strong> (it changes the output distribution &mdash; out of scope; this page is the <em>lossless</em> mechanism &mdash; named &amp; flagged in &sect;4/&sect;7).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The <strong>acceptance math and the losslessness proof are derived on this page</strong> &mdash; the curriculum is self-contained, there is <em>no external cite</em> for them. The memory-BW-bound decode step (the read the speedup amortizes) and the ridge <code>B*</code> (the memory&rarr;compute crossover) are <a href="K1_serving-fundamentals.html#decode">K1</a>&rsquo;s; continuous batching and the per-step accepted-token budget are <a href="K4_continuous-batching-and-scheduling.html#d11">K4</a>&rsquo;s (<strong>D11 is co-hosted &mdash; K4 owns the <em>scheduler / batch-budget</em> side, K13 owns the <em>speculation mechanism</em> side</strong>); rejected-draft KV rollback uses <a href="K2_kv-cache.html#spec-rollback">K2</a>&rsquo;s block table (cite, do not re-derive). <strong>This page derives draft-then-verify and the &alpha;-speedup &mdash; it never re-derives the roofline, the scheduler, or the KV mechanism.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Speculation Spine (stated up front, before &sect;1)</h2>
+      <p>This page is a consumer of <a href="K1_serving-fundamentals.html#decode">K1</a>&rsquo;s memory-bound decode and <a href="K4_continuous-batching-and-scheduling.html">K4</a>&rsquo;s batching. The chain:</p>
+      <ul>
+        <li><strong>Decode reads <em>all</em> model weights from HBM to produce <em>one</em> token</strong> &mdash; arithmetic intensity &asymp; 1, the worst roofline (<a href="K1_serving-fundamentals.html#roofline">K1</a>).</li>
+        <li>&rarr; if several <em>candidate</em> tokens could be verified in <em>one</em> weight-load, the read amortizes.</li>
+        <li>&rarr; a cheap <strong>draft</strong> proposes <code>K</code> tokens; the <strong>target</strong> verifies all <code>K+1</code> in one batched forward (same HBM cost as one decode step).</li>
+        <li><strong>New problem:</strong> naively taking the draft&rsquo;s tokens biases the output to the <em>draft&rsquo;s</em> distribution &mdash; lossy.</li>
+        <li>&rarr; <strong>rejection sampling</strong>: accept the longest correct prefix, resample on first mismatch &rArr; output distribution is <em>exactly</em> the target&rsquo;s (lossless, proved here).</li>
+        <li>Speedup is governed by acceptance <code>&alpha;</code>: <code>E&asymp;1/(1&minus;&alpha;)</code>; <code>&alpha;</code> is draft-quality- and workload-dependent &rarr; the draft-mechanism spectrum (rule&nbsp;11).</li>
+        <li><strong>At large batch decode is <em>already</em> compute-bound</strong> &rArr; the extra draft+verify FLOPs are pure overhead &rArr; speculation <em>hurts</em> (D11) &rArr; speculate iff <code>batch &lt; B_spec</code>.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>decode = one full HBM weight-load per token (worst roofline) &rarr; amortize it: verify K candidates in one forward &rarr; draft proposes, target verifies &rarr; new problem: is the output still the target&rsquo;s? &rarr; rejection-sampling correction &rArr; lossless &rarr; speedup E&asymp;1/(1&minus;&alpha;) &rarr; new problem: at large batch decode is already compute-bound &rarr; speculation hurts (D11) &rarr; &alpha; is draft-dependent &rarr; the draft-mechanism spectrum (rule&nbsp;11) &rarr; objective: lossless TPOT cut while memory-bound, auto-off when compute-bound</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 760" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="290" y="16" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Decode: read ALL model weights from HBM for ONE token</text>
+        <text class="s" x="620" y="58" text-anchor="middle">arithmetic intensity &asymp; 1 &mdash; the worst roofline (K1) &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="102"/>
+        <text class="l" x="636" y="91">amortize the load</text>
+
+        <rect class="bp" x="270" y="102" width="700" height="56" rx="8"/>
+        <text class="t" x="620" y="126" text-anchor="middle">Draft proposes K tokens &rarr; Target verifies K+1 in ONE forward</text>
+        <text class="s" x="620" y="144" text-anchor="middle">same HBM cost as one decode step &middot; §2</text>
+
+        <line x1="620" y1="158" x2="620" y2="188"/>
+        <text class="l" x="636" y="177">new problem</text>
+
+        <rect class="bd" x="290" y="188" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="212" text-anchor="middle">Naively taking the drafts biases output to the DRAFT&rsquo;s distribution</text>
+        <text class="s" x="620" y="230" text-anchor="middle">that is lossy &mdash; not the target&rsquo;s model</text>
+
+        <line x1="620" y1="244" x2="620" y2="274"/>
+        <text class="l" x="636" y="263">fix</text>
+
+        <rect class="bp" x="250" y="274" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="298" text-anchor="middle">Rejection sampling: accept longest correct prefix, resample on mismatch</text>
+        <text class="s" x="620" y="316" text-anchor="middle">output distribution = EXACTLY the target&rsquo;s &mdash; LOSSLESS (proved §2)</text>
+
+        <line x1="620" y1="330" x2="620" y2="360"/>
+        <text class="l" x="636" y="349">speedup</text>
+
+        <rect class="bp" x="290" y="360" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="384" text-anchor="middle">Speedup governed by acceptance &alpha;: E = (1&minus;&alpha;<tspan dy="-4" font-size="8">K+1</tspan><tspan dy="4">)/(1&minus;&alpha;) &asymp; 1/(1&minus;&alpha;)</tspan></text>
+        <text class="s" x="620" y="402" text-anchor="middle">wall-clock &asymp; E, capped by draft cost + verify-batch overhead &middot; §3</text>
+
+        <line x1="620" y1="416" x2="620" y2="446"/>
+        <text class="l" x="636" y="435">new problem (D11)</text>
+
+        <rect class="bs" x="250" y="446" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="470" text-anchor="middle">D11 &mdash; at large batch decode is ALREADY compute-bound</text>
+        <text class="s" x="620" y="488" text-anchor="middle">extra draft+verify FLOPs = pure overhead &rarr; speculation HURTS &middot; §3</text>
+
+        <line x1="620" y1="502" x2="620" y2="532"/>
+        <text class="l" x="636" y="521">and &alpha; varies</text>
+
+        <rect class="bs" x="250" y="532" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="556" text-anchor="middle">Rule 11 &mdash; the draft-mechanism spectrum</text>
+        <text class="s" x="620" y="574" text-anchor="middle">n-gram &rarr; Medusa &rarr; separate draft model &rarr; EAGLE-2 (each: &alpha;, cost) &middot; §3</text>
+
+        <line x1="620" y1="588" x2="620" y2="618"/>
+
+        <rect class="bc" x="290" y="618" width="660" height="64" rx="8"/>
+        <text class="t" x="620" y="642" text-anchor="middle">Objective: lossless TPOT cut while memory-bound</text>
+        <text class="s" x="620" y="660" text-anchor="middle">speculate iff batch &lt; B_spec (the K1 ridge); auto-off when compute-bound &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; decode reads <em>all</em> weights from HBM for one token; arithmetic intensity &asymp; 1, the worst roofline (K1).</li>
+        <li><span class="b">&#9313;</span> <strong>Draft&rarr;verify</strong> &mdash; a cheap draft proposes K tokens; the target verifies K+1 in one forward (= one decode step&rsquo;s HBM cost).</li>
+        <li><span class="b">&#9314;</span> <strong>New problem</strong> &mdash; naively taking the drafts biases output to the draft&rsquo;s distribution (lossy).</li>
+        <li><span class="b">&#9315;</span> <strong>Rejection sampling</strong> &mdash; accept the longest correct prefix, resample on mismatch &rArr; output is <em>exactly</em> the target&rsquo;s (lossless &mdash; proved here).</li>
+        <li><span class="b">&#9316;</span> <strong>Speedup</strong> &mdash; governed by acceptance &alpha;: <code>E=(1&minus;&alpha;<sup>K+1</sup>)/(1&minus;&alpha;)&asymp;1/(1&minus;&alpha;)</code>, capped by draft cost + verify overhead.</li>
+        <li><span class="b">&#9317;</span> <strong>D11 &mdash; the compute-bound cliff</strong> &mdash; at large batch decode is already compute-bound &rarr; extra draft+verify FLOPs are pure overhead &rarr; speculation hurts (co-host K4).</li>
+        <li><span class="b">&#9318;</span> <strong>Rule 11 &mdash; the draft-mechanism spectrum</strong> &mdash; &alpha; is draft-dependent: n-gram &rarr; Medusa &rarr; separate draft model &rarr; EAGLE-2, each with its &alpha;/cost/cliff.</li>
+        <li><span class="b">&#9319;</span> <strong>Objective</strong> &mdash; lossless TPOT cut while memory-bound; speculate iff <code>batch &lt; B_spec</code>; auto-off when compute-bound.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> autoregressive decode emits exactly <em>one</em> token per forward, and each forward must read the <em>entire</em> weight set from HBM (arithmetic intensity &asymp; 1) &mdash; so single-stream / small-batch decode is gated by HBM bandwidth, not FLOPs, and TPOT is bounded below by <code>weights_bytes / HBM_BW</code> no matter how much spare compute the GPU has (cite K1 #decode/#roofline &mdash; do not re-derive). <b>Solution (what the page builds):</b> commit <em>several</em> tokens per weight-load by drafting candidates cheaply and verifying them in a single target forward &mdash; <em>losslessly</em>, so the model&rsquo;s output is unchanged.<span class="meta">number: TPOT floor = weights_bytes/HBM_BW on the trace (no-speculation baseline) &mdash; cites K1 #decode (memory-bound step), #roofline (arithmetic intensity &asymp; 1) &middot; canonical: llm-bottlenecks.html (memory-bandwidth-bound decode)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where speculation lives &mdash; the decode loop (wraps the forward, not a layer)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader expects a &ldquo;layer&rdquo; like KV-cache (attention) &mdash; speculation has none. <b>Solution:</b> it is a <em>decode-loop</em> technique &mdash; it does not change any layer; it changes <em>how many tokens are committed per target forward</em>. Prefill is untouched (prefill already processes all prompt tokens in parallel &rarr; compute-bound, not memory-bound &mdash; nothing to amortize there); the invariant it must preserve is the <em>target&rsquo;s sampling distribution</em>. State this placement before any math.<span class="meta">no number (placement fact) &mdash; cites K1 #decode (why decode, not prefill, is the memory-bound loop) &middot; diagram: the autoregressive loop with a draft block + a single batched verify forward wrapping it</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; draft, verify, accept</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 <code>&quot;I like cat, why?&quot;</code> (6 tokens), prefill done. <b>Without speculation:</b> one target forward &rarr; one token (<code>&quot;Cats&quot;</code>); repeat &mdash; one full weight-load per token. <b>With speculation:</b> the draft autoregressively proposes <code>K=4</code> cheap tokens <code>[&quot;Cats&quot;,&quot;are&quot;,&quot;very&quot;,&quot;independent&quot;]</code>; the target runs <em>one</em> forward over <code>prompt + 4 drafts</code> (K+1 positions, one weight-load = one decode step&rsquo;s HBM cost), producing its own next-token distribution at each position; verify left-to-right by rejection sampling &mdash; e.g. accept <code>&quot;Cats are very&quot;</code>, reject <code>&quot;independent&quot;</code>, resample <code>&quot;creatures&quot;</code> from the corrected distribution and stop &rArr; <strong>4 tokens committed in one weight-load instead of 1</strong>. Show with-vs-without explicitly on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 D11 / rule-11 compare batches &amp; drafts &middot; diagram: the K=4 draft chain + the single K+1-wide verify forward, accept/reject/resample annotated on this exact trace</span></p>
+
+      <h3 id="derive">The acceptance math + the losslessness proof (derived &mdash; the page&rsquo;s home, self-contained)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> if you just keep the draft&rsquo;s tokens, the output follows the draft&rsquo;s distribution <code>q</code>, not the target&rsquo;s <code>p</code> &mdash; that is approximate, not lossless. <b>Solution, derived:</b> (a) <strong>rejection-sampling correction</strong> &mdash; for draft token <code>t<sub>i</sub></code> with draft prob <code>q(t<sub>i</sub>)</code> and target prob <code>p(t<sub>i</sub>)</code>, accept with prob <code>min(1, p/q)</code>; on reject, sample from the normalised residual <code>(p&minus;q)<sub>+</sub></code> and stop; (b) <strong>proof the committed distribution is exactly <code>p</code></strong> &mdash; the accept/residual split telescopes to <code>p</code> at every position (this <em>is</em> why it is lossless, not &ldquo;approximately&rdquo;); (c) expected accepted tokens/step <code>E=(1&minus;&alpha;<sup>K+1</sup>)/(1&minus;&alpha;) &asymp; 1/(1&minus;&alpha;)</code> for large K, where <code>&alpha;</code> = expected per-token acceptance rate; (d) wall-clock speedup <code>&asymp; E</code>, capped by draft cost <code>c<sub>draft</sub>&middot;K</code> + the K+1-wide verify-batch overhead &mdash; derive both directions. <em>No external cite (curriculum self-contained).</em><span class="meta">number: E and the speedup at &alpha;=0.7, K=4 on the trace; the draft-cost-vs-win break-even &mdash; self-derived, cites nothing external &middot; diagram: the per-position accept (min(1,p/q)) vs residual-resample (p&minus;q)<sub>+</sub> split, shown as two stacked probability bars</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where speculation sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> Draft and target are co-resident on the same GPU(s); the draft is one of {a small standalone model with its own HBM, extra heads on the target (Medusa), feature-level AR (EAGLE), or a zero-model n-gram table}. The verify forward is a single batched pass over K+1 positions that reuses the K2 KV cache: accepted tokens&rsquo; KV is kept, <strong>rejected drafts&rsquo; KV must be rolled back</strong> (cite K2 #spec-rollback / #d4 &mdash; correctness note, not a re-derivation).<span class="meta">no new number &mdash; cites K2 #spec-rollback (rejected-draft KV rollback), K2 #d4 (block table append/rollback) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; draft + target on one GPU</strong>draft block (small) feeding a K+1-wide target verify forward; KV cache with accepted-vs-rolled-back blocks marked. Drawn after arc approval.</div>
+
+      <h3 id="d11" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D11 &mdash; speculation under continuous batching (why batch 4 helps, batch 256 hurts; co-host <a href="K4_continuous-batching-and-scheduling.html#d11">K4</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> the speedup <em>is</em> amortising the weight-load over K draft tokens &mdash; that headroom only exists while decode is <strong>memory-bound</strong> (small batch). At large batch the weight-load is already amortised over <code>B</code> sequences &rArr; decode is <strong>compute-bound</strong> &rArr; the extra draft+verify FLOPs are pure overhead &rArr; speculation <em>slows it down</em>. <b>Solution:</b> batch-adaptive speculation (shrink <code>K</code> / disable past a batch threshold), tree-verification batching (verify multiple draft branches in one forward), online <code>&alpha;</code> monitoring (drop the draft if <code>&alpha;</code> decays under distribution shift). <b>Crossover:</b> speculate iff <code>batch &lt; B_spec</code>, where <code>B_spec</code> = the batch at which the <em>speculative</em> path crosses memory&rarr;compute-bound (cite K1 ridge <code>B*</code>). <b>Rule of two:</b> K4 owns the scheduler / per-step accepted-token <em>batch budget</em>; K13 owns the speculation <em>mechanism</em> and this crossover.<span class="meta">number: B=4 (memory-bound, &alpha;=0.7 &rarr; &asymp;3.3&times; speedup) vs B=256 (compute-bound, &asymp; &minus;15%) on the trace &mdash; cites K1 #roofline (ridge B*), K4 #d11 (batch-budget side) &middot; real: vLLM spec-decode, TensorRT-LLM, EAGLE-2 + URLs</span></p>
+      <div class="svgph"><strong>TABLE PLANNED (required artifact) &mdash; &ldquo;Apply speculative decoding?&rdquo; the two regimes, side by side</strong>The reader must see <em>both</em> anchors together so the decision is explicit, not implied. Two rows + the boundary between them. Columns: <em>batch regime &middot; roofline state &middot; effect on TPOT &middot; verdict &middot; scheduler action</em>.<br>&bull; <b>Small / memory-bound batch</b> &mdash; B=4, &alpha;=0.7, K=4 &rArr; E&asymp;3.3 &rArr; &asymp;<b>3.3&times; faster</b> &rArr; <b>APPLY</b> (run the draft).<br>&bull; <b>Boundary</b> &mdash; B = <code>B_spec</code>: the batch where the <em>speculative</em> path crosses the K1 memory&rarr;compute ridge; net speedup = 1&times; (break-even). This is the single number the scheduler switches on.<br>&bull; <b>Large / compute-bound batch</b> &mdash; B=256 &rArr; weight-load already amortised over B sequences &rArr; draft+verify FLOPs are pure overhead &rArr; &asymp;<b>15% slower</b> &rArr; <b>DO NOT APPLY</b> (auto-disable the draft). Drawn after arc approval.</div>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the draft-mechanism spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub (a cost&ndash;benefit decision, not a name-list).</span> n-gram / lookahead (zero model, prompt-derived drafts, &asymp;free, &alpha;&asymp;0.3; cliff: poor on novel text) &rarr; Medusa (extra heads on the target, no separate model, &alpha;&asymp;0.6, small train cost; cliff: heads add params, joint-distribution approx) &rarr; separate small draft model (&alpha;&asymp;0.7, but a whole model to serve &mdash; its own HBM + GPU + version-tracking; cliff: draft cost can exceed the win) &rarr; EAGLE / EAGLE-2 (feature-level autoregression, &alpha;&asymp;0.8, SoTA; cliff: training + tree-verify complexity). Each: &alpha;, GPU cost, named system, and the <strong>adopt-iff crossover</strong> <code>c<sub>draft</sub> + (1&minus;&alpha;)&middot;wasted_verify &lt; (E&minus;1)&middot;decode_step_saved</code>.<span class="meta">number: per-mechanism &alpha; and the adopt-iff break-even on the trace &mdash; cites K1 #decode (decode_step_saved) &middot; real: lookahead/Jacobi, Medusa, draft-model (vLLM), EAGLE-2 + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>K (draft length):</b> too small &rarr; little amortisation; too large &rarr; the <code>&alpha;<sup>K</sup></code> tail is rejected so verify FLOPs on the rejected suffix are wasted &mdash; pick K where marginal <code>E</code>-gain = marginal verify-cost. <b>Draft mechanism:</b> the rule-11 spectrum above. <b>Batch threshold B_spec:</b> the D11 crossover. <b>Tree vs linear verification:</b> tree raises <code>E</code> per forward at the cost of a wider verify batch. Each with its chosen value, reason, and the cliff on each side.<span class="meta">numbers: the per-knob crossover (composes with D11 / rule-11) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Just raise the batch</b> (the natural throughput lever) &mdash; disq: caps at the memory&rarr;compute ridge <code>B*</code> and you cannot always get the concurrency (low-traffic / latency-bound single stream); <em>wins</em> at high concurrency where the batch already saturates compute &mdash; and there speculation is correctly <em>off</em> by D11 (the <strong>L1 contrast</strong>). (b) <b>Smaller / distilled target model</b> &mdash; disq: changes the output distribution (lossy); <em>wins</em> when the quality budget tolerates it; <em>composes</em> with, does not replace, lossless speculation. (c) <b>Quantization (K14)</b> &mdash; disq: lossy, needs an accuracy gate; orthogonal &mdash; cuts the per-step <em>byte</em> bill where speculation cuts the <em>step count</em>; <em>wins</em> as a complement, not a substitute. (d) <b>Non-lossless &ldquo;approximate&rdquo; speculation</b> (accept-on-threshold) &mdash; disq: changes the output distribution; <em>out of scope</em> &mdash; this page is the lossless mechanism; flag the boundary, do not cover.<span class="meta">number: the crossover disqualifying each (B* for (a); quality delta for (b); orthogonal-axis for (c)) &mdash; cites K1 #roofline, K14 (quant, not yet authored) &middot; contrast L1 (huge batch &rArr; speculation off)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>&alpha; collapse under distribution shift</b> &mdash; OOD traffic (code vs prose) &rarr; <code>&alpha;&rarr;low</code>, <code>E&rarr;1</code>, draft+verify FLOPs wasted &rarr; net slowdown; first move: online <code>&alpha;</code> monitor &rarr; disable the draft (llm-bottlenecks.html). <b>Speculation left on at large batch</b> &mdash; the D11 cliff: throughput regression while the GPU &ldquo;looks busy&rdquo; (llm-bottlenecks.html: compute-bound decode + speculation overhead). <b>Rejected-draft KV not rolled back</b> &mdash; silent wrong-context corruption of every subsequent token (cite K2 #spec-rollback / #d4; gpu-failure-modes.html &mdash; correctness, not a crash). <b>Draft/target version skew</b> &mdash; <code>&alpha;</code> silently degrades; if the draft feeds any cache key it goes stale (gpu-failure-modes.html &mdash; version-mismatch).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (&alpha;-collapse, compute-bound-with-speculation), llm/canonicals/gpu-failure-modes.html (KV-rollback corruption, draft version skew), K2 #spec-rollback &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> vLLM speculative decoding (n-gram + draft-model + EAGLE paths), TensorRT-LLM (Medusa / EAGLE / draft-model), EAGLE &amp; EAGLE-2 (feature-level AR &mdash; SoTA &alpha;), Medusa (multi-head), Lookahead Decoding (Jacobi, draft-free), SpecInfer (tree-based speculative verification). Each: which point on the rule-11 spectrum it implements + the D11 batch-adaptive behaviour + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L8-reasoning-model-serving.html">L8</a> (dedicated home &mdash; long deterministic reasoning chains &rarr; high <code>&alpha;</code> &rarr; speculation&rsquo;s biggest win; D11 batch-adaptive is load-bearing there). <b>Contrast:</b> <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> (at its huge batch speculation is <em>off</em> by the D11 crossover). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html#decode">K1</a> &mdash; the memory-BW-bound decode step the speedup amortises; <a href="K1_serving-fundamentals.html#roofline">#roofline</a> = the ridge <code>B*</code> = D11&rsquo;s crossover.</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html#d11">K4</a> &mdash; D11 co-host: continuous batching; accepted-token count varies per step &rarr; the batch budget must adapt. <strong>K4 owns the scheduler/batch-budget side; K13 owns the speculation mechanism &amp; the B_spec crossover.</strong></li>
+        <li><a href="K2_kv-cache.html#spec-rollback">K2</a> &mdash; accepted tokens write KV; rejected-draft KV must be rolled back via the block table (#d4) &mdash; a correctness note, not a re-derivation.</li>
+        <li><strong>Out of scope (named, not covered):</strong> <em>training</em> the draft / EAGLE / Medusa heads (training-side &mdash; serving inherits them); the draft model&rsquo;s own parallelism (it is small &mdash; <a href="K6_parallelism-overview.html">K6</a> only if ever needed); <strong>non-lossless &ldquo;approximate&rdquo; speculation</strong> (it changes the output distribution &mdash; out of scope; this page is the <em>lossless</em> mechanism &mdash; named &amp; flagged).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

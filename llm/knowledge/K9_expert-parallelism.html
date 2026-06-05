@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K9 — Expert Parallelism (MoE) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K9 &mdash; Expert Parallelism <span style="font-weight:400;font-size:.55em;color:#64748b;">(MoE &mdash; the dominant 2025&ndash;26 architecture)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable</em> MoE deployment &mdash; huge total params, tiny active params &mdash; spreading experts across GPUs without the two all-to-alls per layer stalling every decode token or a hot expert straggling the barrier?</strong> This page derives why MoE flips the memory-vs-compute balance, then bounds the all-to-all tax (D30) and the hot-expert skew (D15).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; a K6 child (opens by citing K6&rsquo;s grid + spine) &bull; cites <a href="K6_parallelism-overview.html">K6</a> / <a href="K1_serving-fundamentals.html">K1</a> / <a href="interconnect-and-collectives.html">K20</a> / <a href="K7_tensor-parallelism.html">K7</a> / <a href="K10_data-parallelism.html">K10</a> / <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="fault-tolerance-multi-gpu-inference.html">K22</a> &bull; dedicated scenario: <strong>L1</strong> &bull; ~22 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the EP chain). Approve / redirect the arc, the Problem&rarr;Solution decomposition, deep-dive placement (<strong>D30 the all-to-all tax</strong>, <strong>D15 hot-expert skew</strong>), and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Feasibility (total params fit)</strong> &mdash; spreading experts across GPUs makes a model whose <em>total</em> weight memory dwarfs any few GPUs resident.</li>
+          <li><strong>TPOT</strong> &mdash; the 2 all-to-alls/layer are a barrier on every decode token; D30 hides them under shared-expert/attention compute.</li>
+          <li><strong>Goodput (tail)</strong> &mdash; D15 rebalances hot-expert skew so the straggler rank doesn&rsquo;t gate the MoE-layer barrier.</li>
+          <li><strong>MFU/MBU</strong> &mdash; keeping EP inside the NVLink domain stops the all-to-all from collapsing achieved utilisation.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Derive why MoE is memory-bound differently (big total weights, tiny active FLOPs); show the 2 all-to-alls/layer are a per-token barrier; bound the comm tax (D30) and the hot-expert skew (D15); cap EP at the NVLink domain.</p>
+      <ul>
+        <li><strong>Is:</strong> the memory-vs-compute flip derivation; expert sharding/placement; the 2-all-to-alls-per-layer barrier; D30 (the all-to-all communication tax &mdash; volume, why it stalls, how it&rsquo;s hidden); D15 (hot-expert skew &amp; rebalancing); the EP-degree rule-11 sweep.</li>
+        <li><strong>Is not:</strong> the cross-axis tuple (<a href="K6_parallelism-overview.html">K6</a>); the generic all-to-all <em>cost primitive</em> and the rail topology / all-to-all-over-IB cliff (<a href="K1_serving-fundamentals.html#collectives">K1</a> / <a href="interconnect-and-collectives.html">K20</a>/D28); MoE <em>training</em> (the gating network&rsquo;s training, aux load-balance loss &mdash; training-side; serving inherits the trained routing). All named &amp; linked in &sect;7.</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The generic all-to-all cost <em>primitive</em> is <a href="K1_serving-fundamentals.html#collectives">K1</a>&rsquo;s; the rail-optimised topology and the all-to-all-over-IB cliff are <a href="interconnect-and-collectives.html">K20</a>&rsquo;s (D28); the cross-axis selection is <a href="K6_parallelism-overview.html">K6</a>&rsquo;s. <strong>This page derives the EP-specific all-to-all <em>volume / overlap / ceiling</em> (D30) and the load-imbalance angle (D15) &mdash; it quotes the generic cost and the topology, never re-derives them.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The EP Spine (stated up front, before &sect;1)</h2>
+      <p>This page is a child of <a href="K6_parallelism-overview.html">K6</a> and resolves the <em>MoE: big total / small active</em> binding of K6&rsquo;s grid. The chain:</p>
+      <ul>
+        <li><strong>MoE has huge total weight memory but tiny per-token FLOPs</strong> (only top-k experts fire) &rarr; weights can&rsquo;t sit on a few GPUs but compute is cheap.</li>
+        <li>&rarr; spread experts across GPUs = <strong>EP</strong>.</li>
+        <li><strong>New problem:</strong> routing each token to its experts needs <strong>two all-to-alls per layer</strong> (dispatch + combine).</li>
+        <li><strong>Those all-to-alls are a barrier on every decode token</strong> &rArr; they must stay inside the NVLink domain.</li>
+        <li><strong>Skewed token&rarr;expert routing</strong> overloads the GPU holding a hot expert &rArr; its straggler gates the barrier &rarr; rebalance (capacity factor / EPLB, D15).</li>
+        <li>&rArr; <strong>EP degree is bounded by the NVLink domain, not FLOPs</strong> (the master constraint, <a href="interconnect-and-collectives.html">K20</a>).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>MoE = big total weights, tiny active FLOPs &rarr; spread experts (EP) &rarr; new problem: 2 all-to-alls/layer &rarr; a barrier on every decode token (D30) &rarr; so it must stay inside the NVLink domain &rarr; skewed routing straggles a hot-expert GPU (D15) &rarr; rebalance + overlap &rarr; objective: largest EP whose all-to-all stays intra-domain</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 820" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="310" y="16" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">MoE &mdash; huge total params, tiny active params</text>
+        <text class="s" x="620" y="58" text-anchor="middle">the binding K6 routes here &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="102"/>
+        <text class="l" x="636" y="91">spread experts</text>
+
+        <rect class="bp" x="310" y="102" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="126" text-anchor="middle">EP &mdash; experts sharded across GPUs</text>
+        <text class="s" x="620" y="144" text-anchor="middle">weight memory down; compute already tiny &middot; §2&ndash;3</text>
+
+        <line x1="620" y1="158" x2="620" y2="188"/>
+        <text class="l" x="636" y="177">new problem</text>
+
+        <rect class="bd" x="310" y="188" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="212" text-anchor="middle">2 all-to-alls per layer (dispatch + combine)</text>
+        <text class="s" x="620" y="230" text-anchor="middle">a synchronisation barrier twice per layer</text>
+
+        <line x1="620" y1="244" x2="620" y2="274"/>
+        <text class="l" x="636" y="263">why it bites</text>
+
+        <rect class="bs" x="250" y="274" width="740" height="68" rx="8"/>
+        <text class="t" x="620" y="298" text-anchor="middle">D30 &mdash; the all-to-all tax: on the critical path of</text>
+        <text class="s" x="620" y="316" text-anchor="middle">EVERY decode token &mdash; latency/straggler-bound, not BW-bound</text>
+        <text class="s" x="620" y="332" text-anchor="middle">hidden iff a2a_time &le; overlappable shared-expert/attn compute</text>
+
+        <line x1="620" y1="342" x2="620" y2="372"/>
+        <text class="l" x="636" y="361">skew</text>
+
+        <rect class="bs" x="250" y="372" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="396" text-anchor="middle">D15 &mdash; hot-expert skew: a popular expert straggles its rank</text>
+        <text class="s" x="620" y="414" text-anchor="middle">fix: capacity factor C + EPLB / redundant experts</text>
+
+        <line x1="620" y1="428" x2="620" y2="458"/>
+
+        <rect class="bd" x="40" y="458" width="1160" height="56" rx="8"/>
+        <text class="t" x="620" y="482" text-anchor="middle">MASTER CONSTRAINT &mdash; keep the all-to-all inside the NVLink domain (K20)</text>
+        <text class="s" x="620" y="500" text-anchor="middle">EP &le; N_dom unless weight memory forces it wider &mdash; not FLOPs</text>
+
+        <line x1="620" y1="514" x2="620" y2="544"/>
+
+        <rect class="bc" x="310" y="544" width="620" height="64" rx="8"/>
+        <text class="t" x="620" y="568" text-anchor="middle">Objective: largest EP whose all-to-all stays intra-domain</text>
+        <text class="s" x="620" y="586" text-anchor="middle">EP composed with TP (within-expert) &amp; DP (replica) &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; MoE: huge total params, tiny active params (K6 routes here).</li>
+        <li><span class="b">&#9313;</span> <strong>EP = spread experts</strong> &mdash; experts sharded across GPUs; weight memory down, compute already tiny.</li>
+        <li><span class="b">&#9314;</span> <strong>New problem: 2 all-to-alls/layer</strong> &mdash; dispatch + combine, a barrier twice per layer.</li>
+        <li><span class="b">&#9315;</span> <strong>D30 &mdash; the all-to-all tax</strong> &mdash; on every decode token&rsquo;s critical path; latency/straggler-bound; hidden iff it fits under shared-expert/attention compute.</li>
+        <li><span class="b">&#9316;</span> <strong>D15 &mdash; hot-expert skew</strong> &mdash; a popular expert straggles its rank; fix with capacity factor + EPLB/redundant experts.</li>
+        <li><span class="b">&#9317;</span> <strong>Master constraint</strong> &mdash; keep the all-to-all inside the NVLink domain (K20); EP &le; N_dom unless weight memory forces it wider.</li>
+        <li><span class="b">&#9318;</span> <strong>Objective</strong> &mdash; the largest EP whose all-to-all stays intra-domain; composed with TP (within-expert) and DP (replica).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> an MoE&rsquo;s <em>total</em> expert weights (all experts must be resident) far exceed a few GPUs&rsquo; HBM, even though only top-k experts fire per token (tiny active FLOPs) &mdash; K6&rsquo;s <em>MoE</em> binding lands here. <b>Solution (what the page builds):</b> shard experts across GPUs so total weight memory is spread &mdash; at the cost of two data-dependent all-to-alls per layer, which the rest of the page bounds.<span class="meta">number: total vs active params for a frontier MoE on the trace (e.g. DeepSeek-V3); resident weight bytes / GPU at EP=1 vs EP=N &mdash; cites K1 §3.2 (#memory) &middot; canonical: gpu-inference-cost-shapes.html</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where EP lives &mdash; the MoE-layer FFN, replacing the dense MLP</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> only the FFN sub-layer is replaced by experts; attention is unchanged. <b>Solution:</b> in an MoE block the dense MLP becomes a gate + N experts; EP places those experts on different GPUs, attention/shared-expert stay local (cite K0 for the block structure). It is a deployment cut, not a model change &mdash; serving inherits the trained gate.<span class="meta">no number (placement fact) &mdash; cites K0 (the MoE block) &middot; diagram: a dense block vs an MoE block, experts coloured by GPU</span></p>
+
+      <h3 id="walkthrough">The walkthrough on <code>&quot;I like cat, why?&quot;</code> &mdash; what EP does to these 6 tokens</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 = <code>&quot;I like cat, why?&quot;</code> (6 tokens). At each MoE layer the gate picks top-k experts <em>per token</em> &rarr; the 6 tokens scatter to experts on possibly-different GPUs (<b>dispatch all-to-all</b>) &rarr; experts run the FFN &rarr; results return to the originating token slot (<b>combine all-to-all</b>) for the gate-weighted sum. <b>Prefill:</b> all 6 tokens dispatched in one exchange. <b>Decode:</b> the 1 new token alone &mdash; tiny payload, fixed-latency barrier (this is why decode all-to-all is straggler-bound, sets up D30). Show with-vs-without on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 D30/D15 compare EP degrees &middot; diagram: the 6-token dispatch&rarr;FFN&rarr;combine across 4 expert-GPUs</span></p>
+
+      <h3 id="derive">Why MoE flips the memory-vs-compute balance (derived, the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> reasoning about MoE cost as if it were a dense model mis-prioritises. <b>Solution, derived:</b> (a) dense: active params = total params; (b) MoE: active &asymp; <code>(top_k / n_experts)&middot;total</code>; (c) &rArr; weight <em>memory</em> is dominated by <em>total</em> params (all experts resident) while per-token <em>FLOPs</em> are set by <em>active</em> params (tiny); (d) consequence: decode is <em>still</em> memory-BW-bound (read the selected experts&rsquo; weights per token) but <em>which</em> experts is data-dependent &rArr; the cost that matters is the <strong>data-dependent all-to-all (D30) + the total-param memory footprint</strong>, not a GEMM. This is why EP&rsquo;s design centers on a collective.<span class="meta">numbers: total/active param split + per-GPU resident bytes on the trace &mdash; cites K1 #memory #decode, K0 (block structure)</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where EP sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> Experts are sharded across GPUs in (ideally) one NVLink/NVSwitch domain; dispatch+combine ride that fabric every token. EP composes <em>with</em> TP (within an expert) and DP (across replicas) per K6&rsquo;s grid; the rail topology and the all-to-all-over-IB cliff are K20/D28 (cite, don&rsquo;t re-derive).<span class="meta">no new number &mdash; cites K6 (composition), K20/D28 (rail topology, the IB cliff), K7/K10</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; experts on the fabric</strong>N experts across an NVLink domain; dispatch + combine all-to-all drawn; the IB boundary marked. Drawn after arc approval.</div>
+
+      <h3 id="d30" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D30 &mdash; the all-to-all communication tax (dispatch + combine)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the EP-defining cost).</span> <b>Problem:</b> routing is data-dependent &rArr; a full rank&rarr;rank exchange with a different payload per pair, on the critical path of <em>every</em> token of every decode step. <b>Solution / mechanism:</b> gate picks top-k &rarr; <em>dispatch</em> a2a ships hidden vectors to expert GPUs &rarr; FFN &rarr; <em>combine</em> a2a ships results back. <b>Volume (derived here):</b> per token per MoE layer dispatch moves <code>top_k&times;d_model&times;dtype_bytes</code>, combine the same &asymp; <code>2&times;top_k&times;d_model&times;dtype</code>; worked on a frontier MoE (DeepSeek-V3: <code>d_model=7168, top_k=8</code>, FP8 &rArr; &asymp;57&nbsp;KB/token/layer; &times;~58 layers&times;2 &asymp; <strong>6.6&nbsp;MB cross-GPU/token</strong>) &mdash; tiny vs ~37&nbsp;GB active weights/token &rArr; <strong>at decode the a2a is fixed-latency- and straggler-bound, a barrier, not a pipe</strong>. <b>Knob (formula):</b> hidden iff <code>all_to_all_time(EP,payload) &le; overlappable_compute(shared-expert + next-microbatch attention)</code> &mdash; both directions + the EP where it flips. <b>Ceiling:</b> largest EP keeping the a2a inside one NVLink/NVSwitch (or NVL72) domain.<span class="meta">numbers: the 6.6&nbsp;MB/token derivation + the overlap-condition EP on the trace &mdash; cites K1 #collectives (generic a2a cost), K20/D28 (topology/IB cliff) &middot; real: DeepEP + DeepSeek-V3 report, Microsoft Tutel, Megatron-Core MoE, GShard/GSPMD, GB200 NVL72 + URLs</span></p>
+
+      <h3 id="d15" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D15 &mdash; hot-expert skew &amp; rebalancing</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (D30 owns the primitive; this owns <em>which expert is hot</em>).</span> <b>Problem:</b> token&rarr;expert routing is data-dependent and skewed (some experts &ldquo;popular&rdquo;) &rarr; the GPU holding a hot expert does more FFN work + larger a2a payloads &rarr; it straggles &rarr; the a2a barrier waits on the slowest rank &rarr; the whole MoE layer stalls. <b>Solution:</b> capacity factor <code>C</code> (cap tokens/expert; drop/reroute overflow &mdash; also bounds the statically-sized a2a buffer), <strong>EPLB</strong> (replicate hot experts onto redundant GPUs / permute placement), online rebalancing. <b>Crossover:</b> <code>C</code> too low &rarr; dropped-token quality loss; too high &rarr; re-admits the straggler &rarr; pick the <code>C</code> where dropped-token quality loss = straggler-latency cost.<span class="meta">number: straggler delay vs dropped-token rate at C on the trace &mdash; cites K1 (a2a/FFN cost), llm-bottlenecks.html#hot-expert &middot; real: DeepSeek-V3 EPLB + redundant experts, GShard capacity factor, Tutel adaptive a2a + URLs</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; EP-degree selection</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> 1 &rarr; small &rarr; up to <code>N_dom</code> &rarr; across-IB: more EP = less weight memory/GPU (good) but more off-rank tokens &rarr; larger a2a volume + more likely to cross the NVLink domain (the D30/D28 cliff). Two-sided: too low &rarr; weights don&rsquo;t fit; at the <code>N_dom</code> boundary = the ceiling; past it &rarr; all-to-all-over-IB collapse. <b>Pick</b> the largest EP whose a2a stays inside one NVLink/NVSwitch (or NVL72) domain, unless weight memory forces it wider.<span class="meta">number: weight-mem/GPU vs a2a-volume curve across EP on the trace, with the N_dom knee &mdash; cites K1, K20/D28</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> EP degree (rule-11), capacity factor <code>C</code> (D15), redundant-expert count / EPLB policy (D15), and whether dispatch/combine overlap is enabled (D30) &mdash; each with its chosen value, reason, and the cliff on each side; the master cliff is the NVLink-domain boundary.<span class="meta">numbers: the crossover per knob (composes with D30 / D15) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Pure TP on the MoE FFN</b> &mdash; disq: replicates the gating + still reads all selected experts; doesn&rsquo;t spread total weight memory; <em>wins</em> only for a tiny expert count. (b) <b>EP across IB</b> &mdash; disq: the a2a lands on IB &rarr; the all-to-all-over-IB cliff (D30/D28) &rarr; decode barrier explodes; <em>never</em> wins unless weight memory leaves no choice. (c) <b>Dense model instead of MoE</b> &mdash; disq: matches MoE quality only at far higher active FLOPs/$; <em>wins</em> when serving infra can&rsquo;t afford the a2a complexity. Each: when it actually wins.<span class="meta">number: the constraint disqualifying each (expert count for (a); IB a2a time for (b)) &mdash; cites K7, K20/D28 &middot; contrast L1 (frontier MoE &mdash; D30/D15 load-bearing)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>An expert shard is the fault domain</b> &mdash; lose it and its tokens fail / must reroute (cite K22, gpu-failure-modes.html); hot-expert skew &rarr; straggler stalls the a2a barrier (llm-bottlenecks.html#hot-expert); EP crossing <code>N_dom</code> &rarr; interconnect saturation (the all-to-all over IB &mdash; llm-bottlenecks.html); capacity factor too low &rarr; mass token-drop (silent quality regression).<span class="meta">cites llm/canonicals/gpu-failure-modes.html (expert-shard blast radius), llm/canonicals/llm-bottlenecks.html (hot-expert, interconnect saturation), K22 &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> DeepEP + DeepSeek-V3 (DualPipe / dual-batch overlap, EPLB + redundant experts &mdash; D30/D15 evidence), Microsoft Tutel (adaptive all-to-all), Megatron-Core MoE, GShard/GSPMD (capacity-factor token-drop sizing the collective), GB200 NVL72 (enlarged domain softens the cliff). Each: which EP decision it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> (dedicated frontier-MoE scenario &mdash; D30 all-to-all tax + D15 skew load-bearing). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; the selector; this page opens by citing K6&rsquo;s grid + spine and never re-derives the cross-axis tuple.</li>
+        <li><a href="K1_serving-fundamentals.html#collectives">K1</a> &mdash; the generic all-to-all cost primitive (EP-specific volume derived here in D30).</li>
+        <li><a href="interconnect-and-collectives.html">K20</a> &mdash; interconnect tiers, rail-optimised placement, the all-to-all-over-IB cliff (D28).</li>
+        <li><a href="K7_tensor-parallelism.html">K7</a> / <a href="K10_data-parallelism.html">K10</a> &mdash; EP composed with TP within an expert, DP across replicas.</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> &mdash; the MoE block structure (gate + experts replacing the dense MLP).</li>
+        <li><a href="fault-tolerance-multi-gpu-inference.html">K22</a> &mdash; an expert shard = the fault domain.</li>
+        <li><strong>Out of scope (named, not covered):</strong> training MoE (aux load-balance loss, expert dropout, the gating network&rsquo;s training &mdash; training-side; serving inherits the trained routing); cross-axis tuple selection (K6).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

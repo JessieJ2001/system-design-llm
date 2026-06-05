@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time Gaming Leaderboard — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Design a Real-Time Gaming Leaderboard</h1>
+      <p class="hero-subtitle">50 million players, 100K score updates per second, and "What's my rank?" queries that must answer in under 50ms &mdash; a lesson in sorted sets, fan-out queries, and approximate ranking.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~20 min read &bull; LC #380 / #215 (order-statistic / sorted-set)</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+
+      <div class="callout callout-info full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin: 0 0 1.5rem 0;">
+        <p style="margin:0;"><strong>LC kernel.</strong> The textbook structure behind a leaderboard is an <em>order-statistic tree</em> (or a <em>skip list</em> &mdash; what backs a Redis ZSET): keyed by score, it supports <code>insert/update</code> in O(log&nbsp;n), <code>rank-of(member)</code> in O(log&nbsp;n), and <code>range-by-rank(i, i+m)</code> in O(log&nbsp;n + m). A "Kth Largest in a Stream" (LC&nbsp;#703) heap answers only "top&nbsp;K" &mdash; the order-statistic tree additionally answers <em>arbitrary</em> rank queries, which is the whole point of a leaderboard. <strong>Four properties that break at scale:</strong> (1) <em>one node's tree doesn't take the write rate</em> &mdash; a single Redis instance caps at ~100K ops/sec on a 50M-entry sorted set, below our 260K&nbsp;ops/sec; (2) <em>rank requires a global order, but sharding splits the data</em> &mdash; <code>ZREVRANK</code> on a shard gives you your rank <em>within that shard</em>, not globally; (3) <em>in-RAM only has no durability story</em> &mdash; a crash loses 50M entries; (4) <em>"random" queries aren't free at 100K&nbsp;QPS</em> &mdash; exact rank fanned out to 10 shards is 1M&nbsp;ops/sec. The C8 production cousin: a <em>sharded skip list</em> (hash-by-player) + a <em>coarse bucket histogram</em> that turns the global-rank query into a sum of per-shard counters &mdash; exact for the top, approximate (and Redis-free) for everyone else &mdash; behind AOF/replica durability.</p>
+      </div>
+
+      <p>You are building the leaderboard service for a massively multiplayer online game. Players earn scores through in-game actions, and the leaderboard must reflect these changes in real time. This is a <strong>stateful infra primitive</strong> &mdash; an ordered-set service with a query API &mdash; sitting between the game servers (which write scores) and the clients (which read ranks); the game itself, matchmaking, and anti-cheat are upstream and out of scope. See <a href="../canonicals/functional-requirements.html">functional-requirements.html</a> (infra-primitive class &mdash; the FR vocabulary is <em>operations + semantics</em>, not user-facing features).</p>
+
+      <div>
+        <h3>Requirements</h3>
+        <ul>
+          <li><strong>Players:</strong> 50,000,000 registered accounts.</li>
+          <li><strong>Score updates:</strong> 100,000 updates/sec during peak hours (each update sets a player's new score).</li>
+          <li><strong>Score range:</strong> 0 to 10,000,000,000 (10 billion). Scores are monotonically increasing (new score is always &ge; old score).</li>
+          <li><strong>Latency target:</strong> &lt;50ms for all query types.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Data Size</h3>
+        <pre class="line-numbers"><code class="language-text">Per player: player_id (8 bytes) + score (8 bytes) = 16 bytes
+Total: 50,000,000 × 16 bytes = 800 MB
+
+With Redis sorted set overhead (~64 bytes per entry for skip list pointers):
+  50M × (16 + 64) = 4 GB
+
+This fits in memory on a single machine with 8+ GB RAM.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Query Types</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Query</th><th>Description</th><th>Expected QPS</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Global top-100</strong></td>
+                <td>Show the 100 highest-scoring players worldwide.</td>
+                <td>10,000/sec</td>
+              </tr>
+              <tr>
+                <td><strong>My rank</strong></td>
+                <td>"I have a score of 1,234,567. What is my rank out of 50M players?"</td>
+                <td>100,000/sec</td>
+              </tr>
+              <tr>
+                <td><strong>Window around me</strong></td>
+                <td>"Show ranks 1,234,560&ndash;1,234,580 (10 above and 10 below me)." Folded into "my rank" QPS &mdash; same fan-out shape, just <code>ZRANGE</code> by rank after the rank is known.</td>
+                <td>(part of 100,000/sec)</td>
+              </tr>
+              <tr>
+                <td><strong>Friends top-100</strong></td>
+                <td>Show the top-100 players among my friends list (average 100 friends per player).</td>
+                <td>50,000/sec</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Functional requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <ul>
+          <li><strong><code>submit_score(leaderboard_id, player_id, score)</code></strong> &mdash; set a player's score; idempotent on (player, score) since scores are monotone (re-submitting the same value is a no-op). Latency p99 &le; 50&nbsp;ms.</li>
+          <li><strong><code>get_rank(leaderboard_id, player_id) &rarr; {rank, score, exact?}</code></strong> &mdash; the player's position (1 = top). Exact for the top tier, best-effort (&plusmn;a small window) below it &mdash; see the flagged assumption.</li>
+          <li><strong><code>get_top_k(leaderboard_id, k) &rarr; [{player, score, rank}]</code></strong> &mdash; the K highest, ordered; <code>k &le; ~1,000</code> (clients page beyond that &mdash; cite <a href="../canonicals/api-design-patterns.html#pagination">api-design-patterns#pagination</a>).</li>
+          <li><strong><code>get_window(leaderboard_id, player_id, n) &rarr; [...]</code></strong> &mdash; the <code>n</code> players above and <code>n</code> below the caller (the "around me" strip).</li>
+          <li><strong>Per-segment leaderboards</strong> &mdash; the same operations scoped to a friends list, a region, or a time window (daily / weekly / season). A segment is just another <code>leaderboard_id</code>; friends segments are derived (no separate store).</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> anti-cheat / score validation (an upstream service decides what a legitimate score is &mdash; we trust the writer); the game itself and matchmaking; player identity / profile (we key on an opaque <code>player_id</code>); historical rank-over-time charts (a downstream analytics pipeline owns the request log); reward fulfilment for top finishers.</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) <em>exact rank is required only for the top tier</em> (~top 1,000 &mdash; where a one-position difference is a prize boundary); below that, &ldquo;rank 4,237,000 vs 4,234,567 out of 50M&rdquo; is indistinguishable to a player, so an approximate rank is acceptable &mdash; if the interviewer insists on exact rank for <em>everyone</em>, the cost jumps (every rank query becomes a 10-shard <code>ZCOUNT</code> fan-out, see Iteration&nbsp;2's alternatives). (2) <em>How many leaderboards?</em> &mdash; we assume one global + a handful of region/season segments + on-the-fly friends segments; if the game has thousands of distinct ladders, multiply shard count and memory. (3) <em>Score-update rate</em> 100K/sec at peak, scores monotone &mdash; if scores can decrease (penalties, decay) the histogram maintenance needs the previous score (a side hash, addressed in Takeaways). (4) <em>Read:write ratio</em> &asymp; 1.6:1 (160K read QPS : 100K write QPS) &mdash; write-heavy for a leaderboard; this is why the bottleneck is write throughput, not read latency.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarification ledger</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Question asked</th><th>Answer assumed</th><th>If it flips</th></tr></thead>
+            <tbody>
+              <tr><td>Exact rank for everyone, or just the top?</td><td>Just the top ~1,000; approximate below.</td><td>Exact-everywhere &rarr; 100K&nbsp;QPS &times; 10-shard <code>ZCOUNT</code> fan-out = 1M&nbsp;ops/sec; +1&ndash;2 shards or +read replicas (Iter&nbsp;2 alternatives).</td></tr>
+              <tr><td>One leaderboard or many?</td><td>1 global + a few region/season + derived friends.</td><td>Thousands of ladders &rarr; key-prefix per ladder; shard the <em>set of ladders</em>, not just one ladder; mega-popular ladders get the hot-key treatment (Iter&nbsp;2).</td></tr>
+              <tr><td>Can scores decrease?</td><td>No &mdash; monotone increasing.</td><td>Yes &rarr; keep a <code>player &rarr; current_score</code> hash so a <code>submit_score</code> knows the old bucket to decrement.</td></tr>
+              <tr><td>How fresh must the top-100 be?</td><td>&le; 1&nbsp;s stale is fine.</td><td>Sub-second &rarr; push updates instead of polling a 1-s cache (cross-cutting#real-time-push); the read load goes back up.</td></tr>
+              <tr><td>Durability requirement on scores?</td><td>The game DB is the system of record; Redis is a derived index &mdash; RPO &asymp; seconds (AOF), rebuildable.</td><td>Redis is the system of record &rarr; AOF <code>everysec</code> &rarr; <code>always</code> + sync replica; or move scores to a durable store and keep Redis as cache only.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>The key question: can a single Redis instance handle all operations?</p>
+
+      <div>
+        <h3>Redis Sorted Set Operation Complexity</h3>
+        <pre class="line-numbers"><code class="language-text">Sorted set with N = 50,000,000 entries:
+
+ZADD (update score):
+  Time complexity: O(log N) = O(log 50M) = O(26)
+  Each operation: ~1-2μs of CPU time
+  At 100K updates/sec: 100K × 26 = 2.6M skip list comparisons/sec
+
+ZREVRANGE 0 99 (top-100):
+  Time complexity: O(log N + 100) ≈ O(126)
+  Very fast: traverse to the tail of the skip list, then walk 100 entries.
+
+ZREVRANK (my rank):
+  Time complexity: O(log N) = O(26)
+  At 100K queries/sec: 100K × 26 = 2.6M skip list traversals/sec
+
+Total operations per second:
+  100K ZADD + 10K ZREVRANGE + 100K ZREVRANK + 50K friends queries
+  ≈ 260K+ operations/sec on sorted sets</code></pre>
+      </div>
+
+      <div>
+        <h3>Redis Single-Instance Throughput</h3>
+        <pre class="line-numbers"><code class="language-text">Redis benchmark for sorted sets with 50M entries:
+  Small sorted set (1K entries):  ~200K ops/sec
+  Medium sorted set (1M entries): ~150K ops/sec
+  Large sorted set (50M entries): ~80K-100K ops/sec
+
+  (Throughput decreases with set size because each O(log N) operation
+   does more work, and the skip list doesn't fit in L1/L2 cache.)
+
+Our load: ~260K ops/sec on a single sorted set of 50M entries.
+Redis capacity: ~100K ops/sec.
+
+Result: a single Redis instance cannot handle the load.
+We need to shard.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Access patterns &amp; storage engine</h3>
+        <p>The workload (cite <a href="../canonicals/access-patterns.html">access-patterns.html</a>): score updates are <a href="../canonicals/access-patterns.html#write-heavy-uniform">write-heavy-uniform</a> across players (uniform because <code>player_id</code> is opaque &mdash; no skew); the leaderboards themselves are <a href="../canonicals/access-patterns.html#power-law">power-law</a> (the one global ladder gets the lion's share of reads &mdash; the hot-key shape that bites in Iteration&nbsp;2); friends segments are <a href="../canonicals/access-patterns.html#high-cardinality-query">high-cardinality-query</a> (50M distinct small sets, queried by a key the store doesn't index on). The store is a <strong>sorted-set engine</strong> &mdash; an in-RAM skip list + hash &mdash; which is the <a href="../canonicals/storage-engines.html#kv-engine">KV-engine</a> entry's "sorted-set" variant; we choose it (over a B-tree index, see Iteration&nbsp;1's alternatives) because all three operations &mdash; update, rank-of, range-by-rank &mdash; are O(log&nbsp;n) on it and it lives entirely in memory at this size.</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.25rem; border-radius: var(--radius); margin: 1.5rem 0;">
+        <strong>The bottleneck is throughput, not storage</strong> &mdash; <a href="../canonicals/bottlenecks.html#hot-key">bottlenecks#hot-key</a> in disguise: it's not a hot <em>row</em>, it's a hot <em>data structure</em> (one giant sorted set every op touches). 4&nbsp;GB fits on a single machine easily, but 260K&nbsp;ops/sec exceeds a single Redis instance's capacity for large sorted sets. This is the opposite of the distributed-cache scenario (where storage was the bottleneck).
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Single Redis Sorted Set</h2>
+      <p>The simplest approach: one Redis instance, one sorted set containing all 50M players.</p>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python">import redis
+
+r = redis.Redis()
+LEADERBOARD_KEY = "leaderboard:global"
+
+def update_score(player_id: str, new_score: int):
+    """Update a player's score. O(log N)."""
+    r.zadd(LEADERBOARD_KEY, {player_id: new_score})
+
+def get_top_100():
+    """Get the 100 highest-scoring players. O(log N + 100)."""
+    return r.zrevrange(LEADERBOARD_KEY, 0, 99, withscores=True)
+
+def get_rank(player_id: str):
+    """Get a player's rank (0-indexed, 0 = highest). O(log N)."""
+    rank = r.zrevrank(LEADERBOARD_KEY, player_id)
+    return rank + 1 if rank is not None else None
+
+def get_friends_top_100(player_id: str, friend_ids: list):
+    """Get top 100 among friends. O(F × log N) where F = number of friends."""
+    pipe = r.pipeline()
+    for fid in friend_ids:
+        pipe.zscore(LEADERBOARD_KEY, fid)
+    scores = pipe.execute()
+
+    friends_with_scores = [
+        (fid, score) for fid, score in zip(friend_ids, scores)
+        if score is not None
+    ]
+    friends_with_scores.sort(key=lambda x: x[1], reverse=True)
+    return friends_with_scores[:100]</code></pre>
+      </div>
+
+      <div>
+        <h3>What This Gets Right</h3>
+        <ul>
+          <li>Redis sorted sets are the natural data structure for leaderboards. They maintain elements in score-sorted order with O(log N) operations.</li>
+          <li>Under the hood, Redis implements sorted sets using a skip list (for ordered traversal) plus a hash table (for O(1) lookups by member). This gives O(log N) for rank, range, and update queries.</li>
+          <li>The API is minimal: ZADD, ZREVRANGE, ZREVRANK, ZSCORE. Each maps directly to a leaderboard operation.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+
+      <div>
+        <h3>Problem 1: Throughput Saturation</h3>
+        <pre class="line-numbers"><code class="language-text">Required: ~260K sorted set ops/sec
+Capacity: ~100K ops/sec for a 50M-entry sorted set
+
+At 260K ops/sec:
+  Redis command queue grows faster than it drains.
+  Latency rises: p50 goes from 0.5ms → 5ms → 50ms → timeout.
+  Clients start timing out at 50ms.
+  Retry storms make it worse.
+
+The single Redis instance becomes a hard throughput ceiling.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 2: Single Point of Failure</h3>
+        <p>If the Redis instance crashes, the entire leaderboard is unavailable. With 50M entries, rebuilding from the database takes minutes. During that time, all leaderboard queries fail.</p>
+
+      </div>
+
+      <div>
+        <h3>Problem 3: Writes Block Reads</h3>
+        <p>Redis is single-threaded. A burst of 100K ZADD operations per second consumes CPU time that cannot be spent on ZREVRANK queries. During peak write load, read latency spikes because reads wait in the command queue behind writes.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Problem 4: Friends Query Is Expensive</h3>
+        <pre class="line-numbers"><code class="language-text">Friends top-100 for one player:
+  100 friends × 1 ZSCORE each = 100 Redis commands
+  Pipelined: 1 round trip, 100 commands = ~2ms total
+
+At 50,000 friends queries/sec:
+  50K × 100 = 5,000,000 ZSCORE commands/sec
+  This alone exceeds the 100K ops/sec limit by 50×.
+
+Even with pipelining (which reduces network overhead but not CPU),
+the server still processes 5M commands.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Which failure modes (cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><a href="../canonicals/failure-modes.html#hot-key-meltdown">hot-key-meltdown</a> &mdash; <em>blast radius:</em> the entire leaderboard. One sorted set absorbs 100% of ops; at 260K&nbsp;&gt;&nbsp;100K&nbsp;capacity the command queue grows monotonically, p99 walks past the 50&nbsp;ms SLO into timeouts. <em>Detection:</em> Redis <code>instantaneous_ops_per_sec</code> &gt; ~100K and <code>latency</code> histogram tail rising. <em>Recovery:</em> none without sharding &mdash; this is the bottleneck Iteration&nbsp;1 fixes.</li>
+          <li><a href="../canonicals/failure-modes.html#leader-loss">leader-loss</a> &mdash; <em>trigger:</em> the single Redis process dies. <em>Blast radius:</em> all queries fail. <em>Recovery:</em> reload 50M entries from the game DB &mdash; minutes of full outage (no replica yet). Iteration&nbsp;1 adds a replica per shard; the degradation contract is in the Final Design.</li>
+          <li><a href="../canonicals/failure-modes.html#retry-storm">retry-storm</a> &mdash; once p99 crosses the client timeout, every game server retries; effective load multiplies, the queue never drains. Needs the throughput headroom that sharding + caching provide, plus client-side backoff (Operations block).</li>
+          <li><a href="../canonicals/failure-modes.html#pool-starvation">pool-starvation</a> &mdash; the 5M friends-ZSCORE/sec (50&times; capacity) saturates the single thread; <code>submit_score</code> and <code>get_rank</code> wait behind it &mdash; writes block reads block writes. Iteration&nbsp;2's friends-score cache cuts this to 500K/sec.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Shard by Player ID                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Shard the Leaderboard by Player ID</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck (cite <a href="../canonicals/bottlenecks.html">bottlenecks.html</a>)</h3>
+        <p>The Naive design's dominant bottleneck is <a href="../canonicals/bottlenecks.html#hot-key">bottlenecks#hot-key</a> &mdash; one sorted set takes 260K&nbsp;ops/sec against ~100K capacity (2.6&times; over). The first lever for a hot key that is also a capacity ceiling is to <em>split it</em> (cite <a href="../canonicals/bottleneck-to-decisions.html#hot-key">bottleneck-to-decisions#hot-key</a> &rarr; revisit the sharding decision). The critical question: <strong>shard by what?</strong></p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; the store, and the shard key</h3>
+        <p><strong>The store</strong> (cite <a href="../canonicals/storage-engines.html">storage-engines.html</a>):</p>
+        <ul>
+          <li><strong>Redis-Cluster ZSETs (chosen)</strong> &mdash; the sorted-set engine; O(log&nbsp;n) update / rank-of / range-by-rank, all in RAM; Cluster gives hash-slot sharding + per-shard replica failover out of the box. Cost: in-RAM only (durability via AOF/replica), and cross-shard rank needs work (this whole page).</li>
+          <li><strong>A SQL table with an indexed <code>score</code> column (Postgres / MySQL) &mdash; rejected.</strong> <code>SELECT count(*) WHERE score &gt; ?</code> is the exact rank, and a B-tree index makes it a range scan, but: at 100K updates/sec the index write-amp (<a href="../canonicals/bottlenecks.html#index-write-amp">bottlenecks#index-write-amp</a>) and MVCC bloat crush a single Postgres; <code>get_rank</code> on a 50M-row B-tree is a <code>count</code> over potentially millions of index tuples = tens of ms even with an index, not the &lt;1&nbsp;ms a ZSET <code>ZREVRANK</code> gives; and you'd shard it anyway. Window functions (<code>rank() OVER (ORDER BY score)</code>) compute the <em>whole</em> ranking &mdash; O(n), useless per-query. SQL is right only if you also need rich relational queries on scores, which we don't.</li>
+          <li><strong>A bespoke order-statistic-tree service &mdash; rejected for v1.</strong> A custom in-process augmented BST (subtree-size counters &rarr; O(log&nbsp;n) <code>rank-of</code> directly, no <code>ZCOUNT</code>) is what we'd build if Redis's per-op overhead became the wall; it's strictly more code and ops for the same big-O. Keep it in the back pocket (it's essentially the C8 production cousin, just home-grown).</li>
+          <li><strong>A search engine (Elasticsearch) &mdash; rejected.</strong> Inverted indexes rank documents by a <em>relevance score</em>, not by an arbitrary numeric field with exact-rank-of-element semantics; aggregations approximate; write throughput at 100K/sec needs heavy tuning. Wrong tool.</li>
+        </ul>
+        <p><strong>The shard key</strong> (cite <a href="../canonicals/sharding-strategies.html">sharding-strategies.html</a>):</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Strategy</th><th>How</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td><a href="../canonicals/sharding-strategies.html#range">range</a> &mdash; by score</td><td>shard&nbsp;1 = scores 0&ndash;1B, shard&nbsp;2 = 1B&ndash;2B, &hellip;</td><td><strong>Rejected.</strong> A score update can cross a boundary &rarr; cross-shard transaction (DEL old + ADD new) on the hot path; score distributions are skewed (most players cluster low) &rarr; hot shards (<a href="../canonicals/failure-modes.html#hot-partition-meltdown">failure-modes#hot-partition-meltdown</a>); rebalancing a boundary is a bulk move. <em>Upside it doesn't pay off:</em> "my rank" would be one shard's <code>ZREVRANK</code> + a constant offset &mdash; nice, but not worth the write-path pain.</td></tr>
+              <tr><td><a href="../canonicals/sharding-strategies.html#hash">hash</a> &mdash; by player_id (chosen)</td><td><code>shard = hash(player_id) % 10</code> (Cluster uses CRC16 hash slots)</td><td><strong>Chosen.</strong> Players never move shards; every <code>submit_score</code> is local to one shard; load is uniform (opaque ids). Cost: <em>every</em> global query (top-K, my rank, window) fans out to all shards &mdash; but parallel fan-out to 10 shards is &lt;1&nbsp;ms, and the bucket-histogram trick (Iter&nbsp;2) removes the fan-out for the 99% case.</td></tr>
+              <tr><td><a href="../canonicals/sharding-strategies.html#hybrid">hybrid</a> &mdash; hash + per-shard approx counts</td><td>hash-by-player, plus each shard publishes a coarse score histogram</td><td><strong>This is the destination</strong> &mdash; Iteration&nbsp;2 adds the histogram on top of the hash sharding. Listed here so the arc is visible.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Why Shard by Player ID (Not by Score)</h3>
+        <p>The decision, in one line: <strong>scores change, player IDs do not.</strong> Sharding by player ID makes a score update always local to one shard (no cross-shard transactions) and the distribution uniform. The price &mdash; global queries need fan-out &mdash; is cheap because the fan-out is parallel.</p>
+      </div>
+
+      <div>
+        <h3>Per-Shard Capacity</h3>
+        <pre class="line-numbers"><code class="language-text">10 shards, each with:
+  Players: 50M / 10 = 5M entries
+  Memory: 4GB / 10 = 400MB per shard
+  Score updates: 100K / 10 = 10K ZADD/sec per shard
+  Redis capacity for 5M-entry sorted set: ~150K ops/sec
+
+  Utilization per shard: 10K / 150K = 6.7% — plenty of headroom.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Shard Assignment Code</h3>
+        <pre class="line-numbers"><code class="language-python">NUM_SHARDS = 10
+
+def get_shard(player_id: str) -> int:
+    """Deterministic shard assignment based on player_id hash"""
+    return hash(player_id) % NUM_SHARDS
+
+def update_score(player_id: str, new_score: int):
+    """Update score — goes to exactly one shard"""
+    shard = get_shard(player_id)
+    redis_shards[shard].zadd(f"leaderboard:{shard}", {player_id: new_score})</code></pre>
+      </div>
+
+      <p class="full-width">After sharding, global queries require fan-out across all shards. Here is how each query type works.</p>
+
+      <div>
+        <h3>Query: Global Top-100</h3>
+        <p>No single shard has the global top-100. We must query all 10 shards and merge.</p>
+        <pre class="line-numbers"><code class="language-python">import asyncio
+
+async def get_global_top_100():
+    """Fan-out to all shards, merge results"""
+    # Query all shards in parallel
+    tasks = []
+    for shard_id in range(NUM_SHARDS):
+        tasks.append(
+            redis_shards[shard_id].zrevrange(
+                f"leaderboard:{shard_id}", 0, 99, withscores=True
+            )
+        )
+    shard_results = await asyncio.gather(*tasks)
+
+    # Merge: combine all shard results (10 × 100 = 1,000 entries)
+    all_entries = []
+    for entries in shard_results:
+        all_entries.extend(entries)
+
+    # Sort by score descending, take top 100
+    all_entries.sort(key=lambda x: x[1], reverse=True)
+    return all_entries[:100]</code></pre>
+        <pre class="line-numbers"><code class="language-text">Performance:
+  10 parallel ZREVRANGE queries × ~0.1ms each = 0.1ms (wall clock)
+  Merge 1,000 entries = ~0.01ms (in-memory sort of 1K items)
+  Total: ~1ms — well within 50ms target ✓</code></pre>
+      </div>
+
+      <div>
+        <h3>Query: My Rank</h3>
+        <p>This is where sharding gets interesting. ZREVRANK tells you your rank <em>within your shard</em>, but you need your rank <em>globally</em>. A player ranked #42,000 in shard 3 might be globally ranked #420,000 or #400 &mdash; it depends on how many players in other shards have higher scores.</p>
+        <pre class="line-numbers"><code class="language-python">async def get_global_rank(player_id: str):
+    """Get player's global rank by counting players
+    with higher scores across all shards"""
+    shard = get_shard(player_id)
+
+    # Step 1: Get the player's score from their shard
+    score = await redis_shards[shard].zscore(
+        f"leaderboard:{shard}", player_id
+    )
+    if score is None:
+        return None
+
+    # Step 2: For each shard, count how many players
+    #         have score > this score
+    tasks = []
+    for shard_id in range(NUM_SHARDS):
+        tasks.append(
+            redis_shards[shard_id].zcount(
+                f"leaderboard:{shard_id}",
+                f"({score}",   # exclusive lower bound
+                "+inf"         # to infinity
+            )
+        )
+    counts = await asyncio.gather(*tasks)
+
+    # Step 3: Sum counts across all shards + 1
+    global_rank = sum(counts) + 1
+    return global_rank</code></pre>
+        <pre class="line-numbers"><code class="language-text">Performance:
+  Step 1: 1 ZSCORE = 0.1ms
+  Step 2: 10 parallel ZCOUNT queries = 0.1ms (wall clock)
+  Step 3: sum 10 integers = negligible
+
+  Total: ~0.5ms per rank query — well within 50ms ✓
+
+But: at 100K rank queries/sec, each fans out to 10 shards:
+  100K × 10 = 1,000,000 ZCOUNT commands/sec across the cluster
+  Per shard: 1M / 10 = 100K ZCOUNT/sec
+  Plus 10K ZADD/sec from writes = 110K ops/sec per shard.
+  Redis capacity: 150K ops/sec for 5M entries.
+  Utilization: 110K / 150K = 73% — approaching the limit.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Query: Friends Top-100</h3>
+        <pre class="line-numbers"><code class="language-python">async def get_friends_top_100(player_id: str, friend_ids: list):
+    """Fetch scores for all friends, sort locally"""
+    # Group friends by shard
+    shard_groups = {}
+    for fid in friend_ids:
+        shard = get_shard(fid)
+        shard_groups.setdefault(shard, []).append(fid)
+
+    # Fetch scores from each shard in parallel (pipelined within each shard)
+    tasks = []
+    for shard_id, fids in shard_groups.items():
+        pipe = redis_shards[shard_id].pipeline()
+        for fid in fids:
+            pipe.zscore(f"leaderboard:{shard_id}", fid)
+        tasks.append((fids, pipe.execute()))
+
+    # Collect results
+    results = await asyncio.gather(*[t[1] for t in tasks])
+    friends_with_scores = []
+    for (fids, _), scores in zip(tasks, results):
+        for fid, score in zip(fids, scores):
+            if score is not None:
+                friends_with_scores.append((fid, score))
+
+    # Sort and take top 100
+    friends_with_scores.sort(key=lambda x: x[1], reverse=True)
+    return friends_with_scores[:100]</code></pre>
+        <pre class="line-numbers"><code class="language-text">Performance for 100 friends across 10 shards:
+  ~10 friends per shard (uniform distribution)
+  10 parallel pipelined requests × 10 ZSCORE each = 0.1ms wall clock
+  Sort 100 entries locally = negligible
+  Total: ~0.5ms ✓
+
+At 50K friends queries/sec:
+  50K × 100 friends = 5M ZSCORE commands/sec
+  Per shard: 5M / 10 = 500K/sec ← exceeds capacity!
+
+This is a problem. We'll address it in Iteration 2.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Schema / API delta</h3>
+        <pre class="line-numbers"><code class="language-text">Redis Cluster, 10 hash-slot shards, RF=2 (1 primary + 1 replica per shard).
+Per leaderboard L, the sorted set is keyed by player-hash slot — Cluster
+routes automatically; logically:
+
+  ZSET  lb:{L}                       member = player_id, score = score
+        ZADD lb:{L} <score> <player>           # submit_score      O(log n)
+        ZSCORE lb:{L} <player>                 # my score          O(1)
+        ZREVRANK lb:{L} <player>               # rank WITHIN slot  O(log n)
+        ZREVRANGE lb:{L} 0 99 WITHSCORES       # top-100 of slot   O(log n+100)
+        ZCOUNT lb:{L} (<score> +inf            # count above, per slot
+
+Persistence: AOF appendfsync everysec (RPO ≈ 1 s); the game DB is the
+system of record — Redis is rebuildable. Replica: async (asymp <1 ms lag),
+auto-failover via Cluster. (REST surface lands in the Final Design's C9.)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><a href="../canonicals/failure-modes.html#leader-loss">leader-loss</a> &mdash; a shard's primary dies mid-tournament. <em>Blast radius:</em> 1/10 of players' writes + every fan-out query (which touches that slot) until failover (~seconds with Cluster). <em>Detection:</em> Cluster <code>FAIL</code> gossip; client redirect errors. <em>Recovery:</em> replica promoted; the async replica may have lost &lt;1&nbsp;s of writes &rarr; a few players' scores reappear slightly stale and self-correct on their next <code>submit_score</code> (scores are monotone, so a stale lower value can't beat a fresh higher one).</li>
+          <li><a href="../canonicals/failure-modes.html#replica-divergence">replica-divergence</a> &mdash; async replication means a read served by a replica (if you ever route reads there) can be behind the primary. We keep <code>get_rank</code> on primaries; the only replica reads are in DR. Stated in the degradation contract.</li>
+          <li><a href="../canonicals/failure-modes.html#tail-cascade">tail-cascade</a> / <a href="../canonicals/bottlenecks.html#network-rtt-bound">network-rtt-bound</a> &mdash; a fan-out query is as slow as its slowest shard; one GC pause on shard 7 stalls every "my rank" globally. <em>Mitigation:</em> the fan-out has a tight per-shard deadline (e.g., 30&nbsp;ms); a laggard shard's count is dropped and the rank returned with a "&ge;" qualifier &mdash; and Iteration&nbsp;2 removes the fan-out for 99% of queries entirely, which is the real fix.</li>
+          <li><a href="../canonicals/failure-modes.html#retry-storm">retry-storm</a> still latent &mdash; friends queries are 500K&nbsp;ZSCORE/sec/shard, 3&times; over capacity; if friends QPS spikes, that shard saturates and the storm returns. Iteration&nbsp;2's friends-score cache is required, not optional.</li>
+        </ul>
+        <p><strong>Why this iteration doesn't fully close the loop:</strong> sharding bought throughput headroom for <code>submit_score</code> (10K/shard vs 150K capacity = 7%) and made global queries possible, but it did <em>not</em> fix the two NFR failures that survive &mdash; (a) "my rank" at 100K&nbsp;QPS &times; 10 fan-out = 100K&nbsp;ZCOUNT/sec/shard pushes a shard to 73% (no headroom for a deploy or a spike), and (b) friends queries are still 3&times; over. Both go to Iteration&nbsp;2.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Caching and Approximate Rank                     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Cache Top-100, Approximate Rank, and Friends Optimization</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck (cite <a href="../canonicals/bottlenecks.html">bottlenecks.html</a>)</h3>
+        <p>After Iteration&nbsp;1, two NFRs still fail: (1) "my rank" fans out 100K&nbsp;QPS &times; 10 shards = 100K&nbsp;ZCOUNT/sec/shard &rarr; 73% utilization, no headroom &mdash; this is <a href="../canonicals/bottlenecks.html#network-rtt-bound">bottlenecks#network-rtt-bound</a> + <a href="../canonicals/bottlenecks.html#fanout-asymmetry">bottlenecks#fanout-asymmetry</a> (a cheap read amplified by fan-out into a fleet-wide load); (2) friends queries are 500K&nbsp;ZSCORE/sec/shard, 3&times; over; (3) the global top-100 ladder is the <a href="../canonicals/bottlenecks.html#hot-key">hot-key</a> read &mdash; 10K&nbsp;QPS all reading the same handful of slots. The lever for a fan-out-amplified read and a hot read key is the same: <em>stop hitting the store</em> &mdash; precompute/cache the slow-changing part (cite <a href="../canonicals/bottleneck-to-decisions.html#fanout">bottleneck-to-decisions#fanout</a>, <a href="../canonicals/bottleneck-to-decisions.html#hot-key">#hot-key</a>). Three caches/precomputations, one per failing read.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; exact rank when the data is sharded</h3>
+        <p>The hard problem: <code>ZREVRANK</code> on a shard gives rank <em>within that shard</em>, but a global rank needs a global order, which sharding destroyed. Options:</p>
+        <ul>
+          <li><strong>Exact via 10-shard <code>ZCOUNT</code> fan-out (the Iteration-1 mechanism) &mdash; correct but expensive.</strong> 100K&nbsp;QPS &times; 10 = 1M&nbsp;ZCOUNT/sec; pushes shards to 73%; one slow shard stalls every rank query. Keep it &mdash; but only for the <em>top tier</em> (~1K players where a one-position difference is a prize boundary): 1K&nbsp;QPS &times; 10 = 10K&nbsp;ZCOUNT/sec, negligible.</li>
+          <li><strong>A single fat Redis with replicas (un-shard the rank) &mdash; rejected.</strong> Brings back exact <code>ZREVRANK</code> in one op &mdash; but it's exactly the Naive bottleneck (one sorted set, 260K&nbsp;ops/sec &gt; 100K capacity); replicas scale reads but not the single-threaded write path. Doesn't work.</li>
+          <li><strong>Don't shard the rank index at all &mdash; keep scores sharded by player but maintain ONE unsharded "rank tree" (Redis or a custom order-statistic tree) updated async &mdash; rejected.</strong> The rank tree still takes all 100K writes/sec on one node &mdash; same wall. (A custom OST with lock-striping might push the wall higher, but it's a project, not an iteration.)</li>
+          <li><strong>Approximate via a coarse bucket histogram (chosen for the 99%).</strong> Partition the score space [0,&nbsp;10B] into B&nbsp;buckets; each shard maintains a count-per-bucket (incrementally, on every <code>ZADD</code>); the global histogram is the elementwise sum; <code>rank(score) &asymp; (sum of higher-bucket counts) + (interpolated position within the score's bucket) + 1</code> &mdash; <strong>zero Redis ops per query</strong>, just a local array lookup. Error is bounded by the count in the player's bucket. This is the scenario-specific bit; it's derived below.</li>
+        </ul>
+        <p><strong>The chosen combination:</strong> bucket-histogram for the approximate-rank 99% case + exact <code>ZCOUNT</code> fan-out for the top-1K &mdash; this is the <a href="../canonicals/sharding-strategies.html#hybrid">hybrid</a> sharding strategy: hash-by-player for writes, plus a coarse per-shard summary for the cross-shard aggregate query.</p>
+      </div>
+
+      <div>
+        <h3>Optimization A: Cache the Global Top-100</h3>
+        <p>The global top-100 changes slowly. The #1 player does not change every second. We can compute it once per second and serve it from a cache.</p>
+        <pre class="line-numbers"><code class="language-python">import time, threading
+
+# Background thread recomputes top-100 every second
+cached_top_100 = []
+cached_top_100_time = 0
+
+def top_100_refresh_loop():
+    global cached_top_100, cached_top_100_time
+    while True:
+        cached_top_100 = compute_global_top_100()  # fan-out to 10 shards
+        cached_top_100_time = time.time()
+        time.sleep(1)
+
+threading.Thread(target=top_100_refresh_loop, daemon=True).start()
+
+def get_global_top_100():
+    """Served from cache. Always <0.01ms. Updated every 1 second."""
+    return cached_top_100</code></pre>
+        <pre class="line-numbers"><code class="language-text">Before: 10K top-100 queries/sec × 10 shard fan-out = 100K ZREVRANGE/sec
+After:  1 query/sec × 10 fan-out = 10 ZREVRANGE/sec
+
+Reduction: 10,000× fewer Redis operations for this query type.
+Staleness: top-100 is at most 1 second behind. Imperceptible to users.</code></pre>
+      </div>
+
+      <div>
+        <h3>Optimization C: Friends Score Cache</h3>
+        <p>Friends queries generate 5M ZSCORE/sec across the cluster. Most friends' scores do not change every second. We can cache friend scores with a short TTL.</p>
+        <pre class="line-numbers"><code class="language-python"># Application-level cache for individual player scores
+# TTL: 5 seconds — scores update at most every few seconds per player
+score_cache = {}  # player_id → (score, expiry_time)
+
+def get_player_score_cached(player_id):
+    entry = score_cache.get(player_id)
+    if entry and time.time() < entry[1]:
+        return entry[0]  # cache hit
+
+    # Cache miss — fetch from Redis
+    shard = get_shard(player_id)
+    score = redis_shards[shard].zscore(f"leaderboard:{shard}", player_id)
+    score_cache[player_id] = (score, time.time() + 5)
+    return score
+
+def get_friends_top_100_cached(player_id, friend_ids):
+    scores = [(fid, get_player_score_cached(fid)) for fid in friend_ids]
+    scores = [(fid, s) for fid, s in scores if s is not None]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores[:100]</code></pre>
+        <pre class="line-numbers"><code class="language-text">With 5-second cache TTL:
+  Each unique player's score is fetched at most once every 5 seconds.
+  50M players / 5 seconds = 10M unique fetches/sec in the worst case.
+
+  But: most players' friends overlap with other players' friends.
+  And: most players are not being queried every 5 seconds.
+
+  Realistic cache hit rate: ~90% (most friend score lookups are cached).
+
+  Before: 5M ZSCORE/sec → After: 500K ZSCORE/sec
+  Per shard: 500K / 10 = 50K/sec. Manageable.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Optimization B: Approximate Rank Using Histograms</h3>
+        <p>The "my rank" query is the most expensive: 100K queries/sec, each fanning out to 10 shards. We can reduce this dramatically by pre-computing score distribution histograms.</p>
+      </div>
+
+      <div>
+        <h4>The Histogram Approach</h4>
+        <pre class="line-numbers"><code class="language-text">Divide the score range [0, 10B] into 10,000 buckets:
+  Bucket 0:     scores 0 to 999,999
+  Bucket 1:     scores 1,000,000 to 1,999,999
+  ...
+  Bucket 9,999: scores 9,999,000,000 to 9,999,999,999
+
+Each bucket width: 10B / 10,000 = 1,000,000 (1M points)
+
+Every second, each shard computes its local histogram:
+  "How many players have scores in each bucket?"
+
+Example for Shard 3 (5M players):
+  Bucket 0:     125,000 players
+  Bucket 1:     118,000 players
+  ...
+  Bucket 5,000: 2,100 players  ← your score (5,234,567) is here
+  ...
+  Bucket 9,999: 3 players</code></pre>
+      </div>
+
+      <div>
+        <h4>Accuracy Analysis</h4>
+        <pre class="line-numbers"><code class="language-text">Bucket width: 1,000,000 score points
+Players per bucket (average): 50M / 10,000 = 5,000 players
+
+The approximation error is at most the number of players in your bucket:
+  Maximum error: ±5,000 positions (for average-density buckets)
+  For most players: ±2,000 positions
+
+  At rank ~25,000,000 (median player): ±5,000 = ±0.02% error
+  At rank ~100 (top player): this bucket likely has 0-10 players,
+    so the error is ±5 positions.
+
+For 99% of players (rank > 1,000), ±5,000 error is imperceptible.
+  "You are ranked #4,234,567 out of 50,000,000" vs
+  "You are ranked #4,237,000 out of 50,000,000" — no user cares.
+
+For top-1,000 players (where exact rank matters):
+  Use the exact fan-out query (ZCOUNT across all shards).
+  At 1K exact queries/sec × 10 fan-out = 10K ZCOUNT/sec.
+  This is negligible.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h4>Histogram Code</h4>
+        <pre class="line-numbers"><code class="language-python"># Background: each shard computes its histogram every second
+def compute_shard_histogram(shard_id):
+    """Count players in each score bucket for this shard"""
+    histogram = []
+    for bucket in range(NUM_BUCKETS):
+        low = bucket * BUCKET_WIDTH
+        high = (bucket + 1) * BUCKET_WIDTH - 1
+        count = redis_shards[shard_id].zcount(
+            f"leaderboard:{shard_id}", low, high
+        )
+        histogram.append(count)
+    return histogram
+
+# Global histogram: sum across all shards
+def compute_global_histogram():
+    shard_histograms = [compute_shard_histogram(i) for i in range(NUM_SHARDS)]
+    global_histogram = [0] * NUM_BUCKETS
+    for bucket in range(NUM_BUCKETS):
+        for shard in range(NUM_SHARDS):
+            global_histogram[bucket] += shard_histograms[shard][bucket]
+    return global_histogram
+
+# Approximate rank lookup: no Redis queries needed!
+def get_approximate_rank(player_id: str, score: int):
+    """Estimate rank using the pre-computed histogram"""
+    bucket = int(score / BUCKET_WIDTH)
+
+    # Count all players in buckets above this one
+    players_above = sum(global_histogram[bucket + 1:])
+
+    # Estimate position within this bucket (linear interpolation)
+    bucket_count = global_histogram[bucket]
+    position_in_bucket = (score % BUCKET_WIDTH) / BUCKET_WIDTH
+    players_above_in_bucket = int(bucket_count * (1 - position_in_bucket))
+
+    return players_above + players_above_in_bucket + 1</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h4>Histogram Computation Cost</h4>
+        <pre class="line-numbers"><code class="language-text">Computing the histogram: 10,000 ZCOUNT queries per shard per second.
+  Per shard: 10,000 ZCOUNT/sec (each O(log N + bucket_count))
+
+  This is expensive! 10K ops/sec per shard just for histograms.
+
+Optimization: use Redis ZRANGEBYSCORE to scan once instead of 10K ZCOUNTs.
+  Or: maintain the histogram incrementally.
+  On each ZADD, update the histogram bucket count (decrement old bucket,
+  increment new bucket). This adds 2 operations per score update:
+  100K updates/sec × 2 = 200K histogram ops/sec (spread across 10 shards
+  = 20K per shard). Each op is a simple counter increment — O(1).
+
+Total per-shard load with incremental histograms:
+  10K ZADD (score updates)
+  + 20K counter increments (histogram maintenance)
+  + 10K ZCOUNT (exact rank for top-1K players)
+  + 500 ZSCORE (friends queries — see below)
+  ≈ 40K ops/sec per shard
+
+  Utilization: 40K / 150K = 27% — healthy headroom ✓</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Schema / API delta</h3>
+        <pre class="line-numbers"><code class="language-text">New per shard, per leaderboard L — the bucket histogram (auxiliary structure):
+
+  HASH  hist:{L}:<shard>           field = bucket_index (0..B-1), val = count
+        HINCRBY hist:{L}:<s> <new_bucket> 1     # on submit_score
+        HINCRBY hist:{L}:<s> <old_bucket> -1    #   (needs the old score —
+                                                #    monotone scores, so the
+                                                #    OLD score is the one we
+                                                #    just overwrote; ZSCORE
+                                                #    before ZADD, in a MULTI)
+  B (bucket count) = 10,000  →  width = 10B / 10,000 = 1,000,000 score pts
+                            →  ~5,000 players/bucket avg  →  ±5,000 rank err
+
+API-server local (per leaderboard L):  global_hist[L] = elementwise sum of the
+  10 shard hists, refreshed every 1 s  (10 HGETALL/sec/shard — negligible);
+  top100_cache[L]  (1-s refresh);  score_cache (player→score, 5-s TTL).
+
+The Redis ZSET schema and persistence (AOF everysec, RF=2) are unchanged
+from Iteration 1.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><a href="../canonicals/failure-modes.html#replica-divergence">replica-divergence</a> &mdash; the histogram and the ZSET can drift if the incremental updates aren't atomic with the <code>ZADD</code> (e.g., a crash between <code>ZADD</code> and the two <code>HINCRBY</code>s). <em>Blast radius:</em> a few buckets off by 1 &mdash; sub-position rank error, invisible. <em>Recovery:</em> a slow background job re-derives each shard's histogram from <code>ZCOUNT</code>s once an hour and overwrites it (the "compute_shard_histogram" path), self-healing the drift. Wrapping the three commands in a <code>MULTI</code> makes it atomic on the primary.</li>
+          <li><a href="../canonicals/failure-modes.html#stampede">stampede</a> &mdash; end-of-season: a few minutes before reset, every player checks their final rank &rarr; the top-100 ladder reads spike (and clients that bypass the 1-s cache hammer the fan-out). <em>Detection:</em> top-100-cache hit-rate drop, ZREVRANGE QPS spike on the slots. <em>Mitigation:</em> the 1-s top-100 cache and the Redis-free histogram rank already absorb 99.99% of it; for the exact-top-1K path, single-flight the fan-out (one in-flight recompute per second, all callers share it &mdash; cite <a href="../design-moves/single-flight.html">single-flight.html</a>). Stale-while-revalidate on the cache so a slow recompute never causes a miss.</li>
+          <li><a href="../canonicals/failure-modes.html#leader-loss">leader-loss</a> (still relevant) &mdash; a shard primary dying loses its in-RAM histogram too; the replica has it (replicated like any key); on failover the hourly re-derive job re-syncs anything stale. If both are lost, the histogram rebuilds from <code>ZCOUNT</code>s after the ZSET reloads from the game DB.</li>
+          <li><a href="../canonicals/failure-modes.html#hot-key-meltdown">hot-key-meltdown</a> on a single mega-popular leaderboard &mdash; if one ladder (e.g., "global") is 100&times; hotter than the rest, its 10 slots are hot even after sharding. <em>Mitigation:</em> the caches make <em>reads</em> on it nearly free; for writes, a single ladder's writes are already spread across 10 slots; if one ladder alone exceeds a shard's write capacity, split <em>that ladder</em> into more slots (a per-ladder shard count) &mdash; cross-link <a href="18-hotspot-hashing.html">#18 hotspot hashing</a>.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture Overview</h3>
+        <svg viewBox="0 0 800 520" style="width:100%;max-width:800px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-ld" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" fill="#64748b">
+              <path d="M0,0 L10,5 L0,10 Z"/>
+            </marker>
+          </defs>
+
+          <!-- API Servers box -->
+          <rect x="40" y="10" width="720" height="240" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="400" y="36" text-anchor="middle" font-size="15" font-weight="700" fill="#2563eb">API Servers (20 instances)</text>
+
+          <!-- Local Caches inner box -->
+          <rect x="70" y="50" width="660" height="90" rx="6" fill="#dbeafe" stroke="#94a3b8" stroke-width="1"/>
+          <text x="90" y="72" font-weight="600" fill="#334155">Local Caches (per API server):</text>
+          <text x="90" y="92" fill="#334155">Global top-100 cache (refreshed every 1s)</text>
+          <text x="90" y="112" fill="#334155">Score histogram (refreshed every 1s)</text>
+          <text x="90" y="132" fill="#334155">Player score cache (5s TTL, for friends queries)</text>
+
+          <!-- Query routing text -->
+          <text x="70" y="165" font-weight="600" fill="#334155">Query routing:</text>
+          <text x="70" y="185" fill="#334155">"Global top-100" &rarr; serve from local cache (0ms)</text>
+          <text x="70" y="205" fill="#334155">"My rank" &rarr; histogram (0ms) if rank &gt; 1000; fan-out (0.5ms) if rank &le; 1000</text>
+          <text x="70" y="225" fill="#334155">"Friends top-100" &rarr; batch ZSCORE with local score cache</text>
+
+          <!-- Arrows from API to shards -->
+          <line x1="200" y1="250" x2="140" y2="310" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-ld)"/>
+          <line x1="400" y1="250" x2="400" y2="310" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-ld)"/>
+          <line x1="600" y1="250" x2="660" y2="310" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-ld)"/>
+
+          <!-- Redis Shard 0 -->
+          <rect x="50" y="310" width="180" height="150" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="140" y="335" text-anchor="middle" font-weight="700" fill="#334155">Redis Shard 0</text>
+          <text x="140" y="358" text-anchor="middle" fill="#64748b">5M players</text>
+          <text x="140" y="378" text-anchor="middle" fill="#64748b">400MB RAM</text>
+          <line x1="80" y1="390" x2="200" y2="390" stroke="#94a3b8" stroke-width="0.5"/>
+          <text x="140" y="410" text-anchor="middle" fill="#334155">Sorted set</text>
+          <text x="140" y="430" text-anchor="middle" fill="#334155">+ histogram counters</text>
+          <rect x="75" y="440" width="130" height="16" rx="3" fill="#dbeafe" stroke="none"/>
+          <text x="140" y="453" text-anchor="middle" font-size="11" fill="#2563eb">+ replica (failover)</text>
+
+          <!-- Redis Shard 1 -->
+          <rect x="310" y="310" width="180" height="150" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="400" y="335" text-anchor="middle" font-weight="700" fill="#334155">Redis Shard 1</text>
+          <text x="400" y="358" text-anchor="middle" fill="#64748b">5M players</text>
+          <text x="400" y="378" text-anchor="middle" fill="#64748b">400MB RAM</text>
+          <line x1="340" y1="390" x2="460" y2="390" stroke="#94a3b8" stroke-width="0.5"/>
+          <text x="400" y="410" text-anchor="middle" fill="#334155">Sorted set</text>
+          <text x="400" y="430" text-anchor="middle" fill="#334155">+ histogram counters</text>
+          <rect x="335" y="440" width="130" height="16" rx="3" fill="#dbeafe" stroke="none"/>
+          <text x="400" y="453" text-anchor="middle" font-size="11" fill="#2563eb">+ replica (failover)</text>
+
+          <!-- Ellipsis -->
+          <text x="545" y="390" text-anchor="middle" font-size="22" fill="#64748b">...</text>
+
+          <!-- Redis Shard 9 -->
+          <rect x="570" y="310" width="180" height="150" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="660" y="335" text-anchor="middle" font-weight="700" fill="#334155">Redis Shard 9</text>
+          <text x="660" y="358" text-anchor="middle" fill="#64748b">5M players</text>
+          <text x="660" y="378" text-anchor="middle" fill="#64748b">400MB RAM</text>
+          <line x1="600" y1="390" x2="720" y2="390" stroke="#94a3b8" stroke-width="0.5"/>
+          <text x="660" y="410" text-anchor="middle" fill="#334155">Sorted set</text>
+          <text x="660" y="430" text-anchor="middle" fill="#334155">+ histogram counters</text>
+          <rect x="595" y="440" width="130" height="16" rx="3" fill="#dbeafe" stroke="none"/>
+          <text x="660" y="453" text-anchor="middle" font-size="11" fill="#2563eb">+ replica (failover)</text>
+
+          <!-- Summary annotation -->
+          <text x="400" y="500" text-anchor="middle" font-size="12" fill="#64748b">Total: 10 primary + 10 replica = 20 Redis instances</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Load Summary Per Shard</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Operation</th><th>Ops/Sec Per Shard</th><th>Source</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>ZADD (score updates)</td><td>10,000</td><td>100K total / 10 shards</td></tr>
+              <tr><td>Histogram counter updates</td><td>20,000</td><td>2 increments per ZADD</td></tr>
+              <tr><td>ZCOUNT (exact rank for top-1K)</td><td>1,000</td><td>~1K exact queries × 10 fan-out / 10</td></tr>
+              <tr><td>ZREVRANGE (top-100 refresh)</td><td>1</td><td>1 query/sec from background refresh</td></tr>
+              <tr><td>ZSCORE (friends, after caching)</td><td>50,000</td><td>500K total / 10 shards</td></tr>
+              <tr style="font-weight: 600; border-top: 2px solid var(--color-border);">
+                <td>Total</td><td>~81,000</td><td></td>
+              </tr>
+              <tr>
+                <td>Redis capacity (5M entries)</td><td>~150,000</td><td></td>
+              </tr>
+              <tr>
+                <td>Utilization</td><td>54%</td><td>Healthy headroom for spikes</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Query Response Times</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Query</th><th>Method</th><th>Latency</th><th>Accuracy</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Global top-100</td>
+                <td>Pre-computed, served from local cache</td>
+                <td>&lt;0.1ms</td>
+                <td>Exact (1-second delay)</td>
+              </tr>
+              <tr>
+                <td>My rank (top-1K players)</td>
+                <td>Exact: ZCOUNT fan-out to all 10 shards</td>
+                <td>~1ms</td>
+                <td>Exact</td>
+              </tr>
+              <tr>
+                <td>My rank (other players)</td>
+                <td>Approximate: histogram lookup, no Redis query</td>
+                <td>&lt;0.1ms</td>
+                <td>&plusmn;5,000 positions</td>
+              </tr>
+              <tr>
+                <td>Friends top-100</td>
+                <td>Batch ZSCORE with 5s local cache</td>
+                <td>~1ms</td>
+                <td>Exact (5-second delay on scores)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>End-to-End Flow: Score Update</h3>
+        <pre class="line-numbers"><code class="language-text">1. Player "alice" completes a quest. Game server sends:
+     POST /api/leaderboard/score { player_id: "alice", score: 5234567 }
+
+2. API server computes shard:
+     shard = hash("alice") % 10 = 3
+
+3. API server sends to Redis shard 3:
+     ZADD leaderboard:3 5234567 alice
+
+4. Histogram maintenance (in same pipeline):
+     Old score was 5200000 → old bucket = 5200
+     New score is 5234567 → new bucket = 5234
+     HINCRBY histogram:3 bucket:5200 -1  (decrement old bucket)
+     HINCRBY histogram:3 bucket:5234 +1  (increment new bucket)
+
+5. Response: 200 OK (total time: ~1ms)</code></pre>
+      </div>
+
+      <div>
+        <h3>End-to-End Flow: "What's My Rank?"</h3>
+        <pre class="line-numbers"><code class="language-text">1. Player "alice" (score: 5,234,567) asks for her rank.
+
+2. API server checks: is alice in the top-1000?
+     Look up alice's score in the local score cache → 5,234,567
+     Check the cached top-100 list → max score is 9,876,543,210
+     Check position 1000 in the histogram → score threshold ~9,500,000,000
+     5,234,567 < 9,500,000,000 → alice is NOT in the top-1000
+
+3. Use approximate rank from histogram:
+     Bucket = 5234567 / 1,000,000 = 5 (integer division)
+     Players in buckets 6, 7, 8, ... 9999: sum = 32,456,789
+     Players in bucket 5 with score > 5,234,567: ~2,300 (interpolated)
+     Approximate rank = 32,456,789 + 2,300 + 1 = 32,459,090
+
+4. Response: { rank: 32459090, approximate: true }
+   Total time: <0.1ms (no Redis query needed!)
+
+If alice were in the top-1000:
+3b. Fan out ZCOUNT to all 10 shards in parallel:
+      ZCOUNT leaderboard:0 (5234567 +inf
+      ZCOUNT leaderboard:1 (5234567 +inf
+      ...
+      ZCOUNT leaderboard:9 (5234567 +inf
+    Sum results: exact_rank = 42 + 38 + ... + 51 = 423
+4b. Response: { rank: 423, approximate: false }
+    Total time: ~1ms</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel &rarr; production cousin (property trade)</h3>
+        <p>What the textbook order-statistic tree / skip list (a Redis ZSET in one process) gives, vs. what the production design actually does &mdash; and the trade paid for each:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property (single-node ZSET)</th><th>Production cousin</th><th>Trade</th></tr></thead>
+            <tbody>
+              <tr><td>One sorted set, one process holds every entry</td><td>Sharded by <code>hash(player_id)</code> across 10 Redis-Cluster shards (per-ladder shard count if a ladder is hot)</td><td>Buys: write throughput (10K/shard vs 150K cap) and headroom. Costs: every global query is a fan-out; the single global order is gone (see next row).</td></tr>
+              <tr><td>Exact <code>rank-of(member)</code> in O(log&nbsp;n), one op</td><td>Exact for the top ~1K via 10-shard <code>ZCOUNT</code> fan-out; <strong>approximate</strong> (no Redis op &mdash; local histogram lookup, &plusmn;~5,000 of 50M = &plusmn;0.01%) for everyone else</td><td>Buys: 100K&nbsp;QPS rank served from a local array instead of 1M&nbsp;ZCOUNT/sec. Costs: a bounded error below the top tier &mdash; the design's central concession, valid only because no player distinguishes rank 4,234,567 from 4,237,000.</td></tr>
+              <tr><td><code>range-by-rank(i, i+m)</code> in O(log&nbsp;n + m), one op</td><td>"Around me" = histogram rank &rarr; estimate the score at <code>my_rank&nbsp;&plusmn;&nbsp;n</code> &rarr; <code>ZRANGEBYSCORE</code> on each shard around that score band, merge; top-K served from the 1-s cache</td><td>Buys: a windowed read without an exact global index. Costs: the window edges are fuzzy by the same histogram error; fine for "10 above / 10 below".</td></tr>
+              <tr><td>In-RAM only; a crash loses everything</td><td>AOF <code>appendfsync everysec</code> (RPO&nbsp;&asymp;&nbsp;1&nbsp;s) + 1 async replica per shard with Cluster auto-failover; the game DB is the system of record, so Redis is rebuildable</td><td>Buys: survives a process/host loss in seconds. Costs: &le;1&nbsp;s of writes can be lost on a hard crash &mdash; tolerable because scores are monotone and the next <code>submit_score</code> self-corrects, and the durable copy lives in the game DB.</td></tr>
+              <tr><td>The data structure is a skip list</td><td>A <em>sharded</em> skip list + a <em>coarse bucket histogram</em> per shard (the auxiliary order-statistic summary) + a per-API-server top-100 / friends-score cache layer</td><td>Buys: the histogram is the cross-shard "rank" the sharded skip lists can't provide cheaply. Costs: a second structure to keep consistent (atomic <code>MULTI</code> on writes; hourly re-derive job as a safety net).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Per-node complexity, unchanged:</strong> on each shard, <code>ZADD</code> O(log&nbsp;n) + two O(1) <code>HINCRBY</code>; <code>ZREVRANK</code>/<code>ZCOUNT</code> O(log&nbsp;n); <code>ZREVRANGE 0..k</code> O(log&nbsp;n + k). The histogram lookup is O(B) for the prefix-sum (B&nbsp;=&nbsp;10K &asymp; tens of &micro;s) or O(1) with a maintained suffix-sum array.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; API &amp; schema sketch (cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h3>
+        <pre class="line-numbers"><code class="language-text">REST surface (cite api-design-patterns#pagination for top-K / around-me windows,
+              #concurrency for the score-update conditional):
+
+  PUT  /v1/leaderboards/{id}/scores/{player}
+       body: { score: 5234567, max_observed_at: "2026-05-10T12:00:00Z" }
+       → 200 { score, rank?:approx }    # idempotent: re-PUT same/lower score = no-op
+                                         #   (monotone — server keeps the max)
+       → use If-Match / a version token if a non-monotone variant is enabled
+         (api-design-patterns#concurrency) — not needed here.
+
+  GET  /v1/leaderboards/{id}/rank/{player}
+       → 200 { player, score, rank, exact: true|false, as_of }
+       # exact=true if player is in the top-K_exact (~1000), else histogram estimate
+
+  GET  /v1/leaderboards/{id}/top?k=100
+       → 200 { entries: [{rank, player, score}], as_of, next_cursor? }
+       # k ≤ 1000; beyond that, cursor-paginate (api-design-patterns#pagination) —
+       #   cursor encodes (last_score, last_player) for stable paging under writes
+
+  GET  /v1/leaderboards/{id}/around/{player}?n=10
+       → 200 { entries: [...20 rows centered on player...], center_rank, exact }
+
+Errors (api-design-patterns#errors): 404 unknown leaderboard/player; 409 only if a
+non-monotone score loses a CAS; 503 + Retry-After if a shard is failing over
+(the rank still returns with exact:false from the histogram — never a hard fail).
+
+Schemas (consolidated reference — co-located with the iteration that introduced
+each; this is just the summary):
+  · Redis ZSET  lb:{L}                         — Iter 1 (sorted-set engine, RF=2, AOF everysec)
+  · Redis HASH  hist:{L}:<shard>               — Iter 2 (bucket histogram, B=10,000)
+  · API-server local: top100_cache[L] (1s),    — Iter 2
+                      global_hist[L] (1s),
+                      score_cache (5s TTL)
+  · System of record: the game DB players table (player_id, score, …) — upstream,
+    not designed here; Redis is a derived index, rebuildable from it.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>C10 &mdash; concrete technology, named &amp; justified</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Component</th><th>Choice</th><th>Why, vs. the direct competitors</th></tr></thead>
+            <tbody>
+              <tr><td>Ordered-set store</td><td><strong>Redis 7 Cluster</strong>, 10 shards, RF=2, AOF <code>everysec</code>, <code>maxmemory-policy noeviction</code> (the leaderboard isn't a cache)</td><td><em>vs. a Postgres 16 <code>score</code> B-tree + window functions:</em> rejected &mdash; 100K&nbsp;updates/sec gives B-tree write-amp + MVCC bloat, and <code>rank()</code> over 50M rows is O(n) per query (Redis <code>ZREVRANK</code> is O(log&nbsp;n) one op). <em>vs. Aerospike:</em> great for write-heavy KV, but no native sorted-set rank-of operation &mdash; you'd rebuild the skip list in app code. <em>vs. DynamoDB:</em> a GSI on score gives sorted reads but not <code>rank-of</code> at all, and at 1M+&nbsp;ops/sec the unit cost is 5&ndash;10&times; self-managed Redis. <em>vs. a bespoke order-statistic-tree service:</em> same big-O, strictly more code/ops &mdash; keep it as the escalation if Redis's per-op overhead becomes the wall. Redis 7 specifically for <code>FUNCTION</code> (atomic server-side <code>ZADD</code>+<code>HINCRBY</code> bucket maintenance) and Cluster's improved failover.</td></tr>
+              <tr><td>Histogram / aux summary</td><td><strong>Redis HASH per shard</strong> (counts), summed in the API-server tier</td><td>Co-locating it with the ZSET keeps the maintenance write atomic with the score write (same shard, one <code>MULTI</code>/<code>FUNCTION</code>). A separate store would add a cross-store consistency problem for a structure that's intentionally approximate anyway.</td></tr>
+              <tr><td>Read-side caches</td><td><strong>In-process</strong> on the API servers (top-100, global histogram, friend scores)</td><td>vs. a shared Memcached/Redis cache tier: the cached objects are tiny (top-100 = ~10&nbsp;KB; histogram = 10K ints = ~40&nbsp;KB) and identical across API servers &mdash; replicating them in-process is free and removes a network hop and a dependency. The 1-s / 5-s staleness budget makes per-server copies fine.</td></tr>
+              <tr><td>API tier</td><td><strong>Stateless service</strong>, ~20 instances, behind an L7 LB; co-located with Redis Cluster in one region (multi-region = a cell per region, see X6)</td><td>Standard; the only state is the refresh-on-a-timer caches, rebuilt on start by one fan-out.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>This design</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td><code>submit_score</code> is callable only by authenticated game servers (mTLS / service token) &mdash; we trust the writer; anti-cheat is upstream. Read APIs need only the caller's own player token for "my rank"; <code>top-K</code> is public. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>We key on an opaque <code>player_id</code> and store only <code>(id, score)</code> &mdash; no PII. Public leaderboards expose a display name (resolved from the profile service at render time, not stored here); a player can opt out of public ladders (a flag the profile service owns; we just skip adding them to public <code>lb:{L}</code> keys). Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>The game DB is the system of record (its own DR); Redis Cluster is a derived index &mdash; RPO &asymp; AOF window (~1&nbsp;s) per shard; RTO &asymp; failover seconds, or minutes for a full rebuild from the game DB. Cross-region: a warm standby region rebuilds from the game DB's cross-region replica. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>A cold API server full-fetches top-100 + global histogram (~50&nbsp;KB) on start &mdash; ms. Headroom: shards run at ~54% (Final Design table) &mdash; ~2&times; for a deploy / a burst / an end-of-season spike. Adding a shard = add a Cluster node + slot migration (online). Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>N/A for the data path (every API server can hit every shard &mdash; 20 servers &times; 10 shards = 200 connections, trivial). If the API fleet grew to thousands, subset which servers own which leaderboards.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>Region = cell: each region runs its own API tier + Redis Cluster + region/season ladders; the <em>global</em> ladder is one region's authority with the others reading a 1-s-replicated copy (or, if true global real-time isn't required, a per-region "global" that merges hourly). A region outage loses that region's segments only. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>Today the client polls "my rank" / "top-100". For a live-updating leaderboard UI, push rank changes over a WebSocket / SSE from the API tier (it already has the caches) &mdash; that turns 100K&nbsp;poll&nbsp;QPS into a much smaller change stream. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>The public <code>top-K</code> is CDN-cacheable with a 1-s TTL (it's the same bytes for everyone) &mdash; offloads the read-heavy ladder to the edge. "My rank" is per-player &mdash; not edge-cacheable. Cite <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <ul>
+          <li><strong>A shard primary fails:</strong> Cluster promotes its replica in seconds; up to ~1&nbsp;s of writes for ~1/10 of players may be lost and self-correct on their next <code>submit_score</code> (monotone scores). During the failover window, fan-out rank for the top-1K returns with an "&ge;" qualifier (one shard's count missing); approximate rank is unaffected (it reads the local histogram).</li>
+          <li><strong>A shard is slow (GC pause):</strong> the fan-out has a per-shard 30&nbsp;ms deadline; a laggard's count is dropped, the rank returns slightly low with <code>exact:false</code>. Never a hard fail.</li>
+          <li><strong>The whole Redis Cluster is unreachable:</strong> API servers serve the last cached top-100 and the last global histogram &mdash; reads degrade to "as of N&nbsp;seconds ago"; <code>submit_score</code> returns 503 + Retry-After (the game server buffers and replays; the game DB still has the truth). No data loss (game DB is the SoR).</li>
+          <li><strong>End-of-season read storm:</strong> 99.99% served from the 1-s top-100 cache and the Redis-free histogram; the exact-top-1K fan-out is single-flighted (one recompute/sec shared by all callers). Worst case: rank reads are 1&nbsp;s stale. Acceptable.</li>
+          <li><strong>Histogram drift:</strong> bounded to a few buckets; the hourly re-derive job overwrites it from <code>ZCOUNT</code>s. Rank error stays &plusmn;~5,000; the design already assumes that.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Key SLIs / alerts:</strong> per-shard <code>instantaneous_ops_per_sec</code> (alert &gt; 80% of ~150K cap), p99 command latency (alert &gt; 5&nbsp;ms), Cluster health (alert on any <code>FAIL</code>), AOF fsync lag, replica lag (&gt; 2&nbsp;s), top-100-cache hit rate (&lt; 99%), histogram-drift gauge (max |bucket - re-derived| &gt; threshold), fan-out p99 + per-shard-deadline-exceeded rate, rank-API <code>exact:false</code> fraction (should be ~0 for the top-1K segment).</li>
+          <li><strong>Rollout:</strong> the API tier is stateless &mdash; rolling deploy, one instance at a time (each rebuilds its caches on start in ~ms; keep &le;10% out at once so cache-miss bursts stay small). Redis upgrades: replica first, then failover, then ex-primary &mdash; one shard at a time.</li>
+          <li><strong>Migration single-Redis &rarr; sharded (the actual cutover):</strong> (1) stand up the 10-shard Cluster empty; (2) dual-write: <code>submit_score</code> writes both the old single Redis and the new shard (the new write is fire-and-forget at first); (3) backfill: <code>ZSCAN</code> the old set, <code>ZADD</code> each member to its hash-shard, also seeding the histograms; (4) when the backfill catches up and the shadow read path matches the old one (compare ranks for a sample), flip reads to the Cluster; (5) stop writing the old Redis, decommission. Reversible at every step (the old Redis is still being written until step&nbsp;5).</li>
+          <li><strong>Adding shards (10 &rarr; 20):</strong> add Cluster nodes, migrate hash slots online (Redis Cluster does this live); the histogram bucket count B is unchanged (it's score-space, not shard-space); fan-out width goes 10&rarr;20 &mdash; still &lt;5&nbsp;ms parallel.</li>
+          <li><strong>Headroom &amp; why:</strong> shards target &le;54% of the ~150K&nbsp;ops/sec cap &mdash; the ~2&times; spare covers a rolling deploy (a server's cache rebuild = one extra fan-out), an end-of-season burst, and a slow shard shifting load. Don't run a leaderboard shard hot; a sorted-set op slows as the set grows, so the cap drifts down over a season of new players.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html#cache-heavy">cost-shapes#cache-heavy</a>, <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+        <p>This is a <strong>cache-heavy</strong> cost shape &mdash; the bill is RAM, not storage or egress. <em>Naive baseline:</em> the single Redis can't actually serve the load at all, so "baseline" is the smallest fleet that <em>would</em> have to brute-force it &mdash; ~26 large memory instances just to hit 260K&nbsp;ops/sec on 50M-entry sorted sets with no caching (it never converges &mdash; the point is it's an order of magnitude off). <em>Final design:</em> 20 Redis instances (10 primary + 10 replica), each a small memory-optimized box (4&nbsp;GB working set, &lt;1&nbsp;vCPU of work) &mdash; an <code>r6g.large</code>-class node at ~$0.13/hr (cite <a href="../design-moves/pricing-constants.html#compute">pricing-constants#compute</a>) &times; 20 &times; 24 &times; 30 &asymp; <strong>~$1.9K/mo</strong> for Redis; plus ~20 API servers (<code>c6g.large</code>-class, ~$0.07/hr) &asymp; ~$1K/mo. Order of magnitude: <strong>~$3K/mo</strong> for the leaderboard service &mdash; roughly 10&times; cheaper than the brute-force fleet, and dominated by per-instance RAM. <strong>The cost&ndash;latency trade-off:</strong> the approximate-rank histogram trades a &plusmn;0.01% rank error for not needing the ~26-instance fleet &mdash; the alternative (exact rank for everyone) would put shards at 73%+ and force more shards / read replicas, roughly doubling the Redis bill for an accuracy nobody perceives.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+
+      <div class="callout full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">1. Sorted sets (skip lists) are the natural data structure for leaderboards</h3>
+        <p>Redis sorted sets give O(log N) for score updates, rank queries, and range retrievals. No other data structure provides all three efficiently. The skip list backing structure makes ordered traversal fast (unlike a hash table) while keeping insertion fast (unlike a sorted array).</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">2. Shard by player_id, not by score</h3>
+        <p>Scores change; player IDs do not. Sharding by player_id means a score update is always local to one shard (no cross-shard transactions). The tradeoff is that global queries (top-100, my rank) require fan-out across all shards, but parallel fan-out is fast (&lt;1ms for 10 shards).</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">3. Approximate rank eliminates the most expensive query</h3>
+        <p>Pre-computed score histograms let you answer "what's my rank?" without any Redis query at all &mdash; just a local array lookup. The accuracy trade-off (&plusmn;5,000 positions) is invisible to 99.9% of players. For the top 1,000 where exact rank matters, fall back to the exact (but expensive) fan-out query.</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">4. Cache aggressively for slow-changing data</h3>
+        <p>The global top-100 changes at most a few times per second. Caching it with 1-second refresh eliminates 10,000 fan-out queries per second. Friend scores with a 5-second cache reduce 5M ZSCORE/sec to 500K. In leaderboard systems, the biggest wins come from recognizing which data can tolerate short staleness.</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.25rem; border-radius: var(--radius); margin-top: 2rem;">
+        <h3 style="margin-bottom: 0.75rem;">Assumptions and When They Break</h3>
+        <ul>
+          <li><strong>Scores are monotonically increasing:</strong> If scores can decrease (e.g., penalties, decay), the histogram maintenance becomes more complex (must track previous score for every update, not just the new score). Use a separate hash to store the current score for each player.</li>
+          <li><strong>50M players fit in 10 shards:</strong> If the player count grows to 500M, increase to 100 shards. Fan-out increases from 10 to 100 queries, but parallel execution keeps latency under 5ms. The histogram approach scales perfectly (just a larger sum).</li>
+          <li><strong>Single leaderboard:</strong> If the game has multiple leaderboards (per-region, per-game-mode, weekly reset), each needs its own set of sorted sets. Multiply the shard count and memory accordingly. Weekly reset leaderboards can use a separate key prefix and be deleted en masse.</li>
+          <li><strong>Friends list is small (~100):</strong> If a user can have 10,000 friends (social network style), the friends query becomes a full table scan. At that scale, consider pre-computing each user's friends leaderboard as a materialized view.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+
+      <div>
+        <h3>What if there are 100&times; the players tomorrow &mdash; 5&nbsp;billion accounts? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>The structure doesn't change &mdash; the numbers do. Per-shard entries: scale shards 10&rarr;1,000 to keep ~5M entries/shard (the size at which a sorted-set op stays ~150K&nbsp;ops/sec). Fan-out width 10&rarr;1,000 &mdash; that's the only thing that gets worse: a 1,000-way parallel fan-out for the exact-top-1K rank is ~tens of ms even parallel, so you'd add an intermediate aggregation tier (each of ~30 aggregators fans out to ~33 shards, then a coordinator sums 30 partials) &mdash; classic tree fan-out. The histogram approach scales <em>perfectly</em>: the bucket count B stays 10K (it's score-space), each shard still publishes a 10K-int array, the global histogram is still an elementwise sum &mdash; the 99% rank path is unchanged. Bucket error: ~5M players/bucket now &rarr; &plusmn;0.001% of 5B &mdash; still invisible; if you wanted tighter, raise B to 1M buckets (4&nbsp;MB/shard array &mdash; fine). Cost is linear in shards. Cite <a href="../canonicals/bottlenecks.html#fanout-asymmetry">bottlenecks#fanout-asymmetry</a>.</p>
+      </div>
+
+      <div>
+        <h3>Why not just <code>SELECT count(*) WHERE score &gt; ?</code> on a Postgres table with a B-tree on <code>score</code>? <span style="font-weight:normal;font-size:0.85em;">(alt-engine)</span></h3>
+        <p>Three numbers kill it. (1) <em>Write rate:</em> 100K&nbsp;updates/sec, each rewriting an indexed column &rarr; B-tree page splits + WAL + MVCC dead tuples; a single Postgres tops out an order of magnitude below that and bloats. (2) <em>Rank latency:</em> even <em>with</em> the index, <code>count(*)</code> over scores above a median player visits ~25M index tuples &mdash; tens of ms, not the &lt;1&nbsp;ms a ZSET <code>ZREVRANK</code> gives (the ZSET keeps subtree-size-equivalent skip pointers; the B-tree doesn't, so it must <em>walk</em>). (3) <em>You'd shard it anyway</em> &mdash; and a sharded Postgres has the exact same cross-shard-rank problem as our sharded Redis, minus the in-RAM speed. Window functions (<code>rank() OVER (ORDER BY score)</code>) compute the <em>entire</em> ranking &mdash; O(n) per call. SQL wins only if you also need rich relational queries over scores; we don't. Cite <a href="../canonicals/bottlenecks.html#index-write-amp">bottlenecks#index-write-amp</a>, <a href="../canonicals/storage-engines.html#btree">storage-engines#btree</a>.</p>
+      </div>
+
+      <div>
+        <h3>What if exact rank <em>isn't</em> actually needed for anyone &mdash; how much cheaper? <span style="font-weight:normal;font-size:0.85em;">(requirement flip)</span></h3>
+        <p>Drop the exact-top-1K <code>ZCOUNT</code> fan-out entirely; everything is histogram + the cached top-100 list. Per-shard load loses the ~1K&nbsp;ZCOUNT/sec (it was already tiny); the real win is <em>operational</em> &mdash; no fan-out path means no per-shard deadline, no tail-cascade risk, no single-flight machinery, and "my rank" is a pure local-array lookup at 100K&nbsp;QPS with zero Redis ops. You could even drop a couple of API servers. Conversely, if exact rank <em>were</em> needed for everyone: 100K&nbsp;QPS &times; 10-shard <code>ZCOUNT</code> = 1M&nbsp;ZCOUNT/sec &rarr; 73% per shard &rarr; you'd add ~2 more shards or read replicas &mdash; roughly 2&times; the Redis bill. The histogram is the cheap middle.</p>
+      </div>
+
+      <div>
+        <h3>The Redis primary for shard 3 just died mid-tournament &mdash; what actually happens? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Cluster's gossip marks it <code>FAIL</code> within ~1&ndash;2&nbsp;s; the shard-3 replica is promoted (it has the ZSET, the histogram, the AOF tail &mdash; everything, async-replicated, so at most ~1&nbsp;s of writes behind). During the window: <code>submit_score</code> for the ~5M players hashing to shard 3 gets a brief Cluster redirect/error &rarr; the game server retries with backoff (and the game DB still has the truth). Fan-out exact-rank for the top-1K returns with one shard's count missing &rarr; reported as "&ge; N" (or just <code>exact:false</code> with the histogram estimate). Approximate rank for everyone else: <em>completely unaffected</em> &mdash; it reads the API server's local histogram, which had shard 3's last-second snapshot. The few players whose shard-3 writes were lost: their score reappears at the slightly-older value and self-heals on their next <code>submit_score</code> (monotone &mdash; a stale lower value can't beat a fresh higher one). Net: a few seconds of degraded writes for 10% of players, zero data loss, zero impact on reads. Cite <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a>.</p>
+      </div>
+
+      <div>
+        <h3>Where's the cost, and which knob moves it? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>Cache-heavy shape (cite <a href="../design-moves/cost-shapes.html#cache-heavy">cost-shapes#cache-heavy</a>): the bill is per-instance RAM &times; number of Redis instances &mdash; ~$3K/mo total (20 Redis + 20 API servers, single region). The knob: <em>shard count</em> (drives Redis instance count linearly) and <em>replication factor</em> (RF=2 doubles Redis cost vs RF=1; we keep RF=2 because a leaderboard outage mid-season is bad PR). Going RF=3 (some games want a sync replica + an async one) &asymp; +50% Redis. Multi-region = &times;(number of regions) for the API + region/season ladders, plus a thin global-ladder replication path. The histogram itself is essentially free (40&nbsp;KB/shard). What does <em>not</em> move the bill: more read QPS (the caches absorb it), more friends queries (5-s cache), edge-cached <code>top-K</code>.</p>
+      </div>
+
+      <div>
+        <h3>How do you migrate from the single-Redis Naive design to the sharded one without an incident? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Dual-write + backfill, reversible at every step: (1) stand up the empty 10-shard Cluster; (2) make <code>submit_score</code> write the new shard <em>in addition to</em> the old single Redis (new write fire-and-forget at first, so a Cluster hiccup can't break live writes); (3) backfill &mdash; <code>ZSCAN</code> the old set, <code>ZADD</code> each member to <code>hash(player)%10</code>, seeding the histograms as you go; (4) shadow-read &mdash; for a sample of rank queries, compute the answer from <em>both</em> systems and compare; when they agree, flip reads to the Cluster; (5) stop writing the old Redis; decommission. Rollback before step&nbsp;5 is just "flip reads back" &mdash; the old Redis is still current. (Same shape as adding shards later: online slot migration, no dual-write needed because Cluster does the move.) See the Operations block.</p>
+      </div>
+
+      <div>
+        <h3>A player says their rank looks wrong &mdash; where do you look? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>Decision tree: (1) Is the player in the top-1K segment? &mdash; then the answer came from the <em>exact</em> fan-out; check the per-shard-deadline-exceeded metric (did a shard time out and get dropped, biasing the count low?) and the shard-failover log. (2) Below the top-1K? &mdash; the answer is the histogram estimate; expected error is &plusmn;~5,000 &mdash; if it's way off, check the histogram-drift gauge for that shard (a missed <code>HINCRBY</code> from a non-atomic write? the hourly re-derive job should have caught it &mdash; did it run?) and whether the API server's <code>global_hist</code> is fresh (its 1-s refresh wedged?). (3) Their <em>score</em> looks wrong, not just the rank &mdash; then it's a write-path problem: check the game DB (the SoR) vs Redis; a recent shard failover may have lost their last write &mdash; tell them to re-trigger it (monotone, so harmless). (4) Everyone's ranks are stale &mdash; Redis Cluster unreachable; API servers are serving cached snapshots; check Cluster health. Every branch maps to a What-Breaks entry and an alert; the drift gauge and deadline-exceeded counter exist precisely so this is a dashboard read.</p>
+      </div>
+
+      <div>
+        <h3>End-of-season, everyone checks their final rank at once &mdash; thundering herd on reads? <span style="font-weight:normal;font-size:0.85em;">(stampede)</span></h3>
+        <p>The design is already built for it. "My rank" for 99% of players is a local-array lookup &mdash; <em>zero</em> Redis ops &mdash; so the 100K&rarr;500K&nbsp;QPS spike hits API-server CPU, not Redis. "Top-100" is the 1-s cache &mdash; the underlying fan-out runs once/sec regardless of QPS, with stale-while-revalidate so a slow recompute never causes a miss. The only Redis-touching path is the exact-top-1K <code>ZCOUNT</code> fan-out &mdash; single-flight it (one in-flight recompute per second per leaderboard; all callers in that second share the result &mdash; cite <a href="../design-moves/single-flight.html">single-flight.html</a>, <a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a>). Net: a season finale is an API-tier autoscaling event, not a Redis incident. (Also: pre-warm by bumping the API fleet ahead of a scheduled reset.)</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>LRU eviction, cache-aside pattern, and TTL-based strategies for caching leaderboard results.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>Hash-based sharding for distributing players across Redis instances.</p>
+        </a>
+        <a href="../database-sharding.html" class="card topic-card">
+          <h3>Database Sharding</h3>
+          <p>Shard key selection, cross-shard queries (fan-out), and the scatter-gather pattern.</p>
+        </a>
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>Redis replication for read scaling and failover in the leaderboard cluster.</p>
+        </a>
+        <a href="21-distributed-cache.html" class="card topic-card">
+          <h3>#21 Distributed Cache</h3>
+          <p>The Redis-Cluster patterns this page leans on &mdash; hash-slot sharding, replica failover, eviction policy &mdash; in a storage-bound rather than throughput-bound setting.</p>
+        </a>
+        <a href="15-topk-frequent.html" class="card topic-card">
+          <h3>#15 Top-K Frequent</h3>
+          <p>The top-K cousin &mdash; but top-K-by-<em>count</em> over a stream (Count-Min + heap), which can't answer "what's element X's rank?". A leaderboard is top-K-by-<em>score</em> plus arbitrary-rank queries; that's why it needs an order-statistic structure, not a sketch.</p>
+        </a>
+        <a href="16-topk-largest.html" class="card topic-card">
+          <h3>#16 Top-K Largest</h3>
+          <p>Kth-largest over a dataset (a bounded heap). Same contrast: a heap gives you the top, not "the rank of an arbitrary element" &mdash; the property a leaderboard's skip list / order-statistic tree adds.</p>
+        </a>
+        <a href="17-distributed-hash-table.html" class="card topic-card">
+          <h3>#17 Distributed Hash Table</h3>
+          <p>The hash-sharding / consistent-hashing machinery behind "shard by player_id" and online slot migration.</p>
+        </a>
+        <a href="18-hotspot-hashing.html" class="card topic-card">
+          <h3>#18 Hotspot Hashing</h3>
+          <p>What to do when one leaderboard (or one slot) is 100&times; hotter than the rest &mdash; per-key shard counts, splitting a hot key.</p>
+        </a>
+        <a href="../canonicals/sharding-strategies.html" class="card topic-card">
+          <h3>Canonical: Sharding Strategies</h3>
+          <p>hash / range / hybrid &mdash; why hash-by-player beats range-by-score, and how the bucket-histogram makes it a hybrid.</p>
+        </a>
+        <a href="../canonicals/failure-modes.html" class="card topic-card">
+          <h3>Canonical: Failure Modes</h3>
+          <p>hot-key-meltdown, leader-loss, stampede, replica-divergence &mdash; the modes cited per iteration here.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+
+</body>
+</html>

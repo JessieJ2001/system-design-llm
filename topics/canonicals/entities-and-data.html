@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Core Entities &amp; Data Modeling — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Core Entities &amp; Data Modeling</h1>
+      <p class="hero-subtitle">How to derive the 3–8 entities a system traffics in (the S1 step), what minimum shape each needs, how to spot the entity that becomes the partition key, when a relationship deserves to be its own entity. This is the source-of-truth page; scenario S1 sections cite this for the entity-derivation protocol.</p>
+      <p class="hero-meta">~8 min reference</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>The S1 Step</h2>
+
+      <p>S1 (Core Entities) is where you prove you understood the domain <em>before</em> drawing boxes. The output is 3–8 nouns the system traffics in, each with the <strong>minimum shape</strong> that matters for the design — id + 2–3 attributes that drive a decision.</p>
+
+      <p>Full schemas live in C9 (the schema sketch). S1 is intentionally light: just enough to pin down what the system <em>is about</em>. The nouns you pick here become the table names, the partition keys, the Kafka topic names, the API resource names. Get them right and the rest of the design has clean joints; get them wrong and every later section fights the model.</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The Three-Step Derivation</h2>
+
+      <h3>Step 1: Extract candidate nouns from the FRs</h3>
+      <p>Read the FR list (from <a href="functional-requirements.html">functional-requirements.html</a>). Underline every noun. Common buckets:</p>
+      <ul>
+        <li><strong>Actors</strong> — User, Admin, Tenant, Service.</li>
+        <li><strong>Content / artifacts</strong> — Post, Image, Document, Event, File, Metric.</li>
+        <li><strong>Relationships</strong> — Follow, Friendship, Membership, Permission, Subscription.</li>
+        <li><strong>Aggregates / collections</strong> — Timeline, Inbox, Cart, Playlist, Leaderboard.</li>
+        <li><strong>State / lifecycle</strong> — Order, Job, Booking, Reservation, Session, Lease.</li>
+        <li><strong>Audit / log</strong> — Activity, AuditEntry, Transaction, Receipt.</li>
+      </ul>
+
+      <h3>Step 2: Collapse to 3–8 first-class entities</h3>
+      <p>Not every noun deserves its own entity. Collapse aggressively:</p>
+      <ul>
+        <li><strong>Attributes vs entities.</strong> "User name" and "user email" are <em>attributes</em> of User, not separate entities. "Follower count" is a derived attribute, not an entity.</li>
+        <li><strong>Aggregates vs entities.</strong> Sometimes an aggregate (Timeline) is its own entity because it has its own identity, lifecycle, and access pattern. Sometimes it's just a query against another (Posts where author_id ∈ followees) — not its own entity.</li>
+        <li><strong>State machines vs entities.</strong> If a thing has multiple states (PENDING → ACTIVE → COMPLETED), it's almost certainly its own entity (Order, Booking, Job).</li>
+      </ul>
+
+      <p>Aim for <strong>3–8 entities</strong>. Less than 3 means you've over-collapsed; more than 8 means the model is unfocused (or the system actually has many — fine for #44 object metadata, suspicious for most others).</p>
+
+      <h3>Step 3: For each entity, write the minimum shape</h3>
+      <pre><code class="language-text">EntityName {
+  id (key shape — see partition-key section below)
+  &lt;1–3 attributes that drive a design decision&gt;
+}</code></pre>
+
+      <p><strong>Don't list every attribute.</strong> List only the ones that affect the architecture. <em>"Post has author_id, created_at, body"</em> — body affects storage decisions; author_id affects sharding; created_at affects clustering. Email-address-of-author doesn't.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>When a Relationship Becomes Its Own Entity</h2>
+
+      <p>This is the most-skipped S1 decision. A relationship between two entities can be:</p>
+
+      <ol>
+        <li><strong>An attribute on one side.</strong> Cheap. <em>Comment has post_id.</em></li>
+        <li><strong>A many-to-many join table.</strong> Cheap. <em>Tag and Post connected by PostTag(post_id, tag_id).</em></li>
+        <li><strong>A first-class entity</strong> with its own identity, lifecycle, and access pattern. <strong>Promote when:</strong>
+          <ul>
+            <li>The relationship has its own <strong>state</strong> (Friendship has REQUESTED → ACCEPTED → BLOCKED).</li>
+            <li>The relationship has its own <strong>history</strong> (Membership joined-on, role-at-joining, role-changes).</li>
+            <li>The relationship has its own <strong>access pattern</strong> (Follow is queried independently of User and Followee — "who follows X" / "who does Y follow"; an attribute on User wouldn't support both directions).</li>
+            <li>The relationship has its own <strong>cardinality concerns</strong> (Follow on Twitter — celebrity has 200M; embedding-as-attribute fails).</li>
+          </ul>
+        </li>
+      </ol>
+
+      <p>Twitter's Follow is a first-class entity. Slack's Membership is a first-class entity. A Post's "tags" are usually just an attribute (a list).</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Spotting the Partition Key</h2>
+
+      <p>Among your 3–8 entities, one will dominate the access pattern and become the partition key for the rest. Spotting it early shapes everything downstream.</p>
+
+      <h3>Heuristics, in order</h3>
+
+      <ol>
+        <li><strong>Which entity does the user-facing query path traverse most?</strong> If 90% of reads are "give me this user's X / Y / Z," then user_id is the partition key for X, Y, Z.</li>
+        <li><strong>Which entity has the strongest natural locality?</strong> Tweets by the same author, messages in the same chat, events in the same session — locality favors co-locating to that key.</li>
+        <li><strong>Which entity, when sharded by it, gives uniform-enough load?</strong> user_id usually is uniform (modulo celebrities). post_id is uniform. tenant_id is suspect when tenants are unevenly sized.</li>
+        <li><strong>Which entity, when sharded by something else, would force cross-shard queries?</strong> If your hot query is "all messages in chat X" and you shard by user_id, every read fans out to all users in the chat. Shard by chat_id instead.</li>
+      </ol>
+
+      <h3>The classic conflicts</h3>
+      <ul>
+        <li><strong>"Posts by author" vs "Posts on timeline."</strong> Sharded by author_id: cheap to read author's posts, expensive to assemble timeline. Sharded by reader_id (denormalized into timelines): cheap to read timeline, expensive to update on post (fan-out). The trade is what makes #41 timeline-fanout interesting.</li>
+        <li><strong>"Per-user" vs "per-tenant."</strong> Multi-tenant SaaS often shards by tenant_id, but if tenants are uneven (10 huge, 1M small), tenant_id creates hot partitions. Often: tenant_id + hash(user_id) compound key.</li>
+        <li><strong>"Time-series prefix."</strong> Anything keyed by created_at is a hot-partition trap (the latest partition cooks; older ones are cold). Add a hash prefix or shard by something else.</li>
+      </ul>
+
+      <h3>Document this in S1</h3>
+      <p>For each entity, write the partition key choice next to it, even if just one word. It's a forward reference to C9 but it pins the decision early so you don't accidentally model an entity in a way the partition can't support.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Output Examples</h2>
+
+      <h3>Example A: Twitter</h3>
+      <pre><code class="language-text">Core Entities (3–8):
+
+  User {
+    user_id (PK; partitions Posts, Follows by author/follower)
+    handle, display_name (queried by handle for profile)
+  }
+  Post {
+    post_id (PK; secondary by author_id+created_at)
+    author_id, body, created_at, kind
+  }
+  Follow {
+    (follower_id, followee_id) (composite PK; first-class because
+                                 dual access pattern + cardinality skew)
+    created_at
+  }
+  Like {
+    (user_id, post_id) (composite PK; first-class because audit + count)
+    created_at
+  }
+  Timeline {
+    user_id (PK)
+    materialized list of post_ids (denormalized for read perf —
+                                    promoted to entity because it's
+                                    its own access pattern + storage)
+  }</code></pre>
+
+      <h3>Example B: Distributed cache</h3>
+      <pre><code class="language-text">Core Entities (3–8):
+
+  CacheEntry {
+    key (PK; partition by hash(key))
+    value (opaque bytes)
+    ttl, last_modified, lease_token
+  }
+  Shard {
+    shard_id (PK)
+    primary_node, replica_nodes, weight
+  }
+  Lease (when single-flight is in scope) {
+    (key, lease_id) (PK)
+    holder_node, expires_at
+  }
+
+(That's it — 2–3 entities. Infra primitives often have very few.)</code></pre>
+
+      <h3>Example C: Web crawler</h3>
+      <pre><code class="language-text">Core Entities (3–8):
+
+  URL {
+    url (PK; partition by hash(host) for politeness grouping)
+    host, last_crawled, next_crawl_at, priority, status
+  }
+  Document (the fetched content) {
+    content_hash (PK; content-addressable for dedup)
+    url, fetched_at, http_status, body_ref (S3), outlinks[]
+  }
+  Host {
+    host (PK)
+    robots_txt, last_crawl_at, rate_limit, politeness_state
+  }
+  CrawlJob {
+    job_id (PK)
+    seed_url_set, started_at, completion%, state
+  }</code></pre>
+
+      <h3>Example D: Recommender</h3>
+      <pre><code class="language-text">Core Entities (3–8):
+
+  User {
+    user_id (PK)
+    feature_vector (dense ~256d, refreshed hourly)
+  }
+  Item {
+    item_id (PK)
+    feature_vector, popularity_score
+  }
+  Impression {
+    impression_id (PK; append-only; partition by user_id+ts)
+    user_id, item_id, score_at_serve, position, served_at
+  }
+  Click (Impression with kind=click — could merge or keep separate
+          depending on rate of clicks vs impressions) {
+    impression_id (FK)
+    clicked_at
+  }
+  Model {
+    model_id (PK)
+    artifact_url, trained_at, ndcg, deployed_at
+  }</code></pre>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Anti-Patterns</h2>
+
+      <ul>
+        <li><strong>Entity list = full schema.</strong> S1 is 3–8 entities × 2–3 attributes each. Full schemas (with every column, type, index) live in C9. Mixing them clutters S1 and delays the architecture discussion.</li>
+        <li><strong>Missing the relationship-as-entity decision.</strong> Friendship / Membership / Follow modelled as an attribute when it deserves to be its own entity — and the design later has to fight to support both-direction queries.</li>
+        <li><strong>Time-series partition trap.</strong> Picking created_at as partition key. Always hot-partitions on the latest bucket.</li>
+        <li><strong>Aggregate-as-attribute.</strong> Storing followers as a list field on User. Works at small N; melts at celebrity scale (200M followers in one row).</li>
+        <li><strong>Over-modelled.</strong> 15 entities for a Twitter design — the interviewer can't tell what matters. Collapse.</li>
+        <li><strong>Under-modelled.</strong> Two entities ("User" and "Stuff") for any non-trivial system. Means you haven't thought about access patterns.</li>
+        <li><strong>Picking a partition key that doesn't survive the dominant query.</strong> Sharding messages by user_id when the dominant query is "all messages in chat X" — every read fans out.</li>
+        <li><strong>No partition key noted in S1.</strong> Then S1 is incomplete; the entity doesn't pin its layout.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Scenario Page Template (S1 Block)</h2>
+
+      <pre><code class="language-text">## S1 Core Entities (cite [entities-and-data.html](../canonicals/entities-and-data.html))
+
+EntityA {
+  id (partition key — hash(id))
+  &lt;1–3 attributes that drive design decisions&gt;
+}
+EntityB {
+  (composite_key) (partition by ...)
+  ...
+}
+...
+
+(3–8 entities total.)</code></pre>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="functional-requirements.html">Functional Requirements</a> — derive entities from the FR list.</li>
+        <li><a href="sharding-strategies.html">Sharding Strategies</a> — once you've picked an entity as partition key, this tells you how to shard by it (hash / range / lookup / geo / hybrid).</li>
+        <li><a href="storage-engines.html">Storage Engines</a> — given the entity's access pattern, this tells you which engine wins (B-tree / LSM / columnar / FST / vector).</li>
+        <li><a href="identifier-schemes.html">Identifier Schemes</a> — what shape the id field of each entity takes (UUIDv7 / Snowflake / KSUID / hash-of-content).</li>
+        <li><a href="bottlenecks.html#hot-partition">bottlenecks#hot-partition</a> — the failure mode when the partition key is wrong.</li>
+        <li><a href="api-design-patterns.html">API Design Patterns</a> — how entities map to REST resource paths and IDs.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

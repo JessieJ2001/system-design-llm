@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Design Patterns — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>API Design Patterns</h1>
+      <p class="hero-subtitle">The canonical patterns every C9 API sketch reaches for: pagination, idempotency, concurrency control, error model, versioning, long-running operations, bulk, rate-limit response, REST vs gRPC. This is the source-of-truth page; scenario C9 blocks specify <em>which</em> patterns apply and the scenario-specific shape, not the pattern definitions.</p>
+      <p class="hero-meta">~12 min reference</p>
+    </div>
+  </section>
+
+  <!-- How to use -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Use This Page</h2>
+      <p>The C9 rubric requires every page (with an external API) to specify endpoints with method, path, request/response shape, SLO, pagination, idempotency, error model, versioning, and concurrency control. Most of those are fixed conventions across systems; the scenario-specific work is choosing <em>which</em> conventions and naming the scenario-specific deviations.</p>
+      <p>This page is the catalog. Scenario C9 blocks say: <em>"cursor pagination per <a href="api-design-patterns.html#pagination">api-design-patterns#pagination</a>; idempotency-key required on POST per <a href="api-design-patterns.html#idempotency">api-design-patterns#idempotency</a>"</em>, then add scenario-specific bits.</p>
+    </div>
+  </section>
+
+  <!-- Pagination -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="pagination">Pagination</h2>
+
+      <h3>Three options, one default</h3>
+
+      <h4>Cursor (opaque token) — the default</h4>
+      <ul>
+        <li><strong>Shape.</strong> Server returns <code>{ items: [...], next_cursor: "opaque-token" }</code>. Client passes <code>?cursor=&lt;token&gt;</code> on the next page.</li>
+        <li><strong>Token contents.</strong> Encrypted/signed encoding of (last-position, query-context). Opaque so server can change scheme without breaking clients.</li>
+        <li><strong>When to use.</strong> Default for any list endpoint. Survives writes during pagination; works on any backing store.</li>
+        <li><strong>Why default.</strong> Decouples API contract from storage layout. Server can change indexing without breaking clients.</li>
+      </ul>
+
+      <h4>Keyset (sort-key + tiebreaker)</h4>
+      <ul>
+        <li><strong>Shape.</strong> <code>?after_id=&lt;id&gt;&amp;after_ts=&lt;ts&gt;</code>. Page is <code>WHERE (ts, id) &gt; (after_ts, after_id) ORDER BY ts, id LIMIT N</code>.</li>
+        <li><strong>When to use.</strong> When clients want to express "give me items after this specific record" without server-side cursor state. Common in admin / debugging APIs.</li>
+        <li><strong>Trade.</strong> Couples API to storage sort order. If you re-shard or change clustering keys, the API breaks.</li>
+      </ul>
+
+      <h4>Offset (LIMIT/OFFSET)</h4>
+      <ul>
+        <li><strong>Shape.</strong> <code>?page=N&amp;page_size=K</code>.</li>
+        <li><strong>When to use.</strong> <strong>Almost never for new APIs.</strong> O(N) cost on the database for high page numbers; results shift if items are inserted during pagination.</li>
+        <li><strong>Acceptable use.</strong> Small bounded result sets where total count is needed (admin lists, search results with "page 5 of 100"). Cap the max offset hard.</li>
+      </ul>
+
+      <h3>Required for any pagination</h3>
+      <ul>
+        <li><strong>Bounded result size.</strong> Server enforces a hard cap (typ. 100–1000 items). A request with no <code>limit</code> still returns the cap, not the entire dataset.</li>
+        <li><strong>Stable sort.</strong> Sort key + tiebreaker (always include the primary key as last sort field). Without a tiebreaker, two items with the same sort value can be skipped or duplicated across pages.</li>
+        <li><strong>Cursor expiry.</strong> Cursors live for a bounded TTL (typ. 24 h). Beyond that, return 410 Gone — don't pretend infinite cursor lifetime.</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Returning unbounded results — DOS-vulnerable.</li>
+        <li>Offset pagination on a large append-only collection — O(offset) per page.</li>
+        <li>Cursor that exposes storage internals (e.g., Postgres CTID) — locks the API to that storage.</li>
+        <li>Mixing pagination with filtering by changing the cursor encoding — breaks resume.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Idempotency -->
+  <section class="section">
+    <div class="container">
+      <h2 id="idempotency">Idempotency</h2>
+
+      <h3>The contract</h3>
+      <p>Any mutation that may be retried (network failure, timeout, 5xx) must be idempotent — repeated requests must produce the same effect as one. The pattern: client generates a unique <strong>idempotency key</strong> per logical operation; server dedupes on that key.</p>
+
+      <h3>Mechanism</h3>
+      <ul>
+        <li><strong>Header.</strong> <code>Idempotency-Key: &lt;client-generated-uuid&gt;</code> on POST/PUT/PATCH/DELETE.</li>
+        <li><strong>Server-side dedupe.</strong> Server maintains a table keyed by <code>(tenant_id, idempotency_key)</code> with: original status code, response body, expiry. On repeat: return the original response without re-executing.</li>
+        <li><strong>Dedupe window.</strong> Typ. 24 h. Beyond that, the client must generate a new key (or the operation isn't safe to retry that long).</li>
+        <li><strong>Body fingerprint.</strong> Server should also hash the request body. If same key + different body, return 422 (idempotency-key reuse with conflicting body) — protects against client bugs.</li>
+      </ul>
+
+      <h3>Naturally idempotent operations</h3>
+      <ul>
+        <li><strong>PUT</strong> by definition (replace the resource at this URL).</li>
+        <li><strong>DELETE</strong> by definition (idempotent if you accept that 404 on the second call is fine).</li>
+        <li><strong>GET</strong> always.</li>
+        <li><strong>POST and PATCH</strong> are <em>not</em> naturally idempotent — must use idempotency keys.</li>
+      </ul>
+
+      <h3>Consumer-side patterns</h3>
+      <ul>
+        <li>Generate idempotency key <em>before</em> the first attempt; reuse across retries.</li>
+        <li>Persist the key locally so a client crash doesn't lose it (the most common bug: regenerating on retry, defeating the dedupe).</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Server generating the idempotency key — can't dedupe across the network failure that made the client retry.</li>
+        <li>Idempotency by URL path alone (e.g., POST <code>/orders/&lt;client-supplied-id&gt;</code>) — works but exposes internal IDs and conflates idempotency with identity.</li>
+        <li>No expiry on dedupe table — unbounded growth.</li>
+        <li>Trusting POST + ID to be idempotent without server-side dedupe — the client can race itself.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Concurrency control -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="concurrency">Concurrency Control</h2>
+
+      <h3>Optimistic via ETag / If-Match (default)</h3>
+      <ul>
+        <li><strong>Read.</strong> Server returns the resource with <code>ETag: "&lt;version&gt;"</code> (typ. a hash of the resource state or a version number).</li>
+        <li><strong>Write.</strong> Client sends <code>If-Match: "&lt;version&gt;"</code>. Server compares; if mismatch, returns 412 Precondition Failed; client re-reads, re-applies, retries.</li>
+        <li><strong>Why default.</strong> No locks held across user-think-time; scales to high concurrency on cold rows.</li>
+      </ul>
+
+      <h3>Optimistic via version column (server-side)</h3>
+      <ul>
+        <li><strong>Storage.</strong> Each row has a <code>version</code> column. Updates: <code>UPDATE ... SET ..., version = version + 1 WHERE id = ? AND version = ?</code>.</li>
+        <li><strong>API contract.</strong> Either the version is exposed as the ETag, or the API requires the client to pass the previous version explicitly.</li>
+      </ul>
+
+      <h3>Pessimistic locks (rare on REST APIs)</h3>
+      <ul>
+        <li>Reserved for short-lived backend operations (e.g., <code>SELECT ... FOR UPDATE</code> within a transaction). Don't expose pessimistic locks at the API surface — clients can't be trusted to release.</li>
+      </ul>
+
+      <h3>Create-only via If-None-Match</h3>
+      <ul>
+        <li><code>PUT /resource/{id}</code> with <code>If-None-Match: *</code> creates the resource if absent, returns 412 if present. Used for "create if not exists" semantics.</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Last-write-wins without ETag — silently overwrites concurrent edits.</li>
+        <li>Pessimistic lock held over the network — client crashes leave the lock orphaned.</li>
+        <li>ETag based on timestamp alone — two writes within one timestamp tick collide.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Error model -->
+  <section class="section">
+    <div class="container">
+      <h2 id="errors">Error Model</h2>
+
+      <h3>Status code categories</h3>
+      <ul>
+        <li><strong>2xx success.</strong> 200 OK, 201 Created, 202 Accepted (async), 204 No Content.</li>
+        <li><strong>4xx client error</strong> — never retryable without changing the request.
+          <ul>
+            <li>400 Bad Request — malformed.</li>
+            <li>401 Unauthorized — auth missing/invalid; client must re-auth.</li>
+            <li>403 Forbidden — auth valid but not permitted.</li>
+            <li>404 Not Found — resource doesn't exist.</li>
+            <li>409 Conflict — state conflict (concurrent edit, dup create).</li>
+            <li>410 Gone — was here, intentionally removed.</li>
+            <li>412 Precondition Failed — ETag mismatch.</li>
+            <li>422 Unprocessable Entity — well-formed but semantically invalid (validation error).</li>
+            <li>429 Too Many Requests — rate-limited; retryable after <code>Retry-After</code>.</li>
+          </ul>
+        </li>
+        <li><strong>5xx server error</strong> — generally retryable with backoff.
+          <ul>
+            <li>500 Internal Server Error — unexpected; classify as retryable cautiously.</li>
+            <li>502 Bad Gateway — upstream failure.</li>
+            <li>503 Service Unavailable — overload / maintenance; retry per <code>Retry-After</code>.</li>
+            <li>504 Gateway Timeout — upstream timeout.</li>
+          </ul>
+        </li>
+      </ul>
+
+      <h3>Body shape (RFC 7807 Problem Details)</h3>
+      <pre><code class="language-text">{
+  "type": "https://api.example.com/errors/rate-limit",
+  "title": "Rate limit exceeded",
+  "status": 429,
+  "detail": "Tenant tnt_123 exceeded 1000 req/min",
+  "instance": "/v1/events/abc",
+  "retry_after_seconds": 30,
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+}</code></pre>
+
+      <h3>Retry semantics</h3>
+      <ul>
+        <li><strong>Retryable</strong>: 408, 429, 502, 503, 504 (and 500 with caution).</li>
+        <li><strong>Not retryable</strong>: all 4xx except 408, 429.</li>
+        <li><code>Retry-After</code> header is mandatory on 429 / 503; gives the client a precise time-to-wait. Without it, clients pick arbitrary backoffs.</li>
+        <li>Always pair retry guidance with idempotency keys (otherwise retries can double-execute on the server).</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>200 OK with <code>{ "success": false, "error": "..." }</code> body — defeats HTTP semantics; load balancers, monitoring, and client retry logic all break.</li>
+        <li>Using 5xx for client errors — clients retry forever.</li>
+        <li>Using 4xx for server errors — clients give up when they shouldn't.</li>
+        <li>No <code>Retry-After</code> on 429 — clients hammer with their own arbitrary backoff.</li>
+        <li>No <code>trace_id</code> in error body — debugging across services becomes archaeology.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Versioning -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="versioning">Versioning</h2>
+
+      <h3>Three options</h3>
+      <ul>
+        <li><strong>URL path: <code>/v1/foo</code>, <code>/v2/foo</code>.</strong> Simplest, most explicit. Default for public APIs.</li>
+        <li><strong>Accept header: <code>Accept: application/vnd.example.v2+json</code>.</strong> Cleaner URLs; can be cumbersome on debugging. Common for content-negotiation-aware APIs.</li>
+        <li><strong>Header: <code>X-API-Version: 2</code>.</strong> Pragmatic middle ground; not standardized.</li>
+      </ul>
+
+      <h3>Compatibility rules within a version</h3>
+      <ul>
+        <li><strong>Adding a new optional field</strong>: backward-compatible, no version bump.</li>
+        <li><strong>Adding a new required field</strong>: breaks old clients; bump version.</li>
+        <li><strong>Renaming or removing a field</strong>: breaks old clients; bump version.</li>
+        <li><strong>Changing a field's type or semantics</strong>: breaks old clients; bump version.</li>
+        <li><strong>Adding a new endpoint</strong>: backward-compatible.</li>
+      </ul>
+
+      <h3>Deprecation policy</h3>
+      <ul>
+        <li>Announce deprecation N months before sunset (typ. 6–12 months for public APIs).</li>
+        <li><code>Deprecation: true</code> + <code>Sunset: &lt;date&gt;</code> response headers per RFC 8594.</li>
+        <li>Per-tenant usage telemetry on deprecated endpoints; outreach to top users.</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Breaking changes within a version — clients break unannounced; trust eroded permanently.</li>
+        <li>Multiple "current" versions long-term — every change is N× the work.</li>
+        <li>No deprecation telemetry — flying blind on who uses what.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Long-running operations -->
+  <section class="section">
+    <div class="container">
+      <h2 id="lro">Long-Running Operations (LROs)</h2>
+
+      <h3>The pattern</h3>
+      <p>Operations that take longer than a request can reasonably wait (typ. &gt; 1 s synchronous; mandatory for &gt; 30 s) return a job handle and are polled or webhooked.</p>
+
+      <h3>Three flavors</h3>
+      <ul>
+        <li><strong>202 Accepted + polling.</strong> POST returns 202 with <code>Location: /v1/jobs/{job_id}</code>. Client polls <code>GET /v1/jobs/{job_id}</code> until status = <code>completed | failed</code>.</li>
+        <li><strong>Webhook on completion.</strong> Client registers a callback URL on submit; server POSTs to it on completion. Better for long jobs (hours/days). Required: HMAC signature on the callback for authenticity.</li>
+        <li><strong>Server-Sent Events / WebSocket subscription.</strong> Client subscribes to job-status updates. Best UX for short-medium jobs the user is actively watching.</li>
+      </ul>
+
+      <h3>Job resource shape</h3>
+      <pre><code class="language-text">GET /v1/jobs/{job_id} →
+{
+  "job_id": "job_abc",
+  "state": "running" | "queued" | "completed" | "failed" | "cancelled",
+  "progress": 0.42,                    // optional, [0, 1]
+  "started_at": "2026-05-04T12:00:00Z",
+  "completed_at": null,
+  "result_url": null,                  // populated on success
+  "error": null                        // populated on failure
+}</code></pre>
+
+      <h3>Cancellation</h3>
+      <ul>
+        <li><code>POST /v1/jobs/{job_id}:cancel</code>; idempotent.</li>
+        <li>Server best-effort; if the job has already started a non-cancellable phase, returns 409.</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Synchronous request held open for &gt; 30 s — load balancers cut the connection; clients retry; the job runs N times.</li>
+        <li>Polling without bounded interval — clients hammer the status endpoint.</li>
+        <li>Webhook without signature verification — anyone can spoof completion.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Bulk operations -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="bulk">Bulk Operations &amp; Partial Success</h2>
+
+      <h3>When to expose bulk endpoints</h3>
+      <ul>
+        <li>When N items per logical operation regularly &gt; 10 and per-item RTT is the bottleneck.</li>
+        <li>When clients need atomic-or-nothing semantics across N items (rare).</li>
+      </ul>
+
+      <h3>Two modes</h3>
+      <ul>
+        <li><strong>All-or-nothing (transactional).</strong> Either all items succeed or none. Server response is 200 or 4xx. Use sparingly — increases server-side complexity dramatically.</li>
+        <li><strong>Best-effort with per-item status.</strong> Server returns 207 Multi-Status with per-item results:
+          <pre><code class="language-text">{
+  "results": [
+    { "item_index": 0, "status": 201, "id": "item_a" },
+    { "item_index": 1, "status": 422, "error": "validation failed" },
+    { "item_index": 2, "status": 201, "id": "item_b" }
+  ]
+}</code></pre>
+        </li>
+      </ul>
+
+      <h3>Required</h3>
+      <ul>
+        <li><strong>Bound on N.</strong> Hard cap (typ. 100–1000 items) on a single request. Otherwise DOS-vulnerable.</li>
+        <li><strong>Idempotency-key on the bulk operation</strong> + per-item idempotency where individual items might be retried.</li>
+      </ul>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>Bulk endpoint that returns 200 even if all items failed.</li>
+        <li>Bulk endpoint with no cap — single request can consume server-side memory unboundedly.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Rate limit response -->
+  <section class="section">
+    <div class="container">
+      <h2 id="rate-limit-response">Rate-Limit Response Semantics</h2>
+
+      <h3>The headers</h3>
+      <ul>
+        <li><code>X-RateLimit-Limit</code>: the limit (per minute / per hour / per day, as documented).</li>
+        <li><code>X-RateLimit-Remaining</code>: how many requests left in the current window.</li>
+        <li><code>X-RateLimit-Reset</code>: when the window resets (Unix timestamp or seconds-from-now).</li>
+        <li><code>Retry-After</code>: seconds until the next request will succeed (mandatory on 429).</li>
+      </ul>
+
+      <h3>Standardization</h3>
+      <p>RFC 9239 defines <code>RateLimit</code> and <code>RateLimit-Policy</code> structured headers. Adoption is partial; most APIs still use the <code>X-</code> prefixed forms above for compatibility.</p>
+
+      <h3>The 429 body</h3>
+      <p>Per the <a href="#errors">error model</a>: include <code>retry_after_seconds</code> in the body too (some clients can't read headers).</p>
+
+      <h3>Anti-patterns</h3>
+      <ul>
+        <li>429 without <code>Retry-After</code> — clients pick arbitrary backoffs and hammer.</li>
+        <li>503 (service unavailable) instead of 429 — semantically wrong; clients can't distinguish "service is down" from "you specifically are over quota."</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- REST vs gRPC -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="rest-vs-grpc">REST vs gRPC vs GraphQL</h2>
+
+      <h3>REST (HTTP/JSON)</h3>
+      <ul>
+        <li><strong>Default for public APIs.</strong> Maximum interoperability; debug with curl; cacheable at HTTP layer; works with every client and proxy.</li>
+        <li><strong>Latency overhead</strong> ≈ 1–5 ms per call from JSON parsing + HTTP overhead. Tolerable for human-scale operations; problematic at high RPS.</li>
+      </ul>
+
+      <h3>gRPC</h3>
+      <ul>
+        <li><strong>Default for service-to-service.</strong> Protobuf is 5–10× more compact than JSON, with stronger schemas; HTTP/2 multiplexing reduces connection overhead; bidirectional streaming for free.</li>
+        <li><strong>Tradeoff</strong>: harder to debug (binary on wire), browser support requires gRPC-Web proxy, no HTTP cache.</li>
+      </ul>
+
+      <h3>GraphQL</h3>
+      <ul>
+        <li><strong>Default for client-driven UIs</strong> where the client knows best which fields it needs (mobile apps with bandwidth concerns; web with deep nested data).</li>
+        <li><strong>Tradeoffs</strong>: server-side query complexity (depth + breadth limits required to prevent DOS); cache layer must be GraphQL-aware (Apollo, Relay).</li>
+      </ul>
+
+      <h3>How to choose</h3>
+      <ul>
+        <li>Public-facing user-installable client (third-party developers): <strong>REST</strong>.</li>
+        <li>Internal microservice mesh: <strong>gRPC</strong>.</li>
+        <li>Mobile/web UI with diverse query shapes: <strong>GraphQL</strong> as a BFF layer in front of REST/gRPC.</li>
+        <li>Real-time bidirectional: <strong>WebSocket</strong> or gRPC streaming (see <a href="cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- The C9 template -->
+  <section class="section">
+    <div class="container">
+      <h2>C9 Template (Per-Page)</h2>
+
+      <p>Every scenario page's C9 API sketch should follow this shape — the prose is short because the patterns are cited from this page:</p>
+
+      <pre><code class="language-text">**API.** REST/JSON public surface; gRPC for internal service-to-service.
+- Pagination: <a href="api-design-patterns.html#pagination">cursor</a>, hard cap 100.
+- Idempotency: <a href="api-design-patterns.html#idempotency">Idempotency-Key</a> required on POST /events and POST /bookings.
+- Concurrency: <a href="api-design-patterns.html#concurrency">ETag / If-Match</a> on mutations to /events/{id}.
+- Errors: <a href="api-design-patterns.html#errors">RFC 7807</a>; 429 with Retry-After when shed.
+- Versioning: <a href="api-design-patterns.html#versioning">URL path /v1/</a>; sunset policy 12 months.
+
+| Method | Path                                 | Purpose                  | SLO     |
+|--------|--------------------------------------|--------------------------|---------|
+| POST   | /v1/events                           | create event             | 100 ms  |
+| GET    | /v1/freebusy?users=&from=&to=&tz=    | availability lookup      | 80 ms   |
+| POST   | /v1/bookings                         | book a slot, transactional | 200 ms |
+...
+
+**Schema.** [partition keys, indexes, hot-key risks, evolution plan]</code></pre>
+
+      <p>The pattern definitions live <em>here</em>; the per-scenario sketch only adds endpoint shapes, scenario-specific deviations from the canonical (e.g., <em>"<code>Idempotency-Key</code> dedupe window = 7 days here, vs default 24 h, because settlement can take that long"</em>), and the schema sketch.</p>
+    </div>
+  </section>
+
+  <!-- Cross-references -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="../rate-limiting.html">Rate Limiting</a> — the algorithms behind 429 / Retry-After semantics.</li>
+        <li><a href="cross-cutting.html#security">Cross-Cutting / Security</a> — how auth integrates with the API surface.</li>
+        <li><a href="failure-modes.html#poison-message">Failure Modes / Poison Message</a> — DLQ pattern relevant to async APIs.</li>
+        <li><a href="../api-gateway.html">API Gateway</a> — where most of these patterns are enforced operationally.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

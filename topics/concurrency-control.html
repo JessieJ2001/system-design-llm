@@ -1,0 +1,2058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Concurrency Control — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Topics</a></li>
+        <li><a href="os-concepts.html">OS Concepts</a></li>
+        <li><a href="distributed-transactions.html">Distributed Transactions</a></li>
+        <li><a href="leader-election.html">Leader Election</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Concurrency Control</h1>
+      <p class="hero-subtitle">From OS mutexes to distributed locks, from spinlocks to CRDTs &mdash; how concurrency primitives you learned in operating systems map directly to distributed system coordination, and why getting them wrong causes some of the hardest bugs in production.</p>
+      <span class="hero-meta">35 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>Concurrency control is the set of mechanisms that ensure correct behavior when multiple actors &mdash; threads, processes, services, or users &mdash; access shared resources simultaneously. Without it, concurrent access produces race conditions, lost updates, torn reads, and data corruption. In a single machine, the OS provides primitives like mutexes, semaphores, and read-write locks. In a distributed system, these same coordination problems exist but are dramatically harder because of network partitions, clock skew, partial failures, and the impossibility of instantaneous global state.</p>
+      <p>The insight that makes this topic tractable is that <strong>every OS concurrency primitive has a direct distributed analogue</strong>. A mutex becomes a distributed lock (Redis SETNX, ZooKeeper ephemeral nodes, etcd leases). A semaphore becomes a distributed rate limiter or resource quota. A read-write lock becomes a shared/exclusive distributed lock. Compare-and-swap (CAS) becomes optimistic concurrency control with version vectors or ETags. Even the pathologies &mdash; deadlock, livelock, priority inversion &mdash; have distributed counterparts that manifest in production as cascading timeouts, circular service dependencies, and lock ordering bugs.</p>
+      <p>Understanding concurrency control means understanding the spectrum from pessimistic approaches (acquire a lock before touching the resource) to optimistic approaches (proceed without locking, detect conflicts, retry) to lock-free approaches (CRDTs, append-only logs). The right choice depends on contention level, read/write ratio, latency requirements, and failure tolerance. High-contention writes demand pessimistic locking. Low-contention reads with occasional writes favor optimistic concurrency control. Collaborative editing at scale requires CRDTs or operational transformation &mdash; locks simply cannot scale to thousands of concurrent editors.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Distributed Lock Acquisition &amp; Deadlock</h2>
+      <div class="animation-container" id="concurrency-animation">
+        <canvas id="concurrencyCanvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">Multiple clients attempt to acquire a distributed lock. One succeeds (green), others wait/retry (yellow). After release, the next client acquires it. In the second phase, two clients hold different locks and wait for each other &mdash; a distributed deadlock (red).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+      <p>Concurrency control in distributed systems is built on six foundational primitives, each a direct analogue of an OS-level mechanism:</p>
+
+      <h3>1. Mutex &rarr; Distributed Lock</h3>
+      <p>An OS mutex guarantees mutual exclusion: only one thread can hold the lock at a time. The distributed analogue is a distributed lock, implemented via:</p>
+      <ul>
+        <li><strong>Redis SETNX + TTL:</strong> <code>SET lock_key owner_id NX PX 30000</code> atomically sets the key only if it does not exist, with a 30-second expiry. The caller checks the return value to know if it acquired the lock. Release requires a Lua script that checks ownership before deleting: <code>if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) end</code>. The TTL acts as a safety net &mdash; if the holder crashes, the lock auto-expires.</li>
+        <li><strong>ZooKeeper ephemeral nodes:</strong> The client creates an ephemeral znode at a known path. Only one create succeeds (ZooKeeper guarantees uniqueness within a directory). If the client dies, its session expires and the ephemeral node is automatically deleted, releasing the lock. Other clients set a watch on the node to be notified when it disappears.</li>
+        <li><strong>etcd lease:</strong> Similar to ZooKeeper but using etcd's lease mechanism. The client creates a key with a lease (TTL). The client must periodically refresh the lease via a keep-alive. If the client crashes, the lease expires and the key is deleted.</li>
+      </ul>
+      <p><strong>Critical difference from OS mutexes:</strong> OS mutexes are reliable &mdash; if the holder dies, the OS releases the lock. Distributed locks rely on TTLs, which introduce a fundamental tension: too short a TTL and the lock expires while the holder is still working (due to GC pauses, network delays); too long a TTL and a crashed holder blocks everyone. This is why Martin Kleppmann argues that distributed locks need <strong>fencing tokens</strong> &mdash; monotonically increasing values that the lock service issues on each acquisition. The resource checks the fencing token and rejects stale requests.</p>
+
+      <h4>Fencing Tokens: Why They Are Essential (Attack Scenario Trace)</h4>
+      <p>Without fencing tokens, a GC pause can cause two clients to act on a shared resource simultaneously, leading to data corruption. Here is a step-by-step trace showing exactly how fencing tokens prevent this:</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Client A</th>
+              <th>Client B</th>
+              <th>Storage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>t=0s</code></td>
+              <td>Lock service grants lock to Client A</td>
+              <td>Holds lock, fence_token=<strong>33</strong></td>
+              <td>Idle</td>
+              <td>last_seen_token=32</td>
+            </tr>
+            <tr>
+              <td><code>t=1s</code></td>
+              <td>Client A begins processing order</td>
+              <td>Processing (fence_token=33)</td>
+              <td>Idle</td>
+              <td>last_seen_token=32</td>
+            </tr>
+            <tr>
+              <td><code>t=2s</code></td>
+              <td>Client A hits a GC pause (stop-the-world)</td>
+              <td>PAUSED (unaware, still believes it holds lock)</td>
+              <td>Idle</td>
+              <td>last_seen_token=32</td>
+            </tr>
+            <tr>
+              <td><code>t=12s</code></td>
+              <td>Lock TTL expires (TTL was 10s). Client A is still paused.</td>
+              <td>PAUSED (lock expired, does not know)</td>
+              <td>Idle</td>
+              <td>last_seen_token=32</td>
+            </tr>
+            <tr>
+              <td><code>t=13s</code></td>
+              <td>Lock service grants lock to Client B</td>
+              <td>PAUSED</td>
+              <td>Holds lock, fence_token=<strong>34</strong></td>
+              <td>last_seen_token=32</td>
+            </tr>
+            <tr>
+              <td><code>t=14s</code></td>
+              <td>Client B writes to storage with fence_token=34</td>
+              <td>PAUSED</td>
+              <td>Write accepted (34 &gt; 32)</td>
+              <td>last_seen_token=<strong>34</strong></td>
+            </tr>
+            <tr>
+              <td><code>t=17s</code></td>
+              <td>Client A resumes from GC pause (15s total)</td>
+              <td>Resumes, tries to write with fence_token=33</td>
+              <td>Working normally</td>
+              <td>last_seen_token=34</td>
+            </tr>
+            <tr>
+              <td><code>t=17s</code></td>
+              <td>Storage <strong>rejects</strong> Client A's write: 33 &lt; 34</td>
+              <td>Write REJECTED &mdash; stale token</td>
+              <td>Working normally</td>
+              <td>last_seen_token=34 (unchanged)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Without fencing tokens:</strong> At t=17s, Client A's write would succeed, overwriting Client B's valid data. Both clients would have modified the resource, violating mutual exclusion. The fencing token acts as a <em>logical clock</em> &mdash; even though Client A's wall clock shows it acquired the lock "first," the monotonically increasing token lets the storage server determine which lock grant is current.</p>
+
+      <h3>2. Read-Write Lock &rarr; Distributed Read-Write Lock</h3>
+      <p>An OS read-write lock allows multiple concurrent readers but only one writer (and no readers during a write). The distributed analogue uses a lock service that tracks lock mode:</p>
+      <ul>
+        <li><strong>Shared mode (read):</strong> Multiple clients can hold the lock simultaneously. Implemented by incrementing a counter (<code>INCR readers_count</code>) or creating individual ephemeral znodes under a shared directory.</li>
+        <li><strong>Exclusive mode (write):</strong> Only one client can hold the lock. The writer must wait until all readers release. Implemented by checking that the reader count is zero and setting an exclusive flag atomically.</li>
+      </ul>
+      <p>Read-write locks are critical for read-heavy workloads like configuration stores, metadata caches, and catalog services where reads outnumber writes 100:1 or more. Without them, a naive mutex serializes all reads, destroying throughput.</p>
+
+      <h3>3. Semaphore &rarr; Distributed Semaphore</h3>
+      <p>An OS semaphore allows up to N concurrent accessors. The distributed analogue limits concurrent access to a shared resource across the cluster:</p>
+      <ul>
+        <li><strong>Rate limiting:</strong> A distributed semaphore with N=1000 permits per second limits API calls across all service instances.</li>
+        <li><strong>Connection pool limiting:</strong> A distributed semaphore with N=50 limits concurrent database connections across a fleet of application servers, preventing connection exhaustion.</li>
+        <li><strong>Resource quotas:</strong> A distributed semaphore with N=10 limits concurrent batch jobs, preventing resource starvation.</li>
+      </ul>
+      <p>Implementation typically uses an atomic counter in Redis (<code>INCR/DECR</code> with <code>WATCH</code> for transactions) or a set of ephemeral znodes in ZooKeeper (the number of znodes represents acquired permits; the semaphore is full when the count reaches N).</p>
+
+      <h3>4. Condition Variable &rarr; Distributed Coordination</h3>
+      <p>An OS condition variable lets a thread wait until a condition is met, signaled by another thread. The distributed analogues are:</p>
+      <ul>
+        <li><strong>ZooKeeper watches:</strong> A client sets a watch on a znode. When the znode changes, ZooKeeper sends a notification. This is the distributed equivalent of <code>pthread_cond_wait</code> / <code>pthread_cond_signal</code>.</li>
+        <li><strong>etcd watch:</strong> Similar semantics &mdash; watch a key or key range for changes. The watch provides a revision number for exactly-once event processing.</li>
+        <li><strong>Kafka consumer group rebalance:</strong> When a consumer joins or leaves the group, all consumers are notified and partitions are reassigned. This is a distributed condition variable where the condition is "group membership changed."</li>
+      </ul>
+
+      <h3>5. Spinlock &rarr; Retry Loops with Exponential Backoff</h3>
+      <p>An OS spinlock busy-waits in a tight loop until the lock is available. This is efficient when contention is low and hold times are short (nanoseconds). In distributed systems, naive spinning is catastrophic:</p>
+      <ul>
+        <li>Each "spin" is a network round-trip (1-10ms vs. nanoseconds)</li>
+        <li>Spinning generates massive load on the lock service</li>
+        <li>Under contention, spinning amplifies the problem &mdash; N clients spinning at 100 req/s each creates N*100 req/s on the lock service</li>
+      </ul>
+      <p>The distributed equivalent is a retry loop with <strong>exponential backoff and jitter</strong>: wait 100ms, then 200ms, then 400ms, with random jitter to avoid thundering herd. This is fundamentally different from an OS spinlock &mdash; it trades latency for system stability.</p>
+
+      <h3>6. Compare-and-Swap (CAS) &rarr; Optimistic Concurrency Control</h3>
+      <p>An OS CAS instruction atomically compares a memory location to an expected value and, only if they match, swaps in a new value. The distributed analogues are:</p>
+      <ul>
+        <li><strong>Version vectors / ETags:</strong> Read the resource and its version. Modify locally. Write back with a conditional: "update only if the version is still V." If another client modified the resource in between, the version has changed and the write is rejected. The client re-reads and retries.</li>
+        <li><strong>Conditional writes:</strong> DynamoDB <code>ConditionExpression</code>, Cosmos DB <code>If-Match</code> header, PostgreSQL <code>UPDATE ... WHERE version = V</code>.</li>
+        <li><strong>CRDTs (Conflict-free Replicated Data Types):</strong> The ultimate optimistic approach. CRDTs are data structures designed so that concurrent updates always converge to the same state without coordination. G-Counters, PN-Counters, OR-Sets, and LWW-Registers are common examples. They eliminate the need for locks entirely at the cost of weaker semantics (eventual consistency, limited data types).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Pessimistic Concurrency Control (Locks) When</h4>
+          <ul>
+            <li><strong>High write contention:</strong> Many writers updating the same resource simultaneously. Optimistic approaches waste work through constant retries.</li>
+            <li><strong>Critical correctness requirements:</strong> Financial transactions, inventory management where double-spending must be impossible. "Better to wait than to be wrong."</li>
+            <li><strong>Short lock hold times:</strong> The operation completes in milliseconds. Lock overhead is proportionally small.</li>
+            <li><strong>Sequential consistency required:</strong> Operations must appear to execute in a strict order. Locks enforce this naturally.</li>
+            <li><strong>Single leader or master pattern:</strong> Only one node should perform a task (e.g., cron job, leader election, singleton service).</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Use Optimistic Concurrency Control (Versioning/CAS) When</h4>
+          <ul>
+            <li><strong>Low to moderate contention:</strong> Most operations do not conflict. Locking would add unnecessary latency and reduce throughput.</li>
+            <li><strong>Read-heavy workloads:</strong> Many readers with occasional writers. Locks serialize readers unnecessarily.</li>
+            <li><strong>Long-running operations:</strong> User editing a document for 5 minutes. Holding a lock that long is impractical &mdash; detect conflicts at save time instead.</li>
+            <li><strong>Cross-datacenter replication:</strong> Locks across datacenters add 50-200ms per operation. OCC lets each datacenter operate independently and reconcile conflicts.</li>
+            <li><strong>Collaborative editing:</strong> Multiple users editing the same document. CRDTs or OT (Operational Transformation) handle concurrent edits without locks.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic: Pessimistic Locking (SELECT FOR UPDATE)</h3>
+      <p>The database itself manages locks. <code>SELECT ... FOR UPDATE</code> acquires a row-level exclusive lock that blocks other transactions from reading or writing the row until the transaction commits. This is the simplest and most widely understood approach. It works well for single-database systems with moderate contention. The downside: it holds database connections and locks for the duration of the transaction, which limits throughput under high concurrency. Long-running transactions can cause lock contention cascades.</p>
+
+      <h3>Classic: Two-Phase Locking (2PL)</h3>
+      <p>The standard protocol for serializable transactions. In the growing phase, the transaction acquires locks and never releases any. In the shrinking phase, it releases locks and never acquires new ones. Strict 2PL holds all locks until commit, guaranteeing serializability. The problem: 2PL is prone to deadlocks and reduces concurrency because locks are held for the entire transaction duration. This is why most databases default to weaker isolation levels.</p>
+
+      <h4>Two-Phase Locking: Step-by-Step Deadlock Trace</h4>
+      <p>To see why 2PL is deadlock-prone, consider a concrete example with three transactions transferring money between accounts. Each transaction must lock the source account first (to read the balance), then lock the destination account (to credit it). In the growing phase, locks are only acquired, never released.</p>
+
+      <p><strong>Setup:</strong> Account A has $1000, Account B has $2000. T1 wants to transfer $100 from A to B. T2 wants to transfer $200 from B to A.</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>T1 (A &rarr; B)</th>
+              <th>T2 (B &rarr; A)</th>
+              <th>Lock Table</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>LOCK(A) &mdash; <strong>granted</strong></td>
+              <td>&mdash;</td>
+              <td>A: T1 (exclusive)</td>
+              <td>OK</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>&mdash;</td>
+              <td>LOCK(B) &mdash; <strong>granted</strong></td>
+              <td>A: T1, B: T2</td>
+              <td>OK</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>READ A &rarr; balance=$1000</td>
+              <td>READ B &rarr; balance=$2000</td>
+              <td>A: T1, B: T2</td>
+              <td>OK</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>LOCK(B) &mdash; <strong>BLOCKED</strong> (T2 holds B)</td>
+              <td>&mdash;</td>
+              <td>A: T1, B: T2</td>
+              <td>T1 waiting</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>still waiting for B...</td>
+              <td>LOCK(A) &mdash; <strong>BLOCKED</strong> (T1 holds A)</td>
+              <td>A: T1, B: T2</td>
+              <td>DEADLOCK</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Result:</strong> T1 holds A and waits for B. T2 holds B and waits for A. Neither can proceed &mdash; this is a deadlock. The wait-for graph has a cycle: T1 &rarr; T2 &rarr; T1.</p>
+      <p><strong>Fix &mdash; Lock Ordering:</strong> Establish a rule: <em>always acquire locks in alphabetical order</em> (A before B). Under this rule:</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>T1 (A &rarr; B)</th>
+              <th>T2 (B &rarr; A)</th>
+              <th>Lock Table</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>LOCK(A) &mdash; <strong>granted</strong></td>
+              <td>LOCK(A) &mdash; <strong>BLOCKED</strong> (T1 holds A)</td>
+              <td>A: T1</td>
+              <td>T2 waiting</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>LOCK(B) &mdash; <strong>granted</strong></td>
+              <td>still waiting for A...</td>
+              <td>A: T1, B: T1</td>
+              <td>T2 waiting</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>READ A, WRITE A=$900, WRITE B=$2100</td>
+              <td>still waiting...</td>
+              <td>A: T1, B: T1</td>
+              <td>T2 waiting</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>COMMIT &rarr; UNLOCK(A), UNLOCK(B)</td>
+              <td>LOCK(A) &mdash; <strong>granted</strong></td>
+              <td>A: T2</td>
+              <td>OK</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>&mdash;</td>
+              <td>LOCK(B) &mdash; <strong>granted</strong></td>
+              <td>A: T2, B: T2</td>
+              <td>OK</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>&mdash;</td>
+              <td>READ B=$2100, WRITE B=$1900, WRITE A=$1100. COMMIT.</td>
+              <td>(empty)</td>
+              <td>OK</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Because both transactions acquire A before B, a cycle can never form. T2 waits for T1 to finish, then proceeds. Lock ordering is simple, provably correct, and is the most common deadlock prevention strategy in practice.</p>
+
+      <h3>Transaction Isolation Levels: The Four SQL Levels</h3>
+      <p>Databases offer different <strong>isolation levels</strong> that control what anomalies concurrent transactions can observe. Stronger isolation prevents more anomalies but reduces concurrency (throughput). Understanding these levels is essential because most concurrency bugs in production stem from running at an isolation level that is too weak for the application's invariants.</p>
+
+      <h4>Level 1: READ UNCOMMITTED (Dirty Reads Allowed)</h4>
+      <p>This is the weakest isolation level. A transaction can read data written by another transaction <em>before</em> that transaction commits. If the writing transaction rolls back, the reader has used data that never officially existed &mdash; a <strong>dirty read</strong>.</p>
+      <p><strong>Concrete example &mdash; dirty read:</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>T1 (Transfer)</th>
+              <th>T2 (Balance check)</th>
+              <th>Account Balance in DB</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>t1</td>
+              <td>BEGIN</td>
+              <td>&mdash;</td>
+              <td>$1000</td>
+            </tr>
+            <tr>
+              <td>t2</td>
+              <td>UPDATE balance = $500 (not yet committed)</td>
+              <td>&mdash;</td>
+              <td>$500 (uncommitted)</td>
+            </tr>
+            <tr>
+              <td>t3</td>
+              <td>&mdash;</td>
+              <td>BEGIN</td>
+              <td>$500 (uncommitted)</td>
+            </tr>
+            <tr>
+              <td>t4</td>
+              <td>&mdash;</td>
+              <td>SELECT balance &rarr; reads <strong>$500</strong></td>
+              <td>$500 (uncommitted)</td>
+            </tr>
+            <tr>
+              <td>t5</td>
+              <td>ROLLBACK (abort!)</td>
+              <td>&mdash;</td>
+              <td>$1000 (restored)</td>
+            </tr>
+            <tr>
+              <td>t6</td>
+              <td>&mdash;</td>
+              <td>Uses $500 for a decision &mdash; <strong>WRONG!</strong></td>
+              <td>$1000</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>T2 read $500, but that value never actually committed. T2 made a decision based on phantom data. This level is almost never used in practice.</p>
+
+      <h4>Level 2: READ COMMITTED (No Dirty Reads, but Non-Repeatable Reads)</h4>
+      <p>A transaction can only read data from committed transactions. This prevents dirty reads. However, if a transaction reads the same row twice, it might get different values because another transaction committed a change between the two reads &mdash; a <strong>non-repeatable read</strong>.</p>
+      <p><strong>Concrete example &mdash; non-repeatable read:</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>T1 (Report generation)</th>
+              <th>T2 (Account update)</th>
+              <th>Committed Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>t1</td>
+              <td>BEGIN</td>
+              <td>&mdash;</td>
+              <td>$1000</td>
+            </tr>
+            <tr>
+              <td>t2</td>
+              <td>SELECT balance &rarr; reads <strong>$1000</strong></td>
+              <td>&mdash;</td>
+              <td>$1000</td>
+            </tr>
+            <tr>
+              <td>t3</td>
+              <td>&mdash;</td>
+              <td>BEGIN</td>
+              <td>$1000</td>
+            </tr>
+            <tr>
+              <td>t4</td>
+              <td>&mdash;</td>
+              <td>UPDATE balance = $500; COMMIT</td>
+              <td>$500</td>
+            </tr>
+            <tr>
+              <td>t5</td>
+              <td>SELECT balance &rarr; reads <strong>$500</strong></td>
+              <td>&mdash;</td>
+              <td>$500</td>
+            </tr>
+            <tr>
+              <td>t6</td>
+              <td>T1 sees two different values for the same row!</td>
+              <td>&mdash;</td>
+              <td>$500</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>T1 read the same account balance twice and got different results ($1000 then $500). This is problematic for reports that need a consistent view &mdash; the report might show inconsistent subtotals. READ COMMITTED is PostgreSQL's default and is sufficient for many workloads, but not for reports or invariant checks that read the same data multiple times.</p>
+
+      <h4>Level 3: REPEATABLE READ (No Non-Repeatable Reads, but Phantom Reads)</h4>
+      <p>The transaction sees a consistent snapshot of the data as of the transaction's start time. Re-reading the same row always returns the same value. However, new rows inserted by other transactions can appear &mdash; a <strong>phantom read</strong>.</p>
+      <p><strong>Concrete example &mdash; phantom read:</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>T1 (Scheduling audit)</th>
+              <th>T2 (New hire onboarding)</th>
+              <th>active Doctors Table</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>t1</td>
+              <td>BEGIN</td>
+              <td>&mdash;</td>
+              <td>10 rows (Dr. 1 &ndash; Dr. 10)</td>
+            </tr>
+            <tr>
+              <td>t2</td>
+              <td>SELECT COUNT(*) WHERE status='active' &rarr; <strong>10</strong></td>
+              <td>&mdash;</td>
+              <td>10 rows</td>
+            </tr>
+            <tr>
+              <td>t3</td>
+              <td>&mdash;</td>
+              <td>BEGIN</td>
+              <td>10 rows</td>
+            </tr>
+            <tr>
+              <td>t4</td>
+              <td>&mdash;</td>
+              <td>INSERT new doctor (status='active'); COMMIT</td>
+              <td>11 rows</td>
+            </tr>
+            <tr>
+              <td>t5</td>
+              <td>SELECT COUNT(*) WHERE status='active' &rarr; <strong>11</strong></td>
+              <td>&mdash;</td>
+              <td>11 rows</td>
+            </tr>
+            <tr>
+              <td>t6</td>
+              <td>T1 counted 10, then 11 &mdash; a new "phantom" row appeared</td>
+              <td>&mdash;</td>
+              <td>11 rows</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>T1's count changed from 10 to 11 because T2 inserted a new row that matched T1's query predicate. The existing rows did not change (repeatable read guarantee), but a <em>new</em> row appeared. Note: PostgreSQL's REPEATABLE READ actually uses snapshot isolation, which prevents phantoms in most cases. The SQL standard's definition of REPEATABLE READ technically allows phantoms.</p>
+
+      <h4>Level 4: SERIALIZABLE (All Anomalies Prevented)</h4>
+      <p>The strongest isolation level. Transactions behave as if they executed one at a time, in some serial order. No dirty reads, no non-repeatable reads, no phantom reads, no write skew. The tradeoff is reduced throughput &mdash; transactions that would conflict are either blocked (under 2PL-based serializable) or aborted and retried (under SSI-based serializable).</p>
+
+      <h4>Anomalies Prevented at Each Isolation Level</h4>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Isolation Level</th>
+              <th>Dirty Read</th>
+              <th>Non-Repeatable Read</th>
+              <th>Phantom Read</th>
+              <th>Write Skew</th>
+              <th>Typical Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>READ UNCOMMITTED</td>
+              <td>Possible</td>
+              <td>Possible</td>
+              <td>Possible</td>
+              <td>Possible</td>
+              <td>Almost never used; some analytics on dirty data</td>
+            </tr>
+            <tr>
+              <td>READ COMMITTED</td>
+              <td><strong>Prevented</strong></td>
+              <td>Possible</td>
+              <td>Possible</td>
+              <td>Possible</td>
+              <td>Default for PostgreSQL, Oracle; most OLTP workloads</td>
+            </tr>
+            <tr>
+              <td>REPEATABLE READ</td>
+              <td><strong>Prevented</strong></td>
+              <td><strong>Prevented</strong></td>
+              <td>Possible*</td>
+              <td>Possible</td>
+              <td>Reports needing consistent reads; MySQL InnoDB default</td>
+            </tr>
+            <tr>
+              <td>SERIALIZABLE</td>
+              <td><strong>Prevented</strong></td>
+              <td><strong>Prevented</strong></td>
+              <td><strong>Prevented</strong></td>
+              <td><strong>Prevented</strong></td>
+              <td>Financial systems, invariant-critical business logic</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><em>* PostgreSQL's REPEATABLE READ uses snapshot isolation, which prevents phantoms in most practical cases. The SQL standard technically allows them at this level.</em></p>
+
+      <h3>Modern: Multi-Version Concurrency Control (MVCC)</h3>
+      <p>Instead of locking, the database maintains multiple versions of each row. Readers see a consistent snapshot without blocking writers. Writers create a new version rather than modifying in place. This is how PostgreSQL, MySQL InnoDB, Oracle, and CockroachDB handle concurrency. MVCC enables high read concurrency because readers never block writers and writers never block readers. The tradeoff: more storage (old versions must be retained and garbage collected), and write-write conflicts still require detection.</p>
+
+      <h4>MVCC Visibility Trace (PostgreSQL-Style)</h4>
+      <p>In PostgreSQL, every row version has two hidden columns: <code>xmin</code> (the transaction ID that created this version) and <code>xmax</code> (the transaction ID that deleted or replaced this version; <code>&infin;</code> means "still alive"). To determine whether a row version is visible to a transaction, PostgreSQL applies <strong>visibility rules</strong> based on the transaction's snapshot.</p>
+      <p><strong>Scenario:</strong> An <code>accounts</code> table has one row: Alice with balance=$1000, created by committed transaction T95.</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Action</th>
+              <th>Row Versions on Disk</th>
+              <th>What T100 Sees</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>T100 starts (snapshot: all txns &lt; 100 committed)</td>
+              <td>v1: (xmin=95, xmax=&infin;, balance=$1000)</td>
+              <td>v1 visible: xmin=95 is committed and &lt; 100, xmax=&infin; &rarr; <strong>$1000</strong></td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>T101 starts</td>
+              <td>v1: (xmin=95, xmax=&infin;, balance=$1000)</td>
+              <td>(T100 unchanged)</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>T101 executes: UPDATE accounts SET balance=500 WHERE name='Alice'</td>
+              <td>v1: (xmin=95, <strong>xmax=101</strong>, balance=$1000)<br>v2: (<strong>xmin=101</strong>, xmax=&infin;, balance=$500)</td>
+              <td>(T100 unchanged)</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>T101 commits</td>
+              <td>v1: (xmin=95, xmax=101, balance=$1000)<br>v2: (xmin=101, xmax=&infin;, balance=$500)</td>
+              <td>(T100 unchanged)</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>T100 reads Alice's balance again</td>
+              <td>(same as step 4)</td>
+              <td>v1: xmin=95 committed &lt; 100 &check;, xmax=101 &gt; 100 &rarr; <strong>v1 still visible</strong>. T100 sees <strong>$1000</strong></td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>T102 starts (snapshot: all txns &le; 101 committed)</td>
+              <td>(same as step 4)</td>
+              <td>T102 checks: v1 has xmax=101, which is committed and &le; 102 &rarr; v1 is dead. v2 has xmin=101, committed and &le; 102, xmax=&infin; &rarr; <strong>v2 visible</strong>. T102 sees <strong>$500</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Key insight:</strong> T100 reads the row <em>after</em> T101 has committed the update, but still sees the old value ($1000). This is snapshot isolation at work &mdash; T100 sees a consistent snapshot as of when it started. T102, which started after T101 committed, sees the new value ($500). No locks were needed at any point.</p>
+
+      <h4>MVCC Visibility Rules (Summary)</h4>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Row Version Check</th>
+              <th>Condition</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Was the row <strong>created</strong> by a committed txn visible to my snapshot?</td>
+              <td><code>xmin</code> is committed AND <code>xmin &lt; my_txn_id</code></td>
+              <td>Row creation is visible</td>
+            </tr>
+            <tr>
+              <td>Has the row been <strong>deleted/replaced</strong>?</td>
+              <td><code>xmax = &infin;</code> (no deletion)</td>
+              <td>Row is still alive &rarr; <strong>VISIBLE</strong></td>
+            </tr>
+            <tr>
+              <td>Was the deletion visible to my snapshot?</td>
+              <td><code>xmax</code> is committed AND <code>xmax &lt; my_txn_id</code></td>
+              <td>Deletion is visible &rarr; row is <strong>INVISIBLE</strong> (dead)</td>
+            </tr>
+            <tr>
+              <td>Was the deletion by a still-running or future txn?</td>
+              <td><code>xmax &ge; my_txn_id</code> OR <code>xmax</code> is not committed</td>
+              <td>Deletion is not visible &rarr; row is <strong>VISIBLE</strong> (still alive from my perspective)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Modern: Optimistic Concurrency Control (OCC)</h3>
+      <p>Proceed without locks. Each transaction reads data and records what it read (the read set) and what it wants to write (the write set). At commit time, the system validates that no other transaction modified the read set. If validation passes, the transaction commits. If it fails, the transaction aborts and retries. OCC shines under low contention: no lock acquisition overhead, maximum parallelism. Under high contention, OCC degrades as transactions repeatedly abort and retry, wasting work.</p>
+
+      <h3>Modern: CRDTs (Conflict-free Replicated Data Types)</h3>
+      <p>CRDTs are mathematically guaranteed to converge to the same state regardless of the order in which updates are applied. This means replicas can accept writes independently, without coordination, and eventually agree. Common CRDTs include G-Counter (grow-only counter), PN-Counter (increment/decrement), OR-Set (observed-remove set), and LWW-Register (last-writer-wins register). Used in production by Redis (CRDTs in Redis Enterprise active-active), Riak, and collaborative editors like Figma. The limitation: CRDTs can only represent data structures with commutative, associative, and idempotent merge operations &mdash; not all business logic fits.</p>
+
+      <h4>G-Counter Merge Example: 3 Nodes</h4>
+      <p>A G-Counter (grow-only counter) is the simplest CRDT. Each node maintains a vector of counters, one entry per node. To increment, a node only increments its own entry. To get the total, sum all entries. To merge two replicas, take the element-wise maximum.</p>
+      <p><strong>Setup:</strong> 3 nodes (A, B, C), each tracking page view counts. After some local increments:</p>
+      <ul>
+        <li><strong>Node A's state:</strong> [2, 0, 0] &mdash; A saw 2 page views locally</li>
+        <li><strong>Node B's state:</strong> [0, 3, 0] &mdash; B saw 3 page views locally</li>
+        <li><strong>Node C's state:</strong> [0, 0, 1] &mdash; C saw 1 page view locally</li>
+      </ul>
+      <p><strong>Merge trace (order 1: A merges with B, then with C):</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Operation</th>
+              <th>Result</th>
+              <th>Total (sum)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>merge(A, B) = max([2,0,0], [0,3,0])</td>
+              <td>[2, 3, 0]</td>
+              <td>5</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>merge([2,3,0], C) = max([2,3,0], [0,0,1])</td>
+              <td><strong>[2, 3, 1]</strong></td>
+              <td><strong>6</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Merge trace (order 2: A merges with C first, then with B):</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Operation</th>
+              <th>Result</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>merge(A, C) = max([2,0,0], [0,0,1])</td>
+              <td>[2, 0, 1]</td>
+              <td>3</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>merge([2,0,1], B) = max([2,0,1], [0,3,0])</td>
+              <td><strong>[2, 3, 1]</strong></td>
+              <td><strong>6</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Same result regardless of merge order.</strong> This works because <code>max</code> is:</p>
+      <ul>
+        <li><strong>Commutative:</strong> merge(A, B) = merge(B, A)</li>
+        <li><strong>Associative:</strong> merge(merge(A, B), C) = merge(A, merge(B, C))</li>
+        <li><strong>Idempotent:</strong> merge(A, A) = A (merging with yourself changes nothing)</li>
+      </ul>
+      <p>These three properties guarantee that <em>any</em> merge order, even with duplicate messages, produces the same final state. This is what makes CRDTs "conflict-free."</p>
+
+      <h4>PN-Counter: Supporting Decrements</h4>
+      <p>A G-Counter can only grow. To support both increments and decrements, a PN-Counter uses <em>two</em> G-Counters: <strong>P</strong> (positive/increments) and <strong>N</strong> (negative/decrements). The actual value = sum(P) &minus; sum(N).</p>
+      <p><strong>Example:</strong> A "likes" counter that supports unlike (decrement):</p>
+      <ul>
+        <li><strong>P</strong> = [2, 3, 1] &mdash; total increments = 2 + 3 + 1 = 6</li>
+        <li><strong>N</strong> = [1, 0, 0] &mdash; total decrements = 1 + 0 + 0 = 1</li>
+        <li><strong>Value</strong> = 6 &minus; 1 = <strong>5</strong></li>
+      </ul>
+      <p>Each G-Counter (P and N) merges independently using element-wise max. Since both P and N converge, their difference also converges. Node A had 2 likes and 1 unlike, so its net contribution is 1. Node B had 3 likes and 0 unlikes. Node C had 1 like and 0 unlikes.</p>
+
+      <h3>Modern: Serializable Snapshot Isolation (SSI)</h3>
+      <p>SSI combines the performance of snapshot isolation with the correctness of serializability. It allows transactions to proceed on their snapshots without blocking, then detects serialization anomalies (like write skew) at commit time. CockroachDB and PostgreSQL (since version 9.1) implement SSI. It avoids the deadlocks of 2PL while providing the strongest isolation guarantee. The cost: some transactions are aborted when anomalies are detected, requiring retries.</p>
+
+      <h4>Write Skew: The Hospital On-Call Problem (Detailed Trace)</h4>
+      <p>Write skew is a concurrency anomaly that snapshot isolation (REPEATABLE READ) does <em>not</em> prevent. It occurs when two transactions read overlapping data, make <em>disjoint</em> writes (each writes to a different row), and together violate an invariant that neither violated individually.</p>
+
+      <p><strong>Setup:</strong> A hospital requires at least 1 doctor on call at all times. Currently, Alice and Bob are both on call.</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>T1 (Alice wants to leave)</th>
+              <th>T2 (Bob wants to leave)</th>
+              <th>on_call Table State</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>t1</td>
+              <td>BEGIN (snapshot taken)</td>
+              <td>BEGIN (snapshot taken)</td>
+              <td>Alice=on_call, Bob=on_call (2 on call)</td>
+            </tr>
+            <tr>
+              <td>t2</td>
+              <td>SELECT COUNT(*) WHERE on_call=true &rarr; <strong>2</strong></td>
+              <td>&mdash;</td>
+              <td>(unchanged)</td>
+            </tr>
+            <tr>
+              <td>t3</td>
+              <td>&mdash;</td>
+              <td>SELECT COUNT(*) WHERE on_call=true &rarr; <strong>2</strong></td>
+              <td>(unchanged)</td>
+            </tr>
+            <tr>
+              <td>t4</td>
+              <td>2 &ge; 2, safe to leave. UPDATE SET on_call=false WHERE name='Alice'</td>
+              <td>&mdash;</td>
+              <td>Alice=off, Bob=on_call</td>
+            </tr>
+            <tr>
+              <td>t5</td>
+              <td>&mdash;</td>
+              <td>2 &ge; 2, safe to leave. UPDATE SET on_call=false WHERE name='Bob'</td>
+              <td>Alice=off, Bob=off</td>
+            </tr>
+            <tr>
+              <td>t6</td>
+              <td>COMMIT &check;</td>
+              <td>COMMIT &check;</td>
+              <td><strong>0 doctors on call! INVARIANT VIOLATED</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Why snapshot isolation allows this:</strong> Each transaction's snapshot showed 2 doctors on call. Each transaction wrote to a <em>different</em> row (T1 wrote Alice's row, T2 wrote Bob's row). There is no write-write conflict &mdash; snapshot isolation only detects conflicts when two transactions write the <em>same</em> row. So both commits succeed, and the invariant is violated.</p>
+
+      <p><strong>How SSI detects and prevents this:</strong></p>
+      <p>SSI tracks <strong>rw-dependencies</strong> (read-write dependencies). A rw-dependency from T1 to T2 exists when T2 writes a row that T1 read. SSI looks for cycles in the dependency graph &mdash; a cycle means the transactions cannot be serialized in any order, so one must be aborted.</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Dependency</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>T1 &rarr; T2 (rw-dependency)</td>
+              <td>T1 read the on_call rows (including Bob's row). T2 wrote Bob's row.</td>
+            </tr>
+            <tr>
+              <td>T2 &rarr; T1 (rw-dependency)</td>
+              <td>T2 read the on_call rows (including Alice's row). T1 wrote Alice's row.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Cycle detected:</strong> T1 &rarr; T2 &rarr; T1. SSI aborts one transaction (say T2) at commit time. Bob's request to go off-call fails and must be retried. On retry, T2 reads the count as 1 (Alice already left), sees it is not safe to leave, and the application correctly rejects the request. The invariant is preserved.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Clocks are imperfect:</strong> Distributed locks rely on TTLs, which depend on clocks. Clock skew between nodes means a lock's TTL might expire earlier on one node than another. Google Spanner uses TrueTime (GPS + atomic clocks) to bound clock uncertainty to ~7ms. Most systems do not have this luxury and must design for unbounded clock skew.</li>
+          <li><strong>Processes can pause arbitrarily:</strong> A GC pause, a context switch, or a VM migration can pause a process for seconds. During a pause, the process's distributed lock may expire, but the process still believes it holds the lock. This is the fundamental unsafety of distributed locks without fencing tokens.</li>
+          <li><strong>The network is unreliable:</strong> Messages can be delayed, duplicated, reordered, or lost. A lock holder might be working correctly but appear dead because its heartbeats are delayed. The lock service expires the lock and grants it to another client. Now two clients believe they hold the lock &mdash; the "split-brain" problem.</li>
+          <li><strong>Failures are partial:</strong> In an OS, if the machine dies, all threads die with it. In a distributed system, some nodes fail while others continue. A lock holder might crash while the resource it was protecting is still accessible to other nodes.</li>
+        </ul>
+      </div>
+      <h3>When These Assumptions Break</h3>
+      <ul>
+        <li><strong>GC pauses violate lock safety:</strong> A Java process acquires a lock with a 30-second TTL, then enters a 40-second GC pause. The lock expires, another client acquires it and modifies the resource. The first client resumes, unaware it lost the lock, and overwrites the changes. Solution: fencing tokens, or design the system to tolerate stale lock holders (idempotent operations, version checks on the resource).</li>
+        <li><strong>Network partitions violate lock liveness:</strong> A network partition separates the lock holder from the lock service. The lock service expires the lock (no heartbeats received). The lock holder continues working, believing it still holds the lock. When the partition heals, two clients may have modified the resource. Solution: the resource itself must validate the fencing token, rejecting requests from the old lock holder.</li>
+        <li><strong>Redlock controversy:</strong> Redis's Redlock algorithm attempts to provide distributed locks using multiple independent Redis instances. Martin Kleppmann demonstrated that Redlock is not safe under network delays and GC pauses because it fundamentally depends on timing assumptions. The debate (Kleppmann vs. Antirez) highlights that truly safe distributed locks require consensus (ZooKeeper, etcd) rather than timing-based heuristics.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>Lock Granularity</h3>
+      <p><strong>Coarse-grained locks</strong> (table-level, service-level) are simple but serialize too much. If you lock the entire inventory table to update one SKU, no other SKU can be updated concurrently. <strong>Fine-grained locks</strong> (row-level, resource-level) maximize concurrency but increase lock management overhead and deadlock risk. The key metric: <code>lock_contention_rate = concurrent_writers / lock_granularity_units</code>. If 100 writers contend for 1 lock, contention is 100:1. If they contend for 10,000 locks (one per SKU), average contention is 0.01:1 &mdash; negligible.</p>
+
+      <h3>Lock Hold Time</h3>
+      <p><strong>Too short:</strong> The operation hasn't completed when the lock expires. Another client acquires the lock and corrupts the resource. <strong>Too long:</strong> Locks are held unnecessarily, blocking other clients. <strong>Rule of thumb:</strong> Set the lock TTL to 3-5x the p99 operation time. If the operation takes 50ms at p99, set the TTL to 150-250ms. Implement lock renewal (heartbeat) for operations that might occasionally take longer &mdash; but alert on renewals, because they signal an operation is slower than expected.</p>
+
+      <h3>Contention Level and Strategy Selection</h3>
+      <p>The choice between pessimistic and optimistic concurrency control depends on contention. Below ~5% write conflict rate, OCC is typically faster because it avoids lock acquisition overhead. Above ~30% conflict rate, pessimistic locking wins because OCC wastes too much work on aborted transactions. Between 5-30% is the gray zone where benchmarking is required.</p>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+      <p>Concurrency control parameters should be derived from your Service Level Objectives, not guessed.</p>
+
+      <!-- Example 1 -->
+      <div class="callout callout-info">
+        <p><strong>Example 1 &mdash; E-commerce Inventory: p99 lock acquisition &lt; 10ms, 50K TPS</strong></p>
+        <p>Your inventory service must handle 50,000 transactions per second with p99 lock acquisition under 10ms. Each transaction decrements the stock count for a specific SKU.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Lock granularity:</strong> Per-SKU locks. With 100K SKUs and 50K TPS uniformly distributed, average contention per SKU is 0.5 TPS. Even for hot SKUs (top 1% handling 20% of traffic = 10K TPS across 1000 SKUs = 10 TPS per hot SKU), contention is manageable.</li>
+          <li><strong>Lock service:</strong> <strong>Redis</strong> over ZooKeeper. Redis SETNX round-trip is ~0.5ms (same-region). ZooKeeper ephemeral node creation is 2-10ms. At p99 &lt; 10ms, Redis gives more headroom. A Redis Cluster with 6 nodes handles 500K+ ops/s, well above 50K TPS.</li>
+          <li><strong>Lock TTL:</strong> 50ms. The inventory decrement operation (read + conditional write) takes 5-10ms at p99. A 50ms TTL provides a 5x safety margin. If the holder crashes, the lock is released within 50ms &mdash; well within the p99 SLO.</li>
+          <li><strong>Fencing tokens:</strong> Required. Each lock acquisition returns a monotonically increasing token. The database checks <code>UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND fence_token &lt; ?</code>.</li>
+          <li><strong>Capacity:</strong> 50K lock acquire + 50K lock release = 100K Redis ops/s. A single Redis node handles 100K+ ops/s. Use a cluster for redundancy, not throughput.</li>
+        </ul>
+      </div>
+
+      <!-- Example 2 -->
+      <div class="callout callout-info">
+        <p><strong>Example 2 &mdash; Collaborative Editor: p99 conflict resolution &lt; 50ms, 1000 concurrent editors per doc</strong></p>
+        <p>Your collaborative document editor must support 1000 concurrent editors on a single document with p99 conflict resolution under 50ms.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Strategy:</strong> <strong>CRDTs</strong> over OCC. With 1000 concurrent editors, OCC would have astronomical conflict rates &mdash; nearly every write would conflict with another. CRDTs allow every edit to be applied locally without coordination, then merged.</li>
+          <li><strong>CRDT type:</strong> A sequence CRDT (like RGA or Yjs YATA) for text. Each character has a unique ID. Insertions and deletions are commutative operations that converge regardless of order.</li>
+          <li><strong>Sync protocol:</strong> Each client maintains a local CRDT replica. Edits are broadcast via WebSocket to a coordination server, which relays to all other clients. At 1000 editors typing ~2 chars/second, the server handles 2000 ops/second per document. Each op is ~100 bytes, so 200 KB/s bandwidth per document.</li>
+          <li><strong>Conflict resolution:</strong> CRDTs have no conflicts by design &mdash; merge is deterministic. The p99 &lt; 50ms target applies to the end-to-end sync latency: client-to-server (5-20ms) + server-to-client broadcast (5-20ms) = 10-40ms at p99. Achievable with co-located WebSocket servers.</li>
+          <li><strong>Fallback:</strong> If CRDT state diverges (due to bugs, not theory), use a periodic full-state sync every 30 seconds as a consistency checkpoint.</li>
+        </ul>
+      </div>
+
+      <!-- Example 3 -->
+      <div class="callout callout-info">
+        <p><strong>Example 3 &mdash; Distributed Rate Limiter: p99 &lt; 5ms, 1M RPS</strong></p>
+        <p>Your API gateway must enforce a global rate limit of 10,000 requests per second per customer, across 50 gateway instances, handling 1M total RPS with p99 decision latency under 5ms.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Strategy:</strong> <strong>Local + periodic sync</strong> distributed semaphore. Pure distributed counting at 1M RPS requires 1M Redis ops/s &mdash; expensive and fragile. Instead, each gateway instance maintains a local counter and syncs with Redis every 100ms.</li>
+          <li><strong>Local allocation:</strong> Each instance gets <code>limit / num_instances = 10,000 / 50 = 200</code> requests per second as its local quota. Decisions are made locally against this quota with zero network latency.</li>
+          <li><strong>Sync adjustment:</strong> Every 100ms, each instance reports its count to Redis and receives an adjusted quota. If some instances are underutilized, their unused quota is redistributed to busy instances. This allows burst handling while maintaining the global limit.</li>
+          <li><strong>Accuracy tradeoff:</strong> With 100ms sync intervals, the global count can overshoot by up to <code>50 instances * 200 rps * 0.1s = 1000 requests</code> (10% overshoot). For most rate limiting, 10% accuracy is acceptable. Tighten by syncing every 50ms (5% overshoot) at the cost of 2x Redis traffic.</li>
+          <li><strong>p99 latency:</strong> Local counter check is ~0.01ms. The 5ms budget is met trivially because there is no network round-trip in the hot path. Redis syncs happen in the background.</li>
+        </ul>
+      </div>
+
+      <!-- Example 4 -->
+      <div class="callout callout-info">
+        <p><strong>Example 4 &mdash; Banking Ledger: Serializable isolation, p99 &lt; 100ms</strong></p>
+        <p>Your banking ledger must provide serializable isolation for all transactions (no phantom reads, no write skew) with p99 transaction latency under 100ms.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Strategy:</strong> <strong>Serializable Snapshot Isolation (SSI)</strong> via CockroachDB or PostgreSQL with <code>SERIALIZABLE</code> isolation level. SSI provides serializable guarantees without the deadlock-prone 2PL, using conflict detection at commit time.</li>
+          <li><strong>MVCC parameters:</strong> PostgreSQL retains old row versions for active transactions. With p99 &lt; 100ms, transactions are short-lived. Set <code>old_snapshot_threshold = 1min</code> to aggressively clean dead tuples. Run autovacuum with <code>autovacuum_naptime = 10s</code> and <code>autovacuum_vacuum_cost_delay = 2ms</code> to prevent bloat.</li>
+          <li><strong>Lock pool sizing:</strong> PostgreSQL's <code>max_locks_per_transaction</code> defaults to 64. A banking transfer touches 2-4 rows (debit account, credit account, transaction log, maybe a running balance). 64 is sufficient. Set <code>max_connections = 200</code> with PgBouncer for connection pooling.</li>
+          <li><strong>SSI abort rate:</strong> Under SSI, CockroachDB aborts 1-5% of transactions due to serialization conflicts. With a 100ms p99 budget, one retry (2x the base latency) stays within budget if the base p99 is under 50ms. Monitor <code>txn_aborts_serializable</code> &mdash; if it exceeds 10%, reduce contention by partitioning hot accounts or batching updates.</li>
+          <li><strong>Write skew prevention:</strong> SSI detects write skew automatically. Example: two transactions both read that total withdrawals &lt; $1000, then both withdraw $800, leaving the account at -$600. SSI aborts one of them. Without SSI, you'd need explicit <code>SELECT FOR UPDATE</code> on the balance check.</li>
+        </ul>
+      </div>
+
+      <!-- Interactive Graph: Throughput vs Contention -->
+      <h3>Throughput vs. Contention Level by Strategy</h3>
+      <p>This interactive graph shows how throughput changes as contention increases for three concurrency strategies. Hover over the graph to see exact values. At low contention, optimistic control wins. At high contention, pessimistic locking is more efficient. Lock-free CRDTs maintain stable throughput regardless.</p>
+      <div style="position:relative; max-width:900px; margin:2rem auto;">
+        <canvas id="ccThroughputChart" width="900" height="420" style="width:100%; border:1px solid var(--border, #d0d7de); border-radius:8px; background:var(--surface, #fff);"></canvas>
+        <div id="ccChartTooltip" style="display:none; position:absolute; pointer-events:none; background:rgba(30,30,30,0.92); color:#fff; padding:10px 14px; border-radius:6px; font-size:13px; font-family:'JetBrains Mono',monospace; line-height:1.6; box-shadow:0 2px 8px rgba(0,0,0,0.25); z-index:10; max-width:300px;"></div>
+      </div>
+      <script>
+      (function() {
+        var canvas = document.getElementById('ccThroughputChart');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var tooltip = document.getElementById('ccChartTooltip');
+        var W = canvas.width, H = canvas.height;
+        var PAD = { top: 50, right: 30, bottom: 60, left: 80 };
+        var plotW = W - PAD.left - PAD.right;
+        var plotH = H - PAD.top - PAD.bottom;
+
+        var X_MAX = 100; // contention % (0-100)
+        var Y_MAX = 50000; // throughput (ops/s)
+        var STEPS = 200;
+
+        // Pessimistic locking: starts moderate, degrades linearly under contention but stays stable
+        function pessimistic(contention) {
+          var base = 30000;
+          var degradation = contention * 200;
+          return Math.max(base - degradation, 8000);
+        }
+
+        // Optimistic (OCC): starts high, degrades sharply under contention due to retries
+        function optimistic(contention) {
+          var base = 45000;
+          if (contention < 5) return base - contention * 200;
+          if (contention < 20) return base - 1000 - (contention - 5) * 800;
+          if (contention < 50) return base - 13000 - (contention - 20) * 500;
+          return Math.max(base - 13000 - 15000 - (contention - 50) * 200, 2000);
+        }
+
+        // Lock-free CRDTs: constant throughput, slightly lower baseline
+        function lockFree(contention) {
+          return 25000 + Math.sin(contention * 0.1) * 500;
+        }
+
+        var dataPess = [], dataOpt = [], dataCRDT = [];
+        for (var i = 0; i <= STEPS; i++) {
+          var c = (i / STEPS) * X_MAX;
+          dataPess.push({ c: c, v: pessimistic(c) });
+          dataOpt.push({ c: c, v: optimistic(c) });
+          dataCRDT.push({ c: c, v: lockFree(c) });
+        }
+
+        function cToX(c) { return PAD.left + (c / X_MAX) * plotW; }
+        function vToY(v) { return PAD.top + plotH - (v / Y_MAX) * plotH; }
+
+        function draw() {
+          ctx.clearRect(0, 0, W, H);
+
+          // Grid lines
+          ctx.strokeStyle = '#e5e7eb';
+          ctx.lineWidth = 0.5;
+          var yTicks = [0, 10000, 20000, 30000, 40000, 50000];
+          for (var yi = 0; yi < yTicks.length; yi++) {
+            var y = vToY(yTicks[yi]);
+            ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+          }
+          var xTicks = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+          for (var xi = 0; xi < xTicks.length; xi++) {
+            var x = cToX(xTicks[xi]);
+            ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + plotH); ctx.stroke();
+          }
+
+          // Axes labels
+          ctx.fillStyle = '#6b7280';
+          ctx.font = '12px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          for (var xi = 0; xi < xTicks.length; xi++) {
+            ctx.fillText(xTicks[xi] + '%', cToX(xTicks[xi]), PAD.top + plotH + 20);
+          }
+          ctx.textAlign = 'right';
+          for (var yi = 0; yi < yTicks.length; yi++) {
+            ctx.fillText((yTicks[yi] / 1000) + 'K', PAD.left - 8, vToY(yTicks[yi]) + 4);
+          }
+
+          // Axis titles
+          ctx.fillStyle = '#374151';
+          ctx.font = '13px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Write Contention Level (%)', PAD.left + plotW / 2, H - 10);
+          ctx.save();
+          ctx.translate(16, PAD.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.fillText('Throughput (ops/s)', 0, 0);
+          ctx.restore();
+
+          // Crossover zone
+          ctx.fillStyle = 'rgba(251, 191, 36, 0.08)';
+          ctx.fillRect(cToX(15), PAD.top, cToX(35) - cToX(15), plotH);
+          ctx.fillStyle = '#d97706';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Crossover Zone', cToX(25), PAD.top + 16);
+
+          // Draw lines
+          function drawLine(data, color) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            for (var i = 0; i < data.length; i++) {
+              var x = cToX(data[i].c), y = vToY(data[i].v);
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+          }
+
+          drawLine(dataPess, '#3b82f6');
+          drawLine(dataOpt, '#22c55e');
+          drawLine(dataCRDT, '#a855f7');
+
+          // Legend
+          var legX = W - PAD.right - 250, legY = PAD.top + 40;
+          ctx.lineWidth = 3;
+          var labels = [
+            { color: '#3b82f6', text: 'Pessimistic Locking' },
+            { color: '#22c55e', text: 'Optimistic (OCC + Retry)' },
+            { color: '#a855f7', text: 'Lock-Free (CRDTs)' }
+          ];
+          for (var li = 0; li < labels.length; li++) {
+            ctx.strokeStyle = labels[li].color;
+            ctx.beginPath();
+            ctx.moveTo(legX, legY + li * 22);
+            ctx.lineTo(legX + 28, legY + li * 22);
+            ctx.stroke();
+            ctx.fillStyle = '#374151';
+            ctx.font = '12px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(labels[li].text, legX + 34, legY + li * 22 + 4);
+          }
+        }
+
+        draw();
+
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H / rect.height);
+
+          if (mx < PAD.left || mx > W - PAD.right || my < PAD.top || my > PAD.top + plotH) {
+            tooltip.style.display = 'none';
+            return;
+          }
+
+          var c = ((mx - PAD.left) / plotW) * X_MAX;
+          var idx = Math.round((c / X_MAX) * STEPS);
+          idx = Math.max(0, Math.min(STEPS, idx));
+
+          var vP = dataPess[idx].v;
+          var vO = dataOpt[idx].v;
+          var vC = dataCRDT[idx].v;
+          var contention = dataPess[idx].c;
+
+          var winner = '';
+          if (vO >= vP && vO >= vC) winner = 'Optimistic wins';
+          else if (vP >= vO && vP >= vC) winner = 'Pessimistic wins';
+          else winner = 'CRDTs win';
+
+          tooltip.innerHTML =
+            '<strong>Contention: ' + contention.toFixed(1) + '%</strong><br>' +
+            '<span style="color:#60a5fa">Pessimistic: ' + Math.round(vP).toLocaleString() + ' ops/s</span><br>' +
+            '<span style="color:#4ade80">Optimistic: ' + Math.round(vO).toLocaleString() + ' ops/s</span><br>' +
+            '<span style="color:#c084fc">CRDTs: ' + Math.round(vC).toLocaleString() + ' ops/s</span><br>' +
+            '<em>' + winner + '</em>';
+
+          var tipX = e.clientX - rect.left + 16;
+          var tipY = e.clientY - rect.top - 10;
+          if (tipX + 280 > rect.width) tipX = e.clientX - rect.left - 290;
+          if (tipY < 0) tipY = 10;
+          tooltip.style.left = tipX + 'px';
+          tooltip.style.top = tipY + 'px';
+          tooltip.style.display = 'block';
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+        });
+      })();
+      </script>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>Single Database Locks</h4>
+          <p>One application server, one database. PostgreSQL handles all concurrency via row-level locks and MVCC. You use <code>SELECT FOR UPDATE</code> for the few write-heavy paths (inventory, account balance). Deadlocks are rare because contention is low. Transaction isolation is set to <code>READ COMMITTED</code> (PostgreSQL default) and you haven't thought deeply about it yet. This works fine.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>Application-Level Locking</h4>
+          <p>You scale to multiple app servers behind a load balancer. In-process mutexes no longer work because processes are on different machines. You introduce Redis-based distributed locks for critical sections: inventory reservation, payment processing, idempotency keys. You discover your first distributed deadlock: Service A locks resource X then tries to lock resource Y, while Service B holds Y and tries to lock X. You fix it by establishing a global lock ordering convention.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>Optimistic Concurrency + MVCC</h4>
+          <p>Lock contention becomes a bottleneck for read-heavy paths. You switch read-heavy operations to optimistic concurrency: add a <code>version</code> column to frequently-updated tables, use conditional writes (<code>UPDATE ... WHERE version = ?</code>), and handle conflicts in application code. You adopt CockroachDB for distributed SQL with serializable isolation via SSI. You introduce CRDTs for the real-time collaborative features (shared shopping carts, live dashboards).</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Heterogeneous Concurrency</h4>
+          <p>Different services use different concurrency strategies based on their requirements. The payment ledger uses serializable SSI with CockroachDB. The product catalog uses optimistic versioning with Elasticsearch. The collaborative editor uses CRDTs with a custom sync layer. The rate limiter uses local-plus-sync distributed semaphores. You operate a concurrency strategy guide for your organization that maps use cases to recommended approaches, with monitoring to detect concurrency anomalies (deadlocks, excessive retries, lock timeouts) across all services.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>Distributed Deadlocks: The Coffman Conditions in Distributed Systems</h3>
+      <p>Deadlocks require all four Coffman conditions to hold simultaneously. In distributed systems, each condition manifests differently:</p>
+      <ol>
+        <li><strong>Mutual Exclusion:</strong> Distributed locks inherently provide mutual exclusion. Any system using Redis locks, ZooKeeper locks, or database <code>SELECT FOR UPDATE</code> satisfies this condition. Unlike OS mutexes, distributed mutual exclusion is not guaranteed under network partitions (split-brain scenarios may allow two holders).</li>
+        <li><strong>Hold-and-Wait:</strong> A service holds lock A while waiting to acquire lock B. This is common in multi-resource transactions: a payment service holds a lock on the customer account while waiting for a lock on the merchant account. In microservices, this manifests as a service holding a database lock while making an RPC to another service that is itself waiting for a lock.</li>
+        <li><strong>No Preemption:</strong> Once a distributed lock is acquired, it cannot be forcibly taken away (unlike OS locks where the kernel can preempt). TTL-based expiry is the closest analogue to preemption, but it is time-based, not on-demand.</li>
+        <li><strong>Circular Wait:</strong> Service A holds lock X and waits for lock Y. Service B holds lock Y and waits for lock X. In microservices, this can span multiple services: Order Service holds the order lock and calls Inventory Service, which holds the inventory lock and calls Order Service back &mdash; circular dependency.</li>
+      </ol>
+
+      <h3>Deadlock Prevention Strategies</h3>
+      <ul>
+        <li><strong>Resource ordering:</strong> Assign a global order to all lockable resources (e.g., alphabetical by resource name). Always acquire locks in this order. This breaks the circular wait condition. Simple and effective for systems where all locks are known at transaction start.</li>
+        <li><strong>Timeout-based preemption:</strong> All lock acquisitions have a timeout. If a lock cannot be acquired within the timeout, the transaction aborts and releases all held locks, retrying from the beginning. This breaks the no-preemption condition. The timeout must be shorter than the lock TTL.</li>
+        <li><strong>Lock-free algorithms:</strong> Use CRDTs, append-only logs, or event sourcing to eliminate locks entirely. If there are no locks, there are no deadlocks. Applicable when eventual consistency is acceptable.</li>
+      </ul>
+
+      <h3>Deadlock Detection: Wait-For Graphs</h3>
+      <p>A wait-for graph has nodes representing transactions and directed edges from T1 to T2 meaning "T1 is waiting for a lock held by T2." A cycle in this graph is a deadlock. Databases like PostgreSQL maintain a local wait-for graph and detect cycles with a background thread, aborting the youngest transaction in the cycle. Distributed deadlock detection requires building a global wait-for graph from information scattered across multiple nodes &mdash; a non-trivial problem because the graph changes as messages propagate. Algorithms like the Chandy-Misra-Haas probe-based algorithm detect distributed cycles without building a global graph.</p>
+
+      <h4>Wait-For Graph: Concrete Deadlock Detection Example</h4>
+      <p><strong>Scenario:</strong> Three transactions are running concurrently, each holding one lock and waiting for another:</p>
+      <ul>
+        <li><strong>T1</strong> (started at t=100) holds lock on <code>orders</code> table, needs lock on <code>inventory</code> (held by T2)</li>
+        <li><strong>T2</strong> (started at t=102) holds lock on <code>inventory</code> table, needs lock on <code>payments</code> (held by T3)</li>
+        <li><strong>T3</strong> (started at t=105) holds lock on <code>payments</code> table, needs lock on <code>orders</code> (held by T1)</li>
+      </ul>
+
+      <p><strong>The wait-for graph edges:</strong></p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Edge</th>
+              <th>Meaning</th>
+              <th>T(waiter) Holds</th>
+              <th>T(waiter) Needs</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>T1 &rarr; T2</td>
+              <td>T1 is waiting for a lock held by T2</td>
+              <td><code>orders</code></td>
+              <td><code>inventory</code></td>
+            </tr>
+            <tr>
+              <td>T2 &rarr; T3</td>
+              <td>T2 is waiting for a lock held by T3</td>
+              <td><code>inventory</code></td>
+              <td><code>payments</code></td>
+            </tr>
+            <tr>
+              <td>T3 &rarr; T1</td>
+              <td>T3 is waiting for a lock held by T1</td>
+              <td><code>payments</code></td>
+              <td><code>orders</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Cycle detection:</strong> Following the edges: T1 &rarr; T2 &rarr; T3 &rarr; T1. We return to T1, confirming a cycle. This is a deadlock.</p>
+
+      <p><strong>Victim selection:</strong> The database must abort one transaction to break the cycle. Common strategies:</p>
+      <ul>
+        <li><strong>Youngest transaction (least work lost):</strong> T3 started at t=105, the latest. Abort T3. This releases the <code>payments</code> lock, allowing T2 to proceed, which then releases <code>inventory</code>, allowing T1 to proceed.</li>
+        <li><strong>Least locks held:</strong> All hold 1 lock each &mdash; tie. Fall back to youngest.</li>
+        <li><strong>Least rows modified:</strong> If T3 has modified the fewest rows, aborting it wastes the least work.</li>
+      </ul>
+      <p><strong>After aborting T3:</strong> The graph becomes T1 &rarr; T2 (no cycle). T2 acquires <code>payments</code> and completes. T1 acquires <code>inventory</code> and completes. T3 is rolled back and can retry, now acquiring locks without a cycle because T1 and T2 have finished.</p>
+      <p>PostgreSQL checks for cycles every <code>deadlock_timeout</code> (default: 1 second). Setting this lower (e.g., 200ms) reduces how long deadlocked transactions wait, but increases CPU overhead from more frequent graph traversals. For most workloads, 1 second is a reasonable default.</p>
+
+      <h3>GC Pause Lock Expiry</h3>
+      <p><strong>What happened:</strong> A Java service acquired a Redis distributed lock with a 30-second TTL to process an exclusive batch job. A 45-second GC pause (full GC on a 32GB heap) caused the lock to expire. Another instance acquired the lock and started the same batch job. When the first instance resumed from GC, both instances were processing the same batch, causing duplicate records in the database.</p>
+      <p><strong>Root cause:</strong> The lock TTL was shorter than the worst-case GC pause. No fencing token was used.</p>
+      <p><strong>Mitigation:</strong> Use fencing tokens. The batch job's database writes include the fencing token: <code>INSERT ... WHERE fence_token &gt; last_seen_fence_token</code>. The stale instance's writes are rejected because its fencing token is older. Additionally, tune GC to limit pause times (use G1GC or ZGC with max pause targets) and set lock TTLs to 5x the worst-case pause.</p>
+
+      <h3>Optimistic Locking Retry Storm</h3>
+      <p><strong>What happened:</strong> A flash sale created extreme write contention on a single product's inventory counter. The system used optimistic locking (version-based conditional updates). With 10,000 concurrent buyers, almost every transaction conflicted and retried. Each retry read the latest version, attempted a write, conflicted again, and retried &mdash; creating a retry storm that amplified database load by 50x. The database's CPU hit 100% and all requests failed.</p>
+      <p><strong>Root cause:</strong> OCC assumes low contention. At 10,000 concurrent writers on a single row, the conflict rate was ~99.99%.</p>
+      <p><strong>Mitigation:</strong> For this specific hot-key pattern, switch to pessimistic locking (or a queued/serialized approach). Alternatively, use a pre-allocated token approach: generate 1000 "purchase tokens" and distribute them to requesting clients. Only clients with tokens can attempt the purchase, limiting contention to a manageable level.</p>
+
+      <h3>Write Skew Under Snapshot Isolation</h3>
+      <p><strong>What happened:</strong> A hospital scheduling system used PostgreSQL with <code>REPEATABLE READ</code> (snapshot isolation). The rule: at least one doctor must be on call at all times. Two doctors, both on call, simultaneously checked the on-call count (2), saw it was safe to go off-call, and both updated their status. Now zero doctors are on call. Each transaction saw a consistent snapshot showing 2 on-call doctors, so each believed it was safe to remove one.</p>
+      <p><strong>Root cause:</strong> This is a write skew anomaly &mdash; two transactions read the same data, make disjoint writes, and together violate an invariant that neither violated individually. Snapshot isolation does not prevent write skew.</p>
+      <p><strong>Mitigation:</strong> Use <code>SERIALIZABLE</code> isolation (SSI), which detects write skew at commit time and aborts one transaction. Alternatively, use an explicit <code>SELECT ... FOR UPDATE</code> on all on-call rows to force serialization of the check.</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>What It Tells You</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>lock_acquisition_p99_ms</code></td>
+            <td>How long clients wait to acquire locks. Spikes signal contention.</td>
+            <td>Alert if &gt; 2x baseline sustained over 1 minute</td>
+          </tr>
+          <tr>
+            <td><code>lock_timeout_rate</code></td>
+            <td>Percentage of lock attempts that time out. High rates mean deadlocks or excessive contention.</td>
+            <td>Alert if &gt; 1% over 5 minutes</td>
+          </tr>
+          <tr>
+            <td><code>occ_conflict_rate</code></td>
+            <td>Percentage of optimistic transactions that abort due to conflicts.</td>
+            <td>Alert if &gt; 10% sustained (indicates contention exceeds OCC suitability)</td>
+          </tr>
+          <tr>
+            <td><code>deadlock_detection_count</code></td>
+            <td>Number of deadlocks detected and resolved per minute.</td>
+            <td>Alert if &gt; 0 (any deadlock warrants investigation)</td>
+          </tr>
+          <tr>
+            <td><code>lock_hold_time_p99_ms</code></td>
+            <td>How long locks are held. Long hold times increase contention and deadlock risk.</td>
+            <td>Alert if &gt; 5x the expected operation duration</td>
+          </tr>
+          <tr>
+            <td><code>fencing_token_rejection_rate</code></td>
+            <td>Percentage of writes rejected due to stale fencing tokens. Signals lock expiry during operations.</td>
+            <td>Alert if &gt; 0.1% (indicates locks expiring before operations complete)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>High lock acquisition latency:</strong></p>
+        <p>1. Check <code>lock_acquisition_p99_ms</code> &mdash; which resource or lock key has elevated latency?</p>
+        <p>2. Check <code>lock_hold_time_p99_ms</code> for that key &mdash; are lock holders taking too long? If so, optimize the critical section or increase lock granularity.</p>
+        <p>3. Check for deadlocks &mdash; run <code>SELECT * FROM pg_stat_activity WHERE wait_event_type = 'Lock'</code> to see blocked queries. Use <code>pg_blocking_pids()</code> to find the blocker.</p>
+        <p>4. If using Redis locks, check <code>SLOWLOG GET</code> for slow Redis operations. A slow Redis instance delays all lock operations.</p>
+        <p>5. Check client count &mdash; has the number of lock contenders increased (new deployment, traffic spike)? Consider increasing lock granularity (per-SKU instead of per-category).</p>
+        <p>6. If OCC conflict rate is high, consider switching the hot path to pessimistic locking or a queue-based approach.</p>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Config</th>
+            <th>What It Does</th>
+            <th>Recommended Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>lock_ttl_ms</code></td>
+            <td>How long a distributed lock lives before auto-expiring</td>
+            <td>3-5x the p99 operation time. 30s default for general use.</td>
+          </tr>
+          <tr>
+            <td><code>lock_retry_delay_ms</code></td>
+            <td>Base delay between lock acquisition retries</td>
+            <td>50-200ms with exponential backoff and jitter.</td>
+          </tr>
+          <tr>
+            <td><code>lock_max_retries</code></td>
+            <td>Maximum lock acquisition attempts before giving up</td>
+            <td>5-10 retries. Total wait = sum of backoff delays.</td>
+          </tr>
+          <tr>
+            <td><code>pg_deadlock_timeout</code></td>
+            <td>PostgreSQL wait time before checking for deadlocks</td>
+            <td>1s (default). Lower to 200ms for latency-sensitive workloads.</td>
+          </tr>
+          <tr>
+            <td><code>isolation_level</code></td>
+            <td>Transaction isolation level for the database</td>
+            <td>READ COMMITTED for most workloads. SERIALIZABLE for financial systems.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Distributed Locks + Leader Election</h3>
+      <p>Leader election is often implemented using distributed locks: the leader holds a lock, and when it expires or is released, another node takes over. The pitfall: if the leader's lock expires during a GC pause, two nodes may briefly believe they are the leader. This is identical to the fencing token problem. Use etcd or ZooKeeper for leader election &mdash; they provide linearizable guarantees and session-based leadership that handles this correctly. Do not roll your own leader election with Redis SETNX.</p>
+
+      <h3>Concurrency Control + Database Replication</h3>
+      <p>Pessimistic locks on the primary database do not replicate to read replicas. If you use <code>SELECT FOR UPDATE</code> on the primary and a read query hits a replica, the read bypasses the lock and sees stale data. This is not a bug &mdash; replicas are eventually consistent. The pitfall: reading your own writes via a replica after acquiring a lock on the primary. Solution: always route lock-protected reads to the primary, or use synchronous replication.</p>
+
+      <h3>CRDTs + Undo/Delete Semantics</h3>
+      <p>CRDTs handle concurrent additions well, but deletions are problematic. If one user deletes an element while another concurrently adds the same element, the result depends on the CRDT type. An observed-remove set (OR-Set) gives precedence to add operations (the element reappears after deletion). A remove-wins set does the opposite. Neither may match user expectations. This is the "deleted-but-reappears" bug that plagues collaborative editors using CRDTs. Solution: use tombstones with expiry, or design the UX to handle these edge cases gracefully.</p>
+
+      <h3>Optimistic Locking + Caching</h3>
+      <p>If you cache database rows and use optimistic locking (version-based conditional writes), a stale cache can cause unnecessary conflicts. Client reads version 5 from cache, modifies it, and writes with <code>WHERE version = 5</code>. But the database is already at version 8. The write fails, not because of a real conflict, but because the cache was stale. Solution: for OCC-protected resources, cache versions must be invalidated on writes, or bypass the cache entirely for the version check.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <p><strong>Distributed lock infrastructure:</strong> A Redis Cluster for distributed locking costs $50-200/month (3-6 nodes, r6g.large). ZooKeeper or etcd clusters for consensus-based locks cost $150-500/month (3-5 nodes, m6i.large &mdash; consensus requires odd numbers for quorum). ZooKeeper/etcd is more expensive but provides stronger guarantees.</p>
+        <p><strong>MVCC storage overhead:</strong> MVCC databases (PostgreSQL, CockroachDB) retain old row versions for active transactions. A table with 1M rows, 1KB each, under 100 TPS with average 50ms transactions, retains ~5,000 dead tuples at any time (50ms * 100 TPS = 5 concurrent transactions, each touching ~1,000 rows). Storage overhead is ~5MB &mdash; negligible. But long-running transactions (analytics queries spanning 10 minutes) can cause MVCC bloat: 10min * 100 TPS * 1KB = ~60MB of retained dead tuples. Solution: use separate replicas for analytics.</p>
+        <p><strong>CRDT bandwidth cost:</strong> CRDTs replicate operations across all nodes. A G-Counter with 100 nodes sends 99 update messages per increment. At 10K increments/sec, that is 990K messages/sec cluster-wide. At 100 bytes per message, that is ~95 MB/sec. For a 3-region deployment with inter-region bandwidth at $0.02/GB, this costs ~$165/month. Optimization: batch CRDT updates and sync every 100ms instead of per-operation.</p>
+        <p><strong>Cost of concurrency bugs:</strong> A distributed deadlock in production can cause cascading failures affecting all users. A race condition in payment processing can result in double charges, chargebacks, and regulatory scrutiny. Cloudflare's 2019 outage (caused by a global lock contention issue in their WAF) affected millions of websites for 30 minutes. The cost of getting concurrency wrong vastly exceeds the cost of the infrastructure to get it right.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Google Spanner: TrueTime and Lock-Free Reads</h3>
+      <p>Google Spanner uses TrueTime (GPS + atomic clock synchronization) to bound clock uncertainty to ~7ms. This allows Spanner to implement externally consistent (serializable + linearizable) transactions across globally distributed data. Writers acquire locks and assign commit timestamps. Readers perform lock-free reads at a snapshot timestamp. The key insight: because TrueTime bounds clock uncertainty, Spanner knows that if it waits 7ms after committing, all other nodes will agree on the ordering of events. This eliminates the need for reader locks &mdash; readers just pick a timestamp and read the MVCC version at that timestamp. The result: globally consistent reads with no lock contention.</p>
+
+      <h3>CockroachDB: Serializable Snapshot Isolation</h3>
+      <p>CockroachDB implements SSI across a distributed SQL database. Each transaction operates on a snapshot. At commit time, CockroachDB checks for serialization anomalies (read-write conflicts that could cause write skew). If anomalies are detected, the transaction is aborted and retried. The retry logic is built into the client driver, making it transparent to application code. In production, CockroachDB reports SSI abort rates of 1-5% under typical workloads, with most retries succeeding on the second attempt. This provides serializable isolation without the deadlock risk of traditional 2PL.</p>
+
+      <h3>Redis Distributed Locks (and the Redlock Debate)</h3>
+      <p>Redis SETNX is the most widely used distributed lock mechanism due to its simplicity and low latency. However, Redis is a single-point-of-failure for locks. Antirez (Redis creator) proposed Redlock: acquire the lock on N/2+1 out of N independent Redis instances. If the majority succeed, the lock is acquired. Martin Kleppmann's analysis showed that Redlock's safety depends on timing assumptions (bounded message delays, bounded process pauses) that cannot be guaranteed in practice. The practical takeaway: use Redis locks when efficiency matters (preventing duplicate work) but not when correctness matters (preventing data corruption). For correctness-critical locks, use ZooKeeper or etcd, which provide consensus-based coordination.</p>
+
+      <h3>Figma: CRDTs for Multiplayer Design</h3>
+      <p>Figma uses a custom CRDT implementation for real-time collaborative design editing. Multiple designers can simultaneously move, resize, and modify objects on a shared canvas. Each operation is encoded as a CRDT operation that can be applied in any order and will converge to the same result. Figma chose CRDTs over Operational Transformation (OT) because CRDTs do not require a central server for conflict resolution &mdash; conflict resolution is built into the data structure. This allows Figma to scale to hundreds of concurrent editors per file with sub-50ms sync latency. The engineering challenge was designing CRDTs for the complex domain of vector graphics (layers, groups, masks, styles), which required custom CRDT types beyond standard counters and sets.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>Three essential distributed concurrency patterns in Python: a distributed lock with fencing tokens, optimistic concurrency control with version checking, and a distributed semaphore.</p>
+
+      <h3>Distributed Lock with Fencing Token</h3>
+      <pre><code class="language-python">import uuid, time, random, redis
+
+class DistributedLock:
+    ACQUIRE_SCRIPT = """
+    if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+        local token = redis.call("INCR", KEYS[2])
+        return token
+    end
+    return nil
+    """
+    RELEASE_SCRIPT = """
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    end
+    return 0
+    """
+
+    def __init__(self, client: redis.Redis, lock_key: str, ttl_ms: int = 30000):
+        self.redis = client
+        self.lock_key = lock_key
+        self.ttl_ms = ttl_ms
+        self.owner_id = str(uuid.uuid4())
+        self.fencing_token = None
+
+    def acquire(self, max_retries: int = 5, base_delay_ms: int = 100):
+        for attempt in range(max_retries):
+            result = self.redis.eval(
+                self.ACQUIRE_SCRIPT, 2,
+                self.lock_key, f"{self.lock_key}:fence",
+                self.owner_id, self.ttl_ms,
+            )
+            if result is not None:
+                self.fencing_token = int(result)
+                return {"acquired": True, "fencing_token": self.fencing_token}
+            # Exponential backoff with jitter
+            delay = base_delay_ms * (2 ** attempt) / 1000
+            time.sleep(delay + delay * 0.5 * random.random())
+        return {"acquired": False, "fencing_token": None}
+
+    def release(self) -> bool:
+        return self.redis.eval(self.RELEASE_SCRIPT, 1, self.lock_key, self.owner_id) == 1
+
+    def execute_with_lock(self, fn):
+        lock = self.acquire()
+        if not lock["acquired"]:
+            raise RuntimeError("Failed to acquire distributed lock")
+        try:
+            return fn(lock["fencing_token"])
+        finally:
+            self.release()
+
+# Usage: inventory update with fencing token protection
+lock = DistributedLock(redis_client, "lock:inventory:sku-12345")
+
+def update_inventory(fencing_token):
+    row = db.execute("SELECT stock FROM inventory WHERE sku = %s", ("sku-12345",))
+    if row["stock"] <= 0:
+        raise ValueError("Out of stock")
+    # Fencing token ensures stale writes from expired locks are rejected
+    db.execute(
+        "UPDATE inventory SET stock = stock - 1, last_fence_token = %s "
+        "WHERE sku = %s AND last_fence_token < %s",
+        (fencing_token, "sku-12345", fencing_token),
+    )
+
+lock.execute_with_lock(update_inventory)</code></pre>
+
+      <h3>Optimistic Concurrency Control with Version Check</h3>
+      <pre><code class="language-python">import time, random
+
+class OptimisticStore:
+    def __init__(self, db):
+        self.db = db
+
+    def read_with_version(self, table: str, row_id: str):
+        row = self.db.execute(
+            f"SELECT *, version FROM {table} WHERE id = %s", (row_id,)
+        )
+        if row is None:
+            return None
+        return {"data": row, "version": row["version"]}
+
+    def update_with_version(self, table, row_id, updates, expected_version, max_retries=3):
+        for attempt in range(max_retries + 1):
+            set_clause = ", ".join(f"{k} = %s" for k in updates)
+            params = list(updates.values()) + [row_id, expected_version]
+
+            result = self.db.execute(
+                f"UPDATE {table} SET {set_clause}, version = version + 1 "
+                f"WHERE id = %s AND version = %s RETURNING *",
+                params,
+            )
+
+            if result is not None:
+                return {"success": True, "data": result}
+
+            # Conflict detected: re-read and retry
+            if attempt < max_retries:
+                fresh = self.read_with_version(table, row_id)
+                if fresh is None:
+                    return {"success": False, "reason": "NOT_FOUND"}
+                expected_version = fresh["version"]
+                delay = 0.05 * (2 ** attempt) + random.random() * 0.05
+                time.sleep(delay)
+
+        return {"success": False, "reason": "MAX_RETRIES_EXCEEDED"}
+
+# Usage: update a product price with optimistic locking
+store = OptimisticStore(db)
+product = store.read_with_version("products", "prod-42")
+
+new_price = product["data"]["price"] * 1.1  # 10% price increase
+
+result = store.update_with_version(
+    "products", "prod-42",
+    {"price": new_price},
+    product["version"],
+)
+
+if not result["success"]:
+    print(f"Conflict detected: {result['reason']}")
+    # In a real system: re-read, re-apply business logic, retry</code></pre>
+
+      <h3>Distributed Semaphore</h3>
+      <pre><code class="language-python">import uuid, time, random, redis
+
+ACQUIRE_SCRIPT = """
+redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
+local count = redis.call("ZCARD", KEYS[1])
+if count < tonumber(ARGV[2]) then
+    redis.call("ZADD", KEYS[1], ARGV[3], ARGV[4])
+    return 1
+end
+return 0
+"""
+
+class DistributedSemaphore:
+    def __init__(self, client: redis.Redis, key: str, max_permits: int, ttl_ms: int = 30000):
+        self.redis = client
+        self.key = key
+        self.max_permits = max_permits
+        self.ttl_ms = ttl_ms
+
+    def acquire(self, timeout_ms: int = 5000):
+        permit_id = str(uuid.uuid4())
+        deadline = time.time() + timeout_ms / 1000
+
+        while time.time() < deadline:
+            now = int(time.time() * 1000)
+            result = self.redis.eval(
+                ACQUIRE_SCRIPT, 1, self.key,
+                now, self.max_permits, now + self.ttl_ms, permit_id,
+            )
+            if result == 1:
+                return {"acquired": True, "permit_id": permit_id}
+            time.sleep(0.05 + random.random() * 0.05)
+
+        return {"acquired": False, "permit_id": None}
+
+    def release(self, permit_id: str) -> bool:
+        return self.redis.zrem(self.key, permit_id) == 1
+
+    def current_count(self) -> int:
+        now = int(time.time() * 1000)
+        self.redis.zremrangebyscore(self.key, "-inf", now)
+        return self.redis.zcard(self.key)
+
+# Usage: limit concurrent database connections across a fleet
+semaphore = DistributedSemaphore(redis_client, "sem:db-connections", 50)
+
+permit = semaphore.acquire(timeout_ms=3000)
+if not permit["acquired"]:
+    raise RuntimeError("Database connection pool exhausted across the fleet")
+
+try:
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM large_table LIMIT 1000")
+        result = cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+finally:
+    semaphore.release(permit["permit_id"])
+
+# Monitor: alert if semaphore utilization > 80%
+usage = semaphore.current_count()
+if usage > 0.8 * 50:
+    alerting.warn(f"DB semaphore at {usage}/50 ({usage / 50 * 100:.0f}%)")</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Concurrency Correctness Testing</h3>
+      <p>Use <strong>Jepsen</strong> to test distributed lock implementations against network partitions, clock skew, and process pauses. Jepsen has found bugs in Redis, ZooKeeper, etcd, CockroachDB, and virtually every other distributed system. Run Jepsen against your lock service with nemeses (fault injectors) for network partitions, clock skew, and process kills. Verify linearizability: if a lock is granted to client A and then to client B, B's operations must see all of A's writes.</p>
+
+      <h3>Deadlock Detection Testing</h3>
+      <p>Intentionally create circular lock dependencies in a staging environment. Verify: (1) the deadlock is detected within the configured timeout, (2) one transaction is aborted cleanly, (3) the aborted transaction retries and succeeds, (4) no data corruption occurs. Automate this test: spawn N threads, each acquiring locks in a random order, and verify that the system makes progress (no permanent hangs) and maintains correctness (no lost updates).</p>
+
+      <h3>Load Testing Under Contention</h3>
+      <p>Use <strong>k6</strong> or <strong>Gatling</strong> to simulate realistic contention patterns. Create a "hot key" scenario: 80% of writes target 1% of resources (simulating a flash sale). Measure: (1) throughput under contention &mdash; does the system degrade gracefully or collapse? (2) p99 latency &mdash; is it within SLO? (3) conflict/retry rate &mdash; is it within the expected range for the chosen strategy? (4) deadlock count &mdash; should be zero under correct lock ordering.</p>
+
+      <h3>Chaos Testing for Lock Safety</h3>
+      <p>Simulate the failure modes that break distributed locks: (1) Kill the lock holder process after it acquires the lock but before it completes the operation. Verify the lock expires and another client acquires it. (2) Introduce a network partition between the lock holder and the lock service. Verify the lock expires and is safely reacquired. (3) Simulate a GC pause (use <code>SIGSTOP</code>/<code>SIGCONT</code> on the lock holder process). Verify fencing tokens prevent stale writes. (4) Kill a Redis/ZooKeeper/etcd node during lock acquisition. Verify the lock service remains available (quorum-based systems) or that clients handle the failure gracefully (single-node Redis).</p>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you implement a distributed lock? What are the failure modes?</summary>
+        <div class="answer">
+          <p>A distributed lock ensures mutual exclusion across processes on different machines. The simplest implementation uses <strong>Redis SETNX</strong>: <code>SET lock_key owner_id NX PX 30000</code> atomically sets the key only if it does not exist, with a 30-second TTL. Release uses a Lua script that checks ownership: <code>if GET(key) == owner then DEL(key)</code>. This prevents releasing another client's lock.</p>
+          <p>For stronger guarantees, use <strong>ZooKeeper ephemeral nodes</strong> or <strong>etcd leases</strong>. ZooKeeper provides linearizable guarantees backed by ZAB consensus. The client creates an ephemeral znode; if the client's session dies, ZooKeeper auto-deletes the node. Other clients watch the node for deletion.</p>
+          <p><strong>Failure modes:</strong> (1) <strong>Lock holder crashes:</strong> The lock is stuck until the TTL expires (Redis) or the session times out (ZooKeeper). During this window, the resource is inaccessible. (2) <strong>GC pause outlasts TTL:</strong> The holder pauses, the lock expires, another client acquires it. The holder resumes and believes it still holds the lock. Two clients now operate on the resource concurrently. Fix: <strong>fencing tokens</strong> &mdash; the lock service issues a monotonically increasing token with each acquisition. The resource checks the token and rejects stale operations. (3) <strong>Network partition:</strong> The holder is healthy but partitioned from the lock service. The lock expires, another client acquires it. Same two-holder problem. Fix: fencing tokens again. (4) <strong>Clock skew (Redis):</strong> If Redis nodes have different clocks, TTL expiry may happen earlier or later than expected. Redlock amplifies this problem. Fix: use consensus-based systems (ZooKeeper, etcd) where correctness does not depend on clocks.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "When is a distributed lock not safe enough, and what do you use instead?" &mdash; When strict mutual exclusion is required for data safety (not just efficiency), use consensus-based approaches (etcd, ZooKeeper) with fencing tokens. For the highest safety, make the protected resource itself validate the fencing token, so even if the lock is broken, stale writes are rejected at the resource level.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the difference between optimistic and pessimistic concurrency control. When would you use each?</summary>
+        <div class="answer">
+          <p><strong>Pessimistic concurrency control</strong> assumes conflicts are likely and prevents them by acquiring locks before accessing data. The transaction locks the resource, performs its work, and releases the lock at commit. No other transaction can modify the resource while it's locked. In databases: <code>SELECT ... FOR UPDATE</code>. In distributed systems: acquire a Redis/ZooKeeper lock before proceeding. Pros: simple reasoning, no retries, guaranteed progress for the lock holder. Cons: reduced concurrency (readers block writers and vice versa), deadlock risk, lock management overhead.</p>
+          <p><strong>Optimistic concurrency control</strong> assumes conflicts are rare and detects them at commit time. The transaction reads data and its version, performs work locally, and attempts a conditional write: "update if version is still V." If another transaction modified the data, the version has changed, and the write is rejected. The transaction re-reads and retries. In databases: <code>UPDATE ... WHERE version = V</code>. In distributed systems: DynamoDB ConditionExpression, ETags, CAS operations. Pros: maximum concurrency (no blocking), no deadlocks, readers never block. Cons: wasted work when conflicts occur, retry storms under high contention.</p>
+          <p><strong>When to choose:</strong> Use pessimistic when contention is high (&gt; 20-30% of transactions conflict), operations are non-idempotent (cannot safely retry), or correctness is paramount and throughput is secondary (financial transactions). Use optimistic when contention is low (&lt; 5% conflict rate), the workload is read-heavy with occasional writes, operations span long durations (user editing sessions), or you need maximum throughput and can tolerate retries.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "What about mixed strategies?" &mdash; Many production systems use both. Read-heavy paths use OCC for throughput. Write-heavy hot paths use pessimistic locks for predictability. The hot inventory counter during a flash sale gets a pessimistic lock; the product description update uses OCC.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does MVCC work? Why is it preferred over locking in modern databases?</summary>
+        <div class="answer">
+          <p>MVCC (Multi-Version Concurrency Control) maintains multiple versions of each data item. When a transaction writes a row, it creates a new version rather than overwriting in place. Each version has a creation timestamp (or transaction ID) and a deletion timestamp. When a transaction reads a row, it sees the version that was current at the transaction's start time (its snapshot).</p>
+          <p><strong>How PostgreSQL implements MVCC:</strong> Each row has <code>xmin</code> (the transaction ID that created this version) and <code>xmax</code> (the transaction ID that deleted/updated this version, or 0 if still current). A transaction with ID 100 reading a table sees all rows where <code>xmin &lt; 100</code> and <code>xmax = 0 OR xmax &gt; 100</code>. This is a consistent snapshot. Writers create new row versions; they don't modify existing ones. Old versions are cleaned up by the autovacuum process after all transactions that might need them have completed.</p>
+          <p><strong>Why MVCC is preferred:</strong> (1) <strong>Readers never block writers:</strong> A long-running analytics query reads a consistent snapshot while concurrent OLTP transactions insert and update without interference. With locking, the analytics query would either block all writes or read inconsistent data. (2) <strong>Writers rarely block readers:</strong> Since writes create new versions, readers continue seeing the old version. (3) <strong>No read locks:</strong> Reads never acquire locks, eliminating a major source of contention and deadlocks. (4) <strong>Natural snapshot isolation:</strong> Each transaction sees a consistent point-in-time view of the database. (5) <strong>Higher throughput:</strong> Without read-write contention, throughput scales much better under concurrent workloads.</p>
+          <p><strong>Tradeoffs:</strong> MVCC has higher storage overhead (old versions consume space until vacuumed), requires background cleanup (autovacuum in PostgreSQL, compaction in CockroachDB), and does not prevent write-write conflicts (two concurrent writes to the same row still conflict). Write skew anomalies are possible under snapshot isolation &mdash; SSI or explicit locking is needed for serializable semantics.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "What is the write skew anomaly and how does SSI prevent it?" &mdash; Write skew occurs when two transactions read overlapping data, make disjoint writes, and together violate an invariant. SSI tracks read-write dependencies and aborts one transaction at commit time if a serialization anomaly is detected.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>What causes distributed deadlocks and how would you prevent them?</summary>
+        <div class="answer">
+          <p>Distributed deadlocks occur when the four Coffman conditions hold across multiple nodes: (1) <strong>Mutual exclusion</strong> &mdash; resources can only be held by one transaction at a time (inherent to locks). (2) <strong>Hold-and-wait</strong> &mdash; a transaction holds one lock while waiting for another. (3) <strong>No preemption</strong> &mdash; locks cannot be forcibly taken from a holder. (4) <strong>Circular wait</strong> &mdash; a cycle of transactions, each waiting for a lock held by the next.</p>
+          <p><strong>In distributed systems, common causes include:</strong> (1) Services acquiring locks in different orders: Service A locks user-account then product-inventory; Service B locks product-inventory then user-account. (2) Circular RPC dependencies: Service A calls Service B (holding lock X), Service B calls Service C (holding lock Y), Service C calls Service A (which is blocked on lock X). (3) Multi-table transactions in different orders: Transaction 1 does <code>UPDATE accounts</code> then <code>UPDATE orders</code>; Transaction 2 does <code>UPDATE orders</code> then <code>UPDATE accounts</code>.</p>
+          <p><strong>Prevention strategies:</strong> (1) <strong>Lock ordering:</strong> Define a global total order on all resources (e.g., alphabetical by resource name, or numeric by resource ID). Always acquire locks in ascending order. This provably prevents circular wait. (2) <strong>Timeout-based preemption:</strong> All lock acquisitions have a maximum wait time. If exceeded, abort the transaction, release all held locks, and retry with exponential backoff. This breaks the no-preemption condition. (3) <strong>Acquire all locks upfront:</strong> Determine all needed locks before starting the transaction and acquire them all at once (atomically or in sorted order). This breaks hold-and-wait. (4) <strong>Avoid locks entirely:</strong> Use OCC or CRDTs where possible, eliminating the conditions for deadlock.</p>
+          <p><strong>Detection:</strong> If prevention is not feasible, detect deadlocks using a wait-for graph. PostgreSQL detects local deadlocks by checking for cycles in the lock wait graph every <code>deadlock_timeout</code> interval (default: 1 second). For distributed deadlocks, use the Chandy-Misra-Haas algorithm: when a transaction blocks, it sends a probe message along the wait-for chain. If the probe returns to the originator, a cycle exists and one transaction is aborted.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How do you choose which transaction to abort in a deadlock?" &mdash; Abort the youngest transaction (least work wasted), the transaction holding the fewest locks (easiest recovery), or the transaction with the lowest priority (if priority is defined). PostgreSQL aborts the transaction that detected the deadlock.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a rate limiter using distributed semaphores that handles 1M RPS.</summary>
+        <div class="answer">
+          <p>A pure distributed semaphore at 1M RPS would require 1M Redis operations per second &mdash; expensive and introduces a single point of failure. The key insight is to use a <strong>two-tier architecture</strong>: local semaphores for the hot path, with periodic synchronization to a global distributed semaphore.</p>
+          <p><strong>Architecture:</strong> (1) <strong>N gateway instances</strong> (e.g., 50 instances). Each instance gets an allocated quota: <code>global_limit / N</code> requests per second per customer. (2) <strong>Local token bucket:</strong> Each instance maintains an in-memory token bucket per customer with its allocated quota. Request decisions are made locally in ~0.01ms with zero network calls. (3) <strong>Global sync layer:</strong> Every 100ms, each instance reports its usage to a Redis sorted set and receives an updated quota. Underutilized instances donate unused quota to busy instances. (4) <strong>Redis implementation:</strong> Use <code>ZADD</code> with score = expiry timestamp for the semaphore. <code>ZREMRANGEBYSCORE</code> cleans expired permits. <code>ZCARD</code> checks current count. Total Redis ops: 50 instances * 10 syncs/sec * 3 commands = 1,500 ops/sec &mdash; trivial for Redis.</p>
+          <p><strong>Accuracy analysis:</strong> Between sync intervals, each instance operates independently. Worst case: all 50 instances use their full quota simultaneously before syncing = <code>50 * (limit/50) = limit</code> &mdash; correct. But if traffic is uneven (one instance gets 80% of traffic), that instance exhausts its local quota and must wait for the next sync to get more. The sync interval determines how quickly quotas rebalance. At 100ms sync, the max burst overshoot is ~10%. Tighten to 50ms sync for ~5% accuracy.</p>
+          <p><strong>Failure handling:</strong> If Redis is down, instances continue using their last-known local quota. This degrades to a per-instance rate limiter, which may allow up to N * local_quota = global_limit requests (correct), but won't adapt to uneven traffic distribution until Redis recovers. If an instance crashes, its quota is reclaimed at the next sync interval (100ms) and redistributed to remaining instances.</p>
+          <p><strong>Scaling:</strong> This design handles arbitrary RPS because the hot path is local. To scale beyond Redis's sync capacity, shard the semaphore by customer ID across multiple Redis instances (consistent hashing). Each instance syncs with its assigned Redis shard.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How do you handle customers with very low rate limits (e.g., 10 RPS) across 50 instances?" &mdash; With 50 instances, each gets 0.2 RPS &mdash; less than one request per 5 seconds per instance. This is too granular for per-instance allocation. Solution: route low-limit customers to a dedicated subset of instances (sticky routing by customer ID) so each instance has a meaningful quota, or fall back to centralized Redis counting for low-volume customers.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do CRDTs avoid the need for locks? What are their limitations?</summary>
+        <div class="answer">
+          <p>CRDTs (Conflict-free Replicated Data Types) are data structures designed so that concurrent updates always converge to the same state, regardless of the order in which updates are applied, without any coordination between replicas. They achieve this through mathematical properties: operations must be <strong>commutative</strong> (a + b = b + a), <strong>associative</strong> ((a + b) + c = a + (b + c)), and <strong>idempotent</strong> (a + a = a). When these properties hold, replicas can accept writes independently and merge them in any order, always arriving at the same final state.</p>
+          <p><strong>Common CRDT types:</strong> (1) <strong>G-Counter</strong> (grow-only): each node maintains its own counter; the total is the sum of all node counters. (2) <strong>PN-Counter</strong>: two G-Counters &mdash; one for increments, one for decrements; the value is increments minus decrements. (3) <strong>G-Set</strong> (grow-only set): elements can only be added, never removed. (4) <strong>OR-Set</strong> (observed-remove set): elements can be added and removed; each element has a unique tag, so concurrent add+remove is resolved by keeping the element (add-wins semantics). (5) <strong>LWW-Register</strong> (last-writer-wins): timestamps determine which write "wins"; requires synchronized clocks. (6) <strong>Sequence CRDTs</strong> (RGA, YATA): ordered sequences for collaborative text editing.</p>
+          <p><strong>Why no locks are needed:</strong> Because merge is deterministic and commutative, there is no "conflict" to resolve &mdash; all concurrent updates are simply merged. There is no wrong order. No coordination means no locks, no deadlocks, no contention. Replicas are always writable, even during network partitions.</p>
+          <p><strong>Limitations:</strong> (1) <strong>Limited data types:</strong> Not all operations are commutative. You cannot build a CRDT for arbitrary database transactions. (2) <strong>Eventual consistency only:</strong> CRDTs guarantee convergence but not when. A read might return stale data if not all updates have propagated. (3) <strong>No global invariants:</strong> CRDTs cannot enforce constraints like "account balance must be non-negative" because each replica operates independently and might violate the constraint before hearing about other replicas' operations. (4) <strong>Metadata overhead:</strong> OR-Sets track tombstones for removed elements, which grow unboundedly without garbage collection. G-Counters maintain a counter per node, scaling with the number of nodes. (5) <strong>Conflict resolution is semantic, not syntactic:</strong> CRDTs resolve conflicts deterministically, but the resolution may not match user intent. Two users concurrently editing the same paragraph may get a merged result that is grammatically nonsensical.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How would you implement a shopping cart using CRDTs?" &mdash; Use an OR-Set where elements are (product_id, quantity) tuples with add-wins semantics. Adding an item creates a new tagged element. Removing it creates a tombstone for that tag. Concurrent add-and-remove of the same item resolves to "item is in the cart" (add wins). Quantity changes use a PN-Counter per product. This works but cannot enforce inventory limits (a global invariant) without coordination.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>Every OS concurrency primitive has a distributed analogue:</strong> Mutexes become distributed locks. Semaphores become distributed rate limiters. CAS becomes optimistic concurrency control. Spinlocks become retry loops with exponential backoff. The problems are the same; the failure modes are worse.</li>
+        <li><strong>Distributed locks are fundamentally unsafe without fencing tokens:</strong> GC pauses, network partitions, and clock skew can all cause two clients to believe they hold the same lock simultaneously. Fencing tokens (monotonically increasing values checked by the resource) are the only reliable mitigation.</li>
+        <li><strong>Choose your strategy based on contention level:</strong> Low contention (&lt; 5% conflicts) favors optimistic concurrency control. High contention (&gt; 30% conflicts) favors pessimistic locking. Lock-free CRDTs provide consistent throughput regardless of contention but only support eventually consistent semantics.</li>
+        <li><strong>MVCC is the modern standard for database concurrency:</strong> PostgreSQL, CockroachDB, MySQL InnoDB, and Oracle all use MVCC. Readers never block writers. But MVCC with snapshot isolation allows write skew &mdash; use SSI (Serializable Snapshot Isolation) for the strongest guarantees.</li>
+        <li><strong>The four Coffman conditions apply to distributed deadlocks:</strong> Prevent deadlocks by breaking one condition &mdash; typically circular wait (via lock ordering) or no-preemption (via timeouts). Detect deadlocks via wait-for graphs.</li>
+        <li><strong>Lock granularity is the primary throughput lever:</strong> Coarse-grained locks (table-level, service-level) serialize too much. Fine-grained locks (row-level, resource-level) maximize concurrency. Move from coarse to fine-grained as contention increases.</li>
+        <li><strong>CRDTs eliminate coordination at the cost of semantics:</strong> CRDTs are the ideal solution when eventual consistency is acceptable and the data can be modeled with commutative operations. They cannot enforce global invariants or provide strong consistency.</li>
+        <li><strong>Monitor concurrency health:</strong> Track lock acquisition latency, conflict rates, deadlock counts, and fencing token rejections. These metrics are your early warning system for concurrency problems before they become outages.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="distributed-transactions.html">Distributed Transactions</a> &mdash; How 2PC and Saga patterns coordinate writes across multiple services, building on the concurrency primitives described here.</li>
+        <li><a href="leader-election.html">Leader Election</a> &mdash; Leader election is distributed mutual exclusion: only one node is the leader at a time. Uses the same lock primitives (ZooKeeper, etcd) discussed in this page.</li>
+        <li><a href="os-concepts.html">OS Concepts</a> &mdash; The foundational OS primitives (mutexes, semaphores, condition variables) that map to distributed concurrency mechanisms.</li>
+        <li><a href="database-replication.html">Database Replication</a> &mdash; How replication interacts with concurrency control: locks on the primary don't apply to replicas, and replication lag affects OCC version checks.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> &mdash; Distributed semaphores are the foundation of rate limiting. This page covers the full design of rate limiting systems.</li>
+        <li><a href="cap-theorem.html">CAP Theorem</a> &mdash; The fundamental tradeoff between consistency and availability that underlies every concurrency control decision in distributed systems.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="distributed-transactions.html" class="prev">Distributed Transactions</a>
+      <a href="leader-election.html" class="next">Leader Election</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+
+  <!-- ===== Distributed Lock Animation ===== -->
+  <script>
+  (function() {
+    var canvas = document.getElementById('concurrencyCanvas');
+    if (!canvas) return;
+
+    // Animation state
+    var lockState = 'FREE'; // FREE | HELD
+    var lockHolder = -1;
+    var lockFenceToken = 0;
+    var waitingQueue = [];
+    var phase = 'normal'; // normal | deadlock
+    var phaseStartTime = 0;
+    var clients = [
+      { id: 0, label: 'Client A', state: 'idle', lockAcquired: false, retryCount: 0, heldLocks: [] },
+      { id: 1, label: 'Client B', state: 'idle', lockAcquired: false, retryCount: 0, heldLocks: [] },
+      { id: 2, label: 'Client C', state: 'idle', lockAcquired: false, retryCount: 0, heldLocks: [] }
+    ];
+    var events = [];
+    var lastEventTime = 0;
+
+    function resetAnimState() {
+      lockState = 'FREE';
+      lockHolder = -1;
+      lockFenceToken = 0;
+      waitingQueue = [];
+      phase = 'normal';
+      phaseStartTime = 0;
+      clients.forEach(function(c) {
+        c.state = 'idle';
+        c.lockAcquired = false;
+        c.retryCount = 0;
+        c.heldLocks = [];
+      });
+      events = [];
+      lastEventTime = 0;
+    }
+
+    function drawLockAnim(ctx, time, w, h) {
+      var pad = 20;
+      var cycleDuration = 24; // total animation cycle
+      var normalDuration = 16;
+      var deadlockDuration = 8;
+
+      var cycleTime = time % cycleDuration;
+
+      if (cycleTime < normalDuration) {
+        phase = 'normal';
+      } else {
+        phase = 'deadlock';
+      }
+
+      // Title
+      drawLabel(ctx, w / 2, 12, 'Distributed Lock: Acquisition, Release & Deadlock', {
+        fontSize: 15, bold: true, color: '#1e293b', baseline: 'top'
+      });
+
+      if (phase === 'normal') {
+        drawNormalPhase(ctx, cycleTime, w, h);
+      } else {
+        drawDeadlockPhase(ctx, cycleTime - normalDuration, w, h);
+      }
+    }
+
+    function drawNormalPhase(ctx, t, w, h) {
+      var lockX = w / 2;
+      var lockY = h * 0.4;
+
+      // Draw clients
+      var clientPositions = [
+        { x: w * 0.15, y: h * 0.4 },
+        { x: w * 0.15, y: h * 0.65 },
+        { x: w * 0.15, y: h * 0.88 }
+      ];
+
+      // Lock server
+      drawServer(ctx, w * 0.75, lockY, { label: 'Lock Server', healthy: true, width: 70, height: 45 });
+
+      // Lock state box
+      var lockColor, lockFill, lockText;
+      var currentHolder = -1;
+
+      // Timeline: 0-2s all try, 2-3s client A wins, 3-8s A holds, 8-9s A releases,
+      // 9-10s B acquires, 10-14s B holds, 14-15s B releases, 15-16s C acquires briefly
+      if (t < 2) {
+        lockColor = '#16a34a'; lockFill = '#f0fdf4'; lockText = 'FREE';
+      } else if (t < 8) {
+        lockColor = '#dc2626'; lockFill = '#fef2f2'; lockText = 'HELD'; currentHolder = 0;
+      } else if (t < 9) {
+        lockColor = '#16a34a'; lockFill = '#f0fdf4'; lockText = 'FREE';
+      } else if (t < 14) {
+        lockColor = '#d97706'; lockFill = '#fffbeb'; lockText = 'HELD'; currentHolder = 1;
+      } else if (t < 14.5) {
+        lockColor = '#16a34a'; lockFill = '#f0fdf4'; lockText = 'FREE';
+      } else {
+        lockColor = '#2563eb'; lockFill = '#eff6ff'; lockText = 'HELD'; currentHolder = 2;
+      }
+
+      // Lock state display
+      drawBox(ctx, lockX - 50, lockY - 25, 100, 50, {
+        color: lockColor, fill: lockFill, text: 'Lock', fontSize: 13
+      });
+      drawStatusBadge(ctx, lockX, lockY + 38, lockText, lockText === 'FREE' ? 'success' : 'danger');
+
+      // Fencing token
+      var token = 0;
+      if (t >= 2) token = 1;
+      if (t >= 9) token = 2;
+      if (t >= 14.5) token = 3;
+      drawLabel(ctx, lockX, lockY - 35, 'Fence Token: ' + token, {
+        fontSize: 11, bold: true, color: '#6366f1'
+      });
+
+      // Draw clients and their states
+      for (var i = 0; i < 3; i++) {
+        var cx = clientPositions[i].x;
+        var cy = clientPositions[i].y;
+        var clientColor = '#94a3b8';
+        var stateText = 'idle';
+
+        if (currentHolder === i) {
+          clientColor = '#16a34a';
+          stateText = 'HOLDING';
+        } else if (t >= 2 && t < 8 && i > 0) {
+          clientColor = '#d97706';
+          stateText = 'WAITING';
+        } else if (t >= 9 && t < 14 && i === 2) {
+          clientColor = '#d97706';
+          stateText = 'WAITING';
+        } else if (t >= 1 && t < 2) {
+          clientColor = '#2563eb';
+          stateText = 'ACQUIRING';
+        }
+
+        drawClient(ctx, cx, cy, { label: clients[i].label, color: clientColor });
+        drawStatusBadge(ctx, cx, cy - 35, stateText,
+          stateText === 'HOLDING' ? 'success' : stateText === 'WAITING' ? 'warning' : 'info');
+
+        // Arrow to lock
+        if (stateText === 'ACQUIRING' || stateText === 'HOLDING') {
+          var progress = stateText === 'ACQUIRING' ? ((t - 1) / 1) : 1;
+          progress = Math.min(1, progress);
+          drawArrow(ctx, cx + 30, cy, lockX - 55, lockY, {
+            color: clientColor, width: 2
+          });
+          if (stateText === 'ACQUIRING') {
+            drawMovingDot(ctx, cx + 30, cy, lockX - 55, lockY, ease.out(progress), {
+              color: clientColor, radius: 4
+            });
+          }
+        } else if (stateText === 'WAITING') {
+          drawArrow(ctx, cx + 30, cy, lockX - 55, lockY, {
+            color: '#e2e8f0', width: 1, dashed: true
+          });
+          // Retry indicator
+          var retryBounce = Math.sin(t * 3 + i * 2) * 0.5 + 0.5;
+          drawMovingDot(ctx, cx + 30, cy, cx + 60, cy - 10, retryBounce, {
+            color: '#d97706', radius: 3
+          });
+        }
+      }
+
+      // Waiting queue display
+      drawLabel(ctx, w * 0.5, h * 0.78, 'Waiting Queue:', {
+        fontSize: 12, bold: true, color: '#1e293b', align: 'left'
+      });
+
+      var queueItems = [];
+      if (t >= 2 && t < 8) queueItems = ['B', 'C'];
+      else if (t >= 9 && t < 14) queueItems = ['C'];
+      else if (t >= 14.5) queueItems = [];
+
+      for (var qi = 0; qi < queueItems.length; qi++) {
+        drawBox(ctx, w * 0.5 + 110 + qi * 45, h * 0.78 - 12, 35, 24, {
+          color: '#d97706', fill: '#fffbeb', text: queueItems[qi], fontSize: 11
+        });
+      }
+      if (queueItems.length === 0 && t > 2) {
+        drawLabel(ctx, w * 0.5 + 120, h * 0.78, '(empty)', {
+          fontSize: 11, color: '#94a3b8', align: 'left'
+        });
+      }
+
+      // Phase label
+      drawLabel(ctx, w / 2, h - 15, 'Phase 1: Normal Lock Acquisition & Release', {
+        fontSize: 11, color: '#64748b'
+      });
+    }
+
+    function drawDeadlockPhase(ctx, t, w, h) {
+      // Two clients, two locks, circular dependency
+      var clientAx = w * 0.15, clientAy = h * 0.35;
+      var clientBx = w * 0.15, clientBy = h * 0.7;
+      var lockXx = w * 0.55, lockXy = h * 0.35;
+      var lockYx = w * 0.55, lockYy = h * 0.7;
+
+      // Client A holds Lock X, wants Lock Y
+      // Client B holds Lock Y, wants Lock X
+      var deadlocked = t > 2;
+      var resolved = t > 6;
+
+      // Draw locks
+      var lockXHolder = resolved ? -1 : 0; // A holds X
+      var lockYHolder = resolved ? -1 : 1; // B holds Y
+
+      drawBox(ctx, lockXx - 45, lockXy - 22, 90, 44, {
+        color: deadlocked && !resolved ? '#dc2626' : '#2563eb',
+        fill: deadlocked && !resolved ? '#fef2f2' : '#eff6ff',
+        text: 'Lock X', fontSize: 12
+      });
+      drawStatusBadge(ctx, lockXx, lockXy + 30,
+        resolved ? 'FREE' : 'HELD by A',
+        resolved ? 'success' : 'danger'
+      );
+
+      drawBox(ctx, lockYx - 45, lockYy - 22, 90, 44, {
+        color: deadlocked && !resolved ? '#dc2626' : '#2563eb',
+        fill: deadlocked && !resolved ? '#fef2f2' : '#eff6ff',
+        text: 'Lock Y', fontSize: 12
+      });
+      drawStatusBadge(ctx, lockYx, lockYy + 30,
+        resolved ? 'FREE' : 'HELD by B',
+        resolved ? 'success' : 'danger'
+      );
+
+      // Draw clients
+      var clientAColor = deadlocked && !resolved ? '#dc2626' : '#2563eb';
+      var clientBColor = deadlocked && !resolved ? '#dc2626' : '#2563eb';
+
+      drawClient(ctx, clientAx, clientAy, { label: 'Client A', color: clientAColor });
+      drawClient(ctx, clientBx, clientBy, { label: 'Client B', color: clientBColor });
+
+      // A holds X (solid arrow)
+      if (!resolved) {
+        drawArrow(ctx, clientAx + 30, clientAy, lockXx - 50, lockXy, {
+          color: '#16a34a', width: 2
+        });
+        drawLabel(ctx, (clientAx + 30 + lockXx - 50) / 2, clientAy - 15, 'holds', {
+          fontSize: 10, color: '#16a34a'
+        });
+
+        // A wants Y (dashed arrow)
+        drawArrow(ctx, clientAx + 30, clientAy + 15, lockYx - 50, lockYy - 15, {
+          color: '#dc2626', width: 2, dashed: true
+        });
+        drawLabel(ctx, clientAx + 70, (clientAy + lockYy) / 2 - 10, 'waits for', {
+          fontSize: 10, color: '#dc2626'
+        });
+
+        // B holds Y (solid arrow)
+        drawArrow(ctx, clientBx + 30, clientBy, lockYx - 50, lockYy, {
+          color: '#16a34a', width: 2
+        });
+        drawLabel(ctx, (clientBx + 30 + lockYx - 50) / 2, clientBy + 18, 'holds', {
+          fontSize: 10, color: '#16a34a'
+        });
+
+        // B wants X (dashed arrow)
+        drawArrow(ctx, clientBx + 30, clientBy - 15, lockXx - 50, lockXy + 15, {
+          color: '#dc2626', width: 2, dashed: true
+        });
+        drawLabel(ctx, clientBx + 70, (clientBy + lockXy) / 2 + 10, 'waits for', {
+          fontSize: 10, color: '#dc2626'
+        });
+      }
+
+      // Deadlock indicator
+      if (deadlocked && !resolved) {
+        // Circular arrow indicator
+        var pulseAlpha = 0.5 + 0.5 * Math.sin(t * 4);
+        ctx.save();
+        ctx.globalAlpha = pulseAlpha;
+        drawBox(ctx, w * 0.72, h * 0.45, 130, 40, {
+          color: '#dc2626', fill: '#fef2f2',
+          text: 'DEADLOCK!', fontSize: 14, textColor: '#dc2626'
+        });
+        ctx.restore();
+
+        // Wait-for cycle visualization
+        ctx.save();
+        ctx.strokeStyle = '#dc2626';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.globalAlpha = 0.6;
+        var cycleProgress = loopProgress(t, 2);
+        ctx.beginPath();
+        ctx.arc(w * 0.35, h * 0.52, 60, -Math.PI * 0.3 + cycleProgress * Math.PI * 2, Math.PI * 0.3 + cycleProgress * Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (resolved) {
+        drawBox(ctx, w * 0.72, h * 0.45, 150, 40, {
+          color: '#16a34a', fill: '#f0fdf4',
+          text: 'Timeout: B aborted', fontSize: 11, textColor: '#16a34a'
+        });
+
+        drawStatusBadge(ctx, clientAx, clientAy - 35, 'RETRYING', 'warning');
+        drawStatusBadge(ctx, clientBx, clientBy - 35, 'ABORTED', 'danger');
+      } else if (deadlocked) {
+        drawStatusBadge(ctx, clientAx, clientAy - 35, 'BLOCKED', 'danger');
+        drawStatusBadge(ctx, clientBx, clientBy - 35, 'BLOCKED', 'danger');
+      } else {
+        drawStatusBadge(ctx, clientAx, clientAy - 35, 'ACQUIRING', 'info');
+        drawStatusBadge(ctx, clientBx, clientBy - 35, 'ACQUIRING', 'info');
+      }
+
+      // Phase label
+      drawLabel(ctx, w / 2, h - 15, 'Phase 2: Distributed Deadlock (Circular Wait)', {
+        fontSize: 11, color: '#dc2626'
+      });
+    }
+
+    var anim = createAnimation(canvas, drawLockAnim, { height: 400 });
+    setupControls(document.getElementById('concurrency-animation'), anim);
+  })();
+  </script>
+
+</body>
+</html>

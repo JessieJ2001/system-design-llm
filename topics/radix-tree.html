@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Radix Tree (Patricia Trie) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="stylesheet" href="../css/diagrams.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../llm/index.html">LLM Serving</a></li>
+        <li><a href="design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Radix Tree <span style="font-weight:400;color:#64748b;">(Patricia Trie)</span></h1>
+      <p class="hero-subtitle">A trie whose single-child chains are collapsed into one edge, so the tree&rsquo;s height tracks how much keys <em>differ</em>, not how long they are. Its native operation &mdash; <strong>longest-prefix match in time linear in the query, independent of how many keys are stored</strong> &mdash; is exactly what IP routers, autocomplete, and LLM prefix caches need.</p>
+      <p class="hero-meta">~12 min read &bull; data-structure reference</p>
+    </div>
+  </section>
+
+  <!-- What is it -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>Start with a <strong>trie</strong> (prefix tree): a tree where each edge is labelled with one character and the path from the root to a node spells a string. All keys sharing a prefix share that prefix&rsquo;s path, so &ldquo;does any stored key share a prefix with <code>X</code>?&rdquo; is answered by walking down from the root &mdash; no scan of the key set.</p>
+      <p>The trie&rsquo;s flaw: a key of length <code>k</code> with no branching still costs <code>k</code> single-child nodes. The word <code>internationalization</code> is a 20-node chain even if it is the only key. Most nodes carry no decision &mdash; they exist only because the edge alphabet is one character.</p>
+      <p>A <strong>radix tree</strong> (a.k.a. <strong>Patricia trie</strong>, radix trie, compressed trie) applies one rule: <em>any node with exactly one child is merged into its parent, and the two edge labels are concatenated.</em> Edges are now labelled with <em>strings</em> (runs), not single characters. A node exists only where keys actually branch or a key terminates. The result stores the same set, answers the same prefix queries, and has height bounded by the number of <em>distinguishing</em> positions among the keys &mdash; not by key length.</p>
+    </div>
+  </section>
+
+  <!-- Trie -> Radix -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Trie &rarr; Radix Tree, by Example</h2>
+      <p>Keys: <code>car</code>, <code>card</code>, <code>care</code>, <code>cat</code>, <code>dog</code>. The trie spends a node per character; the radix tree keeps only the branch points (after <code>ca</code>, after <code>car</code>) and the leaves.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Trie (one char per edge)</th><th>Radix tree (runs per edge)</th></tr></thead>
+        <tbody><tr>
+          <td><pre style="margin:0;background:none;border:none;"><code class="language-text">(root)
+ ├─c─a─┬─t            cat
+ │     └─r            car
+ │         ├─d        card
+ │         └─e        care
+ └─d─o─g              dog
+
+11 internal nodes for 5 keys</code></pre></td>
+          <td><pre style="margin:0;background:none;border:none;"><code class="language-text">(root)
+ ├─"ca"─┬─"t"         cat
+ │      └─"r"         car  (key ends here)
+ │          ├─"d"     card
+ │          └─"e"     care
+ └─"dog"              dog
+
+4 internal nodes; "car" is a key
+AND a branch point (card/care)</code></pre></td>
+        </tr></tbody>
+      </table></div>
+      <p>Note <code>car</code> is both a stored key and an internal branch &mdash; radix-tree nodes carry an <code>is_key</code> flag precisely so &ldquo;<code>car</code> is a word&rdquo; and &ldquo;<code>car</code> is the split point for <code>card</code>/<code>care</code>&rdquo; can be true at the same node.</p>
+    </div>
+  </section>
+
+  <!-- Diagram + longest prefix match -->
+  <section class="section">
+    <div class="container">
+      <h2>The Longest-Prefix-Match Walk</h2>
+      <p>The defining query: given a string <code>s</code>, find the longest stored key that is a prefix of <code>s</code>. Walk from the root, consuming whole edge-labels; remember the deepest <code>is_key</code> node reached; stop when no edge matches the next characters. Below, the query <code>cares</code> matches the stored key <code>care</code> (4 chars) and then halts because no edge leaves <code>care</code> for <code>s</code>.</p>
+
+      <div class="full-width svg-wrap">
+        <!-- Radix tree for {car,card,care,cat,dog}; query "cares" path highlighted; viewBox 0 0 900 470 -->
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" role="img" aria-label="Radix tree for car, card, care, cat, dog; the query 'cares' walks root to ca to car to care, matching the stored key care, then stops because no edge consumes the trailing s">
+          <defs>
+            <marker id="rt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+            <marker id="rth" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+          </defs>
+          <style>
+            .tt  { font: 600 14px system-ui; fill:#1e293b; }
+            .lb  { font: 12px system-ui; fill:#334155; }
+            .el  { font: 700 13px 'JetBrains Mono', monospace; fill:#1e293b; }
+            .elh { font: 700 13px 'JetBrains Mono', monospace; fill:#2563eb; }
+            .cap { font: 11px system-ui; fill:#475569; }
+            .inner { fill:#f1f5f9; stroke:#64748b; stroke-width:1.3; }
+            .key   { fill:#dcfce7; stroke:#16a34a; stroke-width:1.4; }
+            .onpath{ fill:#dbeafe; stroke:#2563eb; stroke-width:1.8; }
+            .e   { stroke:#475569; stroke-width:1.5; fill:none; }
+            .eh  { stroke:#2563eb; stroke-width:2.4; fill:none; }
+          </style>
+
+          <text x="450" y="28" text-anchor="middle" class="tt">Radix tree of {car, card, care, cat, dog} &mdash; query &ldquo;cares&rdquo; highlighted</text>
+
+          <!-- nodes -->
+          <circle cx="450" cy="64" r="22" class="onpath"/><text x="450" y="69" text-anchor="middle" class="el">root</text>
+          <rect x="306" y="148" width="58" height="42" rx="8" class="onpath"/><text x="335" y="174" text-anchor="middle" class="el">&middot;ca</text>
+          <rect x="612" y="148" width="78" height="42" rx="8" class="key"/><text x="651" y="174" text-anchor="middle" class="el">dog</text>
+          <rect x="206" y="270" width="64" height="42" rx="8" class="key"/><text x="238" y="296" text-anchor="middle" class="el">cat</text>
+          <rect x="406" y="270" width="64" height="42" rx="8" class="onpath"/><text x="438" y="296" text-anchor="middle" class="el">car</text>
+          <rect x="320" y="392" width="70" height="42" rx="8" class="key"/><text x="355" y="418" text-anchor="middle" class="el">card</text>
+          <rect x="490" y="392" width="70" height="42" rx="8" class="onpath"/><text x="525" y="418" text-anchor="middle" class="el">care</text>
+
+          <!-- edges (highlighted path: root-ca-car-care) -->
+          <line x1="438" y1="84"  x2="348" y2="146" class="eh" marker-end="url(#rth)"/>
+          <text x="372" y="116" class="elh">"ca"</text>
+          <line x1="468" y1="82"  x2="628" y2="146" class="e"  marker-end="url(#rt)"/>
+          <text x="556" y="112" class="el">"dog"</text>
+          <line x1="322" y1="190" x2="252" y2="268" class="e"  marker-end="url(#rt)"/>
+          <text x="270" y="232" class="el">"t"</text>
+          <line x1="348" y1="190" x2="430" y2="268" class="eh" marker-end="url(#rth)"/>
+          <text x="398" y="232" class="elh">"r"</text>
+          <line x1="430" y1="312" x2="368" y2="390" class="e"  marker-end="url(#rt)"/>
+          <text x="384" y="354" class="el">"d"</text>
+          <line x1="448" y1="312" x2="516" y2="390" class="eh" marker-end="url(#rth)"/>
+          <text x="486" y="354" class="elh">"e"</text>
+
+          <text x="450" y="462" text-anchor="middle" class="cap">Walk consumes "ca"&rarr;"r"&rarr;"e" = "care" (an is_key node); next char 's' has no edge &rArr; longest prefix = "care".</text>
+        </svg>
+      </div>
+      <div class="full-width">
+        <ul class="legend-list">
+          <li><span class="b" style="color:#2563eb;">&#9632;</span> <strong>On the query path</strong> &mdash; nodes/edges the walk for <code>cares</code> traverses (root &rarr; ca &rarr; car &rarr; care).</li>
+          <li><span class="b" style="color:#16a34a;">&#9632;</span> <strong>Stored-key node (<code>is_key</code>)</strong> &mdash; a path that spells an inserted key (<code>cat</code>, <code>card</code>, <code>dog</code> here).</li>
+          <li><span class="b" style="color:#64748b;">&#9632;</span> <strong>Internal node</strong> &mdash; exists only because keys branch here (e.g. <code>&middot;ca</code>).</li>
+          <li><span class="b" style="color:#475569;">&rarr;</span> <strong>Edge label</strong> &mdash; the <em>run</em> of characters consumed (a trie would split each into single-char edges).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Operations & complexity -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operations &amp; Complexity</h2>
+      <p>Let <code>k</code> = query length, <code>N</code> = number of stored keys, <code>&Sigma;</code> = alphabet size. The headline property: <strong>cost depends on the key, not on N.</strong></p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Operation</th><th>Cost</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td>Lookup / insert / delete</td><td><code>O(k)</code></td><td>One downward walk; independent of N. A hash map is also O(k) for the hash but loses the next two rows.</td></tr>
+          <tr><td>Longest-prefix match</td><td><code>O(k)</code></td><td>The native query (IP routing, prefix cache). A hash map cannot do this without trying all <code>k</code> prefixes.</td></tr>
+          <tr><td>Ordered / range / autocomplete</td><td><code>O(k + m)</code></td><td>Keys are stored in sorted order by construction; a subtree is a prefix class of <code>m</code> results.</td></tr>
+          <tr><td>Insert with edge split</td><td><code>O(k)</code></td><td>If a new key diverges mid-edge, split that edge into two (the only structurally interesting case &mdash; see code).</td></tr>
+          <tr><td>Space</td><td><code>O(total distinguishing chars)</code></td><td>&le; a trie always; nodes only at branches/terminals, not per character.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Versus alternatives.</strong> A <em>hash map</em> wins for pure exact-key lookup with no prefix/order needs (O(1) expected, simpler) but cannot answer longest-prefix or range queries. A <em>balanced BST</em> gives order but at <code>O(k log N)</code> per comparison-heavy operation. A <em>plain trie</em> is simpler but pays <code>O(key length)</code> nodes; the radix tree is the trie with that waste removed.</p>
+    </div>
+  </section>
+
+  <!-- Where used -->
+  <section class="section">
+    <div class="container">
+      <h2>Where It&rsquo;s Used</h2>
+      <ul>
+        <li><strong>IP routing tables.</strong> A router picks the route with the longest matching address prefix &mdash; literal longest-prefix match. The Linux kernel&rsquo;s routing trie (LPC-trie / LC-trie) is a radix-tree variant.</li>
+        <li><strong>LLM prefix caching (RadixAttention).</strong> Cached KV blocks are keyed by a chained block hash; finding how much of an incoming prompt is already cached <em>is</em> a longest-prefix walk over a radix tree. This is the data structure behind <a href="../llm/knowledge/K2_kv-cache.html">K2 &mdash; KV Cache (Role 2: inter-request reuse &amp; cache-aware routing)</a> (SGLang&rsquo;s RadixAttention); subtree-LRU eviction maps cleanly onto radix subtrees.</li>
+        <li><strong>Autocomplete &amp; dictionaries.</strong> The subtree under a typed prefix is exactly the candidate set, in sorted order.</li>
+        <li><strong>Databases &amp; in-memory indexes.</strong> The <strong>Adaptive Radix Tree (ART)</strong> is a production main-memory index (used in DuckDB, HyPer-style engines) &mdash; a radix tree with node sizes that adapt to fan-out.</li>
+        <li><strong>Filesystem / config / key-value paths.</strong> Hierarchical, slash-delimited keys share long prefixes; etcd and many KV stores keep range/prefix scans cheap this way.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Variants -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Variants &amp; Names</h2>
+      <ul>
+        <li><strong>Trie / prefix tree</strong> &mdash; the uncompressed parent; one character per edge.</li>
+        <li><strong>Radix tree / radix trie / compressed trie / Patricia trie</strong> &mdash; single-child chains collapsed; the subject of this page. (&ldquo;PATRICIA&rdquo; historically meant the radix-2/binary form for bitstrings; today &ldquo;Patricia trie&rdquo; is used loosely for any compressed trie.)</li>
+        <li><strong>Adaptive Radix Tree (ART)</strong> &mdash; a radix tree whose internal nodes switch representation (4/16/48/256 children) by fan-out to stay cache-efficient; the common database form.</li>
+        <li><strong>Ternary search tree</strong> &mdash; a hybrid (BST of characters) trading the per-node child array for three pointers; relevant when <code>&Sigma;</code> is large and tries waste space.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Code -->
+  <section class="section">
+    <div class="container">
+      <h2>Code &mdash; Insert &amp; Longest-Prefix Match</h2>
+      <p>The only non-obvious case is <em>edge splitting</em>: a new key shares part of an edge label, so the edge is broken at the divergence point and a new branch node is inserted.</p>
+<pre class="line-numbers"><code class="language-python">class RadixNode:
+    def __init__(self):
+        self.edges = {}      # first_char -> (label: str, child: RadixNode)
+        self.is_key = False  # True if a stored key ends at this node
+
+
+class RadixTree:
+    def __init__(self):
+        self.root = RadixNode()
+
+    def insert(self, key: str) -> None:
+        node, i = self.root, 0
+        while i &lt; len(key):
+            c = key[i]
+            if c not in node.edges:                 # no edge: attach the rest
+                leaf = RadixNode(); leaf.is_key = True
+                node.edges[c] = (key[i:], leaf)
+                return
+            label, child = node.edges[c]
+            j = 0                                   # longest common run
+            while (j &lt; len(label) and i + j &lt; len(key)
+                   and label[j] == key[i + j]):
+                j += 1
+            if j == len(label):                     # whole edge consumed
+                node, i = child, i + j
+                continue
+            mid = RadixNode()                       # split edge at j
+            node.edges[c] = (label[:j], mid)
+            mid.edges[label[j]] = (label[j:], child)
+            if i + j == len(key):
+                mid.is_key = True                   # new key ends at split
+            else:
+                leaf = RadixNode(); leaf.is_key = True
+                mid.edges[key[i + j]] = (key[i + j:], leaf)
+            return
+        node.is_key = True                          # key was an existing path
+
+    def longest_prefix(self, s: str) -> str:
+        node, i, best = self.root, 0, 0
+        while i &lt; len(s):
+            c = s[i]
+            if c not in node.edges:
+                break
+            label, child = node.edges[c]
+            if s[i:i + len(label)] != label:        # partial edge: stop
+                break
+            i += len(label); node = child
+            if node.is_key:
+                best = i                            # deepest stored key so far
+        return s[:best]
+
+
+t = RadixTree()
+for w in ["car", "card", "care", "cat", "dog"]:
+    t.insert(w)
+print(t.longest_prefix("cares"))   # -> "care"
+print(t.longest_prefix("cab"))     # -> ""      (no stored key is a prefix)
+print(t.longest_prefix("cards!"))  # -> "card"</code></pre>
+    </div>
+  </section>
+
+  <!-- Takeaways -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li>A radix tree is a trie with single-child chains collapsed &mdash; edges carry <em>runs</em>, nodes sit only at branches and key-ends.</li>
+        <li>Lookup, insert, delete, and <strong>longest-prefix match</strong> are all <code>O(query length)</code>, <em>independent of how many keys are stored</em>.</li>
+        <li>Longest-prefix match is the operation a hash map cannot do &mdash; it is why routers, autocomplete, and LLM prefix caches use this structure rather than a map.</li>
+        <li>Edge-splitting on divergent insert is the one structurally interesting operation; everything else is a downward walk.</li>
+        <li>In LLM serving it underlies RadixAttention: walk the prompt&rsquo;s block-hash chain, the deepest existing node is the longest already-cached prefix &mdash; see <a href="../llm/knowledge/K2_kv-cache.html">K2 (Role 2)</a>.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container-wide">
+      <p>System Design Interview Prep. Built for engineers, by engineers.</p>
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+</body>
+</html>

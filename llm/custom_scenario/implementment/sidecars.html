@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sidecars (S1&ndash;S3) &mdash; Optional Interview-Depth Add-ons for the Distributed KV Cache</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.86rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:700;
+      padding:.05rem .35rem; border-radius:4px; margin-left:.25rem; vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-fa { color:#b45309; background:#fef3c7; border:1px solid #fcd34d; }
+    .dc { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .dc h3 { margin:0 0 .25rem; color:#1e3a8a; }
+    .dc .dc-prob { font-weight:700; color:#7c2d12; }
+    .dc .dc-sols { font-weight:700; color:#0c4a6e; }
+    .dc .dc-why { font-weight:700; color:#14532d; }
+    .dc .dc-why.lead { margin-bottom:.15rem; }
+    .dc ul { margin:.2rem 0 .35rem 1rem; padding:0; }
+    .dc .pick { background:#dcfce7; padding:.05rem .3rem; border-radius:3px; }
+    ol.steps { margin:.3rem 0 .6rem 1.2rem; padding:0; }
+    ol.steps > li { margin:.3rem 0; }
+    .where { font-size:.85rem; color:#475569; margin:.2rem 0 .5rem; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">&larr; Scenario page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page</a></li>
+          <li><a class="sidebar-section-link" href="cache_eviction_policy.html">cache_eviction_policy.html</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html">kv_store.html</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#intro">Why these are sidecars</a></li>
+          <li><a class="sidebar-section-link" href="#sidecar-s1">&sect;S1 &mdash; membership summary</a></li>
+          <li><a class="sidebar-section-link" href="#sidecar-s2">&sect;S2 &mdash; P(continue) / LPC</a></li>
+          <li><a class="sidebar-section-link" href="#sidecar-s3">&sect;S3 &mdash; retention_TTL</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <section class="topic-hero">
+    <div class="container">
+      <p class="eyebrow">LLM Serving &middot; Distributed KV Cache &middot; appendix</p>
+      <h1>Sidecars (S1&ndash;S3)</h1>
+      <p class="lead">Optional, interview-depth add-ons to the distributed KV cache &mdash; the <em>predictor-free, filter-free</em> main line ships without any of them. Each is described once here and <strong>linked from the iteration it would attach to</strong> on <a href="distributed_kv_cache.html">distributed_kv_cache.html</a>. <strong>None is load-bearing; none is inherited</strong> &mdash; every iteration&rsquo;s running state, numbers, and SLOs are derived as if all three are absent.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="intro">Why these are sidecars (and where each attaches)</h2>
+      <p>The main line ships <strong>predictor-free</strong>: plain LRU per tier + a length-based pool admit gate + a direct <code>CH(conv_id, pool_ring)</code> probe on local miss. The three sidecars below are add-ons to raise <em>only if an interviewer probes</em> &mdash; each trades a little complexity for a marginal win that the main line does not need.</p>
+      <table class="sheet">
+        <thead><tr><th>Sidecar</th><th>What it adds</th><th>Attaches at (on the scenario page)</th></tr></thead>
+        <tbody>
+          <tr><td><a href="#sidecar-s1"><strong>&sect;S1</strong></a> &mdash; membership summary</td><td>A local &ldquo;is <code>conv_id</code> in the pool?&rdquo; pre-check &mdash; burst-insurance over the direct CH probe</td><td><a href="distributed_kv_cache.html#iter3b-dc-index">Iter 3b DC4</a> (lookup path) / <a href="distributed_kv_cache.html#iter3b-dc-overeng">DC5</a> / <a href="distributed_kv_cache.html#iter3b-dc-scale">DC6</a></td></tr>
+          <tr><td><a href="#sidecar-s2"><strong>&sect;S2</strong></a> &mdash; <code>P(continue)</code> / LPC</td><td>A learned estimator that orders session-tail eviction + refines pool admission better than raw LRU + the length gate</td><td><a href="distributed_kv_cache.html#iter1a-dc">Iter 1a DC5/DC6</a> (eviction) &amp; <a href="distributed_kv_cache.html#iter3b-dc-admit">Iter 3b DC2</a> (admission)</td></tr>
+          <tr><td><a href="#sidecar-s3"><strong>&sect;S3</strong></a> &mdash; <code>retention_TTL</code></td><td>A cross-tier privacy/retention sweep (evict-on-session-end + max-age), <em>not</em> a cache-performance policy</td><td><a href="distributed_kv_cache.html#iter1a-dc">Iter 1a DC5</a> (TTL-as-cache rejection) &middot; B2C compliance</td></tr>
+        </tbody>
+      </table>
+
+      <div class="dc" id="sidecar-s1">
+        <h3>&sect;S1 &mdash; local &ldquo;is it in the pool?&rdquo; membership summary (optional)</h3>
+        <p class="where">Attaches at <a href="distributed_kv_cache.html#iter3b-dc-index">Iter 3b DC4</a> (the lookup-path design choice) &middot; <a href="distributed_kv_cache.html#iter3b-dc-overeng">DC5</a> (is it over-engineering) &middot; <a href="distributed_kv_cache.html#iter3b-dc-scale">DC6</a> (Cuckoo scale).</p>
+        <p>A compact local summary of &ldquo;is <code>conv_id</code> in the pool?&rdquo;, probed <em>before</em> any RDMA. <strong>It is optional &mdash; the main line carries no filter.</strong></p>
+        <ul>
+          <li><strong>Why optional at all.</strong> The no-filter path &mdash; a direct <code>CH(conv_id, pool_ring)</code> probe on local miss (<a href="distributed_kv_cache.html#iter3b-dc-index">Iter 3b DC4/DC5</a>) &mdash; is fully supportable on its own: the per-task probe load is <code>&le; ~6 250 /s &asymp; 0.06%</code> of a CPU core (derived below), and a wasted RTT on an absent key is noise against a hundreds-of-ms recompute.</li>
+          <li><strong>When a summary earns its keep.</strong> Only under correlated <em>consult bursts</em> &mdash; a rolling deploy, a large autoscale step, or a fabric blip mass-invalidates local residency &rarr; a synchronized wave of absent probes onto the scarce store tier. A local summary absorbs the <em>absent</em> answers locally instead of as an RDMA-probe storm.</li>
+        </ul>
+        <p class="dc-why lead">Why &ldquo;affordable&rdquo; is a <em>calculation</em>, not an assertion &mdash; and why the flagged-model pool size (its &alpha;-uncertainty) can&rsquo;t flip it:</p>
+        <div class="formula-box"># Givens: &lambda;_peak = 100 000 req/s [&sect;1.2];  CPU hashmap &asymp; 10 M ops/s [G];
+#         kv_store_job_task_num = 16 (pre-DC7, storage-bound &mdash; post-DC7 only GROWS, see (2)).
+
+# (1) Conservative per-task ceiling &mdash; each request probes the pool AT MOST once on a local miss:
+probes/s/store-task  &le;  &lambda;_peak / kv_store_job_task_num  =  100 000 / 16  =  6 250 /s/task   [D]
+CPU cost             =  6 250 / 10 000 000  &asymp;  <strong>0.06%</strong> of one core&rsquo;s hashmap throughput   [D]
+# (16 = the conservative fewest-tasks bound; the flow-derived ~36 store tasks (&sect;9b.4) gives ~2 800/s &asymp; 0.03% &mdash; even safer.)
+
+# (2) Structurally bounded &mdash; this is what makes it robust to the flagged-model pool size (the &alpha;-uncertainty in W_pool):
+kv_store_job_task_num = max( storage-sized , QPS-sized ),   QPS-sized = &lceil; pool_QPS / per_kv_store_task_QPS &times; headroom &rceil;
+# The QPS term EXISTS to cap each store task's request rate &le; per_kv_store_task_QPS BY CONSTRUCTION,
+# so per-task probe load stays affordable AS THE POOL GROWS &mdash; whatever the pool size settles to.
+
+# (3) Margin: even a 10&times; consult surge &rarr; 62 500 /s/task &asymp; 0.6% CPU &mdash; still 2+ orders below saturation.
+&rArr; the direct probe is affordable by ~3 orders of magnitude, so the &alpha;-uncertainty in the pool size CANNOT flip the
+  conclusion &mdash; the filter is optional burst-insurance, not a requirement.   [D]</div>
+        <p>The <em>latency</em> the filter would save is noise too: it removes one wasted RDMA RTT (~tens of &micro;s) ahead of a hundreds-of-ms recompute. So its only real value is absorbing correlated <em>absent-probe bursts</em> &mdash; which is precisely why it is a sidecar, not the main line.</p>
+        <p class="dc-sols"><strong>Three options, not two</strong> (cheapest-correct first):</p>
+        <ul>
+          <li><span class="pick">(i) No filter &mdash; the MAIN LINE</span>. The direct-probe numbers above carry it; nothing to build, gossip, or keep consistent.</li>
+          <li><span class="pick">(ii) Exact membership set of <code>conv_id</code>s &mdash; PREFERRED <em>if</em> a summary is added</span>. <strong>No false-positive rate, trivial delete, no load-factor cliff</strong>, at ~7&times; the memory of (iii) &mdash; and that memory (a few MB/task, re-derive off the <a href="distributed_kv_cache.html#iter3b-nums">&sect;9b.4</a> working set) is noise against a CPU task&rsquo;s tens of GB of RAM.</li>
+          <li><span style="color:#b45309;font-weight:700;">(iii) Cuckoo filter &mdash; only if the exact set&rsquo;s memory actually bites</span> (~7&times; smaller; supports deletes unlike Bloom, which a victim cache needs since pool entries are constantly evicted). It is, however, <strong>the only probabilistic / load-factor-cliff component in the whole design</strong> &mdash; the reason it is not the default. Full Cuckoo scaling analysis: <a href="distributed_kv_cache.html#iter3b-dc-index">Iter 3b DC4</a>/<a href="distributed_kv_cache.html#iter3b-dc-scale">DC6</a>.</li>
+        </ul>
+        <p class="dc-why"><strong>Pick order.</strong> Prefer the <strong>exact set (ii)</strong> &mdash; it sidesteps the FPR and the load-factor cliff and the memory is noise; reach for <strong>Cuckoo (iii)</strong> only if that memory genuinely bites at consumer scale. <strong>This supersedes the scenario&rsquo;s earlier &ldquo;Cuckoo required&rdquo; DC4.</strong> Not inherited: every iteration&rsquo;s running numbers assume the no-filter direct probe.</p>
+      </div>
+
+      <div class="dc" id="sidecar-s2">
+        <h3>&sect;S2 &mdash; <code>P(continue)</code>-predicted eviction / admission (LPC &mdash; Learned Prefix Caching)</h3>
+        <p class="where">Attaches at <a href="distributed_kv_cache.html#iter1a-dc">Iter 1a DC5/DC6</a> (an optional learned ordering over the session-tail LRU) and <a href="distributed_kv_cache.html#iter3b-dc-admit">Iter 3b DC2</a> (an optional EV refinement over the length-gate admission).</p>
+        <p>A learned continuation-probability estimator that orders <strong>session-tail</strong> eviction (and refines pool admission) better than raw LRU + the length gate. It is the home for the <code>P(continue)</code> machinery retired from the Iter 3b main line. <strong>Three parts, all off the hot path:</strong></p>
+        <ul>
+          <li><strong>1. Async scoring at insert.</strong> The predictor runs <em>in parallel to prefill</em> on the serving task (prefill = 100s of ms; CPU prediction = 10&ndash;20 ms &rarr; score ready before decode finishes). Scored once, at insert: when a sequence&rsquo;s decode completes, its KV blocks enter a prefix-cache <strong>min-heap keyed by predicted <code>P(continue)</code></strong>.</li>
+          <li><strong>2. Async background re-scoring sweep.</strong> At a fixed interval (LPC default ~10 s) a sweep re-evaluates <code>P(continue)</code> via a <strong>decay function</strong> and reorganises the heap. Optional extension: proactively evict blocks whose decayed score falls below a threshold, freeing memory <em>before</em> the cache fills.</li>
+          <li><strong>3. Predictor-down fallback &rarr; LRU.</strong> Keep <em>two</em> structures &mdash; a plain LRU linked list and the LPC min-heap. <em>All blocks labelled</em> &rarr; evict from the min-heap low&rarr;high <code>P(continue)</code>; <em>half-labelled</em> &rarr; evict heap entries scoring &lt; 50% first, else the LRU tail; <em>predictor down (long)</em> &rarr; the coordinator migrates heap entries into the LRU list, degrading gracefully to pure LRU.</li>
+        </ul>
+        <p>It also supplies the popularity signal for shared-prefix blocks &mdash; which the <em>main</em> line already covers via the <a href="distributed_kv_cache.html#iter5-hotkey">Iter 5 pin-list</a>, so this is strictly an upgrade, never a dependency. (One adaptive extension named on the scenario page: folding observed latency / effective BW / queue depth into an EWMA to drive a <em>live</em> recompute-vs-pull crossover &mdash; <a href="distributed_kv_cache.html#iter3b-paths">Iter 3b &sect;9b.3.2</a>.)</p>
+      </div>
+
+      <div class="dc" id="sidecar-s3">
+        <h3>&sect;S3 &mdash; <code>retention_TTL</code> cross-tier privacy / retention sweep</h3>
+        <p class="where">Attaches at <a href="distributed_kv_cache.html#iter1a-dc">Iter 1a DC5</a> (where TTL-as-a-cache-policy is rejected &mdash; its one real use is this privacy sweep) and to the B2C data-retention requirement.</p>
+        <ul>
+          <li><strong>A privacy control, NOT a cache-performance policy.</strong> It bounds how long a user&rsquo;s conversation KV may persist <em>anywhere it is stored</em> &mdash; local DRAM and the remote pool (front + NVMe back). A low-rate background sweep evicts blocks whose age (or owning conversation&rsquo;s idle time) exceeds the retention window, <em>regardless of capacity pressure</em>.</li>
+          <li><strong>Why a sidecar.</strong> It does nothing for wear, capacity, or correctness &mdash; the cache runs fine on pure capacity-LRU without it (KV is immutable, so there is no staleness for a TTL to fix). It exists <em>only</em> where a B2C data-retention / compliance requirement demands a hard upper bound on KV persistence.</li>
+          <li><strong>Granularity.</strong> Cleanest at <em>conversation-lifecycle</em> granularity (evict-on-session-end + a max-age cap), not a blind per-block timer. If enabled it also <em>shortens</em> mean residency &mdash; most visibly the pool working set <code>W<sub>pool</sub></code> (the <a href="distributed_kv_cache.html#iter3b-nums">D5 sizing</a>).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../../js/sidebar.js"></script>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sharding Strategies — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Sharding Strategies</h1>
+      <p class="hero-subtitle">Hash, range, geo, lookup-table, hybrid — what each is good at, what breaks each, rebalancing cost, hot-prefix risk. This is the source-of-truth page; scenarios cite this when picking a partition strategy.</p>
+      <p class="hero-meta">~10 min reference</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>How to Use This Page</h2>
+
+      <p>Once you've picked an entity as the partition key (see <a href="entities-and-data.html">entities-and-data.html</a>), <strong>how</strong> you partition by it determines how the cluster scales. Hash and range are the two main families; geo and lookup-table are special cases; hybrid is what real systems do.</p>
+
+      <p>Three properties to weigh for any choice: <strong>uniformity of load</strong> (does it avoid hot partitions?), <strong>locality of queries</strong> (does the dominant query hit one partition or many?), <strong>rebalancing cost</strong> (when capacity changes, how much data moves?).</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The Strategy Matrix</h2>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Strategy</th><th>Uniformity</th><th>Locality</th><th>Rebalancing</th><th>Range scan</th></tr></thead>
+        <tbody>
+          <tr><td><a href="#hash">Hash</a></td><td>Excellent (modulo hot keys)</td><td>None — random distribution</td><td>Cheap with consistent hashing</td><td>Fan-out to all shards</td></tr>
+          <tr><td><a href="#range">Range</a></td><td>Risky — depends on key distribution</td><td>Excellent — adjacent keys co-located</td><td>Cheap with auto-split</td><td>Sequential, single shard</td></tr>
+          <tr><td><a href="#geo">Geo</a></td><td>Excellent (per-region)</td><td>Excellent within region</td><td>Region-bounded</td><td>Per-region; cross-region fan-out</td></tr>
+          <tr><td><a href="#lookup-table">Lookup table</a></td><td>Operator-controlled</td><td>Operator-controlled</td><td>Trivial (just update the table)</td><td>Depends on layout</td></tr>
+          <tr><td><a href="#composite">Composite</a></td><td>Tunable</td><td>Tunable per dimension</td><td>Depends</td><td>Depends</td></tr>
+          <tr><td><a href="#hybrid">Hybrid (per-tier)</a></td><td>Tunable per tier</td><td>Tunable per tier</td><td>Per-tier</td><td>Depends</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Per-Strategy Detail</h2>
+
+      <h3 id="hash">Hash sharding</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> <code>shard = hash(key) % N</code>, or — better — <code>shard = lookup_in_consistent_hash_ring(key)</code>. Each key lands on one shard deterministically; distribution is uniform if the hash is good.</li>
+        <li><strong>Wins.</strong> Uniform load distribution by default. Adding/removing shards moves only ~1/N of keys (with consistent hashing + virtual nodes). Simple to reason about.</li>
+        <li><strong>Loses.</strong> No locality — adjacent keys in any natural ordering land on random shards. Range scans must fan out to all N shards. Doesn't help with hot keys (one popular key still pegs one shard).</li>
+        <li><strong>Pick when.</strong> Point lookup is the dominant query; range scans are rare; load distribution is the priority.</li>
+        <li><strong>Real implementations.</strong> Cassandra, DynamoDB, Memcached / Redis Cluster, Kafka (partitioner), most KV stores.</li>
+        <li><strong>Surfaces.</strong> <a href="bottlenecks.html#hot-key">hot-key</a> when one key dominates; cite <a href="../consistent-hashing.html">consistent hashing</a> for ring + vnodes detail.</li>
+      </ul>
+
+      <h3 id="range">Range sharding</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Each shard owns a contiguous key range. Keys are sorted; a new key lands on the shard whose range contains it. Auto-split when a shard exceeds size or QPS threshold.</li>
+        <li><strong>Wins.</strong> Range scans are sequential (single-shard for in-range queries). Locality preserved — adjacent keys co-located. LIST / scan APIs return naturally ordered results.</li>
+        <li><strong>Loses.</strong> Hot-partition risk is high. Any key prefix correlated with insertion time (created_at, sequence numbers) creates a hot tail. Auto-split helps but lags behind sudden spikes.</li>
+        <li><strong>Pick when.</strong> Range scan or LIST is the dominant query (object store metadata, time-series with rolling reads, document stores with sorted access).</li>
+        <li><strong>Real implementations.</strong> Bigtable, HBase, Spanner, CockroachDB (range with auto-split), TiKV, S3 metadata.</li>
+        <li><strong>Surfaces.</strong> <a href="bottlenecks.html#hot-partition">hot-partition</a> on prefix-skewed keys; mitigate by salting the key prefix or sub-dividing.</li>
+      </ul>
+
+      <h3 id="geo">Geo sharding</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Partition by user's home region or by data residency. Each region's data lives in that region's cluster; cross-region access is the exception.</li>
+        <li><strong>Wins.</strong> Latency: in-region access is ~ms; out-of-region adds the cross-region RTT. Compliance: residency requirements (GDPR, sovereignty) are structurally enforced. Per-region cluster failure has bounded blast radius.</li>
+        <li><strong>Loses.</strong> Cross-region queries (a user travels; an admin queries globally) must federate or replicate. Per-region capacity must be sized for that region's peak (vs aggregate peak).</li>
+        <li><strong>Pick when.</strong> Multi-region active-active with bounded staleness; residency requirements; latency-sensitive user-facing reads.</li>
+        <li><strong>Real implementations.</strong> Per-region partitioning in DynamoDB Global Tables, Cosmos DB, Spanner. Pattern: per-region writes, async replication; conflict resolution per dataset.</li>
+        <li><strong>Surfaces.</strong> <a href="bottlenecks.html#cross-region">cross-region latency</a>; <a href="cross-cutting.html#privacy">data residency (X2)</a>.</li>
+      </ul>
+
+      <h3 id="lookup-table">Lookup-table sharding</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> A table maps key (or key range) to shard explicitly. <em>"keys 1–1000 → shard A; keys 1001–2000 → shard B; tenant_X_keys → shard X."</em> Lookup adds one indirection.</li>
+        <li><strong>Wins.</strong> Maximum operator control. Hot keys can be moved manually. Uneven shards (big tenants, premium customers) can be carved out. Rebalancing is just a table update.</li>
+        <li><strong>Loses.</strong> The lookup table itself is a coordinator (must be available, fast, and consistent). Operator burden — someone has to manage the table.</li>
+        <li><strong>Pick when.</strong> Heterogeneous tenant sizes; manual control over hot-key placement; small N (10s–100s of shards) where the table fits in memory and changes rarely.</li>
+        <li><strong>Real implementations.</strong> Vitess (lookup-vindex), some custom multi-tenant systems, Notion's tenant→shard map. Pattern: table cached at every router; updates via gossip or pub-sub.</li>
+        <li><strong>Surfaces.</strong> <a href="bottlenecks.html#coordinator-bottleneck">coordinator</a> if the table is on the hot path; mitigate by caching aggressively.</li>
+      </ul>
+
+      <h3 id="composite">Composite key sharding</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Partition by one dimension, cluster by another within the partition. <em>partition by user_id, cluster by created_at within partition.</em> Two-level addressing within one engine.</li>
+        <li><strong>Wins.</strong> Combines uniform partition distribution (if the partition key is high-cardinality) with locality on the secondary dimension (range scans within partition are cheap).</li>
+        <li><strong>Loses.</strong> Range scans across partitions still fan out. Choosing partition vs cluster wrong locks you in (changing the partition key is a full rewrite).</li>
+        <li><strong>Pick when.</strong> Most queries are <em>"&lt;partition-key&gt;'s range of &lt;cluster-key&gt;"</em> — e.g., "this user's messages from this week."</li>
+        <li><strong>Real implementations.</strong> Cassandra (PARTITION KEY + CLUSTERING KEY), DynamoDB (partition key + sort key), Bigtable (row-key composed of partition + cluster).</li>
+        <li><strong>Surfaces.</strong> <a href="bottlenecks.html#hot-partition">hot-partition</a> if the partition-key half is skewed; the cluster-key half doesn't help.</li>
+      </ul>
+
+      <h3 id="hybrid">Hybrid (per-tier)</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Different sharding for different tiers of data. Hot tier: range; warm tier: hash; archive: by-time. Or: most data hash-sharded, hot keys carved out into dedicated tier.</li>
+        <li><strong>Wins.</strong> Each tier optimizes for its dominant access pattern. Hot keys can be isolated from the rest.</li>
+        <li><strong>Loses.</strong> Routing complexity — the system must know which tier each key is in. Migration between tiers is its own subsystem.</li>
+        <li><strong>Pick when.</strong> Workload has clearly different tiers (hot/warm/cold) with different access patterns; one strategy doesn't fit all.</li>
+        <li><strong>Real implementations.</strong> Many caching systems (L1 hash + L2 hash with different placement); hot-key replication as a hybrid where hot keys get more replicas.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Decision Heuristics</h2>
+
+      <p>Walk these in order; pick the first that fits.</p>
+
+      <ol>
+        <li><strong>Is range scan the dominant query?</strong> → range. (Object store LIST, time-series rolling reads.)</li>
+        <li><strong>Are there residency / locality requirements?</strong> → geo as the outer layer. Within each region, pick another strategy.</li>
+        <li><strong>Are tenants heterogeneous (very uneven sizes)?</strong> → lookup-table for the largest tenants; hash for the rest.</li>
+        <li><strong>Is the dominant query "this user's range of this thing"?</strong> → composite (partition by user, cluster by time/range).</li>
+        <li><strong>Otherwise (point lookup dominates; uniform-ish keys)</strong> → hash with consistent-hashing + vnodes. Default for most stateful services.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>The Hot-Key / Hot-Partition Defense</h2>
+
+      <p>Whatever strategy you pick, hot keys are still possible (Zipfian access — celebrity user, viral post, popular product). Sharding alone doesn't fix it; specific defenses do:</p>
+
+      <ul>
+        <li><strong>Cache in front.</strong> The cache absorbs hot reads; the shard sees only cold-tail traffic. Cite <a href="../caching.html">caching</a>.</li>
+        <li><strong>Single-flight on miss.</strong> Coalesces the burst when a hot key's cache entry expires. Cite <a href="../design-moves/single-flight.html">single-flight</a>.</li>
+        <li><strong>Hot-key replication via salting.</strong> Replicate the key under <code>key#salt0..saltN-1</code>; route reads round-robin across the replicas; pay write-amp to fan out.</li>
+        <li><strong>Hot-key isolation tier.</strong> Move detected hot keys to a dedicated cluster (or memory tier).</li>
+        <li><strong>Hot-key detection.</strong> CMS sketch tracks per-key QPS; threshold triggers escalation to one of the above. Cite <a href="sketches.html#cms">sketches#cms</a>.</li>
+      </ul>
+
+      <p>Defense should be layered: cache + single-flight handles most cases; salting / isolation handles persistent skew; detection + escalation handles surprises.</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Rebalancing</h2>
+
+      <p>When capacity changes (add/remove shards), how much data moves?</p>
+
+      <ul>
+        <li><strong>Naive hash (mod N).</strong> Adding a shard reshuffles ~all keys. Disastrous at scale. Don't use mod-N at scale.</li>
+        <li><strong>Consistent hashing.</strong> Adding a shard moves ~1/N of keys. With virtual nodes, distribution stays uniform. Standard for hash-sharded systems.</li>
+        <li><strong>Range with auto-split.</strong> Adding a shard takes some hot range and splits it; minimal data motion (just the split range). Standard for range-sharded systems.</li>
+        <li><strong>Lookup-table.</strong> Trivial — update the table. Data motion equals the keys whose mapping changed.</li>
+        <li><strong>Geo.</strong> Adding a region is a heavy operation (full data set replication). Adding capacity within a region is per-region rebalancing.</li>
+      </ul>
+
+      <p>Rebalancing is a planned operation, not a hot-path concern — but its cost determines how aggressively you can autoscale. Hash + consistent-hashing is the most autoscale-friendly.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Anti-Patterns</h2>
+
+      <ul>
+        <li><strong>Hash sharding by created_at.</strong> Defeats the purpose — hash gives uniformity; using a monotonic field as input gives a predictable distribution that creates hot writes on the latest hash bucket regardless of hashing.</li>
+        <li><strong>Range sharding by user_id.</strong> The user-id distribution often has prefix correlations (sequentially-allocated IDs); range over them creates time-correlated hot shards.</li>
+        <li><strong>Mod-N hashing at scale.</strong> Adding a shard reshuffles everything. Always use consistent hashing.</li>
+        <li><strong>Geo-sharding without per-dataset CAP audit.</strong> Treating all data as "EU stays in EU" without distinguishing per-dataset consistency requirements forces every dataset onto the worst-latency profile.</li>
+        <li><strong>Lookup-table on the hot path without caching.</strong> The lookup adds an RPC per request; it must be cached in-process at every router.</li>
+        <li><strong>Choosing strategy before access pattern.</strong> "Use hash because that's what we always do" — without checking whether range scans are dominant. Match strategy to query.</li>
+        <li><strong>Forgetting that sharding doesn't fix hot keys.</strong> All strategies still leave one key on one shard. Hot-key defense is separate from sharding strategy.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="entities-and-data.html">Core Entities</a> — picks <em>which</em> entity to shard; this page picks <em>how</em>.</li>
+        <li><a href="../database-sharding.html">Database Sharding</a> — deeper-derivation page (existing).</li>
+        <li><a href="../consistent-hashing.html">Consistent Hashing</a> — the substrate for hash sharding.</li>
+        <li><a href="storage-engines.html">Storage Engines</a> — engine choice and shard strategy interact (LSM is more shard-friendly than B-tree at write rate).</li>
+        <li><a href="replication-decisions.html">Replication Decisions</a> — once shards are picked, replication topology applies per-shard.</li>
+        <li><a href="bottlenecks.html#hot-partition">bottlenecks#hot-partition</a> and <a href="bottlenecks.html#hot-key">#hot-key</a>.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

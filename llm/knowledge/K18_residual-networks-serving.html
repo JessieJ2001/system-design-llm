@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K18 — Residual Networks (Serving Slice) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+    .scope-honest { background:#eef2ff; border-left:4px solid #4f46e5; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K18 &mdash; Residual Networks <span style="font-weight:400;font-size:.55em;color:#64748b;">(the serving slice only &mdash; deliberately the narrowest page)</span></h1>
+      <p class="hero-subtitle"><strong>What are the <em>only two</em> serving-relevant consequences of the residual/skip connection &mdash; (1) it decides <em>where you may cut a model across GPUs</em> (PP between blocks, TP within, the residual add stays GPU-local), and (2) it decides <em>how much activation memory prefill burns</em> (<code>[batch&times;seq&times;d_model]</code> per layer) so that long prefill OOMs <em>before</em> the KV cache does?</strong> This page derives those two consequences and D46 (the prefill-activation-OOM vs KV-OOM crossover) &mdash; and honestly states it has no independent rule-11 because it is a <em>structural constraint</em>, not a policy.</p>
+      <p class="hero-meta">GPU-serving SoT &bull; supplies the legal-cut constraint <a href="K6_parallelism-overview.html">K6</a>/<a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a> obey &bull; cites <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="K1_serving-fundamentals.html">K1</a> / <a href="K4_continuous-batching-and-scheduling.html#d1">K4</a> &bull; dedicated scenario: <strong>L3</strong> &bull; ~11 min (intentionally short)</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. The <strong>decision-tree spine SVG below is real</strong>. This page is <strong>deliberately the narrowest in the curriculum</strong> &mdash; that is the scope-honest call, not a gap (flagged in-page). Approve / redirect the arc, the <strong>two-serving-consequences derivation</strong>, deep-dive placement (<strong>D46 prefill-activation-OOM vs KV-OOM crossover; rule-of-two with K4/D1 for the chunked-prefill fix</strong>), the explicit <strong>&ldquo;no independent rule-11 &mdash; it is a structural constraint&rdquo;</strong> note, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>) &mdash; honest framing: this is a <em>constraint</em> page, it does not tune an SLI directly, it <em>bounds a failure</em>:
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Long-context feasibility / OOM-avoidance (primary)</strong> &mdash; the prefill-activation footprint <code>[batch&times;seq&times;d_model]/layer</code> is <em>why prefill OOMs before decode</em>; knowing the D46 crossover is what makes chunked prefill (K4/D1) a <em>memory</em> tool, not just a latency one.</li>
+          <li><strong>Correct parallelism selection</strong> &mdash; the residual add is the legal-cut constraint K6/K7/K8 obey (PP between blocks, TP within, add GPU-local); a wrong cut is incorrect, not just slow.</li>
+          <li><strong>No direct TPOT/throughput claim</strong> &mdash; stated plainly: the lever is chunk size, owned by <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a>; K18 supplies the constraint, not the knob.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> The residual/skip connection (<code>x &rarr; x + f(x)</code>) has exactly two serving-relevant consequences: it makes a block an atomic, same-width unit (so you may cut <em>between</em> blocks but not inside the residual add), and it makes prefill materialize <code>[batch&times;seq&times;d_model]</code> activations per layer (so long prefill OOMs before KV). Nothing else about residuals is in serving scope.</p>
+      <ul>
+        <li><strong>Is:</strong> the two serving consequences (placement constraint + activation-memory footprint), derived; D46 (the prefill-activation-OOM vs KV-OOM crossover seq; heavy GQA &rarr; activation dominates <em>sooner</em>).</li>
+        <li><strong>Is not:</strong> residual-network <em>theory</em> / why skip connections let you train deep nets (training-side); activation-checkpointing-for-backprop (training-side &mdash; the inference analog is chunked prefill, <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a>); model-architecture design (the residual structure is taken as given); chunked prefill <em>as the fix</em> (<a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a> owns it &mdash; K18 owns only the footprint + crossover; rule of two).</li>
+        <li><strong>Scoped out, named not covered (siblings, owned elsewhere):</strong> the <em>logits/unembed</em> <code>[batch,seq,vocab]</code> prefill spike (a sibling activation-OOM &mdash; <code>vocab</code> &gt; <code>d_model</code>, so it can exceed the residual stream; mitigated by computing logits for the <em>last</em> position only during prefill) is <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>-adjacent, not a residual-stream consequence &mdash; flag it, do not cover. The <em>decode-side</em> residual add is a memory-bound elementwise op fused into the adjacent kernel &mdash; <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> owns kernel fusion; there is no K18 decode consequence (seq=1 &rArr; negligible).</li>
+      </ul>
+      <div class="scope-honest"><strong>Scope-honest note (read before reviewing).</strong> This page is <em>deliberately the shortest K-page</em> and has <strong>no independent rule-11 selection sweep</strong> &mdash; the residual stream sets a <em>structural constraint</em>, not a tunable policy. The sole knob is the chunk size, and that knob is owned by <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a> (plus the GQA factor that sets the D46 crossover). Saying so explicitly is the scope-honest call; a manufactured rule-11 here would be padding, which is a defect.</div>
+      <div class="warn-box"><strong>Dedup rule.</strong> The <code>[batch,seq,d_model]</code> residual-stream shape is <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>&rsquo;s vocabulary; the activation-bytes math + the D46 crossover number rest on <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s sheet; chunked prefill <em>as the fix</em> is <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a>&rsquo;s; PP stage-memory <em>consuming</em> this footprint is <a href="K8_pipeline-parallelism.html#d38">K8/D38</a>&rsquo;s. <strong>K18 owns only: the legal-cut constraint and the prefill-activation footprint + crossover &mdash; it cites every fix, owns none.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Residual-Serving Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>The residual/skip connection is a per-block identity path</strong> (<code>x &rarr; x + Attn(LN x) &rarr; x + MLP(LN x)</code>).</li>
+        <li><strong>Consequence 1 &mdash; placement:</strong> the <code>x +</code> identity makes input/output the same width <code>d_model</code> and the block an <em>atomic</em> unit &rArr; you may cut <em>between</em> blocks (PP) but not inside the residual add; TP splits the within-block matmuls but the element-wise add stays GPU-local.</li>
+        <li>&rarr; that is <strong>the legal-cut constraint K6/K7/K8 obey</strong>.</li>
+        <li><strong>Corollary of consequence 1 &mdash; the cut-edge payload:</strong> the <em>only</em> edge that survives a block boundary is the residual stream, so the PP cross-stage P2P payload <em>is</em> that tensor &mdash; size <code>[microbatch, chunk, d_model]&middot;dtype</code>, which couples PP micro-batch sizing to interconnect BW. <strong>K8/K20 own the cost; K18 owns the identity</strong> (rule of two).</li>
+        <li><strong>Consequence 2 &mdash; memory:</strong> during prefill every layer&rsquo;s residual + attention/MLP intermediates are live at <code>[batch, seq, d_model]</code> &rArr; scales with <code>seq</code>.</li>
+        <li><strong>Problem:</strong> at long context this rivals KV and <strong>prefill OOMs <em>before</em> decode</strong> &mdash; the hidden OOM (D46).</li>
+        <li><strong>D46 holds only under four production caveats</strong> (this is what makes the crossover a staff derivation, not a toy formula): <em>(i)</em> it assumes FlashAttention removed the <code>O(seq&sup2;)</code> score-matrix term &mdash; without it that term dominates and OOMs far sooner (cite <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a>); <em>(ii)</em> TP <em>replicates</em> the residual stream, it does not shard it &rArr; more-TP does <strong>not</strong> move the crossover (only CP/SP/chunked-prefill do); <em>(iii)</em> weight-quant does not move it &mdash; the residual stream stays BF16 while weights go FP8/INT4 (cite <a href="K14_quantization.html">K14</a>/D36); <em>(iv)</em> the activation <em>peak</em> and the resident KV coexist in the same HBM at different timescales &rArr; the design response is an activation-headroom reservation carved out of the KV pool (cite <a href="K2_kv-cache.html">K2</a>), not merely &ldquo;which OOMs first&rdquo;.</li>
+        <li>&rarr; chunked prefill caps activation at <code>O(C&middot;d_model)</code> independent of <code>seq</code> (<a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a> owns the fix &mdash; rule of two).</li>
+        <li><strong>Objective:</strong> the sole knob is the chunk size (K4/D1) + the GQA factor that sets the crossover &mdash; <em>no independent K18 rule-11</em> (scope-honest).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>residual = per-block identity path &rarr; consequence 1: atomic same-width block &rarr; legal-cut constraint (K6/K7/K8) &rarr; corollary: the cut-edge payload IS the residual stream &rArr; PP P2P volume (K8/K20) &rarr; consequence 2: prefill materializes [batch,seq,d_model]/layer &rarr; problem: long prefill OOMs before KV (D46) &rarr; D46 holds only under 4 production caveats (FA precondition / TP replicates&ne;shards / weight-quant doesn&rsquo;t move it / activation+KV coexist&rarr;reserve headroom) &rarr; chunked prefill caps it (K4/D1) &rarr; objective: the only knob is chunk size + GQA; no independent rule-11</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 760" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="290" y="16" width="660" height="54" rx="8"/>
+        <text class="t" x="620" y="38" text-anchor="middle">Residual / skip connection = a per-block identity path</text>
+        <text class="s" x="620" y="56" text-anchor="middle">x &rarr; x + Attn(LN x) &rarr; x + MLP(LN x) &middot; §1</text>
+
+        <line x1="500" y1="70" x2="430" y2="104"/>
+        <line x1="740" y1="70" x2="810" y2="104"/>
+        <text class="l" x="380" y="92">consequence 1</text>
+        <text class="l" x="800" y="92">consequence 2</text>
+
+        <!-- LEFT CHAIN: placement -->
+        <rect class="bp" x="120" y="104" width="600" height="56" rx="8"/>
+        <text class="t" x="420" y="128" text-anchor="middle">Placement: block is atomic, same width d_model</text>
+        <text class="s" x="420" y="146" text-anchor="middle">cut BETWEEN blocks (PP), not inside the residual add &middot; §2</text>
+
+        <line x1="420" y1="160" x2="420" y2="196"/>
+
+        <rect class="bc" x="120" y="196" width="600" height="56" rx="8"/>
+        <text class="t" x="420" y="220" text-anchor="middle">The legal-cut constraint K6 / K7 / K8 obey</text>
+        <text class="s" x="420" y="238" text-anchor="middle">TP within a block; residual add stays GPU-local &middot; §3</text>
+
+        <line x1="420" y1="252" x2="420" y2="288"/>
+        <text class="l" x="436" y="274">corollary</text>
+
+        <rect class="bc" x="120" y="288" width="600" height="64" rx="8"/>
+        <text class="t" x="420" y="312" text-anchor="middle">The cut-edge payload IS the residual stream</text>
+        <text class="s" x="420" y="332" text-anchor="middle">PP cross-stage P2P = [mb, chunk, d_model]&middot;dtype &mdash; K8/K20 own the cost &middot; §3</text>
+
+        <!-- RIGHT CHAIN: memory -->
+        <rect class="bp" x="740" y="104" width="500" height="56" rx="8"/>
+        <text class="t" x="990" y="128" text-anchor="middle">Memory: prefill materializes</text>
+        <text class="s" x="990" y="146" text-anchor="middle">[batch, seq, d_model] per layer &middot; §2</text>
+
+        <line x1="990" y1="160" x2="990" y2="196"/>
+
+        <rect class="bd" x="740" y="196" width="500" height="56" rx="8"/>
+        <text class="t" x="990" y="220" text-anchor="middle">Activation scales with seq</text>
+        <text class="s" x="990" y="238" text-anchor="middle">decode seq=1 tiny; prefill full-seq huge &middot; §2</text>
+
+        <line x1="990" y1="252" x2="990" y2="288"/>
+        <text class="l" x="1006" y="274">problem</text>
+
+        <rect class="bd" x="740" y="288" width="500" height="56" rx="8"/>
+        <text class="t" x="990" y="312" text-anchor="middle">Long prefill OOMs BEFORE decode</text>
+        <text class="s" x="990" y="330" text-anchor="middle">the hidden activation OOM &middot; §3</text>
+
+        <line x1="990" y1="344" x2="990" y2="380"/>
+        <text class="l" x="1006" y="366">D46</text>
+
+        <rect class="bs" x="740" y="380" width="500" height="56" rx="8"/>
+        <text class="t" x="990" y="404" text-anchor="middle">D46 &mdash; activation-OOM vs KV-OOM crossover seq</text>
+        <text class="s" x="990" y="422" text-anchor="middle">heavy GQA shrinks KV &rarr; activation dominates SOONER &middot; §3</text>
+
+        <line x1="990" y1="436" x2="990" y2="472"/>
+        <text class="l" x="1006" y="458">holds only if&hellip;</text>
+
+        <rect class="bd" x="740" y="472" width="500" height="86" rx="8"/>
+        <text class="t" x="990" y="492" text-anchor="middle">D46&rsquo;s 4 production caveats</text>
+        <text class="s" x="990" y="510" text-anchor="middle">&#9312; FlashAttention killed the O(seq&sup2;) term &nbsp; &#9313; TP replicates &ne; shards</text>
+        <text class="s" x="990" y="526" text-anchor="middle">&#9314; weight-quant doesn&rsquo;t move it (residual stays BF16)</text>
+        <text class="s" x="990" y="544" text-anchor="middle">&#9315; activation+KV coexist &rarr; reserve headroom, not &ldquo;which first&rdquo; &middot; §3</text>
+
+        <line x1="990" y1="558" x2="990" y2="594"/>
+        <text class="l" x="1006" y="580">fix (K4/D1)</text>
+
+        <rect class="bp" x="740" y="594" width="500" height="56" rx="8"/>
+        <text class="t" x="990" y="618" text-anchor="middle">Chunked prefill caps activation at O(C&middot;d_model)</text>
+        <text class="s" x="990" y="636" text-anchor="middle">K4/D1 owns the fix &mdash; K18 owns the footprint (rule of two) &middot; §3</text>
+
+        <!-- converge to objective -->
+        <line x1="420" y1="352" x2="420" y2="688"/>
+        <line x1="990" y1="650" x2="990" y2="688"/>
+
+        <rect class="bc" x="290" y="688" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="712" text-anchor="middle">Objective: the only knob is chunk size (K4/D1) + GQA factor</text>
+        <text class="s" x="620" y="730" text-anchor="middle">NO independent K18 rule-11 &mdash; it is a structural constraint (scope-honest) &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; the residual/skip connection is a per-block identity path.</li>
+        <li><span class="bp">&#9313;</span> <strong>Consequence 1 (placement)</strong> &mdash; the block is atomic, same width &rarr; cut between blocks, not inside the add.</li>
+        <li><span class="bc">&#9314;</span> <strong>Legal-cut constraint</strong> &mdash; K6/K7/K8 obey it: TP within a block, residual add GPU-local.</li>
+        <li><span class="bc">&#9315;</span> <strong>Corollary (cut-edge payload)</strong> &mdash; the only edge surviving a block-cut is the residual stream, so the PP cross-stage P2P payload <em>is</em> that tensor (<code>[mb,chunk,d_model]&middot;dtype</code>), coupling PP micro-batch to interconnect BW. <strong>K8/K20 own the cost; K18 owns the identity</strong> (rule of two).</li>
+        <li><span class="bp">&#9316;</span> <strong>Consequence 2 (memory)</strong> &mdash; prefill materializes <code>[batch,seq,d_model]</code>/layer; decode seq=1 tiny, prefill full-seq huge.</li>
+        <li><span class="bd">&#9317;</span> <strong>Problem</strong> &mdash; at long context activation rivals KV &rarr; prefill OOMs <em>before</em> decode (the hidden OOM).</li>
+        <li><span class="bs">&#9318;</span> <strong>D46</strong> &mdash; the crossover seq where activation overtakes KV; heavy GQA shrinks KV &rarr; activation dominates sooner.</li>
+        <li><span class="bd">&#9319;</span> <strong>D46&rsquo;s 4 production caveats</strong> &mdash; <em>(i)</em> assumes FlashAttention removed the <code>O(seq&sup2;)</code> score-matrix term, else it OOMs far sooner (cite K17); <em>(ii)</em> TP <em>replicates</em> the residual stream, doesn&rsquo;t shard it &rarr; more-TP does not move the crossover (only CP/SP/chunked-prefill do); <em>(iii)</em> weight-quant doesn&rsquo;t move it &mdash; residual stays BF16 while weights go FP8/INT4 (cite K14/D36); <em>(iv)</em> activation peak + resident KV coexist in one HBM &rarr; reserve an activation headroom out of the KV pool (cite K2), not just &ldquo;which OOMs first&rdquo;.</li>
+        <li><span class="bp">&#9320;</span> <strong>Fix (cited, not owned)</strong> &mdash; chunked prefill caps activation at <code>O(C&middot;d_model)</code> (K4/D1 owns it; rule of two).</li>
+        <li><span class="bc">&#9321;</span> <strong>Objective</strong> &mdash; the only knob is chunk size + the GQA factor; <em>no independent K18 rule-11</em> (scope-honest).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> two production surprises trace to one structure &mdash; (a) engineers ask &ldquo;where can I split this model across GPUs?&rdquo; and pick illegal cuts; (b) engineers size HBM for weights+KV and hit a <em>prefill</em> OOM at long context that the KV math never predicted. Both are governed by the residual stream. <b>Solution (what the page builds):</b> the two serving consequences of the residual connection &mdash; the legal-cut constraint and the prefill-activation footprint &mdash; and the crossover at which activation, not KV, is what OOMs.<span class="meta">number: the context length at which prefill activation overtakes KV for the trace model (the D46 number that makes chunked prefill a memory tool) &mdash; cites K1 (activation-bytes math) &middot; canonical: llm-bottlenecks.html (prefill activation OOM &mdash; the hidden one)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where the residual stream lives &mdash; the per-block identity edge (the cut boundary &amp; the activation footprint)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader must see <em>where</em> the constraint physically sits. <b>Solution:</b> each block is <code>x &rarr; x + Attn(LN x) &rarr; x + MLP(LN x)</code>; the <code>x +</code> identity edge carries the residual stream of shape <code>[batch, seq, d_model]</code> (cite <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>). That edge is simultaneously (i) the only legal cut boundary across GPUs and (ii) the live activation that prefill must hold. State this before any math.<span class="meta">no number (placement fact) &mdash; cites K0 (the residual-stream shape) &middot; diagram: one block with the residual identity edge highlighted as both the cut boundary and the live-activation tensor</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; short prompt vs 200k prompt; prefill vs decode</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 <code>&quot;I like cat, why?&quot;</code> (6 tokens). <b>Prefill, short:</b> the residual stream is <code>[1, 6, d_model]</code> per layer &mdash; tiny; no OOM. <b>Scale the same prompt to a 200k-token codebase prompt:</b> prefill must hold <code>[1, 200k, d_model]</code> &times; live-intermediates per layer &rarr; this OOMs the GPU <em>before</em> the KV cache does. <b>Decode token 7:</b> <code>seq=1</code> &rarr; activation is <code>[1, 1, d_model]</code> (negligible) but the <em>full</em> KV is resident &mdash; the asymmetry: <strong>prefill is activation-bound, decode is KV-bound</strong>. <b>With chunked prefill (C=4096):</b> peak activation is <code>O(C&middot;d_model)</code> independent of the 200k length &mdash; flat. Show with-vs-without explicitly on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (D46 puts the crossover seq + GQA factor in) &middot; diagram: activation footprint vs seq for unchunked (linear, OOM line crossed) vs chunked (flat at O(C&middot;d_model)); KV line for comparison</span></p>
+
+      <h3 id="derive">The two serving consequences (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> &ldquo;residual connection&rdquo; sounds like training theory; its serving meaning is two concrete constraints. <b>Solution, derived:</b> (1) <strong>placement</strong> &mdash; the <code>x +</code> identity makes input/output the same width <code>d_model</code> and the block atomic &rArr; you may cut <em>between</em> blocks (PP, <a href="K8_pipeline-parallelism.html">K8</a>) but not inside the residual add; TP (<a href="K7_tensor-parallelism.html">K7</a>) splits the within-block matmuls but the element-wise add stays GPU-local &mdash; <em>this is why</em> that cut is the legal one <a href="K6_parallelism-overview.html">K6</a> obeys; (2) <strong>memory</strong> &mdash; during prefill every layer&rsquo;s residual + attention/MLP intermediates are live at <code>[batch, seq, d_model]</code> &rArr; scales with <code>seq</code>; decode has <code>seq=1</code> activations but full KV, prefill has full-seq activations &rArr; <strong>prefill is the hidden OOM</strong> (cite <a href="K1_serving-fundamentals.html">K1</a> for the bytes math). <strong>Corollary of (1), derived in the same place:</strong> because the block is atomic and the residual edge is the <em>only</em> tensor that crosses a block boundary, the PP cross-stage P2P payload <em>is</em> exactly that residual stream &mdash; size <code>[microbatch, chunk, d_model]&middot;dtype</code>; <strong>K18 owns this identity, K8/K20 own its cost</strong> (rule of two) &mdash; this is why a PP cut&rsquo;s wire volume and a long-prefill&rsquo;s activation footprint are the <em>same tensor</em> seen at two scopes.<span class="meta">number: per-layer activation bytes [batch,seq,d_model]&middot;dtype on the trace, decode vs prefill; the per-stage P2P payload [mb,chunk,d_model]&middot;dtype on the trace &mdash; cites K0 (shape), K1 (bytes), K8/K20 (P2P cost &mdash; cited, not derived) &middot; diagram: the legal-cut map (PP between blocks, TP within, add local) + the residual-edge highlighted as BOTH the wire payload and the live prefill activation</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where the constraint sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> The legal cut boundaries are the block edges: PP places contiguous blocks on a stage (<a href="K8_pipeline-parallelism.html">K8</a>), TP splits the matmuls inside a block across the NVLink domain (<a href="K7_tensor-parallelism.html">K7</a>), and the residual add executes GPU-local on every rank. <b>The corollary made concrete here:</b> the tensor that physically crosses each PP stage boundary <em>is</em> the residual stream &mdash; <code>[microbatch, chunk, d_model]&middot;dtype</code> per P2P send &mdash; so the PP cut&rsquo;s wire volume and the long-prefill activation footprint are the <em>same tensor at two scopes</em>; this couples PP micro-batch sizing to the interconnect tier (K8/K20 own that cost, K18 owns the identity &mdash; rule of two). The prefill-activation footprint is also what <a href="K8_pipeline-parallelism.html#d38">K8/D38</a> (PP stage-memory) consumes per in-flight micro-batch.<span class="meta">number: per-stage P2P payload [mb,chunk,d_model]&middot;dtype vs the NVLink/IB tier BW on the trace &mdash; cites K6 (selector obeys this), K7 (TP within block), K8/D38 (PP stage-memory consumes the footprint), K20 (P2P tier cost &mdash; cited, not derived) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the legal-cut map</strong>L blocks on a residual spine; PP cut lines between blocks (legal), a struck-out cut inside a residual add (illegal), TP shading inside one block with the residual-add edge marked GPU-local. Drawn after arc approval.</div>
+
+      <h3 id="d46" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D46 &mdash; the prefill-activation-OOM vs KV-OOM crossover (rule-of-two with <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> engineers size HBM for weights + KV and hit a surprise <em>prefill</em> OOM at long context. <b>Solution:</b> derive both footprints &mdash; resident KV <code>&asymp; 2&middot;L&middot;n_kv_heads&middot;d_head&middot;seq&middot;dtype</code> (persists, grows with seq); peak prefill activation <code>&asymp; c&middot;L&middot;batch&middot;seq&middot;d_model&middot;dtype</code> (transient per forward, grows with seq) &mdash; and the crossover <code>seq</code> where activation &gt; KV. <strong>Heavy GQA shrinks KV &rarr; activation dominates <em>sooner</em></strong> (the non-obvious staff point). Chunked prefill caps activation at <code>O(C&middot;d_model)</code> independent of seq &rarr; moves the OOM ceiling. <b>Rule of two:</b> K18 owns the <em>footprint + crossover</em>; <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a> owns <em>chunked prefill as the fix</em>.
+      <br><br><b>The four production caveats that make this a staff derivation, not a toy formula (each Problem&rarr;Solution):</b></p>
+      <p class="stub"><span class="ps">Caveat (i) &mdash; the FlashAttention precondition.</span> <b>Problem:</b> the <code>c&middot;L&middot;batch&middot;seq&middot;d_model</code> term is <em>linear</em> in seq &mdash; but a naive attention kernel materializes the <code>[batch, n_heads, seq, seq]</code> score matrix, an <code>O(seq&sup2;)</code> term that dominates and OOMs <em>far</em> sooner, making the crossover meaningless. <b>Solution:</b> the residual-stream term is the relevant one <em>only because</em> FlashAttention (<a href="K17_attention-kernels-and-cuda-graphs.html">K17</a>) never materializes the score matrix &mdash; state this assumption explicitly; cite K17, do not re-derive the kernel (rule of two).<span class="meta">number: the O(seq&sup2;) attention-matrix bytes vs the O(seq&middot;d_model) residual term at the trace seq &mdash; shows which dominates with/without FA &mdash; cites K17 (FlashAttention), K1 (bytes)</span></p>
+      <p class="stub"><span class="ps">Caveat (ii) &mdash; more-TP does not move the crossover.</span> <b>Problem:</b> the staff reflex for &ldquo;long context OOMs&rdquo; is &ldquo;add TP&rdquo; &mdash; but TP <em>replicates</em> the residual stream on every rank (only the matmul intermediates are sharded), so the activation footprint is unchanged by TP degree. <b>Solution:</b> only CP / sequence-parallel / chunked-prefill shrink it &mdash; this is <em>why</em> D40&rsquo;s &ldquo;more-TP&rdquo; branch loses on the activation side; cross-link <a href="K7_tensor-parallelism.html">K7</a> (sequence-parallel) / <a href="K11_context-parallelism.html">K11</a> (CP).<span class="meta">number: residual-stream bytes/rank at TP=1 vs TP=8 (unchanged) on the trace &mdash; cites K7/K11 (the axes that DO shrink it)</span></p>
+      <p class="stub"><span class="ps">Caveat (iii) &mdash; weight-quant does not move the crossover.</span> <b>Problem:</b> a reader arriving from D36 (quantize-to-fit) expects FP8/INT4 to shrink activation memory &mdash; it does not; the residual stream stays BF16 (low-precision repeated residual adds accumulate error). <b>Solution:</b> weight-quant fixes the <em>weight</em>-OOM; the <em>prefill-activation</em>-OOM is exactly where it was &mdash; D46&rsquo;s crossover is invariant to weight precision; cite <a href="K14_quantization.html">K14</a>/D36.<span class="meta">number: weight bytes FP16&rarr;FP8 (halved) vs prefill-activation bytes (unchanged) on the trace &mdash; cites K14/D36</span></p>
+      <p class="stub"><span class="ps">Caveat (iv) &mdash; activation and KV coexist; D46 is a headroom reservation, not just &ldquo;which OOMs first&rdquo;.</span> <b>Problem:</b> the activation <em>peak</em> is transient per-forward; the KV is <em>resident</em> &mdash; they contend for the same HBM at different timescales, so sizing the KV pool to fill HBM OOMs the instant a long prefill&rsquo;s activation spikes, even though steady state &ldquo;fit&rdquo;. <b>Solution:</b> the design response is an explicit activation-headroom reservation carved out of the KV pool budget = peak prefill activation; <a href="K2_kv-cache.html">K2</a> owns pool sizing, K18 owns <em>why the reservation exists</em> (the transient residual peak) &mdash; rule of two.<span class="meta">number: the activation-headroom GB to reserve out of the KV pool at the trace prefill seq &mdash; cites K2 (pool sizing), K1 (bytes)</span></p>
+      <p class="stub"><span class="meta">D46 number plan: the context length where prefill activation overtakes KV for Llama-3-70B (GQA-8) on the trace &mdash; the number that makes chunked prefill a memory tool, not just a latency one &mdash; cites K1 (both footprint formulas), K0 (shapes) &middot; real: vLLM chunked prefill, DeepSpeed-Inference + URLs</span></p>
+
+      <h3 id="no-rule11">The only lever is chunk size &mdash; no independent rule-11 (stated honestly)</h3>
+      <p class="stub"><span class="ps">Scope-honest stub (this <em>replaces</em> a rule-11 sweep &mdash; on purpose).</span> K18 sets a <em>structural constraint</em>, not a policy: the sole knob is the chunk size (owned by <a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a>) and the GQA factor that sets the D46 crossover. There is no K18-local selection spectrum to sweep &mdash; manufacturing one would be padding. Stating this is the scope-honest call required by the methodology, not an omission; the rule-11 trigger-grep returns nothing K18-owned, and that is the correct outcome.<span class="meta">no number (a scope statement) &mdash; cites K4/D1 (where the only knob lives) &middot; this satisfies the rule-11 gate by explicit scope-out, per methodology rule 11</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt &mdash; alternatives to <em>handling the activation footprint</em>).</span> (a) <b>Just buy more HBM / bigger GPU</b> &mdash; disq: activation grows with seq unboundedly &rarr; any fixed HBM has a context ceiling; <em>wins</em> only for moderate context where the headroom is cheap. (b) <b>Reduce batch during long prefill</b> &mdash; disq: activation &prop; batch&times;seq, so dropping batch helps but tanks throughput; <em>wins</em> as a stopgap, not a design. (c) <b>Chunked prefill (K4/D1)</b> &mdash; the actual fix: caps activation at <code>O(C&middot;d_model)</code> independent of seq; disq for K18 to <em>own</em>: it is a scheduler policy &mdash; <em>cite K4/D1, do not re-derive</em>. (d) <b>Activation-checkpointing-for-backprop</b> &mdash; disq: training-side; the inference analog <em>is</em> chunked prefill; <em>out of scope</em> &mdash; flag the boundary, do not cover.<span class="meta">number: the context ceiling per fixed HBM (a); throughput cost of batch-drop (b) on the trace &mdash; cites K1 (activation bytes), K4/D1 (the fix) &middot; contrast L3 (long-context, where this is the bottleneck)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>The hidden prefill-activation OOM</b> &mdash; HBM sized for weights+KV, a long prompt OOMs in prefill before any KV pressure; first move: chunked prefill to cap activation (llm-bottlenecks.html &mdash; prefill activation OOM). <b>Illegal model cut</b> &mdash; a split inside the residual add / mid-block &rarr; wrong outputs or a broken pipeline (gpu-failure-modes.html &mdash; incorrect parallelism placement). <b>GQA-masked surprise</b> &mdash; heavy GQA makes KV look tiny so engineers over-extend context, then activation OOMs <em>sooner</em> than the KV math implied (llm-bottlenecks.html). <b>Deep-PP stage-memory OOM</b> &mdash; this footprint &times; in-flight micro-batches OOMs a stage (cite K8/D38; gpu-failure-modes.html).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (prefill activation OOM, GQA-masked), llm/canonicals/gpu-failure-modes.html (illegal cut, PP stage-memory) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> vLLM chunked prefill (the activation-cap fix in production), DeepSpeed-Inference &amp; Megatron-LM (block-boundary PP cut, TP-within-block &mdash; the legal-cut constraint as shipped), TensorRT-LLM (engine build respects the same block atomicity). Each: how it realises the legal cut / caps the activation footprint + URL, justified vs 2&ndash;3 competitors. (Short section &mdash; the constraint is structural; few systems &ldquo;implement&rdquo; it, they <em>obey</em> it.)<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L3-long-context-serving.html">L3</a> (long-context &mdash; D46, the hidden activation-OOM, is its bottleneck); <a href="K8_pipeline-parallelism.html#d38">K8/D38</a> (PP stage-memory consumes this footprint). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> &mdash; the <code>[batch,seq,d_model]</code> residual-stream shape this page reasons about.</li>
+        <li><a href="K1_serving-fundamentals.html">K1</a> &mdash; the activation-bytes math + the D46 crossover number.</li>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; K18 supplies the legal-cut constraint K6&rsquo;s selection obeys.</li>
+        <li><a href="K7_tensor-parallelism.html">K7</a> &mdash; TP within a block; the residual add stays GPU-local.</li>
+        <li><a href="K8_pipeline-parallelism.html#d38">K8</a> &mdash; PP on a block boundary; D38 stage-memory <em>consumes</em> this footprint; <a href="K20_interconnect-and-collectives.html">K20</a> &mdash; the PP cross-stage P2P payload <em>is</em> the residual stream (K18 owns the identity, K8/K20 own the cost).</li>
+        <li><a href="K7_tensor-parallelism.html">K7</a> / <a href="K11_context-parallelism.html">K11</a> &mdash; TP <em>replicates</em> the residual stream (caveat ii); CP / sequence-parallel are the axes that actually shrink the activation footprint.</li>
+        <li><a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> &mdash; FlashAttention removes the <code>O(seq&sup2;)</code> score-matrix term (D46 caveat i); also owns decode-side residual-add fusion.</li>
+        <li><a href="K14_quantization.html">K14</a>/D36 &mdash; weight-quant does <em>not</em> move the D46 crossover (caveat iii: residual stays BF16).</li>
+        <li><a href="K2_kv-cache.html">K2</a> &mdash; KV-pool sizing; the activation-headroom reservation (D46 caveat iv) is carved out of the K2 pool budget.</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html#d1">K4/D1</a> &mdash; chunked prefill = the D46 fix (rule of two: K18 owns the footprint, K4 owns the fix).</li>
+        <li><strong>Out of scope (named, not covered):</strong> residual-network <em>theory</em> / why skip connections train deep nets (training-side); activation-checkpointing-for-backprop (training-side); model-architecture design (residual structure taken as given); the logits/unembed <code>[batch,seq,vocab]</code> prefill spike (sibling activation-OOM &mdash; K0-adjacent); decode-side residual-add kernel fusion (K17).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

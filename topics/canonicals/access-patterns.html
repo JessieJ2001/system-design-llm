@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Access Patterns — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Access Patterns</h1>
+      <p class="hero-subtitle">The canonical taxonomy of read/write/skew shapes a distributed system can face — and the first techniques you reach for under each. This is the source-of-truth page; scenario pages link here instead of redefining patterns.</p>
+      <p class="hero-meta">~10 min reference</p>
+    </div>
+  </section>
+
+  <!-- How to use -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Use This Page</h2>
+      <p>Every staff+ design probe eventually becomes some variant of <em>"you said X — what if reads are 100× writes?"</em> or <em>"what if 1% of keys take 50% of traffic?"</em> The 12 patterns below are the canonical answers to that question. They are the dimensions any interviewer is implicitly comparing against when they ask about scale.</p>
+      <p>Use this page in two ways:</p>
+      <ul>
+        <li><strong>While clarifying requirements (S0).</strong> Walk down the table. For each pattern, ask: <em>"does this apply to my system?"</em> If yes, that pattern's first/second levers are pre-validated starting points. If no, mark it explicitly as out-of-scope.</li>
+        <li><strong>While iterating (S5).</strong> When a bottleneck appears, classify it as one of the 12 patterns; that classification tells you which lever to reach for next, and what number tells you the lever has run out.</li>
+      </ul>
+      <p>Other pages on this site link <em>here</em> for definitions of these patterns. Do not redefine them in scenario pages — link instead.</p>
+    </div>
+  </section>
+
+  <!-- The taxonomy -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The 12 Canonical Access Patterns</h2>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Pattern</th><th>What it looks like</th><th>First lever</th><th>Second lever</th></tr>
+        </thead>
+        <tbody>
+          <tr id="read-heavy-uniform"><td><strong>Read-heavy uniform</strong></td><td>100:1 R:W, no skew</td><td>Add read replicas (async)</td><td>Cache-aside in front</td></tr>
+          <tr id="write-heavy-uniform"><td><strong>Write-heavy uniform</strong></td><td>1:10 R:W, batch ingest</td><td>Shard the write path; batch + async</td><td>LSM engine; separate write nodes</td></tr>
+          <tr id="power-law"><td><strong>Power-law / hot keys</strong></td><td>Top 1% of keys = 50% of QPS (Zipfian)</td><td>Client-side cache + request coalescing</td><td>Replicate hot keys; key salting on writes</td></tr>
+          <tr id="hot-partition"><td><strong>Hot partition / hot shard</strong></td><td>One PK or one range cooks one node</td><td>Salt the PK; subdivide the range</td><td>Move hot range to dedicated nodes</td></tr>
+          <tr id="bursty"><td><strong>Bursty / spiky</strong></td><td>10× peak for 5 min, idle otherwise</td><td>Queue + smooth (write-behind); auto-scale read tier</td><td>Provision for peak (managed: on-demand)</td></tr>
+          <tr id="scan-heavy"><td><strong>Scan-heavy / range</strong></td><td>Few large queries, big result sets</td><td>Range partitioning + clustering keys; columnar storage</td><td>Push scans to a replica; precompute</td></tr>
+          <tr id="fan-out-write"><td><strong>Fan-out write</strong> (one → N reads)</td><td>"Celebrity" feed, broadcast notification</td><td>Fan-out-on-write to materialized inboxes</td><td>Fan-out-on-read with cache for celebrity case</td></tr>
+          <tr id="fan-in-read"><td><strong>Fan-in read</strong> (N → one)</td><td>Aggregate across many keys</td><td>Pre-aggregate / rollup tables</td><td>Stream-processor pre-compute; store result</td></tr>
+          <tr id="long-tail"><td><strong>Long-tail / cold</strong></td><td>Massive key space, mostly cold</td><td>Tiered storage; bloom filter to skip cold</td><td>Compression-friendly engine; TTL on cold</td></tr>
+          <tr id="large-items"><td><strong>Large items</strong></td><td>Items &gt; 1 MB (videos, blobs, model weights)</td><td>Store blob in object store; KV holds pointer</td><td>Don't put it in this DB</td></tr>
+          <tr id="high-cardinality-query"><td><strong>High-cardinality query</strong></td><td>Filter by N rare attributes</td><td>Inverted index (Lucene); secondary index</td><td>Move to search engine</td></tr>
+          <tr id="strict-ordering"><td><strong>Strict ordering / monotonic</strong></td><td>Per-user ordered events</td><td>Single partition per user (sequential write)</td><td>Sequence number / fencing token</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Per-pattern signature -->
+  <section class="section">
+    <div class="container">
+      <h2>Per-Pattern Signature</h2>
+      <p>For each pattern: the <strong>signal</strong> that tells you you're in it, the <strong>first lever</strong> (what you reach for), the <strong>cliff</strong> (the number that says the lever has run out), and the <strong>last resort</strong>.</p>
+
+      <h3 id="sig-read-heavy-uniform">Read-heavy uniform</h3>
+      <ul>
+        <li><strong>Signal:</strong> R:W ratio &gt; 10:1; no measurable skew across keys.</li>
+        <li><strong>First lever:</strong> Async read replicas; route reads to replica pool.</li>
+        <li><strong>Cliff:</strong> Replica replication lag &gt; read freshness SLO, or replica fan-out &gt; primary's outbound bandwidth.</li>
+        <li><strong>Last resort:</strong> Shard the dataset; or move to a different read-optimized engine (e.g., search index, OLAP store).</li>
+      </ul>
+
+      <h3 id="sig-write-heavy-uniform">Write-heavy uniform</h3>
+      <ul>
+        <li><strong>Signal:</strong> R:W &lt; 1:1; sustained ingest dominates the workload; uniform key distribution.</li>
+        <li><strong>First lever:</strong> Shard the write path by hash(key); batch + async commit; consider an LSM engine if currently on a B-tree.</li>
+        <li><strong>Cliff:</strong> Cross-shard write fan-out blowing the network; per-shard fsync queue depth; compaction debt unbounded.</li>
+        <li><strong>Last resort:</strong> Append-only log + downstream materializers (Kafka + consumers); abandon point-write semantics.</li>
+      </ul>
+
+      <h3 id="sig-power-law">Power-law / hot keys</h3>
+      <ul>
+        <li><strong>Signal:</strong> Top-1% keys account for &gt; 50% of QPS (Zipf's law). Hot-key detection (CMS sketch) shows 1–10 keys at 100× the median.</li>
+        <li><strong>First lever:</strong> Client-side L1 cache with short TTL; request coalescing (single-flight) on the read path.</li>
+        <li><strong>Cliff:</strong> One node pegged at 100% CPU regardless of cluster size (single-thread bottleneck on the hot key); coalescing window saturates.</li>
+        <li><strong>Last resort:</strong> Replicate hot keys with key suffixing (`key#salt`); on writes, fan-out to all replicas; on reads, route to one of N replicas.</li>
+      </ul>
+
+      <h3 id="sig-hot-partition">Hot partition / hot shard</h3>
+      <ul>
+        <li><strong>Signal:</strong> Per-shard QPS or storage skewed &gt; 5× the median for &gt; 5 minutes sustained.</li>
+        <li><strong>First lever:</strong> Salt the partition key with a short hash prefix; or subdivide the hot range with auto-split.</li>
+        <li><strong>Cliff:</strong> Splits can't keep up with growth; cross-shard query cost dominates.</li>
+        <li><strong>Last resort:</strong> Move the hot range to dedicated nodes; carve into its own keyspace.</li>
+      </ul>
+
+      <h3 id="sig-bursty">Bursty / spiky</h3>
+      <ul>
+        <li><strong>Signal:</strong> Peak-to-average ratio &gt; 5×; bursts shorter than the autoscaling response time.</li>
+        <li><strong>First lever:</strong> Smooth with a queue (write-behind via Kafka); auto-scale the read tier on a leading metric.</li>
+        <li><strong>Cliff:</strong> Queue depth grows faster than drainage; cold-start latency &gt; SLO.</li>
+        <li><strong>Last resort:</strong> Provision for peak (warm capacity); pre-warm via shadow traffic.</li>
+      </ul>
+
+      <h3 id="sig-scan-heavy">Scan-heavy / range</h3>
+      <ul>
+        <li><strong>Signal:</strong> Few queries return many rows; OLAP-shaped workload (aggregations, time-range scans).</li>
+        <li><strong>First lever:</strong> Range partitioning with clustering keys aligned to scan order; columnar storage.</li>
+        <li><strong>Cliff:</strong> Per-query scanned bytes &gt; per-query memory budget; concurrent scans starve point reads.</li>
+        <li><strong>Last resort:</strong> Push scans to a separate replica fleet; pre-compute materialized aggregates.</li>
+      </ul>
+
+      <h3 id="sig-fan-out-write">Fan-out write (one → N reads)</h3>
+      <ul>
+        <li><strong>Signal:</strong> One write triggers N downstream materializations; N varies wildly (celebrity follower count).</li>
+        <li><strong>First lever:</strong> Fan-out-on-write to per-recipient inboxes (push pattern).</li>
+        <li><strong>Cliff:</strong> Top-percentile fan-out cost dominates total write cost; celebrity write pegs the worker pool.</li>
+        <li><strong>Last resort:</strong> Hybrid — fan-out-on-write for normals, fan-out-on-read with cache for celebrities.</li>
+      </ul>
+
+      <h3 id="sig-fan-in-read">Fan-in read (N → one)</h3>
+      <ul>
+        <li><strong>Signal:</strong> Read assembles result from many sources (timeline, dashboard, leaderboard).</li>
+        <li><strong>First lever:</strong> Pre-aggregate / rollup tables maintained on write.</li>
+        <li><strong>Cliff:</strong> Roll-up freshness lag &gt; SLO; combinatorial explosion of pre-aggregations.</li>
+        <li><strong>Last resort:</strong> Stream processor (Flink) maintaining materialized views; query the view, not the source.</li>
+      </ul>
+
+      <h3 id="sig-long-tail">Long-tail / cold</h3>
+      <ul>
+        <li><strong>Signal:</strong> &gt; 80% of keys account for &lt; 5% of QPS; storage growth dominates compute cost.</li>
+        <li><strong>First lever:</strong> Tiered storage (RAM → NVMe → S3); bloom filter to skip cold lookups.</li>
+        <li><strong>Cliff:</strong> Cold-tier read latency &gt; user-facing SLO; bloom false-positive rate too high.</li>
+        <li><strong>Last resort:</strong> Compression-friendly columnar format; aggressive TTL; archive to immutable storage.</li>
+      </ul>
+
+      <h3 id="sig-large-items">Large items</h3>
+      <ul>
+        <li><strong>Signal:</strong> p99 item size &gt; 1 MB; per-row read amplification &gt; 10× the requested bytes.</li>
+        <li><strong>First lever:</strong> Store blob in object store (S3 / GCS); KV holds the pointer + metadata only.</li>
+        <li><strong>Cliff:</strong> Latency for the indirect lookup blows the SLO; metadata table itself becomes large.</li>
+        <li><strong>Last resort:</strong> Don't put it in this database. Switch to a blob-native store (S3 + presigned URLs).</li>
+      </ul>
+
+      <h3 id="sig-high-cardinality-query">High-cardinality query</h3>
+      <ul>
+        <li><strong>Signal:</strong> Filter by &gt; 5 distinct rare attributes; queries are not by primary key.</li>
+        <li><strong>First lever:</strong> Inverted index (Lucene/Elasticsearch); secondary indexes for the most common predicates.</li>
+        <li><strong>Cliff:</strong> Index size &gt; data size; index update lag &gt; freshness SLO.</li>
+        <li><strong>Last resort:</strong> Move to a dedicated search engine; treat the OLTP store as source-of-truth, the search engine as derived.</li>
+      </ul>
+
+      <h3 id="sig-strict-ordering">Strict ordering / monotonic</h3>
+      <ul>
+        <li><strong>Signal:</strong> Per-entity events must be totally ordered (account ledger, per-user state machine).</li>
+        <li><strong>First lever:</strong> Single partition per ordering key (per-user, per-account); sequential write within partition.</li>
+        <li><strong>Cliff:</strong> One ordering key's QPS exceeds single-partition throughput; cross-partition transactions needed.</li>
+        <li><strong>Last resort:</strong> Sequence number / fencing token assigned by a coordinator; or move to a strongly-consistent log (Kafka with single-partition topic, or a Raft-replicated log).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Combinations & precedence -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Combinations &amp; Precedence</h2>
+      <p>Real systems exhibit multiple patterns at once. When they conflict, the order in which they manifest dictates the design path:</p>
+      <ul>
+        <li><strong>Power-law + Read-heavy uniform.</strong> Replicas help only the uniform tail; the hot 1% needs key replication on top. Don't conflate them — they are two separate fixes.</li>
+        <li><strong>Bursty + Write-heavy.</strong> The queue absorbs the burst <em>and</em> reshapes write distribution; one design move (Kafka in front) addresses both. Show the math for each.</li>
+        <li><strong>Hot partition + Strict ordering.</strong> Direct conflict — you cannot salt the partition key without giving up per-key ordering. Resolve by introducing a sequence number or a per-key partition with a coordinator (sacrifices throughput for order).</li>
+        <li><strong>Long-tail + Large items.</strong> The combination is dangerous: a cold large item is the worst case for both latency and cost. Indirect via blob store + bloom-filter lookup is the canonical answer.</li>
+      </ul>
+      <p>When you list multiple patterns in a scenario's S0, name which one <strong>dominates</strong> for the system's primary path; the rest become secondary considerations addressed where they bite.</p>
+    </div>
+  </section>
+
+  <!-- Cross-references -->
+  <section class="section">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <p>Scenario pages that exemplify each pattern (canonical examples to study):</p>
+      <ul>
+        <li><strong>Power-law:</strong> <a href="../scenarios/15-topk-frequent.html">15-topk-frequent</a>, <a href="../scenarios/21-distributed-cache.html#hot-key-iteration">21-distributed-cache (hot-key iteration)</a>, <a href="../scenarios/24-realtime-leaderboard.html">24-realtime-leaderboard</a>.</li>
+        <li><strong>Hot partition:</strong> <a href="../scenarios/02-sharding-vs-replication.html">02-sharding-vs-replication</a>, <a href="../scenarios/18-hotspot-hashing.html">18-hotspot-hashing</a>.</li>
+        <li><strong>Bursty:</strong> <a href="../scenarios/13-backpressure.html">13-backpressure</a>, <a href="../scenarios/27-thundering-herd.html">27-thundering-herd</a>, <a href="../scenarios/28-flash-sale.html">28-flash-sale</a>.</li>
+        <li><strong>Fan-out write:</strong> <a href="../scenarios/10-fan-out-notification.html">10-fan-out-notification</a>, <a href="../scenarios/03-push-vs-pull.html">03-push-vs-pull</a>.</li>
+        <li><strong>Strict ordering:</strong> <a href="../scenarios/12-pubsub-ordering.html">12-pubsub-ordering</a>, <a href="../scenarios/14-exactly-once.html">14-exactly-once</a>.</li>
+        <li><strong>Scan-heavy / Long-tail:</strong> <a href="../scenarios/30-logging-system.html">30-logging-system</a>.</li>
+      </ul>
+      <p>Foundational concept pages that complement this taxonomy:</p>
+      <ul>
+        <li><a href="../caching.html">Caching</a> — the canonical first lever for read-heavy + power-law.</li>
+        <li><a href="../database-replication.html">Database Replication</a> — first lever for read-heavy uniform.</li>
+        <li><a href="../database-sharding.html">Database Sharding</a> — first lever for write-heavy + hot-partition.</li>
+        <li><a href="../consistent-hashing.html">Consistent Hashing</a> — the substrate that makes most sharding levers work.</li>
+        <li><a href="../rate-limiting.html">Rate Limiting</a> — how systems defend against bursty / pathological access.</li>
+        <li><a href="../cap-theorem.html">CAP Theorem</a> — the constraint that bounds your choices for strict-ordering / multi-region patterns.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

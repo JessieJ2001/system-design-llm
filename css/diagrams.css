@@ -1,0 +1,70 @@
+/* ============================================================
+   Shared diagram / image styles for the system-design site.
+
+   Link this AFTER css/style.css on every knowledge (K*) and
+   scenario (L*) page:
+
+     <link rel="stylesheet" href="../../css/style.css">
+     <link rel="stylesheet" href="../../css/diagrams.css">
+
+   Goal: every SVG diagram renders at ONE consistent size — graph
+   and text — across all pages. Pages must NOT redefine .svg-wrap,
+   .svg-wrap svg, or .legend-list in their own <style> block, and
+   <svg> tags must NOT carry inline width/height/font styling.
+   Size is governed here and only here.
+   ============================================================ */
+
+/* The white framed box a diagram sits in. One canonical max width
+   for the whole site. The box fills the full content width of its
+   column (the page .container is itself capped at 94vw), so diagrams
+   are as large as the layout allows and identical across every page —
+   works for plain pages and for .full-width inside a dense-columns
+   grid alike. Do NOT add a px max-width here: that shrinks every
+   diagram site-wide (regressed once already). */
+.svg-wrap {
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin: 1.25rem 0;
+  overflow-x: auto;
+}
+
+/* The SVG fills its box and scales proportionally. Because the SVG
+   uses a viewBox, its internal text scales with the graph — so the
+   text-to-graph ratio (and thus the apparent text size) is identical
+   on every page. Set the font family here so it is consistent too;
+   per-element font-size stays in each SVG's own <style>/attributes. */
+.svg-wrap svg {
+  display: block;
+  width: 50%;
+  height: auto;
+  margin: 0 auto;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+.svg-wrap-small svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0 auto;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* Color / connection key rendered under a diagram. */
+.legend-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: .4rem 1.5rem;
+}
+.legend-list li { font-size: .92rem; }
+.legend-list .b {
+  display: inline-block;
+  min-width: 1.4rem;
+  padding-right: .35rem;
+  color: var(--color-primary);
+  font-weight: 700;
+  white-space: nowrap;
+}

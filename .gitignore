@@ -1,0 +1,66 @@
+# Ignore all Markdown files
+*.md
+
+# Ignore all Python files
+*.py
+
+# Ignore all dotfiles and dot-directories (anything starting with .)
+.*
+
+# ...but keep this .gitignore tracked so the rules are shared
+!.gitignore
+
+# --- Secrets & credentials ---
+# Environment / config files (non-dotfile variants; dotfiles already covered above)
+*.env
+env.*
+*.cfg
+secrets.*
+*secret*
+*credential*
+*password*
+
+# Keys & certificates
+*.pem
+*.key
+*.pub
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Cloud / service credentials
+*.pkcs12
+gha-creds-*.json
+service-account*.json
+*-key.json
+credentials.json
+client_secret*.json
+
+# Tokens & auth
+*.token
+*.netrc
+.htpasswd
+
+# --- Local / generated artifacts ---
+*.log
+*.sqlite
+*.sqlite3
+*.db
+node_modules/
+__pycache__/
+dist/
+build/
+*.bak
+*.tmp
+*.swp
+
+# Scratch / temporary directory at repo root
+/tmp/

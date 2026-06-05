@@ -1,0 +1,1661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Circuit Breakers — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Topics</a></li>
+        <li><a href="microservices.html">Microservices</a></li>
+        <li><a href="load-balancing.html">Load Balancing</a></li>
+        <li><a href="observability.html">Observability</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Circuit Breakers</h1>
+      <p class="hero-subtitle">A resilience pattern that detects failing downstream services and fails fast, preventing cascading failures from bringing down your entire system.</p>
+      <span class="hero-meta">22 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>A circuit breaker is a resilience pattern that wraps calls to downstream services and monitors them for failures. When failures exceed a configured threshold, the breaker "trips" and immediately rejects subsequent calls without even attempting them. This prevents your service from wasting threads, connections, and time waiting on a backend that is already down — and more critically, prevents the failure from cascading upstream through the entire call chain.</p>
+      <p>The analogy is an electrical circuit breaker in your home. When a short circuit causes dangerous current to flow, the breaker trips and cuts power to that circuit. This protects the wiring from melting and your house from catching fire. You don't keep trying to push electricity through a broken circuit — you stop, let things cool down, and then carefully test whether it's safe to reconnect.</p>
+      <p>A circuit breaker has three states: <strong>Closed</strong> (normal operation — requests flow through, failures are counted), <strong>Open</strong> (failing fast — all requests are immediately rejected without calling the downstream service), and <strong>Half-Open</strong> (testing recovery — a limited number of probe requests are let through to check if the downstream service has recovered). If the probes succeed, the breaker closes again. If they fail, it reopens.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Circuit Breaker State Machine</h2>
+      <div class="animation-container" id="circuit-breaker-animation">
+        <canvas id="circuitBreakerCanvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">Requests flow through the circuit breaker to a backend service. Watch the failure counter tick up, the breaker trip open, the timeout expire, and half-open probes test recovery.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+      <p>The circuit breaker operates as a state machine with three states and well-defined transitions:</p>
+      <ol>
+        <li><strong>Closed (normal):</strong> All requests pass through to the downstream service. The breaker maintains a rolling window of recent results. Every failure increments a failure counter. Every success resets or decrements it (depending on implementation).</li>
+        <li><strong>Threshold exceeded — trip to Open:</strong> When the failure count (or failure rate) within the sliding window exceeds the configured threshold, the breaker trips. The state transitions from Closed to Open. A timeout timer starts.</li>
+        <li><strong>Open (failing fast):</strong> All incoming requests are immediately rejected with a fallback response or error — the downstream service is never called. This protects both the caller (no wasted threads/connections) and the downstream service (no additional load while it's struggling).</li>
+        <li><strong>Timeout expires — transition to Half-Open:</strong> After a configured timeout duration (e.g., 30 seconds), the breaker transitions to Half-Open. This is the recovery-testing phase.</li>
+        <li><strong>Half-Open (probing):</strong> A limited number of requests (often just one) are allowed through to the downstream service. These are "probe" requests that test whether the service has recovered.</li>
+        <li><strong>Probe succeeds — close the breaker:</strong> If the probe request(s) succeed, the breaker transitions back to Closed. Normal traffic resumes. The failure counter is reset.</li>
+        <li><strong>Probe fails — reopen the breaker:</strong> If any probe request fails, the breaker transitions back to Open and the timeout timer resets. The cycle repeats.</li>
+      </ol>
+      <p>This creates a self-healing loop: the system automatically detects failure, stops hammering the broken service, periodically tests for recovery, and resumes normal operation when the downstream service is healthy again — all without human intervention.</p>
+
+      <h3>Step-by-Step State Machine Walkthrough</h3>
+      <p>Let's trace through a complete lifecycle with a concrete scenario. Our circuit breaker is configured with a <strong>failure threshold of 5 consecutive failures</strong> and an <strong>open-state timeout of 30 seconds</strong>. The downstream payment service starts healthy, goes down, and eventually recovers.</p>
+
+      <div class="table-responsive"><table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th>Event</th>
+            <th>State</th>
+            <th>Failure Count</th>
+            <th>Action Taken</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>Request succeeds</td>
+            <td>CLOSED</td>
+            <td>0/5</td>
+            <td>Normal operation. Request passes through to payment service, gets 200 OK.</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>Request fails (503)</td>
+            <td>CLOSED</td>
+            <td>1/5</td>
+            <td>Payment service returns an error. Failure counter increments to 1.</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>Request fails (timeout)</td>
+            <td>CLOSED</td>
+            <td>2/5</td>
+            <td>Payment service doesn't respond within 3s. Counter increments to 2.</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>Request succeeds</td>
+            <td>CLOSED</td>
+            <td>0/5</td>
+            <td>A request gets through! In <em>consecutive failure</em> mode, the count resets to 0.</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td>Request fails (503)</td>
+            <td>CLOSED</td>
+            <td>1/5</td>
+            <td>Payment service failing again. Counter starts climbing.</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td>Request fails (connection refused)</td>
+            <td>CLOSED</td>
+            <td>2/5</td>
+            <td>Can't even connect — the service may have crashed.</td>
+          </tr>
+          <tr>
+            <td>7</td>
+            <td>Request fails (503)</td>
+            <td>CLOSED</td>
+            <td>3/5</td>
+            <td>Counter at 3. Still below threshold.</td>
+          </tr>
+          <tr>
+            <td>8</td>
+            <td>Request fails (timeout)</td>
+            <td>CLOSED</td>
+            <td>4/5</td>
+            <td>Counter at 4. One more failure will trip the breaker.</td>
+          </tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);">
+            <td><strong>9</strong></td>
+            <td><strong>Request fails (503)</strong></td>
+            <td><strong>CLOSED &rarr; OPEN</strong></td>
+            <td><strong>5/5</strong></td>
+            <td><strong>Threshold reached! Breaker trips OPEN. A 30-second timer starts. No more requests will be sent to the payment service.</strong></td>
+          </tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);">
+            <td>10</td>
+            <td>Request arrives</td>
+            <td>OPEN</td>
+            <td>&mdash;</td>
+            <td>REJECTED immediately. The breaker returns a fallback response without calling the payment service. Response time: &lt;1ms (instead of waiting for a 3s timeout).</td>
+          </tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);">
+            <td>10a</td>
+            <td>5 more requests arrive</td>
+            <td>OPEN</td>
+            <td>&mdash;</td>
+            <td>All 5 REJECTED immediately. The payment service receives zero load — it has time to recover.</td>
+          </tr>
+          <tr style="background-color: rgba(217, 119, 6, 0.06);">
+            <td><strong>11</strong></td>
+            <td><strong>30s timer expires</strong></td>
+            <td><strong>OPEN &rarr; HALF-OPEN</strong></td>
+            <td><strong>&mdash;</strong></td>
+            <td><strong>Time to test! The breaker allows ONE probe request through to the payment service.</strong></td>
+          </tr>
+          <tr style="background-color: rgba(22, 163, 74, 0.06);">
+            <td>12a</td>
+            <td>Probe request succeeds</td>
+            <td>HALF-OPEN &rarr; CLOSED</td>
+            <td>0/5</td>
+            <td>The payment service is back! Breaker closes. Failure counter resets. All subsequent requests flow through normally.</td>
+          </tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);">
+            <td>12b</td>
+            <td>Probe request fails</td>
+            <td>HALF-OPEN &rarr; OPEN</td>
+            <td>&mdash;</td>
+            <td>Still broken. Breaker reopens. The 30-second timer restarts. The cycle repeats from step 10.</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <p>Notice how step 4 is crucial for understanding the <em>consecutive failure</em> counting strategy: a single success resets the counter to zero. This is both a strength (avoids false positives during intermittent issues) and a weakness (one lucky success during a real outage resets the count and delays tripping). We'll explore alternative counting strategies below.</p>
+
+      <h4>State Transition Rules Summary</h4>
+      <ul>
+        <li><strong>CLOSED &rarr; OPEN:</strong> When failure count reaches the threshold (5 consecutive failures in this example). The trigger can also be a failure <em>rate</em> exceeding a percentage — see "Failure Counting Strategies" below.</li>
+        <li><strong>OPEN &rarr; HALF-OPEN:</strong> Automatically, after the timeout period expires (30 seconds). No human intervention needed.</li>
+        <li><strong>HALF-OPEN &rarr; CLOSED:</strong> If the probe request(s) succeed. The downstream service has recovered.</li>
+        <li><strong>HALF-OPEN &rarr; OPEN:</strong> If any probe request fails. The downstream is still broken. The timeout timer restarts.</li>
+      </ul>
+      <p>Note: there is no direct transition from OPEN &rarr; CLOSED. The system <em>must</em> pass through HALF-OPEN first. This is a safety mechanism — we never declare recovery without actually testing it with a real request.</p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Circuit Breakers When</h4>
+          <ul>
+            <li><strong>Calling external or unreliable services:</strong> Third-party APIs, payment gateways, or any service outside your direct control that may go down without warning.</li>
+            <li><strong>Preventing cascade failures:</strong> In a microservices architecture where Service A calls Service B calls Service C — if C goes down, without a breaker, A and B both hang waiting, exhausting their thread pools, and the failure cascades to every upstream caller.</li>
+            <li><strong>Protecting thread pools from exhaustion:</strong> Each pending request ties up a thread or connection. If a downstream service is slow or unresponsive, breakers prevent your thread pool from filling up with blocked requests.</li>
+            <li><strong>Providing graceful degradation:</strong> When you can serve a degraded response (cached data, default values, reduced functionality) instead of failing completely when a dependency is down.</li>
+            <li><strong>Synchronous RPC calls:</strong> Any blocking call where you're waiting for a response is a candidate for circuit breaking.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use Circuit Breakers When</h4>
+          <ul>
+            <li><strong>Local in-process function calls:</strong> If the call is to local code, it won't fail due to network issues. A try/catch is sufficient.</li>
+            <li><strong>Failures are expected and normal:</strong> Validation errors, 400 Bad Request, or business logic rejections are not signs of a failing service. Don't count these as "failures" for breaker purposes.</li>
+            <li><strong>Idempotent retry is better suited:</strong> For transient one-off errors (a single timeout, a DNS blip), a simple retry with exponential backoff may be more appropriate than tripping a breaker. Use both together: retry first, then break if retries consistently fail.</li>
+            <li><strong>Asynchronous messaging:</strong> For fire-and-forget messages via a queue, the queue itself provides the buffering. Circuit breaking is for synchronous call paths.</li>
+            <li><strong>Database queries:</strong> Connection pool exhaustion and query timeouts are better handled by connection pool configuration and query timeouts than by a circuit breaker (though breakers can wrap DB calls in extreme cases).</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic: Threshold-Based Circuit Breaker</h3>
+      <p>The original pattern, popularized by Michael Nygard's <em>Release It!</em> (2007). A simple counter tracks consecutive failures. When the count exceeds a fixed threshold (e.g., 5 failures), the breaker trips. After a fixed timeout, it transitions to half-open. Simple to implement and reason about, but brittle: a fixed threshold doesn't adapt to varying traffic volumes. Five failures out of 10 requests (50% error rate) is very different from five failures out of 10,000 requests (0.05% error rate), but a basic threshold breaker treats them identically.</p>
+
+      <h3>Adaptive Circuit Breakers</h3>
+      <p>Instead of a fixed failure count, adaptive breakers use a <strong>sliding window</strong> and calculate the <strong>error rate</strong> over that window. The breaker trips when the error rate exceeds a percentage threshold (e.g., 50%) within a minimum sample size. This handles varying traffic volumes correctly. Some implementations dynamically adjust the threshold based on historical error rate trends — if the baseline error rate is 2%, a spike to 15% is significant; if the baseline is 10%, 15% might be normal.</p>
+
+      <h3>Netflix Hystrix (now in maintenance mode)</h3>
+      <p>Hystrix pioneered production-grade circuit breaking at scale. It introduced thread pool isolation (each dependency gets its own thread pool so a slow service can't exhaust the shared pool), request collapsing (batching multiple requests to the same service), request caching, and a sophisticated dashboard for real-time monitoring. Hystrix used a rolling window of 10 seconds divided into 10 one-second buckets. Netflix put Hystrix into maintenance mode in 2018, recommending Resilience4j as the successor.</p>
+
+      <h3>Resilience4j</h3>
+      <p>The modern JVM library for fault tolerance. Lightweight (no thread pool isolation by default — uses a semaphore), composable (circuit breaker, retry, rate limiter, bulkhead, and time limiter can be stacked as decorators), and designed for functional programming and reactive streams. Uses a count-based or time-based sliding window. Supports automatic state transitions and configurable wait durations in the open state.</p>
+
+      <h3>Envoy Outlier Detection (Proxy-Level Breaking)</h3>
+      <p>Instead of application-code breakers, Envoy (the sidecar proxy) implements circuit breaking at the network layer. Outlier detection monitors individual upstream hosts and ejects unhealthy ones from the load balancing pool. This is more granular than a traditional circuit breaker: instead of breaking the entire circuit to a service, it removes just the failing instances. Configured via <code>consecutive_5xx</code>, <code>consecutive_gateway_errors</code>, and <code>success_rate</code> ejection policies.</p>
+
+      <h3>Service Mesh Circuit Breaking (Istio)</h3>
+      <p>Istio builds on Envoy's capabilities and adds centralized policy management. Circuit breaking rules are configured declaratively via <code>DestinationRule</code> resources, applied uniformly across the mesh without modifying application code. Supports connection pool limits (<code>maxConnections</code>, <code>maxPendingRequests</code>) and outlier detection at the mesh level. The advantage: consistent resilience policy across polyglot services.</p>
+    </div>
+  </section>
+
+  <!-- ===== 6b. Failure Counting Strategies ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Failure Counting Strategies</h2>
+      <p>The state machine walkthrough above used <strong>consecutive failure counting</strong> — the simplest approach. But how you count failures has a huge impact on how well the breaker detects real outages versus tripping on noise. There are three main strategies, each with distinct tradeoffs.</p>
+
+      <h3>Strategy 1: Consecutive Failures</h3>
+      <p>The breaker maintains a simple counter that increments on each failure and <strong>resets to zero on any success</strong>. When the counter reaches the threshold (e.g., 5), the breaker trips.</p>
+      <p><strong>How it works:</strong> Imagine the downstream returns these results for 12 consecutive requests:</p>
+      <p style="font-family:'JetBrains Mono',monospace; text-align:center; margin:1rem 0; font-size:0.95rem;">
+        OK, FAIL, FAIL, <span style="color:#16a34a; font-weight:bold;">OK</span>, FAIL, FAIL, FAIL, FAIL, <span style="color:#dc2626; font-weight:bold;">FAIL</span>, &mdash;, &mdash;, &mdash;
+      </p>
+      <ul>
+        <li>Request 1: OK &rarr; counter = 0</li>
+        <li>Request 2: FAIL &rarr; counter = 1</li>
+        <li>Request 3: FAIL &rarr; counter = 2</li>
+        <li>Request 4: <strong>OK &rarr; counter resets to 0</strong> (the single success clears the count)</li>
+        <li>Request 5: FAIL &rarr; counter = 1 (starting over)</li>
+        <li>Request 6: FAIL &rarr; counter = 2</li>
+        <li>Request 7: FAIL &rarr; counter = 3</li>
+        <li>Request 8: FAIL &rarr; counter = 4</li>
+        <li>Request 9: <strong>FAIL &rarr; counter = 5 &rarr; BREAKER TRIPS OPEN</strong></li>
+        <li>Requests 10-12: REJECTED (breaker is open)</li>
+      </ul>
+      <p><strong>The problem:</strong> Look at the overall results — 7 failures out of 9 requests (78% failure rate). The service was clearly degraded from request 2 onward. But that single success at request 4 reset the counter, delaying the trip by 4 more failures. In the worst case, a service that fails 80% of the time but succeeds every 4th request will <em>never</em> trip a consecutive-failures breaker with a threshold of 5.</p>
+
+      <h3>Strategy 2: Failure Rate Over a Time Window</h3>
+      <p>Instead of counting consecutive failures, track the <strong>failure rate</strong> (percentage of failed requests) over a sliding time window. If the failure rate exceeds a threshold (e.g., 50%), the breaker trips.</p>
+      <p><strong>How it works:</strong> The breaker looks at all requests in the last W seconds. It divides failures by total requests to get the failure rate.</p>
+      <p><strong>Example:</strong> Window = 60 seconds, threshold = 50% failure rate.</p>
+      <ul>
+        <li>In the last 60 seconds: 100 requests total, 55 failed.</li>
+        <li>Failure rate = 55 / 100 = <strong>55%</strong></li>
+        <li>55% &gt; 50% threshold &rarr; <strong>BREAKER TRIPS OPEN</strong></li>
+      </ul>
+      <p>This is much better at detecting degraded services that intermittently succeed. The 80%-failure service from the previous example would trip this breaker quickly.</p>
+      <p><strong>The problem:</strong> What about low-traffic endpoints? If only 3 requests were made in the last 60 seconds and 2 failed, the failure rate is 67%. That looks bad, but with only 3 data points, it's probably just bad luck — not a real outage. Tripping the breaker on 2 failures out of 3 requests is a false positive.</p>
+
+      <h3>Strategy 3: Failure Rate with Minimum Request Threshold</h3>
+      <p>Same as Strategy 2, but the breaker <strong>does not evaluate the failure rate until at least M requests have been made</strong> in the window. This prevents false positives from statistical noise in low-traffic scenarios.</p>
+      <p><strong>Example:</strong> Window = 60 seconds, threshold = 50%, minimum requests = 20.</p>
+      <ul>
+        <li>Scenario A: 3 requests, 2 failed (67% failure rate). But 3 &lt; 20 minimum &rarr; <strong>DO NOT TRIP</strong>. Not enough data.</li>
+        <li>Scenario B: 25 requests, 14 failed (56% failure rate). 25 &ge; 20 minimum, and 56% &gt; 50% threshold &rarr; <strong>TRIP</strong>.</li>
+        <li>Scenario C: 200 requests, 8 failed (4% failure rate). 200 &ge; 20 minimum, but 4% &lt; 50% threshold &rarr; <strong>DO NOT TRIP</strong>. Normal error rate.</li>
+      </ul>
+      <p>This is the strategy used by most production circuit breaker implementations, including Resilience4j and Netflix Hystrix. It adapts to traffic volume and avoids both false positives (tripping on noise) and false negatives (ignoring gradual degradation).</p>
+
+      <h3>Comparison</h3>
+      <div class="table-responsive"><table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Pros</th>
+            <th>Cons</th>
+            <th>Best For</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Consecutive failures</strong></td>
+            <td>Simple to implement. Fast to trigger when failures are truly continuous. Easy to reason about.</td>
+            <td>A single success during degradation resets the count, keeping the breaker closed when it should open. Cannot detect "90% failure rate" scenarios.</td>
+            <td>Binary up/down services (healthy or completely dead, no partial failures)</td>
+          </tr>
+          <tr>
+            <td><strong>Rate over window</strong></td>
+            <td>Handles intermittent errors correctly. Detects gradual degradation. Adapts to partial failures.</td>
+            <td>Can produce false positives with low traffic (2 out of 3 failures = 67% but not meaningful). Window size tuning is tricky.</td>
+            <td>High-traffic services where the sample size is always large enough</td>
+          </tr>
+          <tr>
+            <td><strong>Rate + minimum threshold</strong></td>
+            <td>Avoids false positives from low traffic. Adapts to varying traffic volumes. Statistically sound decisions.</td>
+            <td>More configuration parameters (rate, window, minimum count). Slow to trigger on low-traffic endpoints (must wait for minimum requests).</td>
+            <td>Production systems (this is the most common strategy in practice)</td>
+          </tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ===== 6c. Adaptive Circuit Breakers / Hystrix Deep Dive ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Adaptive Circuit Breakers: Netflix Hystrix Deep Dive</h2>
+      <p>Netflix Hystrix (now in maintenance mode, succeeded by <strong>Resilience4j</strong>) popularized adaptive circuit breakers and set the standard for how production systems implement this pattern. Understanding Hystrix's approach is essential because virtually every modern circuit breaker library follows its design.</p>
+
+      <h3>Hystrix Configuration</h3>
+      <p>Hystrix uses the "failure rate + minimum threshold" strategy with a <strong>rolling window</strong> divided into time buckets:</p>
+      <ul>
+        <li><strong>Rolling window:</strong> 10 seconds (the evaluation period)</li>
+        <li><strong>Bucket count:</strong> 10 buckets (each bucket = 1 second)</li>
+        <li><strong>Minimum request threshold:</strong> 20 requests in the window</li>
+        <li><strong>Failure rate threshold:</strong> 50%</li>
+        <li><strong>Sleep window (open-state duration):</strong> 5 seconds</li>
+      </ul>
+
+      <h4>How the Rolling Window Works</h4>
+      <p>The rolling window is the key innovation. Instead of storing individual request timestamps (which uses a lot of memory at high traffic), Hystrix divides time into fixed-size "buckets." Each bucket is a 1-second interval that stores aggregate counts: total requests, failures, successes, and timeouts.</p>
+      <p>Every second, the oldest bucket (from 10 seconds ago) is discarded, and a new empty bucket is created for the current second. This gives a sliding 10-second view of health, using only 10 buckets of memory regardless of traffic volume.</p>
+
+      <p><strong>Visual example — the rolling window at time t=15s:</strong></p>
+      <div class="table-responsive"><table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Bucket</th>
+            <th>Time Range</th>
+            <th>Total Requests</th>
+            <th>Failures</th>
+            <th>Successes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>6s &ndash; 7s</td><td>5</td><td>0</td><td>5</td></tr>
+          <tr><td>2</td><td>7s &ndash; 8s</td><td>4</td><td>0</td><td>4</td></tr>
+          <tr><td>3</td><td>8s &ndash; 9s</td><td>3</td><td>1</td><td>2</td></tr>
+          <tr><td>4</td><td>9s &ndash; 10s</td><td>4</td><td>1</td><td>3</td></tr>
+          <tr><td>5</td><td>10s &ndash; 11s</td><td>3</td><td>2</td><td>1</td></tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);"><td>6</td><td>11s &ndash; 12s</td><td>3</td><td>3</td><td>0</td></tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);"><td>7</td><td>12s &ndash; 13s</td><td>2</td><td>2</td><td>0</td></tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);"><td>8</td><td>13s &ndash; 14s</td><td>3</td><td>3</td><td>0</td></tr>
+          <tr style="background-color: rgba(220, 38, 38, 0.06);"><td>9</td><td>14s &ndash; 15s</td><td>2</td><td>2</td><td>0</td></tr>
+          <tr><td>10</td><td>15s &ndash; 16s (current)</td><td>1</td><td>1</td><td>0</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4>Evaluation at t=15s</h4>
+      <ul>
+        <li><strong>Total requests in window:</strong> 5 + 4 + 3 + 4 + 3 + 3 + 2 + 3 + 2 + 1 = <strong>30</strong></li>
+        <li><strong>Total failures:</strong> 0 + 0 + 1 + 1 + 2 + 3 + 2 + 3 + 2 + 1 = <strong>15</strong> (this is not used directly for the trip check, but for illustration)</li>
+        <li>Wait — let's recalculate: failures = 0 + 0 + 1 + 1 + 2 + 3 + 2 + 3 + 2 + 1 = <strong>15</strong></li>
+        <li><strong>Check 1 — Minimum requests:</strong> 30 &ge; 20 &rarr; <strong>PASS</strong> (enough data to evaluate)</li>
+        <li><strong>Failure rate:</strong> 15 / 30 = <strong>50%</strong></li>
+        <li><strong>Check 2 — Failure rate threshold:</strong> 50% &ge; 50% &rarr; <strong>TRIP</strong></li>
+        <li><strong>Result:</strong> Breaker transitions from CLOSED &rarr; OPEN. After a 5-second sleep window, one probe request is sent.</li>
+      </ul>
+
+      <p><strong>One second later (t=16s):</strong> Bucket 1 (the 6s-7s bucket) is discarded, and a new empty bucket is created for 16s-17s. The window now covers 7s to 17s. This is why it's called a "rolling" window — it continuously slides forward in time.</p>
+
+      <h4>Why Buckets Instead of Individual Timestamps?</h4>
+      <p>At 10,000 requests per second, storing individual timestamps would require 100,000 entries in a 10-second window. With 10 buckets, you store exactly 10 counters regardless of traffic. The tradeoff is precision — you can't tell exactly when within a 1-second bucket the failures occurred. But for circuit breaking, second-level granularity is more than sufficient.</p>
+    </div>
+  </section>
+
+  <!-- ===== 6d. Bulkhead Pattern ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Bulkhead Pattern</h2>
+      <p>The bulkhead pattern is named after ship bulkheads — watertight compartments that divide a ship's hull into isolated sections. If the hull is breached in one section, only that compartment floods. The other compartments remain dry, and the ship stays afloat. Without bulkheads, a single leak sinks the entire ship.</p>
+      <p>In software, the bulkhead pattern means <strong>isolating resources so that a failure in one component cannot exhaust resources needed by others</strong>. It is one of the most important companions to the circuit breaker pattern.</p>
+
+      <h3>The Problem Without Bulkheads</h3>
+      <p>Consider Service A, which calls three downstream dependencies: Payment Service, Inventory Service, and Email Service. Service A has a shared thread pool of 25 threads for handling all outgoing requests.</p>
+      <p><strong>What happens when Payment Service hangs:</strong></p>
+      <ol>
+        <li>Requests to Payment Service start timing out (each blocks a thread for 30 seconds).</li>
+        <li>More requests arrive. More threads are blocked waiting for Payment.</li>
+        <li>Within minutes, all 25 threads are stuck waiting for Payment Service responses that will never come.</li>
+        <li>Now Inventory Service and Email Service calls <em>also</em> fail — not because those services are broken, but because <strong>there are no available threads to make the call</strong>.</li>
+        <li>Service A becomes completely unresponsive. One slow dependency has killed everything.</li>
+      </ol>
+
+      <h3>Thread Pool Bulkhead</h3>
+      <p>The solution: give each dependency its own isolated thread pool.</p>
+      <ul>
+        <li><strong>Payment Service pool:</strong> 10 threads</li>
+        <li><strong>Inventory Service pool:</strong> 10 threads</li>
+        <li><strong>Email Service pool:</strong> 5 threads</li>
+      </ul>
+      <p><strong>Now when Payment Service hangs:</strong></p>
+      <ol>
+        <li>Payment requests consume all 10 threads in the Payment pool.</li>
+        <li>The 11th Payment request is rejected immediately (pool full) — a form of fast failure.</li>
+        <li>Meanwhile, Inventory's 10 threads and Email's 5 threads are <strong>completely unaffected</strong>.</li>
+        <li>Inventory and Email calls continue working normally.</li>
+        <li>Service A is partially degraded (no payments) but <strong>still functional</strong> for inventory and email operations.</li>
+      </ol>
+      <p>This is exactly how ship bulkheads work: the damage is contained to one compartment.</p>
+
+      <h3>Connection Pool Bulkhead</h3>
+      <p>The same principle applies to connection pools for databases and external APIs:</p>
+      <ul>
+        <li><strong>Database A:</strong> connection pool max 50</li>
+        <li><strong>Database B:</strong> connection pool max 50</li>
+        <li><strong>External API:</strong> connection pool max 20</li>
+      </ul>
+      <p>If Database A becomes slow and connections pile up, it can consume at most 50 connections. Database B and the External API retain their own dedicated pools. Without separate pools, Database A could consume all 120 connections, starving every other dependency.</p>
+
+      <h3>How Bulkhead Complements Circuit Breaker</h3>
+      <p>Bulkheads and circuit breakers solve related but different problems, and they work best together:</p>
+      <div class="table-responsive"><table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Pattern</th>
+            <th>What It Prevents</th>
+            <th>How It Works</th>
+            <th>Analogy</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Bulkhead</strong></td>
+            <td>Resource exhaustion spreading across dependencies</td>
+            <td>Limits the resources (threads, connections) any single dependency can consume</td>
+            <td>Watertight compartments on a ship — contains the flooding</td>
+          </tr>
+          <tr>
+            <td><strong>Circuit Breaker</strong></td>
+            <td>Wasting resources on a broken dependency</td>
+            <td>Stops calling a dependency after detecting persistent failure</td>
+            <td>An electrical fuse — cuts the circuit when current is dangerous</td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p><strong>Together:</strong> The bulkhead contains the blast radius (prevents one slow dependency from starving others), while the circuit breaker speeds up recovery (stops calling the broken dependency entirely). The bulkhead buys time during the detection window — while the circuit breaker is still counting failures before tripping, the bulkhead ensures the damage is contained to that one dependency's thread pool.</p>
+      <p><strong>Example timeline:</strong></p>
+      <ol>
+        <li><strong>t=0s:</strong> Payment Service starts hanging. Payment thread pool starts filling up.</li>
+        <li><strong>t=5s:</strong> Payment thread pool is full (10/10 threads blocked). New payment requests are rejected. <strong>But Inventory and Email are fine</strong> (bulkhead working).</li>
+        <li><strong>t=10s:</strong> Circuit breaker detects 5 consecutive failures. Breaker trips OPEN. Now payment requests are rejected <em>before</em> even entering the thread pool (circuit breaker working).</li>
+        <li><strong>t=15s:</strong> Blocked threads start timing out and returning to the pool. Payment thread pool drains back to 0/10.</li>
+        <li><strong>t=40s:</strong> Circuit breaker enters HALF-OPEN. Sends one probe. If Payment is back, breaker closes. If not, reopens for another 30 seconds.</li>
+      </ol>
+      <p>Without the bulkhead, all 25 threads would be consumed by Payment between t=0 and t=10 (before the breaker trips), and Inventory and Email would also fail during that window. The bulkhead prevents the collateral damage during the detection window.</p>
+    </div>
+  </section>
+
+  <!-- ===== 6e. Envoy Outlier Detection Deep Dive ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Envoy's Outlier Detection: Proxy-Level Circuit Breaking</h2>
+      <p>Envoy proxy implements a form of passive circuit breaking called <strong>outlier detection</strong>. Instead of the application maintaining a circuit breaker in code, the sidecar proxy automatically monitors responses from each backend and ejects unhealthy instances from the load balancing pool. This happens transparently — the application code doesn't even know it's happening.</p>
+
+      <h3>How It Works Step by Step</h3>
+      <ol>
+        <li><strong>Envoy monitors responses</strong> from each backend instance individually. Every 5xx response is counted against that specific backend host (not the whole cluster).</li>
+        <li><strong>If a backend returns consecutive 5xx errors</strong> (default: 5 in a row), it's flagged as an outlier.</li>
+        <li><strong>The outlier is ejected</strong> from the load balancing pool. Traffic is routed only to healthy instances. The ejected instance receives zero requests.</li>
+        <li><strong>The ejection lasts for a base ejection time</strong> (default: 30 seconds). During this time, the backend has a chance to recover without being hammered by traffic.</li>
+        <li><strong>Each subsequent ejection doubles the time:</strong> first ejection = 30s, second = 60s, third = 120s, and so on. This implements exponential backoff for chronically unhealthy backends.</li>
+        <li><strong>After the ejection period, the backend is automatically re-included</strong> in the pool. If it returns healthy responses, it stays. If it returns 5xx again, it's re-ejected (with a longer duration).</li>
+      </ol>
+
+      <h3>Safety Mechanism: Maximum Ejection Percentage</h3>
+      <p>This is a critical guardrail: <strong>at most 10% of backends can be ejected at any time</strong> (configurable). Here's why this matters:</p>
+      <p>Imagine you deploy a bad version to all 20 backend pods. Without a cap, outlier detection would eject all 20 pods, leaving zero backends in the pool. Every request would fail with "no healthy upstream" — a total outage caused by the safety mechanism itself.</p>
+      <p>With <code>max_ejection_percent: 10</code> and 20 backends, at most 2 backends can be ejected at once. The remaining 18 stay in the pool. Yes, those 18 are also returning errors (because the deploy is bad), but at least traffic can still flow through — and the errors are visible to monitoring systems, triggering alerts and rollback. This is far better than a silent total blackout.</p>
+
+      <h3>Configuration Example</h3>
+      <pre class="line-numbers"><code class="language-yaml">outlier_detection:
+  consecutive_5xx: 5              # eject after 5 consecutive 5xx responses
+  interval: 10s                   # evaluate health every 10 seconds
+  base_ejection_time: 30s         # first ejection lasts 30 seconds
+  max_ejection_percent: 10        # at most 10% of backends can be ejected
+  enforcing_consecutive_5xx: 100  # 100% enforcement (vs probabilistic sampling)
+  consecutive_gateway_errors: 5   # also eject on gateway errors (502/503/504)
+  success_rate_minimum_hosts: 5   # need at least 5 hosts to do success rate ejection
+  success_rate_request_volume: 100  # need 100+ requests to evaluate success rate
+  success_rate_stdev_factor: 1900   # eject if success rate is 1.9 stdev below average</code></pre>
+
+      <h3>Walkthrough: Outlier Detection in Action</h3>
+      <p>Cluster of 10 backend pods. Pod 7 starts returning 503 errors due to a memory leak.</p>
+      <div class="table-responsive"><table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Event</th>
+            <th>Pool Status</th>
+            <th>Pod 7 Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>t=0s</td><td>Pod 7 starts returning 503s</td><td>10/10 active</td><td>In pool, serving errors</td></tr>
+          <tr><td>t=2s</td><td>Pod 7: 3 consecutive 5xx</td><td>10/10 active</td><td>Still in pool (threshold not reached)</td></tr>
+          <tr><td>t=3s</td><td>Pod 7: 5 consecutive 5xx</td><td>10/10 &rarr; 9/10</td><td><strong>EJECTED for 30 seconds</strong></td></tr>
+          <tr><td>t=3-33s</td><td>Traffic served by pods 1-6, 8-10</td><td>9/10 active</td><td>Ejected (no traffic)</td></tr>
+          <tr><td>t=33s</td><td>Ejection expires</td><td>9/10 &rarr; 10/10</td><td><strong>Re-included</strong></td></tr>
+          <tr><td>t=34s</td><td>Pod 7 still sick — returns 5xx again</td><td>10/10 active</td><td>Counting failures again</td></tr>
+          <tr><td>t=36s</td><td>Pod 7: 5 consecutive 5xx again</td><td>10/10 &rarr; 9/10</td><td><strong>EJECTED for 60 seconds</strong> (doubled)</td></tr>
+          <tr><td>t=96s</td><td>Ejection expires. Pod was restarted by Kubernetes at t=50s.</td><td>9/10 &rarr; 10/10</td><td><strong>Re-included. Now healthy.</strong></td></tr>
+          <tr><td>t=97s+</td><td>Pod 7 returns 200 OK</td><td>10/10 active</td><td>Healthy, serving traffic normally</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Outlier Detection vs. Application-Level Circuit Breaker</h3>
+      <p>The key difference: outlier detection operates <strong>per backend instance</strong>, while a traditional circuit breaker operates <strong>per service</strong>. If one pod out of ten is unhealthy:</p>
+      <ul>
+        <li><strong>Outlier detection:</strong> Ejects that one pod. 90% of capacity preserved. Only ~10% of requests saw errors before ejection.</li>
+        <li><strong>Application-level breaker:</strong> Trips the entire circuit. 0% of capacity — all requests get the fallback. The 9 healthy pods sit idle.</li>
+      </ul>
+      <p>Outlier detection is almost always better for partial failures (one bad pod, one bad deploy to a subset of instances). Application-level breakers are better when the entire downstream service is down (all pods failing, or a network partition between your service and the downstream).</p>
+      <p><strong>In practice, use both:</strong> Envoy outlier detection handles individual bad pods (surgical), while an application-level circuit breaker handles total downstream failure (nuclear option). They operate at different granularities and complement each other.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Failures are transient and will recover:</strong> The circuit breaker model assumes that the downstream service will eventually come back. The half-open state exists to detect recovery. If the failure is permanent (service decommissioned, endpoint removed), the breaker will cycle between open and half-open indefinitely, never resolving.</li>
+          <li><strong>A single backend's failure is detectable:</strong> The model assumes you can distinguish "this service is failing" from "my request was bad." If your error detection lumps client errors (4xx) with server errors (5xx), the breaker trips on normal validation failures — a classic misconfiguration.</li>
+          <li><strong>Failing fast is better than waiting:</strong> The model assumes that an immediate error is more useful to the caller than a slow timeout. This is true when callers can handle the error gracefully (fallback, cached data, degraded response). It is not true if the only option is to show the user an error — in that case, waiting a few seconds for a potential recovery might be better.</li>
+          <li><strong>The breaker has enough traffic to make statistically meaningful decisions:</strong> A breaker monitoring a low-traffic endpoint may trip on a single failure because the sample size is too small. Minimum request thresholds mitigate this.</li>
+        </ul>
+      </div>
+      <h3>When These Assumptions Break</h3>
+      <ul>
+        <li><strong>Permanent failures:</strong> The breaker cycles open/half-open forever. Solution: add alerting when a breaker has been open for extended periods, indicating human intervention is needed.</li>
+        <li><strong>Partial failures:</strong> Some endpoints on the backend work fine, others don't. A single breaker for the entire service is too coarse — it blocks healthy endpoints too. Solution: per-endpoint or per-operation breakers.</li>
+        <li><strong>Shared breaker for independent backends:</strong> If a single breaker wraps calls to multiple independent backends, one backend's failure trips the breaker for all of them. Solution: one breaker per downstream dependency.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>Failure Threshold</h3>
+      <p><strong>Too low</strong> (e.g., 2 failures): The breaker trips on occasional, normal errors. You get false positives — the service is fine, but the breaker thinks it's broken. Traffic is unnecessarily rejected. <strong>Too high</strong> (e.g., 100 failures): Slow detection. The downstream service has been failing for a long time before the breaker notices. Hundreds of requests fail before protection kicks in.</p>
+      <p><strong>Rule of thumb:</strong> Use a percentage-based threshold with a minimum sample size. "Trip when error rate exceeds 50% in a 10-second window, with a minimum of 20 requests." This adapts to traffic volume.</p>
+
+      <h3>Timeout Duration (Open State)</h3>
+      <p><strong>Too short</strong> (e.g., 5 seconds): The breaker transitions to half-open too quickly and hammers the recovering service with probe requests before it's ready. <strong>Too long</strong> (e.g., 5 minutes): Extended outage — even after the downstream service has recovered, your service continues to reject requests for minutes.</p>
+      <p><strong>Rule of thumb:</strong> Start with 30 seconds. Adjust based on the downstream service's typical recovery time. If it's a containerized service that restarts in 10 seconds, 30 seconds is generous. If it's a database cluster that takes 2 minutes to failover, use 60-90 seconds.</p>
+
+      <h3>Half-Open Request Count</h3>
+      <p>Allowing just <strong>1 probe request</strong> is conservative — minimal risk, but a single request isn't statistically meaningful (it might succeed by luck). Allowing <strong>3-5 probes</strong> gives more confidence but means more requests hit a potentially still-broken service.</p>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+      <p>Circuit breaker parameters should never be guessed — they should be <em>derived</em> from your Service Level Objectives. Work backward from the availability, latency, or success-rate targets your team has committed to.</p>
+
+      <!-- Example 1: Payment Service -->
+      <div class="callout callout-info">
+        <p><strong>Example 1 — Payment Service Dependency: 99.9% Success Rate SLO</strong></p>
+        <p>Your checkout service calls a payment processor and must maintain a 99.9% success rate (no more than 1 failure per 1,000 requests). The payment processor's baseline error rate is ~0.05%.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Error budget:</strong> 0.1% of requests can fail. At 500 req/s, that is 0.5 errors/s — or about 5 errors per 10-second window.</li>
+          <li><strong>Failure threshold:</strong> Trip when error rate exceeds <strong>1%</strong> over a 10-second sliding window (minimum 50 requests). This is 10x the baseline, so it clearly signals a real problem rather than noise, and trips well before you exhaust your 0.1% error budget over the SLO measurement period (30-day rolling).</li>
+          <li><strong>Window size:</strong> <strong>10 seconds</strong> (time-based). At 500 req/s this evaluates 5,000 requests — highly statistically significant. Shorter windows (e.g., 5s) risk flapping; longer windows (e.g., 30s) burn too much error budget before tripping.</li>
+          <li><strong>Open-state timeout:</strong> <strong>30 seconds.</strong> The payment processor's historical P95 recovery time is 20 seconds (container restart). 30 seconds provides margin.</li>
+          <li><strong>Half-open probes:</strong> <strong>5 requests.</strong> Payment is critical — you need high confidence before re-closing. With 5 probes, the probability of all 5 succeeding by luck against a 50%-broken service is only 3.1%.</li>
+          <li><strong>Fallback:</strong> Queue the payment for async retry and return "Payment processing — you'll receive confirmation shortly."</li>
+        </ul>
+      </div>
+
+      <!-- Example 2: Microservices Mesh -->
+      <div class="callout callout-info">
+        <p><strong>Example 2 — Microservices Mesh: p99 &lt; 200ms Per Service SLO</strong></p>
+        <p>In a request path that spans 4 microservices, the end-to-end p99 target is 800ms, giving each service a budget of 200ms (p99). A slow downstream must be cut off before it consumes the entire latency budget.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Request timeout:</strong> <strong>150ms.</strong> Set below the 200ms SLO to leave headroom for local processing (~50ms). Any request exceeding 150ms is a timeout failure from the circuit breaker's perspective.</li>
+          <li><strong>Failure threshold:</strong> Trip when <strong>25% of requests</strong> time out within a 5-second window (minimum 30 requests). A 25% timeout rate means p75 is already above your p99 target — the service is clearly degraded.</li>
+          <li><strong>Window size:</strong> <strong>5 seconds</strong> (time-based). In a mesh with high request rates (1,000+ req/s between services), 5 seconds provides 5,000+ data points. Short windows are essential here: every second of delay cascades through 4 services.</li>
+          <li><strong>Open-state timeout:</strong> <strong>15 seconds</strong> with <strong>&plusmn;3 seconds jitter</strong>. Mesh services are typically auto-scaled and recover quickly. Jitter prevents synchronized probe storms across the mesh.</li>
+          <li><strong>Half-open probes:</strong> <strong>3 requests.</strong> Lower count because the mesh has many callers — even 3 probes per caller adds up. The service mesh (Envoy/Istio) can coordinate this across instances.</li>
+          <li><strong>Key insight:</strong> The timeout (150ms) is the real lever here. Without a circuit breaker, a slow downstream would cause your service to block for its full timeout (e.g., 30s default), violating SLO by 150x.</li>
+        </ul>
+      </div>
+
+      <!-- Example 3: Third-Party API -->
+      <div class="callout callout-info">
+        <p><strong>Example 3 — Third-Party API Integration: 95% Vendor Availability &rarr; 99.9% System Availability</strong></p>
+        <p>You depend on a third-party geocoding API with a published SLA of 95% availability (up to 36 hours of downtime per month). Your system SLO is 99.9% availability. The circuit breaker must bridge the gap.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>The gap:</strong> The vendor is unavailable 5% of the time, but you can only be unavailable 0.1% of the time. The circuit breaker + fallback must handle the remaining 4.9% — meaning the fallback must work reliably.</li>
+          <li><strong>Failure threshold:</strong> Trip when error rate exceeds <strong>10%</strong> in a 30-second window (minimum 10 requests). Third-party APIs have higher baseline error rates (1-3%), so the threshold must be higher to avoid false trips. But 10% is clearly above baseline and triggers before extended degradation.</li>
+          <li><strong>Window size:</strong> <strong>30 seconds</strong> (time-based). Third-party APIs often have longer, sustained outages rather than brief blips. A wider window reduces flapping during intermittent connectivity issues.</li>
+          <li><strong>Open-state timeout:</strong> <strong>60 seconds</strong> with <strong>exponential backoff</strong> on repeated trips (60s &rarr; 120s &rarr; 240s, capped at 5 minutes). Vendor outages can last hours — aggressive probing wastes quota and may trigger rate limiting.</li>
+          <li><strong>Half-open probes:</strong> <strong>2 requests.</strong> Minimal probing to conserve API quota (many vendors charge per call or enforce rate limits).</li>
+          <li><strong>Fallback:</strong> Return cached geocoding results (even if stale) or use a secondary provider. The fallback quality determines whether you actually achieve 99.9% — the breaker just ensures you <em>switch</em> fast enough.</li>
+        </ul>
+      </div>
+
+      <!-- Example 4: Database Connection Pool -->
+      <div class="callout callout-info">
+        <p><strong>Example 4 — Database Connection Pool: p99 &lt; 50ms Query Time SLO</strong></p>
+        <p>Your service has a p99 query latency target of 50ms. When the database is under load, connection acquisition from the pool starts timing out, cascading into request failures and thread starvation.</p>
+        <p><strong>Derivation:</strong></p>
+        <ul>
+          <li><strong>Connection acquisition timeout:</strong> <strong>20ms.</strong> If the pool cannot provide a connection within 20ms, the database is saturated. This leaves 30ms for the query itself (which normally completes in 5-10ms at p99).</li>
+          <li><strong>Failure threshold:</strong> Trip when <strong>15% of connection acquisitions</strong> time out in a 5-second window (minimum 100 requests). Database connection pools have near-zero baseline timeout rates, so 15% is an unambiguous signal of saturation.</li>
+          <li><strong>Window size:</strong> <strong>5 seconds</strong> (count-based, 500 calls). Database issues escalate extremely fast — a full connection pool causes 100% failure within seconds. Detection must be rapid.</li>
+          <li><strong>Open-state timeout:</strong> <strong>10 seconds.</strong> Database recovery from connection pool exhaustion is fast once load is shed — typically within 2-5 seconds. A 10-second timeout lets the pool drain and connections recycle.</li>
+          <li><strong>Half-open probes:</strong> <strong>5 requests.</strong> Higher probe count because database health is binary — either the pool has capacity or it does not. 5 probes quickly confirm recovery.</li>
+          <li><strong>Key insight:</strong> The circuit breaker on connection acquisition prevents thread starvation. Without it, threads block waiting for connections (up to the pool's max-wait, often 30s), request queues grow, and the entire service becomes unresponsive — far exceeding the 50ms SLO.</li>
+        </ul>
+      </div>
+
+      <!-- Interactive Graph: Response Time With vs Without Circuit Breaker -->
+      <h3>Response Time During Cascading Failure: With vs. Without Circuit Breaker</h3>
+      <p>This interactive graph shows how response times evolve during a cascading failure event. Hover over the graph to see exact values at each point in the timeline. The downstream service begins failing at t=10s and recovers at t=70s.</p>
+      <div style="position:relative; max-width:900px; margin:2rem auto;">
+        <canvas id="cbResponseTimeChart" width="900" height="420" style="width:100%; border:1px solid var(--border, #d0d7de); border-radius:8px; background:var(--surface, #fff);"></canvas>
+        <div id="cbChartTooltip" style="display:none; position:absolute; pointer-events:none; background:rgba(30,30,30,0.92); color:#fff; padding:10px 14px; border-radius:6px; font-size:13px; font-family:'JetBrains Mono',monospace; line-height:1.6; box-shadow:0 2px 8px rgba(0,0,0,0.25); z-index:10; max-width:280px;"></div>
+      </div>
+      <script>
+      (function() {
+        var canvas = document.getElementById('cbResponseTimeChart');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var tooltip = document.getElementById('cbChartTooltip');
+        var W = canvas.width, H = canvas.height;
+        var PAD = { top: 50, right: 30, bottom: 60, left: 70 };
+        var plotW = W - PAD.left - PAD.right;
+        var plotH = H - PAD.top - PAD.bottom;
+
+        // Timeline: 0 to 100 seconds
+        var T_MAX = 100;
+        var Y_MAX = 5000; // ms
+        var STEPS = 200;
+
+        // Model: downstream fails at t=10, recovers at t=70
+        var T_FAIL = 10, T_RECOVER = 70;
+        // CB trips at t=15 (5s detection), enters half-open at t=45, closes at t=47 (after recovery attempt fails),
+        // reopens, then at t=75 enters half-open again (after recovery), closes at t=77
+        var CB_TRIP = 15, CB_HALFOPEN_1 = 45, CB_REOPEN = 47, CB_HALFOPEN_2 = 75, CB_CLOSE = 77;
+
+        function withoutCB(t) {
+          if (t < T_FAIL) return 40 + Math.sin(t * 0.7) * 8;
+          if (t < T_FAIL + 3) return 40 + (t - T_FAIL) / 3 * 2960; // ramp to 3000
+          if (t < T_RECOVER) {
+            // Cascading: response time spikes and stays high with oscillation
+            var base = 3000 + Math.sin((t - 13) * 0.3) * 800;
+            // Thread pool exhaustion causes further spikes
+            if (t > 30 && t < 60) base += Math.min((t - 30) * 40, 1200);
+            return Math.min(base, Y_MAX);
+          }
+          if (t < T_RECOVER + 15) {
+            // Slow recovery: threads draining, connection pool refilling
+            var peak = 4200;
+            var progress = (t - T_RECOVER) / 15;
+            return peak - progress * (peak - 40);
+          }
+          return 40 + Math.sin(t * 0.7) * 8;
+        }
+
+        function withCB(t) {
+          if (t < T_FAIL) return 40 + Math.sin(t * 0.7) * 8;
+          if (t < CB_TRIP) {
+            // Brief spike before CB trips
+            var progress = (t - T_FAIL) / (CB_TRIP - T_FAIL);
+            return 40 + progress * 960; // up to 1000ms
+          }
+          if (t < CB_HALFOPEN_1) return 5 + Math.sin(t * 1.2) * 2; // CB open: fast fail (~5ms)
+          if (t < CB_REOPEN) return 800 + Math.sin(t * 2) * 200; // half-open probe fails
+          if (t < CB_HALFOPEN_2) return 5 + Math.sin(t * 1.2) * 2; // CB open again
+          if (t < CB_CLOSE) return 60 + Math.sin(t * 2) * 15; // half-open probes succeed (service recovered)
+          return 40 + Math.sin(t * 0.7) * 8; // normal
+        }
+
+        // Generate data points
+        var dataWithout = [], dataWith = [];
+        for (var i = 0; i <= STEPS; i++) {
+          var t = (i / STEPS) * T_MAX;
+          dataWithout.push({ t: t, v: withoutCB(t) });
+          dataWith.push({ t: t, v: withCB(t) });
+        }
+
+        function tToX(t) { return PAD.left + (t / T_MAX) * plotW; }
+        function vToY(v) { return PAD.top + plotH - (v / Y_MAX) * plotH; }
+
+        function draw() {
+          ctx.clearRect(0, 0, W, H);
+
+          // Background zones
+          // Failure zone
+          ctx.fillStyle = 'rgba(255, 80, 80, 0.07)';
+          ctx.fillRect(tToX(T_FAIL), PAD.top, tToX(T_RECOVER) - tToX(T_FAIL), plotH);
+
+          // CB open zones
+          ctx.fillStyle = 'rgba(59, 130, 246, 0.06)';
+          ctx.fillRect(tToX(CB_TRIP), PAD.top, tToX(CB_HALFOPEN_1) - tToX(CB_TRIP), plotH);
+          ctx.fillRect(tToX(CB_REOPEN), PAD.top, tToX(CB_HALFOPEN_2) - tToX(CB_REOPEN), plotH);
+
+          // Zone labels
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.fillStyle = '#e74c3c';
+          ctx.textAlign = 'center';
+          ctx.fillText('Downstream Failing', tToX((T_FAIL + T_RECOVER) / 2), PAD.top + 16);
+          ctx.fillStyle = '#3b82f6';
+          ctx.fillText('CB Open', tToX((CB_TRIP + CB_HALFOPEN_1) / 2), PAD.top + 30);
+
+          // Grid lines
+          ctx.strokeStyle = '#e5e7eb';
+          ctx.lineWidth = 0.5;
+          var yTicks = [0, 1000, 2000, 3000, 4000, 5000];
+          for (var yi = 0; yi < yTicks.length; yi++) {
+            var y = vToY(yTicks[yi]);
+            ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+          }
+          var xTicks = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+          for (var xi = 0; xi < xTicks.length; xi++) {
+            var x = tToX(xTicks[xi]);
+            ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + plotH); ctx.stroke();
+          }
+
+          // Axes labels
+          ctx.fillStyle = '#6b7280';
+          ctx.font = '12px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          for (var xi = 0; xi < xTicks.length; xi++) {
+            ctx.fillText(xTicks[xi] + 's', tToX(xTicks[xi]), PAD.top + plotH + 20);
+          }
+          ctx.textAlign = 'right';
+          for (var yi = 0; yi < yTicks.length; yi++) {
+            ctx.fillText(yTicks[yi] + 'ms', PAD.left - 8, vToY(yTicks[yi]) + 4);
+          }
+          // Axis titles
+          ctx.fillStyle = '#374151';
+          ctx.font = '13px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Time (seconds)', PAD.left + plotW / 2, H - 10);
+          ctx.save();
+          ctx.translate(16, PAD.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.fillText('Response Time (ms)', 0, 0);
+          ctx.restore();
+
+          // SLO line at 200ms
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(PAD.left, vToY(200));
+          ctx.lineTo(W - PAD.right, vToY(200));
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = '#f59e0b';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'left';
+          ctx.fillText('SLO: 200ms', W - PAD.right - 80, vToY(200) - 6);
+
+          // Draw "Without CB" line
+          ctx.strokeStyle = '#e74c3c';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          for (var i = 0; i < dataWithout.length; i++) {
+            var x = tToX(dataWithout[i].t), y = vToY(Math.min(dataWithout[i].v, Y_MAX));
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+
+          // Draw "With CB" line
+          ctx.strokeStyle = '#22c55e';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          for (var i = 0; i < dataWith.length; i++) {
+            var x = tToX(dataWith[i].t), y = vToY(Math.min(dataWith[i].v, Y_MAX));
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+
+          // Legend
+          var legX = PAD.left + 10, legY = PAD.top + 50;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#e74c3c';
+          ctx.beginPath(); ctx.moveTo(legX, legY); ctx.lineTo(legX + 28, legY); ctx.stroke();
+          ctx.fillStyle = '#374151'; ctx.font = '12px JetBrains Mono, monospace'; ctx.textAlign = 'left';
+          ctx.fillText('Without Circuit Breaker', legX + 34, legY + 4);
+
+          ctx.strokeStyle = '#22c55e';
+          ctx.beginPath(); ctx.moveTo(legX, legY + 20); ctx.lineTo(legX + 28, legY + 20); ctx.stroke();
+          ctx.fillText('With Circuit Breaker', legX + 34, legY + 24);
+        }
+
+        draw();
+
+        // Hover tooltip
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H / rect.height);
+
+          if (mx < PAD.left || mx > W - PAD.right || my < PAD.top || my > PAD.top + plotH) {
+            tooltip.style.display = 'none';
+            return;
+          }
+
+          var t = ((mx - PAD.left) / plotW) * T_MAX;
+          var idx = Math.round((t / T_MAX) * STEPS);
+          idx = Math.max(0, Math.min(STEPS, idx));
+
+          var vNo = dataWithout[idx].v;
+          var vWith = dataWith[idx].v;
+          var tVal = dataWithout[idx].t;
+
+          var state = '';
+          if (tVal < T_FAIL) state = 'Normal';
+          else if (tVal < CB_TRIP) state = 'Failing (CB detecting)';
+          else if (tVal < CB_HALFOPEN_1) state = 'CB Open (fast-fail)';
+          else if (tVal < CB_REOPEN) state = 'CB Half-Open (probing)';
+          else if (tVal < CB_HALFOPEN_2) state = 'CB Open (re-tripped)';
+          else if (tVal < CB_CLOSE) state = 'CB Half-Open (recovery)';
+          else if (tVal < T_RECOVER + 15 && tVal >= T_RECOVER) state = 'Recovering';
+          else state = 'Normal';
+
+          tooltip.innerHTML =
+            '<strong>t = ' + tVal.toFixed(1) + 's</strong><br>' +
+            'State: ' + state + '<br>' +
+            '<span style="color:#ef6b6b">Without CB: ' + Math.round(vNo) + 'ms</span><br>' +
+            '<span style="color:#4ade80">With CB: ' + Math.round(vWith) + 'ms</span><br>' +
+            '<span style="color:#fbbf24">SLO: 200ms</span>';
+
+          var tipX = e.clientX - rect.left + 16;
+          var tipY = e.clientY - rect.top - 10;
+          if (tipX + 260 > rect.width) tipX = e.clientX - rect.left - 270;
+          if (tipY < 0) tipY = 10;
+          tooltip.style.left = tipX + 'px';
+          tooltip.style.top = tipY + 'px';
+          tooltip.style.display = 'block';
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+        });
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Circuit breaker parameters and capacity planning are deeply intertwined. The breaker's behavior during failures directly affects your required infrastructure capacity. Use these principles to plan capacity around your SLO targets:</p>
+
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Planning Factor</th>
+            <th>How the Circuit Breaker Affects It</th>
+            <th>Capacity Implication</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Fallback compute</strong></td>
+            <td>When the breaker opens, fallback logic runs instead of the normal path. If your fallback queries a cache or secondary datastore, that system must handle the redirected load.</td>
+            <td>Size fallback infrastructure for <strong>100% of traffic</strong> to the protected dependency. If the dependency handles 10K req/s, your cache must sustain 10K req/s during an outage.</td>
+          </tr>
+          <tr>
+            <td><strong>Thread pool headroom</strong></td>
+            <td>Without a breaker, slow downstream calls consume threads for the full timeout duration. With a breaker, threads are freed in &lt;10ms (fast-fail). The thread pool can be smaller.</td>
+            <td>Without CB: provision for <code>concurrent_requests &times; timeout</code> threads. With CB: provision for <code>concurrent_requests &times; avg_response_time</code>. Often a <strong>10-50x reduction</strong> in required threads.</td>
+          </tr>
+          <tr>
+            <td><strong>Error budget burn rate</strong></td>
+            <td>The time between failure onset and breaker trip is the "detection window" — errors during this window count against your SLO error budget.</td>
+            <td>For a 99.9% SLO (43.2 min/month budget): if your breaker takes 10 seconds to trip and you have 4 incidents/month, that consumes 40 seconds — roughly 1.5% of your error budget. Budget the rest for other failure modes.</td>
+          </tr>
+          <tr>
+            <td><strong>Recovery surge capacity</strong></td>
+            <td>When the breaker closes after an outage, pent-up demand floods the recovered service. This "recovery surge" can cause the downstream to fail again.</td>
+            <td>Implement <strong>gradual ramp-up</strong>: after closing, route only 10% of traffic through the dependency, increasing by 10% every 5 seconds. The downstream needs capacity for only 110% of normal load, not 200%+.</td>
+          </tr>
+          <tr>
+            <td><strong>Multi-dependency budget allocation</strong></td>
+            <td>If your service has 5 dependencies, each with its own breaker, and your system SLO is 99.9%, you must allocate the error budget across all of them.</td>
+            <td>With 5 dependencies: each gets ~0.02% error budget (0.1% / 5). This means each dependency's breaker should trip fast enough that its failure contributes no more than 0.02% unavailability. Use this to derive per-dependency detection windows.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <p><strong>Capacity Planning Formula:</strong> For a service with SLO <em>S</em>, <em>n</em> dependencies, and circuit breaker detection time <em>d</em> seconds:</p>
+        <p style="font-family:'JetBrains Mono',monospace; text-align:center; font-size:1rem; margin:1rem 0;">
+          max_incidents_per_month = (1 &minus; S) &times; 2,592,000 / (n &times; d)
+        </p>
+        <p>For 99.9% SLO, 5 dependencies, 10s detection: <strong>(0.001 &times; 2,592,000) / (5 &times; 10) = 51.8 incidents/month</strong> before breaching SLO. If you experience more incidents, either reduce detection time, reduce dependencies, or relax your SLO.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>No Protection</h4>
+          <p>Monolithic app with a few dependencies. If something fails, you catch the exception and log it. Retries are ad-hoc. Failures are rare because traffic is low and there are few moving parts. You might not even notice a downstream hiccup.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>Try/Catch + Retry</h4>
+          <p>You start calling external APIs (payment, email, SMS). You add try/catch blocks with simple retry logic and exponential backoff. This works until a downstream service has an extended outage — your retries pile up, thread pools fill, and response times spike for all users.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>In-Process Breaker</h4>
+          <p>You adopt a library like Resilience4j or Polly. Circuit breakers wrap each external dependency. Fallbacks return cached data or degraded responses. You add bulkheads (separate thread pools per dependency) so a slow payment service doesn't starve the product catalog. Dashboards show breaker state in real time.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Service Mesh Breaker</h4>
+          <p>Hundreds of microservices in multiple languages. You move circuit breaking to the sidecar proxy layer (Envoy/Istio). Policies are configured centrally via CRDs, applied consistently across all services. Outlier detection ejects individual unhealthy pods rather than breaking entire circuits. Combined with automated canary deployments and progressive rollouts.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>Breaker Trips Too Aggressively During Deploys</h3>
+      <p><strong>What happened:</strong> During a rolling deployment, old pods are terminated and new pods are starting up. For a brief window, health check failures spike as old pods go down before new pods are ready. The circuit breaker trips, rejecting all traffic to the service — even though healthy pods are available.</p>
+      <p><strong>Root cause:</strong> The breaker threshold was tuned for steady-state traffic, not for the transient spike in errors during deployment. The rolling update strategy didn't have sufficient readiness probe delay.</p>
+      <p><strong>Mitigation:</strong> Tune readiness probes so pods are only added to the load balancer pool when fully ready. Use a percentage-based breaker (not absolute count) so the error rate during deployment stays below the threshold. Consider excluding deployment-related errors from the breaker's failure count.</p>
+
+      <h3>Breaker State Not Shared Across Instances</h3>
+      <p><strong>What happened:</strong> A service has 20 replicas, each with its own in-process circuit breaker. When the downstream service starts failing, some replicas trip their breakers quickly (they happened to send more requests) while others haven't yet seen enough failures. Traffic shifts to the replicas with closed breakers, which then experience a burst of failures. The breakers trip in a staggered cascade over 30+ seconds.</p>
+      <p><strong>Root cause:</strong> Each replica independently tracks failures. With traffic spread across 20 replicas, each individual replica sees 1/20th of the errors, so it takes 20x longer for each to reach the threshold.</p>
+      <p><strong>Mitigation:</strong> Lower per-instance thresholds proportionally, or use a shared state store (Redis) for breaker state. Alternatively, move to a service mesh where the proxy handles breaking with cluster-wide visibility.</p>
+
+      <h3>Half-Open Thundering Herd</h3>
+      <p><strong>What happened:</strong> After the open-state timeout expires, all 50 instances of the calling service simultaneously enter half-open and send probe requests to the recovering downstream service. The burst of 50 simultaneous probes overwhelms the service, causing it to fail again — and all breakers reopen.</p>
+      <p><strong>Root cause:</strong> All instances had their breakers trip at approximately the same time, so their timeouts expired simultaneously.</p>
+      <p><strong>Mitigation:</strong> Add jitter to the open-state timeout (e.g., 30s +/- 5s random). Limit the half-open probe count to 1 per instance. Use a central coordinator to stagger probe requests.</p>
+
+      <h3>Breaker Masks Permanent Failures</h3>
+      <p><strong>What happened:</strong> A misconfigured DNS entry meant all requests to a downstream service were going to the wrong IP. The circuit breaker dutifully opened, served fallback responses, and periodically probed (which also failed). Because the fallback was "good enough," nobody noticed the breaker was open for three days.</p>
+      <p><strong>Root cause:</strong> No alerting on breaker state duration. The fallback masked the failure from end users.</p>
+      <p><strong>Mitigation:</strong> Alert when a breaker has been open for more than 5 minutes. Track and dashboard breaker state transitions. Distinguish between "graceful degradation" and "something is broken."</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>What It Tells You</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>circuit_breaker_state</code></td>
+            <td>Current state (closed/open/half-open) per dependency</td>
+            <td>Alert if open &gt; 5 minutes</td>
+          </tr>
+          <tr>
+            <td><code>circuit_breaker_trip_rate</code></td>
+            <td>How often the breaker trips per hour</td>
+            <td>Alert if &gt; 3 trips/hour (flapping)</td>
+          </tr>
+          <tr>
+            <td><code>downstream_error_rate</code></td>
+            <td>Percentage of failed calls to each dependency</td>
+            <td>Alert if &gt; 10% sustained over 1 minute</td>
+          </tr>
+          <tr>
+            <td><code>fallback_invocation_rate</code></td>
+            <td>How often fallback logic is triggered</td>
+            <td>Alert if &gt; 5% of requests use fallback</td>
+          </tr>
+          <tr>
+            <td><code>downstream_p99_latency</code></td>
+            <td>Tail latency to downstream — slow responses precede failures</td>
+            <td>Alert if &gt; 2x normal baseline</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Breaker is open — requests failing fast:</strong></p>
+        <p>1. Check <code>circuit_breaker_state</code> dashboard — which dependency's breaker is open?</p>
+        <p>2. Check <code>downstream_error_rate</code> for that dependency — is the downstream actually failing?</p>
+        <p>3. If YES: Check the downstream service's health — is it crashing, overloaded, or misconfigured? Is it a deployment in progress?</p>
+        <p>4. If NO (low error rate but breaker is open): The threshold may be too sensitive. Check the sliding window config — is the minimum request count too low? Are 4xx errors being counted as failures?</p>
+        <p>5. Check if breaker is flapping (rapid open/close cycles) — this indicates the downstream is intermittently unhealthy. Look for resource contention, GC pauses, or connection pool exhaustion on the downstream.</p>
+        <p>6. Check if half-open probes are succeeding but breaker is still opening — the probe may be hitting a healthy instance while most instances are unhealthy. Consider increasing half-open probe count.</p>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Config</th>
+            <th>What It Does</th>
+            <th>Recommended Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>failureRateThreshold</code></td>
+            <td>Error percentage that triggers the breaker</td>
+            <td>50% (Resilience4j default). Lower for critical paths.</td>
+          </tr>
+          <tr>
+            <td><code>waitDurationInOpenState</code></td>
+            <td>How long the breaker stays open before probing</td>
+            <td>30 seconds. Match to downstream recovery time.</td>
+          </tr>
+          <tr>
+            <td><code>slidingWindowSize</code></td>
+            <td>Number of calls (or seconds) in the evaluation window</td>
+            <td>100 calls or 10 seconds. Larger = less noise, slower detection.</td>
+          </tr>
+          <tr>
+            <td><code>minimumNumberOfCalls</code></td>
+            <td>Minimum calls before the error rate is calculated</td>
+            <td>20. Prevents tripping on low-traffic endpoints.</td>
+          </tr>
+          <tr>
+            <td><code>permittedNumberOfCallsInHalfOpenState</code></td>
+            <td>Probes allowed during half-open</td>
+            <td>3-5. Enough for confidence without overwhelming.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Circuit Breakers + Load Balancers</h3>
+      <p>If the load balancer doesn't know about the circuit breaker's state, it keeps routing traffic to instances that have their breakers open — those instances immediately reject the request, and the user gets an error. The LB should either integrate with the breaker state (e.g., Envoy outlier detection removes unhealthy upstream hosts from the pool) or the breaker's fallback should return a response that the LB interprets as "try another instance" (via retries). In a service mesh, Envoy handles both load balancing and circuit breaking in the same proxy, avoiding this coordination problem.</p>
+
+      <h3>Circuit Breakers + Retries</h3>
+      <p>If you have a retry policy that retries through an open circuit breaker, you're just retrying immediate rejections — burning CPU and adding latency for no benefit. <strong>Retries should be below the circuit breaker.</strong> The call chain should be: caller &rarr; circuit breaker &rarr; retry &rarr; downstream. The retry handles transient single-request failures. If retries consistently fail, the breaker trips and stops the retries too. Never put retries above the breaker.</p>
+
+      <h3>Circuit Breakers + Timeouts</h3>
+      <p>The request timeout must be shorter than the breaker's evaluation window. If your timeout is 30 seconds and your breaker window is 10 seconds, you'll have at most a few timed-out requests in the window (because each takes 30 seconds). The breaker won't trip because it hasn't seen enough failures in 10 seconds. <strong>Set timeouts aggressively</strong> (1-5 seconds for most service calls) so failures are detected quickly and the breaker has enough data points in its window.</p>
+
+      <h3>Circuit Breakers + Message Queues</h3>
+      <p>Circuit breakers are designed for synchronous request-response calls. For asynchronous communication via message queues, the queue itself acts as the buffer. If a consumer is down, messages queue up and are processed when the consumer recovers. You don't need a circuit breaker on the producer side. However, if a consumer synchronously calls a downstream service while processing a message, that call should have a circuit breaker.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <p><strong>Direct cost: Minimal.</strong> Circuit breakers are in-process logic — a few counters, a state variable, and a timer. No additional infrastructure unless you centralize breaker state in Redis (a small single-node Redis instance costs ~$15/month on AWS). In a service mesh, the cost is already baked into the sidecar proxy overhead.</p>
+        <p><strong>Dominant cost driver:</strong> Engineering time for tuning and testing. Getting thresholds right requires load testing, chaos testing, and iteration. A poorly tuned breaker (too aggressive or too lenient) causes more problems than it solves.</p>
+        <p><strong>Cost optimization:</strong> Start with library-level breakers (free). Move to service mesh only when you have enough services to justify the mesh overhead. Use sensible defaults (Resilience4j defaults are good starting points) and tune incrementally based on production data.</p>
+        <p><strong>Cost of NOT having circuit breakers:</strong> Cascading failures can take down your entire platform. A single slow or failing downstream service — without a breaker — can exhaust thread pools, cause timeouts to propagate upstream, and result in a total outage affecting all users. One incident like this can cost hours of engineering time, SLA credits, and user trust. Netflix estimated that a single major cascading failure incident could cost millions in lost revenue.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Netflix Hystrix</h3>
+      <p>Netflix pioneered the circuit breaker pattern at scale. With hundreds of microservices and billions of daily API calls, a single failing dependency could cascade through the entire streaming platform. Hystrix wrapped every inter-service call with circuit breakers, thread pool isolation, and fallbacks. When the recommendation service went down, the UI showed generic recommendations from cache instead of failing entirely. Hystrix also provided a real-time dashboard (Hystrix Dashboard + Turbine) that showed breaker state across the fleet. Though now in maintenance mode, Hystrix established the patterns that all modern implementations follow.</p>
+
+      <h3>Envoy Proxy Outlier Detection</h3>
+      <p>Envoy, the proxy at the heart of Istio and many service meshes, implements circuit breaking via "outlier detection." Instead of a binary open/closed breaker on the entire service, Envoy tracks the health of individual upstream hosts. When a host returns consecutive 5xx errors, Envoy ejects it from the healthy pool for a configurable duration. This is more granular — one bad pod doesn't break the circuit for all pods. Envoy also implements connection pool circuit breaking: when the number of pending requests or active connections to an upstream cluster exceeds limits, additional requests are rejected immediately.</p>
+
+      <h3>AWS App Mesh Circuit Breaking</h3>
+      <p>AWS App Mesh provides managed service mesh capabilities built on Envoy. Circuit breaking is configured via virtual node connection pool settings: <code>maxConnections</code> and <code>maxPendingRequests</code> for TCP, plus <code>maxRequestsPerConnection</code> for HTTP. When limits are exceeded, the proxy returns a 503 to the caller. This protects downstream services from being overwhelmed, and integrates with CloudWatch for monitoring breaker activity. The managed approach means teams get circuit breaking without operating the mesh control plane.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>A minimal circuit breaker state machine in Python (~40 lines). This captures the core logic: failure counting, state transitions, and timeout-based recovery testing.</p>
+      <pre class="line-numbers"><code class="language-python">import time
+
+class CircuitBreaker:
+    def __init__(self, threshold=5, timeout=30):
+        self.threshold = threshold
+        self.timeout = timeout
+        self.failures = 0
+        self.state = "closed"       # closed | open | half-open
+        self.opened_at = None
+
+    def call(self, fn, *args, **kwargs):
+        if self.state == "open":
+            if time.time() - self.opened_at >= self.timeout:
+                self.state = "half-open"  # Try a probe
+            else:
+                raise Exception("Circuit is OPEN — failing fast")
+
+        try:
+            result = fn(*args, **kwargs)
+            self._on_success()
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise
+
+    def _on_success(self):
+        self.failures = 0
+        if self.state == "half-open":
+            self.state = "closed"   # Recovery confirmed
+
+    def _on_failure(self):
+        self.failures += 1
+        if self.failures >= self.threshold:
+            self.state = "open"
+            self.opened_at = time.time()
+
+# Usage:
+breaker = CircuitBreaker(threshold=3, timeout=10)
+def call_payment_api():
+    # ... HTTP call to payment service
+    pass
+
+try:
+    result = breaker.call(call_payment_api)
+except Exception as e:
+    print(f"Fallback: {e}")  # Serve cached/default response</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Chaos Testing</h3>
+      <p>Inject failures into the downstream service and verify the breaker trips correctly. Use <strong>toxiproxy</strong> to add latency, return errors, or sever connections to a downstream dependency. Verify: (1) the breaker transitions to open after the configured failure threshold, (2) requests receive the fallback response, (3) no threads or connections are leaked during the open state. Use <strong>Chaos Monkey</strong> or <strong>Litmus</strong> to randomly kill downstream pods in a staging environment and observe breaker behavior.</p>
+
+      <h3>Test Recovery</h3>
+      <p>After injecting failures and observing the breaker trip, restore the downstream service and verify: (1) the breaker transitions to half-open after the timeout, (2) probe requests succeed, (3) the breaker closes and normal traffic resumes, (4) no request backlog floods the recovering service. Time the end-to-end recovery cycle — from failure injection to full recovery — and verify it matches your expected timeout + probe duration.</p>
+
+      <h3>Load Testing</h3>
+      <p>Use <strong>k6</strong> or <strong>Locust</strong> to generate realistic traffic while a downstream is failing. Measure: (1) latency during the open state — it should be near-zero (immediate rejection), (2) throughput to healthy dependencies — they should be unaffected by the broken dependency, (3) thread pool utilization — it should drop when the breaker opens, not spike. Compare latency distributions with and without the circuit breaker during a simulated outage. Without the breaker, p99 latency will spike to the timeout duration (e.g., 30 seconds). With it, p99 should stay low (sub-millisecond for rejected requests).</p>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you prevent cascading failures in a microservices architecture?</summary>
+        <div class="answer">
+          <p>Cascading failures happen when a failing downstream service causes its callers to hang (waiting for timeouts), exhausting their thread pools, which in turn makes them unresponsive to their callers — propagating the failure upstream through the entire call chain.</p>
+          <p>The primary defense is the <strong>circuit breaker pattern</strong>: wrap every synchronous call to a downstream service with a breaker that monitors failure rates. When failures exceed a threshold, the breaker opens and immediately rejects requests without calling the downstream — this is "failing fast." Combine with <strong>timeouts</strong> (aggressive, 1-5 seconds per hop) so individual requests don't hang, <strong>bulkheads</strong> (isolate each dependency's thread pool so one slow service can't starve others), and <strong>fallbacks</strong> (return cached data, defaults, or gracefully degraded responses when the breaker is open).</p>
+          <p>At scale, implement these patterns at the <strong>service mesh layer</strong> (Envoy/Istio) rather than in application code. This ensures consistent protection across all services regardless of language. Add <strong>load shedding</strong> so services under pressure can reject excess requests before they become overloaded.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How do you choose between circuit breakers at the application level vs. the service mesh level?" — Application-level breakers give more control (custom fallbacks, business-logic-aware failure classification), while mesh-level breakers provide consistent policy across polyglot services with zero code changes.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the circuit breaker states and transitions</summary>
+        <div class="answer">
+          <p>A circuit breaker is a state machine with three states. <strong>Closed</strong> is the normal state: all requests pass through to the downstream service, and failures are recorded in a sliding window (count-based or time-based). When the failure rate in the window exceeds a threshold (e.g., 50% error rate with a minimum of 20 requests), the breaker transitions to <strong>Open</strong>.</p>
+          <p>In the Open state, all requests are immediately rejected without calling the downstream — this is the "fail fast" behavior. A timeout timer starts (e.g., 30 seconds). When the timer expires, the breaker transitions to <strong>Half-Open</strong>.</p>
+          <p>In Half-Open, a limited number of probe requests (e.g., 3) are allowed through to test if the downstream has recovered. If all probes succeed, the breaker transitions back to Closed and normal operation resumes. If any probe fails, the breaker transitions back to Open, the timer resets, and the cycle repeats.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "What happens to the in-flight requests when the breaker first trips to open?" — Requests already in flight continue to completion (or timeout). Only new requests are rejected. Some implementations also cancel in-flight requests, but that's more aggressive.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you tune circuit breaker thresholds?</summary>
+        <div class="answer">
+          <p>Tuning is the hardest part of operating circuit breakers. The key parameters are: <strong>failure rate threshold</strong> (what percentage of failures triggers the breaker — start at 50%), <strong>sliding window size</strong> (how many requests or how long a time period to evaluate — start at 10 seconds or 100 requests), <strong>minimum request count</strong> (don't evaluate the error rate until you have enough data — start at 20), and <strong>open-state timeout</strong> (how long to wait before probing — start at 30 seconds).</p>
+          <p>The process is: (1) start with library defaults, (2) observe production behavior for a week, (3) look for false positives (breaker trips when the downstream is healthy — lower sensitivity or increase minimum request count) and false negatives (downstream is failing but the breaker hasn't tripped — increase sensitivity or shrink the window), (4) adjust incrementally. Run chaos tests in staging to validate the tuning before production.</p>
+          <p>Critical mistake: using an absolute failure count (e.g., "5 failures") instead of a rate. Five failures out of 10,000 requests is noise; five failures out of 10 requests is a crisis. Always use percentage-based thresholds with a minimum sample size.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How do you tune differently for high-traffic vs. low-traffic endpoints?" — High-traffic endpoints can use smaller windows (error rate stabilizes quickly). Low-traffic endpoints need higher minimum request counts to avoid noise, and you may need to use count-based windows instead of time-based.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Circuit breaker vs. retry — when to use which?</summary>
+        <div class="answer">
+          <p>Retries and circuit breakers solve different problems and complement each other. <strong>Retries</strong> handle transient, isolated failures — a single dropped connection, a momentary blip, a brief DNS hiccup. The assumption is that the next attempt will succeed. Use retries with exponential backoff and jitter for idempotent operations.</p>
+          <p><strong>Circuit breakers</strong> handle sustained failures — the downstream service is down, overloaded, or degraded for an extended period. The assumption is that repeated attempts will all fail, so stop trying. Use circuit breakers when the downstream is genuinely broken, not just flaky.</p>
+          <p>In practice, use both together in layers: the circuit breaker wraps the retry. A request first hits the circuit breaker check. If the breaker is closed, the request goes through with retry logic (e.g., retry up to 3 times with exponential backoff). If all retries fail, the failure is reported to the breaker. If enough retries fail across enough requests, the breaker trips. Once open, the breaker short-circuits both the request and the retries — no retries through an open breaker.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "What about non-idempotent operations like payment processing?" — For non-idempotent operations, retries are dangerous (you might charge the customer twice). Use circuit breakers without retries, and implement idempotency keys if retries are needed.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does Envoy implement circuit breaking?</summary>
+        <div class="answer">
+          <p>Envoy implements circuit breaking at two levels: <strong>connection pool limits</strong> and <strong>outlier detection</strong>. Connection pool limits set hard ceilings on concurrent connections (<code>max_connections</code>), pending requests (<code>max_pending_requests</code>), and concurrent requests (<code>max_requests</code>) to an upstream cluster. When any limit is hit, additional requests get a 503 immediately — this prevents overwhelming the upstream.</p>
+          <p>Outlier detection is Envoy's equivalent of the traditional circuit breaker pattern, but more granular. Instead of breaking the circuit for an entire service, Envoy monitors individual upstream hosts. When a host returns consecutive 5xx errors (configurable via <code>consecutive_5xx</code>), Envoy ejects that host from the healthy pool for a configurable duration (<code>base_ejection_time</code>). The host is automatically re-added after the ejection period. Envoy can also eject based on success rate: if a host's success rate is statistically lower than the cluster average, it gets ejected.</p>
+          <p>This per-host approach is more precise than application-level breakers: if one pod out of ten is unhealthy, only that pod is removed from the pool, and 90% of capacity is preserved. Application-level breakers would break the entire circuit, losing 100% of capacity.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How does Envoy's outlier detection interact with Kubernetes readiness probes?" — They're complementary. Readiness probes remove pods that fail health checks. Outlier detection removes pods that pass health checks but return errors on real traffic (a more realistic signal). Together, they cover both startup/crash failures and runtime degradation.</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a fallback strategy when a circuit breaker is open</summary>
+        <div class="answer">
+          <p>The fallback strategy depends on the dependency and the business context. The hierarchy from best to worst user experience is: (1) <strong>serve from cache</strong> — if you have a recently cached response from the downstream service, return it. For many use cases (product catalog, recommendations, user profiles), slightly stale data is far better than no data. Set a "fallback TTL" that's longer than your normal cache TTL. (2) <strong>return defaults</strong> — if no cached data is available, return sensible defaults. For a recommendation engine, show popular items. For a currency conversion service, use the last known exchange rate. (3) <strong>degrade gracefully</strong> — remove the feature that depends on the broken service. If the review service is down, show the product page without reviews. (4) <strong>queue for later</strong> — for write operations, queue the request and process it when the service recovers (requires idempotent processing). (5) <strong>return an error</strong> — last resort. Return a clear error message with a retry suggestion.</p>
+          <p>Key implementation details: fallbacks should be fast (no network calls in the fallback path), simple (the fallback itself should never fail), and monitored (track fallback invocation rate — if it's high, something is wrong). Never fall back to calling the same failing service through a different path.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> "How do you test that your fallbacks actually work?" — Run regular chaos tests in staging that trip breakers for each dependency and verify the fallback behavior. Without testing, you discover your fallback is broken during a real outage — the worst possible time.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>Circuit breakers prevent cascading failures</strong> by detecting failing downstream services and failing fast, protecting the entire call chain from being dragged down by one broken dependency.</li>
+        <li><strong>Three states: Closed, Open, Half-Open.</strong> Closed = normal operation. Open = failing fast. Half-Open = probing for recovery. The state machine is self-healing.</li>
+        <li><strong>Use percentage-based thresholds, not absolute counts.</strong> "50% error rate with a minimum of 20 requests" adapts to traffic volume. "5 failures" does not.</li>
+        <li><strong>Circuit breakers and retries are complementary, not alternatives.</strong> Retries handle transient failures. Circuit breakers handle sustained failures. Layer them: breaker wraps retry.</li>
+        <li><strong>Always have a fallback.</strong> An open breaker is only useful if you can serve a degraded response. Without a fallback, the user sees an error either way.</li>
+        <li><strong>Monitor breaker state.</strong> Alert when a breaker has been open for more than 5 minutes. Dashboard breaker transitions. Track fallback invocation rates.</li>
+        <li><strong>At scale, move to the proxy layer.</strong> In-process breakers work for small deployments. Service mesh breakers (Envoy/Istio) provide consistent, language-agnostic protection at scale.</li>
+        <li><strong>Tune incrementally from production data.</strong> Start with defaults, observe, adjust. Don't guess thresholds — measure them.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="microservices.html">Microservices</a> — Circuit breakers are essential in microservices architectures where inter-service calls are the norm.</li>
+        <li><a href="load-balancing.html">Load Balancing</a> — How load balancers interact with circuit breakers, and why they need to be coordinated.</li>
+        <li><a href="observability.html">Observability</a> — Monitoring circuit breaker state, distributed tracing through open breakers, and alerting on breaker transitions.</li>
+        <li><a href="service-discovery.html">Service Discovery</a> — How services find each other, and how circuit breakers interact with service registry health checks.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> — A related protection pattern: rate limiting controls the volume of requests; circuit breakers control whether to send requests at all.</li>
+        <li><a href="api-gateway.html">API Gateway</a> — API gateways often implement circuit breakers at the edge, protecting backend services from cascading failures.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="distributed-transactions.html" class="prev">Distributed Transactions</a>
+      <a href="observability.html" class="next">Observability</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <!-- ===== Circuit Breaker Animation ===== -->
+  <script>
+  (function() {
+    const canvas = document.getElementById('circuitBreakerCanvas');
+    if (!canvas) return;
+
+    // State
+    let breakerState = 'closed'; // closed | open | half-open
+    let failureCount = 0;
+    const FAILURE_THRESHOLD = 5;
+    const OPEN_TIMEOUT = 4; // seconds (compressed for animation)
+    let openedAt = 0;
+    let requests = [];
+    let lastSpawnTime = 0;
+    let totalSent = 0;
+    let backendHealthy = true;
+    let healthCycleTime = 0;
+
+    function resetState() {
+      breakerState = 'closed';
+      failureCount = 0;
+      openedAt = 0;
+      requests = [];
+      lastSpawnTime = 0;
+      totalSent = 0;
+      backendHealthy = true;
+      healthCycleTime = 0;
+    }
+
+    function drawCircuitBreaker(ctx, time, w, h) {
+      const pad = 20;
+
+      // Layout positions
+      const clientX = pad + 40;
+      const clientY = h * 0.45;
+      const breakerX = w * 0.35;
+      const breakerY = h * 0.45;
+      const breakerW = 110;
+      const breakerH = 55;
+      const serverX = w - pad - 50;
+      const serverY = h * 0.45;
+
+      // Backend health cycle: healthy 6s, unhealthy 6s, recover 6s...
+      const cyclePeriod = 18;
+      const cyclePos = time % cyclePeriod;
+      if (cyclePos < 7) {
+        backendHealthy = true;
+      } else if (cyclePos < 13) {
+        backendHealthy = false;
+      } else {
+        backendHealthy = true; // recovery
+      }
+
+      // State transition logic
+      if (breakerState === 'closed' && failureCount >= FAILURE_THRESHOLD) {
+        breakerState = 'open';
+        openedAt = time;
+      }
+      if (breakerState === 'open' && (time - openedAt) >= OPEN_TIMEOUT) {
+        breakerState = 'half-open';
+        failureCount = 0;
+      }
+
+      // --- Draw static elements ---
+
+      // Title
+      drawLabel(ctx, w / 2, 15, 'Circuit Breaker Pattern', {
+        fontSize: 16, bold: true, color: '#1e293b', baseline: 'top'
+      });
+
+      // Client
+      drawClient(ctx, clientX, clientY, { label: 'Client' });
+
+      // Arrow: client → breaker
+      drawArrow(ctx, clientX + 25, clientY, breakerX - breakerW / 2 - 5, breakerY, {
+        color: '#94a3b8', width: 2
+      });
+
+      // Circuit breaker box
+      let breakerColor, breakerFill, breakerLabel;
+      if (breakerState === 'closed') {
+        breakerColor = '#16a34a';
+        breakerFill = '#f0fdf4';
+        breakerLabel = 'CLOSED';
+      } else if (breakerState === 'open') {
+        breakerColor = '#dc2626';
+        breakerFill = '#fef2f2';
+        breakerLabel = 'OPEN';
+      } else {
+        breakerColor = '#d97706';
+        breakerFill = '#fffbeb';
+        breakerLabel = 'HALF-OPEN';
+      }
+
+      drawBox(ctx, breakerX - breakerW / 2, breakerY - breakerH / 2, breakerW, breakerH, {
+        color: breakerColor, fill: breakerFill, text: 'Circuit Breaker', fontSize: 11
+      });
+
+      // State badge below breaker
+      const badgeType = breakerState === 'closed' ? 'success' : breakerState === 'open' ? 'danger' : 'warning';
+      drawStatusBadge(ctx, breakerX, breakerY + breakerH / 2 + 14, breakerLabel, badgeType);
+
+      // Failure counter
+      drawLabel(ctx, breakerX, breakerY - breakerH / 2 - 12,
+        'Failures: ' + failureCount + '/' + FAILURE_THRESHOLD, {
+        fontSize: 11, bold: true,
+        color: failureCount >= FAILURE_THRESHOLD - 1 ? '#dc2626' : '#64748b'
+      });
+
+      // Arrow: breaker → server (dashed if open)
+      if (breakerState === 'open') {
+        drawArrow(ctx, breakerX + breakerW / 2 + 5, breakerY, serverX - 40, serverY, {
+          color: '#e2e8f0', width: 2, dashed: true
+        });
+        // X mark on the line
+        const midLineX = (breakerX + breakerW / 2 + serverX - 40) / 2;
+        ctx.save();
+        ctx.strokeStyle = '#dc2626';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(midLineX - 8, breakerY - 8);
+        ctx.lineTo(midLineX + 8, breakerY + 8);
+        ctx.moveTo(midLineX + 8, breakerY - 8);
+        ctx.lineTo(midLineX - 8, breakerY + 8);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        drawArrow(ctx, breakerX + breakerW / 2 + 5, breakerY, serverX - 40, serverY, {
+          color: '#94a3b8', width: 2
+        });
+      }
+
+      // Backend server
+      drawServer(ctx, serverX, serverY, {
+        label: 'Backend', healthy: backendHealthy
+      });
+
+      // Backend status
+      drawStatusBadge(ctx, serverX, serverY - 35,
+        backendHealthy ? 'HEALTHY' : 'FAILING',
+        backendHealthy ? 'success' : 'danger'
+      );
+
+      // --- Spawn requests ---
+      const spawnInterval = breakerState === 'half-open' ? 2.0 : 0.8;
+      if (time - lastSpawnTime > spawnInterval) {
+        lastSpawnTime = time;
+        totalSent++;
+        requests.push({
+          id: totalSent,
+          startTime: time,
+          phase: 'toBreaker', // toBreaker → atBreaker → toServer → result
+          accepted: null,
+          success: null
+        });
+      }
+
+      // --- Process and draw requests ---
+      const keepRequests = [];
+      for (const req of requests) {
+        const age = time - req.startTime;
+
+        if (req.phase === 'toBreaker') {
+          // Moving from client to breaker
+          const duration = 0.5;
+          if (age < duration) {
+            const progress = age / duration;
+            drawMovingDot(ctx,
+              clientX + 25, clientY,
+              breakerX - breakerW / 2 - 5, breakerY,
+              ease.out(progress),
+              { color: '#2563eb', radius: 5 }
+            );
+            keepRequests.push(req);
+          } else {
+            req.phase = 'atBreaker';
+            req.startTime = time;
+            // Decide at breaker
+            if (breakerState === 'open') {
+              req.accepted = false;
+            } else {
+              req.accepted = true;
+            }
+            keepRequests.push(req);
+          }
+        } else if (req.phase === 'atBreaker') {
+          if (!req.accepted) {
+            // Rejected — animate downward
+            req.phase = 'rejected';
+            req.startTime = time;
+            keepRequests.push(req);
+          } else {
+            // Accepted — move to server
+            req.phase = 'toServer';
+            req.startTime = time;
+            keepRequests.push(req);
+          }
+        } else if (req.phase === 'toServer') {
+          const duration = 0.5;
+          if (age < duration) {
+            const progress = age / duration;
+            drawMovingDot(ctx,
+              breakerX + breakerW / 2 + 5, breakerY,
+              serverX - 40, serverY,
+              ease.out(progress),
+              { color: '#2563eb', radius: 5 }
+            );
+            keepRequests.push(req);
+          } else {
+            // Determine outcome from backend
+            req.success = backendHealthy;
+            if (!req.success) {
+              failureCount = Math.min(failureCount + 1, FAILURE_THRESHOLD + 2);
+            } else {
+              if (breakerState === 'half-open') {
+                breakerState = 'closed';
+                failureCount = 0;
+              } else {
+                failureCount = Math.max(0, failureCount - 1);
+              }
+            }
+            req.phase = 'result';
+            req.startTime = time;
+            keepRequests.push(req);
+          }
+        } else if (req.phase === 'result') {
+          const duration = 0.8;
+          if (age < duration) {
+            const progress = age / duration;
+            if (req.success) {
+              // Green dot returns to client
+              drawMovingDot(ctx,
+                serverX - 40, serverY,
+                clientX + 25, clientY,
+                ease.out(progress),
+                { color: '#16a34a', radius: 5 }
+              );
+              if (progress < 0.4) {
+                drawStatusBadge(ctx, (serverX - 40 + clientX + 25) / 2, serverY - 25, '200 OK', 'success');
+              }
+            } else {
+              // Red dot fades down
+              const dotY = serverY + 60 * ease.out(progress);
+              const alpha = 1 - progress;
+              ctx.save();
+              ctx.globalAlpha = alpha;
+              ctx.fillStyle = '#dc2626';
+              ctx.beginPath();
+              ctx.arc(serverX - 40, dotY, 5, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.globalAlpha = alpha * 0.3;
+              ctx.beginPath();
+              ctx.arc(serverX - 40, dotY, 10, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+              if (progress < 0.4) {
+                drawStatusBadge(ctx, serverX - 60, serverY - 25, '503 ERROR', 'danger');
+              }
+              // If in half-open and failed, go back to open
+              if (breakerState === 'half-open') {
+                breakerState = 'open';
+                openedAt = time;
+              }
+            }
+            keepRequests.push(req);
+          }
+          // else: done, discard
+        } else if (req.phase === 'rejected') {
+          const duration = 0.8;
+          if (age < duration) {
+            const progress = age / duration;
+            const dotY = breakerY + 60 * ease.out(progress);
+            const alpha = 1 - progress * 0.8;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = '#dc2626';
+            ctx.beginPath();
+            ctx.arc(breakerX, dotY, 5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = alpha * 0.3;
+            ctx.beginPath();
+            ctx.arc(breakerX, dotY, 10, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+            if (progress < 0.4) {
+              drawStatusBadge(ctx, breakerX, breakerY + breakerH / 2 + 40, 'REJECTED', 'danger');
+            }
+            keepRequests.push(req);
+          }
+        }
+      }
+      requests = keepRequests;
+
+      // Open-state timer
+      if (breakerState === 'open') {
+        const remaining = Math.max(0, OPEN_TIMEOUT - (time - openedAt));
+        drawLabel(ctx, breakerX, breakerY + breakerH / 2 + 32,
+          'Retry in: ' + remaining.toFixed(1) + 's', {
+          fontSize: 11, color: '#dc2626', bold: true
+        });
+      }
+
+      // Legend at bottom
+      const legendY = h - 25;
+      ctx.save();
+      ctx.fillStyle = '#16a34a';
+      ctx.beginPath(); ctx.arc(w * 0.2, legendY, 5, 0, Math.PI * 2); ctx.fill();
+      drawLabel(ctx, w * 0.2 + 10, legendY - 5, 'Success', { fontSize: 10, align: 'left', color: '#64748b' });
+
+      ctx.fillStyle = '#dc2626';
+      ctx.beginPath(); ctx.arc(w * 0.45, legendY, 5, 0, Math.PI * 2); ctx.fill();
+      drawLabel(ctx, w * 0.45 + 10, legendY - 5, 'Failure/Rejected', { fontSize: 10, align: 'left', color: '#64748b' });
+
+      ctx.fillStyle = '#2563eb';
+      ctx.beginPath(); ctx.arc(w * 0.75, legendY, 5, 0, Math.PI * 2); ctx.fill();
+      drawLabel(ctx, w * 0.75 + 10, legendY - 5, 'In-flight', { fontSize: 10, align: 'left', color: '#64748b' });
+      ctx.restore();
+    }
+
+    const anim = createAnimation(canvas, drawCircuitBreaker, { height: 350 });
+    setupControls(document.getElementById('circuit-breaker-animation'), anim);
+
+    const originalReset = anim.reset;
+    anim.reset = function() {
+      resetState();
+      originalReset.call(anim);
+    };
+  })();
+  </script>
+
+</body>
+</html>

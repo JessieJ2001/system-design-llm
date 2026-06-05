@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Technologies — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="design-principles.html">Design Principles</a></li>
+        <li><a href="interview-scenarios.html">Scenarios</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Technologies</h1>
+      <p class="hero-subtitle">Per-category comparison-and-contrast pages for every technology a candidate needs to defend in an interview. The question is never "explain Cassandra" &mdash; it is always "you said Cassandra, why not DynamoDB or Mongo or Postgres?" These pages answer the second question.</p>
+      <p class="hero-meta">15 categories &bull; comparison pages first, per-tech reference pages second</p>
+    </div>
+  </section>
+
+  <!-- How to use -->
+  <section class="section">
+    <div class="container">
+      <h2>How to use these pages</h2>
+      <div class="callout callout-info">
+        <p><strong>Each category has a comparison page (the centerpiece) and a set of per-tech reference pages.</strong></p>
+        <ol>
+          <li><strong>Start at the comparison page</strong> &mdash; see the decision flowchart, feature matrix, access-pattern table, and interview decision rules.</li>
+          <li><strong>Drill into per-tech pages</strong> only when you need depth on one product &mdash; mechanism, replication topology, deployment modes, scaling for hot keys, ops knobs.</li>
+          <li><strong>The matrix shape is consistent across categories</strong> &mdash; same column ordering, same scoring scale, same workload-pattern shapes &mdash; so two categories are scannable side by side.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 1: Datastores -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">1. Datastores</h2>
+      <p>SQL relational, NoSQL key-value, document, wide-column, graph &mdash; all the systems where data lives. The single most-asked category in any interview.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-datastores.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <ellipse cx="6" cy="10" rx="4" ry="6" stroke="white" stroke-width="1.5"/>
+                <ellipse cx="14" cy="10" rx="4" ry="6" stroke="white" stroke-width="1.5"/>
+              </svg>
+            </span>
+            <h3>Datastores: Comparison</h3>
+            <p>Postgres, MySQL, Spanner, CockroachDB, Redis, Memcached, DynamoDB, MongoDB, Cassandra, ScyllaDB, Bigtable, Neo4j &mdash; decision flowchart, feature matrix, access-pattern matrix, hybrid patterns, interview rules.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+
+      <h3 style="margin-top: 1rem;">Per-tech reference pages</h3>
+      <div class="topic-grid">
+        <article class="card topic-card"><a href="technologies/postgresql.html"><h3>PostgreSQL</h3><p>MVCC + B+tree heap + WAL. The default SQL choice.</p></a></article>
+        <article class="card topic-card"><a href="technologies/mysql.html"><h3>MySQL (InnoDB)</h3><p>Clustered B+tree + undo/redo log.</p></a></article>
+        <article class="card topic-card"><a href="technologies/spanner.html"><h3>Spanner</h3><p>Paxos groups + TrueTime + 2PC. Global SQL textbook example.</p></a></article>
+        <article class="card topic-card"><a href="technologies/cockroachdb.html"><h3>CockroachDB</h3><p>Distributed SQL: Raft per range, MVCC, HLC.</p></a></article>
+        <article class="card topic-card"><a href="technologies/redis.html"><h3>Redis</h3><p>Event loop + hash table + skiplist. Cache, queue, leaderboard, lock.</p></a></article>
+        <article class="card topic-card"><a href="technologies/memcached.html"><h3>Memcached</h3><p>Slab + LRU, multi-threaded. Pure ephemeral cache.</p></a></article>
+        <article class="card topic-card"><a href="technologies/dynamodb.html"><h3>DynamoDB</h3><p>Consistent-hash partitioning + per-partition leader.</p></a></article>
+        <article class="card topic-card"><a href="technologies/mongodb.html"><h3>MongoDB</h3><p>WiredTiger B-tree, oplog tailing, replica sets.</p></a></article>
+        <article class="card topic-card"><a href="technologies/cassandra.html"><h3>Cassandra</h3><p>LSM + Dynamo-style ring + tunable quorum.</p></a></article>
+        <article class="card topic-card"><a href="technologies/scylladb.html"><h3>ScyllaDB</h3><p>Cassandra-compatible C++ rewrite, shard-per-core.</p></a></article>
+        <article class="card topic-card"><a href="technologies/bigtable-hbase.html"><h3>Bigtable / HBase</h3><p>LSM + tablets + Chubby/ZK.</p></a></article>
+        <article class="card topic-card"><a href="technologies/neo4j.html"><h3>Neo4j</h3><p>Index-free adjacency for graph traversals.</p></a></article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 2: Search -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">2. Search</h2>
+      <p>Full-text and vector search &mdash; both are "ranked retrieval" engines. Pick the comparison page first, then drill into the engine you'd actually deploy.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-search.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <circle cx="9" cy="9" r="5" stroke="white" stroke-width="1.5"/>
+                <line x1="13" y1="13" x2="17" y2="17" stroke="white" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <h3>Search: Comparison</h3>
+            <p>Elasticsearch, Solr, Algolia, Typesense, MeiliSearch, Postgres tsvector, pgvector, Pinecone, Milvus, Weaviate, Qdrant, FAISS &mdash; full-text vs vector vs hybrid; managed vs self-host.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+
+      <h3 style="margin-top: 1rem;">Per-tech reference pages</h3>
+      <div class="topic-grid">
+        <article class="card topic-card"><a href="technologies/elasticsearch.html"><h3>Elasticsearch / OpenSearch</h3><p>Lucene inverted index + segments + BM25; HNSW for vectors.</p></a></article>
+        <article class="card topic-card"><a href="technologies/pgvector.html"><h3>pgvector</h3><p>Postgres extension. IVFFlat + HNSW.</p></a></article>
+        <article class="card topic-card"><a href="technologies/pinecone.html"><h3>Pinecone (and Milvus / Weaviate / Qdrant)</h3><p>Dedicated vector stores: HNSW or IVF+PQ.</p></a></article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 3: Analytics -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">3. Analytics / OLAP / Warehousing</h2>
+      <p>Cloud data warehouses, real-time OLAP engines, time-series databases. They overlap heavily &mdash; the question is which to pick and what is the cost shape.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-analytics.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect x="3" y="11" width="3" height="6" stroke="white" stroke-width="1.5"/>
+                <rect x="8.5" y="6" width="3" height="11" stroke="white" stroke-width="1.5"/>
+                <rect x="14" y="9" width="3" height="8" stroke="white" stroke-width="1.5"/>
+              </svg>
+            </span>
+            <h3>Analytics: Comparison</h3>
+            <p>BigQuery, Snowflake, Redshift, ClickHouse, Druid, Pinot, DuckDB, Prometheus, InfluxDB, TimescaleDB.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+
+      <h3 style="margin-top: 1rem;">Per-tech reference pages</h3>
+      <div class="topic-grid">
+        <article class="card topic-card"><a href="technologies/bigquery.html"><h3>BigQuery</h3><p>Dremel + Capacitor columnar + Colossus.</p></a></article>
+        <article class="card topic-card"><a href="technologies/snowflake.html"><h3>Snowflake</h3><p>Micro-partitions + virtual warehouses.</p></a></article>
+        <article class="card topic-card"><a href="technologies/clickhouse.html"><h3>ClickHouse</h3><p>MergeTree columnar + vectorized exec.</p></a></article>
+        <article class="card topic-card"><a href="technologies/duckdb.html"><h3>DuckDB</h3><p>Embedded in-process columnar OLAP.</p></a></article>
+        <article class="card topic-card"><a href="technologies/prometheus.html"><h3>Prometheus</h3><p>Pull-based scrape + TSDB chunks per series.</p></a></article>
+        <article class="card topic-card"><a href="technologies/influxdb.html"><h3>InfluxDB</h3><p>TSI inverted index + TSM log-structured.</p></a></article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 4: Caches -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">4. Caches</h2>
+      <p>Distributed caches, in-process caches, HTTP caches. Cache-aside vs write-through vs read-through; eviction; stampedes.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-caches.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect x="3" y="5" width="14" height="3" stroke="white" stroke-width="1.5"/>
+                <rect x="3" y="9" width="14" height="3" stroke="white" stroke-width="1.5"/>
+                <rect x="3" y="13" width="14" height="3" stroke="white" stroke-width="1.5"/>
+              </svg>
+            </span>
+            <h3>Caches: Comparison</h3>
+            <p>Redis (cache mode), Memcached, Caffeine, Varnish, Nginx proxy_cache, CDN-as-cache.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 5: Messaging -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">5. Messaging (queues, streams, pub/sub)</h2>
+      <p>The single biggest "what should I pick" category after datastores. Log vs queue vs pub/sub; ordering; delivery semantics; retention.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-messaging.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect x="2" y="6" width="3" height="8" stroke="white" stroke-width="1.5"/>
+                <rect x="6" y="6" width="3" height="8" stroke="white" stroke-width="1.5"/>
+                <rect x="10" y="6" width="3" height="8" stroke="white" stroke-width="1.5"/>
+                <line x1="14" y1="10" x2="18" y2="10" stroke="white" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <h3>Messaging: Comparison</h3>
+            <p>Kafka, Pulsar, RabbitMQ, SQS, Kinesis, Pub/Sub, NATS, Redis Streams, ActiveMQ.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+
+      <h3 style="margin-top: 1rem;">Per-tech reference pages</h3>
+      <div class="topic-grid">
+        <article class="card topic-card"><a href="technologies/kafka.html"><h3>Kafka</h3><p>Distributed append-only log + ISR.</p></a></article>
+        <article class="card topic-card"><a href="technologies/rabbitmq.html"><h3>RabbitMQ</h3><p>AMQP smart broker (queues + exchanges).</p></a></article>
+        <article class="card topic-card"><a href="technologies/sqs.html"><h3>SQS</h3><p>Managed pull-based queue, visibility timeout.</p></a></article>
+        <article class="card topic-card"><a href="technologies/pulsar.html"><h3>Pulsar</h3><p>Broker + BookKeeper, tiered storage.</p></a></article>
+        <article class="card topic-card"><a href="technologies/pubsub.html"><h3>Cloud Pub/Sub</h3><p>Global, push or pull.</p></a></article>
+        <article class="card topic-card"><a href="technologies/kinesis.html"><h3>Kinesis</h3><p>Kafka-like, AWS managed shards.</p></a></article>
+        <article class="card topic-card"><a href="technologies/nats.html"><h3>NATS / JetStream</h3><p>Lightweight pub/sub + log.</p></a></article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 6: Stream Processing -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">6. Stream Processing</h2>
+      <p>True streaming vs micro-batch vs library; exactly-once mechanics; stateful operators.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-stream-processing.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M2 10 Q 6 4, 10 10 T 18 10" stroke="white" stroke-width="1.5" fill="none"/>
+              </svg>
+            </span>
+            <h3>Stream Processing: Comparison</h3>
+            <p>Flink, Spark Streaming, Kafka Streams, Beam.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 7: Edge -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">7. Networking Edge (LB / proxy / gateway / mesh / CDN)</h2>
+      <p>Everything between the client and your services. L4 vs L7; reverse proxy vs API gateway vs service mesh; CDN vs proxy; where each layer terminates TLS / authenticates / rate-limits.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-edge.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <circle cx="4" cy="10" r="2" stroke="white" stroke-width="1.5"/>
+                <circle cx="10" cy="10" r="2" stroke="white" stroke-width="1.5"/>
+                <circle cx="16" cy="10" r="2" stroke="white" stroke-width="1.5"/>
+                <line x1="6" y1="10" x2="8" y2="10" stroke="white" stroke-width="1.5"/>
+                <line x1="12" y1="10" x2="14" y2="10" stroke="white" stroke-width="1.5"/>
+              </svg>
+            </span>
+            <h3>Edge: Comparison</h3>
+            <p>Nginx, HAProxy, Envoy, Traefik, Istio, Linkerd, Kong, ALB/NLB, GCLB, CloudFront, Cloudflare, Fastly, Akamai.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 8: Storage -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">8. Storage (object / block / file)</h2>
+      <p>Object vs block vs file. Throughput per prefix; consistency; cost shape; when each is wrong.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-storage.html">
+            <span class="card-icon">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect x="3" y="4" width="14" height="12" rx="2" stroke="white" stroke-width="1.5"/>
+                <line x1="3" y1="8" x2="17" y2="8" stroke="white" stroke-width="1.5"/>
+                <line x1="3" y1="12" x2="17" y2="12" stroke="white" stroke-width="1.5"/>
+              </svg>
+            </span>
+            <h3>Storage: Comparison</h3>
+            <p>S3, GCS, Azure Blob, MinIO, Ceph, EBS / Persistent Disk, EFS / Filestore, HDFS.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 9: Coordination -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">9. Coordination &amp; Service Discovery</h2>
+      <p>CP vs AP discovery; watches, leases, locks; when to not run one yourself.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-coordination.html">
+            <h3>Coordination: Comparison</h3>
+            <p>Zookeeper, etcd, Consul, Eureka.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 10: Compute -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">10. Compute &amp; Orchestration</h2>
+      <p>VM vs container vs container-as-a-service vs serverless function; cold starts; statefulness; cost shape.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-compute.html">
+            <h3>Compute: Comparison</h3>
+            <p>Kubernetes, Nomad, ECS / Fargate, Cloud Run, GKE Autopilot, Lambda / Cloud Functions.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 11: Workflow -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">11. Workflow &amp; Durable Execution</h2>
+      <p>DAG scheduler vs durable execution vs state machine; retries and exactly-once steps; failure visibility.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-workflow.html">
+            <h3>Workflow: Comparison</h3>
+            <p>Airflow, Dagster, Prefect, Argo, Temporal, AWS Step Functions, GCP Workflows.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 12: Observability -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">12. Observability</h2>
+      <p>Metrics, logs, tracing &mdash; the three pillars. Pull vs push metrics; centralized index vs label-based logs; sampling; OpenTelemetry as the unifying spec.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-observability.html">
+            <h3>Observability: Comparison</h3>
+            <p>Prometheus, VictoriaMetrics, Mimir, ELK, Loki, Splunk, Jaeger, Zipkin, OpenTelemetry, Datadog, New Relic.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 13: CDC -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">13. CDC &amp; ETL</h2>
+      <p>Log-based vs query-based CDC; ordering guarantees; schema evolution; warehouse-targeted SaaS vs streaming self-host.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-cdc.html">
+            <h3>CDC: Comparison</h3>
+            <p>Debezium, Maxwell, Canal, Fivetran, Airbyte.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 14: Identity -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">14. Identity / Secrets / Feature Flags</h2>
+      <p>Three sub-pillars covered together. Managed vs self-host; SSO vs CIAM vs B2B; static vs dynamic secrets; in-proc SDK vs server-evaluated flags.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-identity-secrets-flags.html">
+            <h3>Identity / Secrets / Flags: Comparison</h3>
+            <p>OAuth2/OIDC, Keycloak, Auth0, Cognito, Okta, Vault, AWS Secrets Manager, LaunchDarkly, GrowthBook, Unleash.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+        <article class="card topic-card">
+          <a href="technologies/request-ids.html">
+            <h3>Request IDs</h3>
+            <p>Generation (client/edge/app), uniqueness math, UUIDv7 / W3C traceparent / Snowflake / ULID, propagation, request_id vs Idempotency-Key.</p>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Category 15: ML Serving -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 class="category-header">15. ML / LLM Serving</h2>
+      <p>Generic model server vs LLM-specific; throughput vs latency; batching strategies; GPU utilization.</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="technologies/comparison-ml-serving.html">
+            <h3>ML Serving: Comparison</h3>
+            <p>TensorFlow Serving, TorchServe, Triton, vLLM, TGI, Ray Serve, KServe.</p>
+            <span class="badge">Centerpiece</span>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Cloud Equivalents -->
+  <section class="section">
+    <div class="container">
+      <h2 class="category-header">Cross-cutting: Cloud Equivalents</h2>
+      <p>One big matrix mapping each technology to its AWS / GCP / Azure / open-source equivalent. Use this when the interview pivots from "use Cassandra" to "we're on GCP, what do we use?"</p>
+
+      <div class="topic-grid">
+        <article class="card topic-card topic-card-featured">
+          <a href="cloud-equivalents.html">
+            <h3>Cloud Equivalents Matrix</h3>
+            <p>AWS &harr; GCP &harr; Azure &harr; open-source for every category above.</p>
+          </a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <script src="../js/sidebar.js"></script>
+</body>
+</html>

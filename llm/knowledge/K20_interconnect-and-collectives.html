@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K20 — Interconnect &amp; Collectives — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K20 &mdash; Interconnect &amp; Collectives <span style="font-weight:400;font-size:.55em;color:#64748b;">(the master constraint, not FLOPs)</span></h1>
+      <p class="hero-subtitle"><strong>Why is the interconnect topology &mdash; not FLOPs &mdash; the master constraint that decides every parallelism tuple: because each collective (TP all-reduce, EP all-to-all, PP P2P, CP ring) must live on a bandwidth tier it can afford, and the single fact &ldquo;<em>TP stays inside the NVLink domain; everything that crosses it pays the InfiniBand tax</em>&rdquo; is what K6 actually obeys?</strong> This page derives the bandwidth hierarchy + the collective-cost models, then D28 (NCCL cost &amp; rail-aware placement) and D48 (the NVL72 domain-size shift &mdash; the curriculum&rsquo;s master sensitivity).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; the master constraint <a href="K6_parallelism-overview.html">K6</a>/<a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a>/<a href="K9_expert-parallelism.html">K9</a>/<a href="K11_context-parallelism.html">K11</a> obey &bull; cites <a href="K1_serving-fundamentals.html">K1</a> (BW table + collective-cost primitive) / <a href="K5_disaggregated-serving.html">K5</a> / <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a> &bull; dedicated scenario: <strong>L1</strong> &bull; ~18 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the interconnect chain). Approve / redirect the arc, the <strong>bandwidth-hierarchy + collective-cost derivation</strong> (which tier each collective must live on), deep-dive placement (<strong>D28 NCCL cost &amp; rail-aware placement; D48 the NVL72 domain-size shift &mdash; the curriculum&rsquo;s master sensitivity</strong>), the <strong>rule-11 placement/topology spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>) &mdash; honest framing: this is a <em>master-constraint</em> page; it decides which tier a collective lives on so it does not <em>become</em> the bottleneck:
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>TPOT / ITL (primary)</strong> &mdash; the TP all-reduce / EP all-to-all is on the decode critical path; on NVLink it hides, across IB it explodes ~18&times; &mdash; this page keeps it on the affordable tier.</li>
+          <li><strong>TPOT p99 specifically</strong> &mdash; every collective is a barrier, so per-token p99 is the <em>slowest</em> rank&rsquo;s collective, not the mean; this page bounds that tail (in-domain, rail-optimized, contention-isolated &mdash; not just the average case).</li>
+          <li><strong>MFU</strong> &mdash; a collective stalled on the wrong tier &mdash; or an &ldquo;overlapped&rdquo; one still stealing SMs/L2 from the GEMM &mdash; idles or starves every GPU in the group; correct placement <em>and</em> channel/contention tuning keep compute fed.</li>
+          <li><strong>Max feasible TP/EP within budget</strong> &mdash; the NVLink-domain size is the ceiling on in-domain parallelism (the D48 master sensitivity).</li>
+          <li><strong>Constrains K6&rsquo;s tuple</strong> &mdash; &ldquo;TP &le; N_dom; crossing pays the IB tax&rdquo; is the single fact that decides the parallelism tuple (not FLOPs).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Bandwidth is a strict hierarchy (HBM &gg; NVLink &gg; IB &gg; Ethernet); each collective has a cost model and a critical-path position that dictate which tier it <em>must</em> live on; the load-bearing fact is &ldquo;TP stays inside the NVLink domain, everything crossing it pays the IB tax&rdquo;, and that fact &mdash; not FLOPs &mdash; decides K6&rsquo;s tuple; NVL72 enlarges the domain, which is the curriculum&rsquo;s master sensitivity.</p>
+      <ul>
+        <li><strong>Is:</strong> the bandwidth hierarchy + the collective-cost models (which tier each must live on, derived); D28 (NCCL collective-cost &amp; topology / rail-aware placement); D48 (the NVL72-era domain-size shift &mdash; every tuple is dated to <code>N_dom</code>; the formula is the invariant, the number is hardware-dated); the placement/topology rule-11 spectrum.</li>
+        <li><strong>Is not:</strong> the parallelism axes themselves (<a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a>/<a href="K9_expert-parallelism.html">K9</a>/<a href="K11_context-parallelism.html">K11</a> own their mechanics &mdash; each cites the tier its collective lives on); the tuple <em>selection</em> (<a href="K6_parallelism-overview.html">K6</a> &mdash; K20 supplies the constraint K6 obeys); training-collective overlap in backprop (training-side &mdash; the <em>primitive</em> is shared, K20 covers the <em>serving</em> collectives); switch/NIC hardware internals (named, not designed); physical network cabling (DC-eng layer).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The BW table and the generic ring collective-cost primitive are <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s &mdash; this page derives <em>which tier</em> each collective must live on <em>from</em> them, never re-states the primitive. K6 owns tuple selection; K20 owns the constraint. Each parallelism page (K7/K8/K9/K11) owns its collective <em>pattern</em>; K20 owns the <em>tier</em> it runs on. The KV-transport tier choice is shared with <a href="K5_disaggregated-serving.html">K5</a> (K20 owns the tiers + GPUDirect path; K5 owns the transport policy). Domain size = blast radius is the <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a> trade (D48).</div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Interconnect Spine (stated up front, before &sect;1)</h2>
+      <ul>
+        <li><strong>Every parallelism degree (TP/PP/EP/CP) is bounded by which GPUs can talk to which, how fast</strong> &mdash; topology, not FLOPs, is the master constraint.</li>
+        <li>&rarr; the <strong>bandwidth hierarchy</strong>: HBM &gg; NVLink/NVSwitch &gg; IB/RoCE &gg; Ethernet.</li>
+        <li>&rarr; each collective must live on a tier it can afford (<strong>all-reduce/TP on NVLink</strong>; <strong>P2P/PP survives IB</strong>; <strong>all-to-all/EP is the hardest</strong>).</li>
+        <li>&rarr; <strong>the design rule:</strong> TP stays inside the NVLink domain; everything that crosses it pays the IB tax.</li>
+        <li>&rarr; <strong>this single fact decides the K6 tuple</strong> (not FLOPs).</li>
+        <li>&rarr; <strong>but the <code>M/BW</code> cost model is idealized:</strong> even on the right tier the collective steals SMs/L2 from the GEMM it is supposed to hide under (the NCCL channel tax), and the fabric is not a clean pipe &mdash; congestion / all-to-all incast / RoCE-lossless (PFC/ECN/DCQCN) / GPU&harr;NIC NUMA affinity / non-uniform intra-node links.</li>
+        <li>&rarr; <strong>and collectives never run alone:</strong> TP/PP/EP/DP/CP + (under K5) KV-transfer share the same NICs/links and contend; every collective is a synchronization barrier &rArr; per-step p99 = the <em>slowest</em> rank, not the mean (the decode-TPOT-p99 story, jitter-amplified with group size).</li>
+        <li><strong>Problem:</strong> same TP degree, different physical placement &rarr; one is 3&times; slower on the all-reduce (D28).</li>
+        <li>&rarr; ring-vs-tree by message size + rail-optimized placement + topology-aware NCCL + in-network reduction (D28).</li>
+        <li><strong>Master sensitivity:</strong> NVL72 enlarges the NVLink domain &rarr; the IB cliff softens, the tuple shifts, <em>and the fault blast radius grows ~9&times;</em> (D48, the K22 trade).</li>
+        <li><strong>Objective:</strong> place every collective on a tier it can afford; state the assumed <code>N_dom</code> &mdash; the formula is the invariant, the number is hardware-dated.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>parallelism bounded by who-can-talk-how-fast (not FLOPs) &rarr; the bandwidth hierarchy &rarr; each collective must live on a tier it can afford &rarr; the design rule: TP &le; NVLink domain, crossing pays the IB tax &rarr; this decides K6&rsquo;s tuple &rarr; but the <code>M/BW</code> model is idealized: the collective taxes compute (NCCL SMs/L2) &amp; the fabric isn&rsquo;t a clean pipe (congestion / incast / RoCE-lossless) &rarr; and collectives co-run on shared links &amp; every collective is a barrier (p99 = slowest rank) &rarr; problem: same TP, different placement = 3&times; slower (D28) &rarr; ring/tree + rail-optimized + topology-aware NCCL (D28) &rarr; master sensitivity: NVL72 enlarges N_dom (D48) &rarr; objective: every collective on an affordable tier; state N_dom</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 968" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="260" y="16" width="720" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Every parallelism degree is bounded by who-can-talk-how-fast</text>
+        <text class="s" x="620" y="58" text-anchor="middle">topology, NOT FLOPs, is the master constraint &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="100"/>
+        <text class="l" x="636" y="90">the hierarchy</text>
+
+        <rect class="bp" x="260" y="100" width="720" height="56" rx="8"/>
+        <text class="t" x="620" y="124" text-anchor="middle">Bandwidth hierarchy: HBM &gg; NVLink &gg; IB &gg; Ethernet</text>
+        <text class="s" x="620" y="142" text-anchor="middle">order-of-magnitude BW/latency per tier (K1 table) &middot; §2</text>
+
+        <line x1="620" y1="156" x2="620" y2="184"/>
+        <text class="l" x="636" y="174">afford a tier</text>
+
+        <rect class="bp" x="240" y="184" width="760" height="56" rx="8"/>
+        <text class="t" x="620" y="208" text-anchor="middle">Each collective must live on a tier it can afford</text>
+        <text class="s" x="620" y="226" text-anchor="middle">all-reduce/TP &rarr; NVLink &middot; P2P/PP survives IB &middot; all-to-all/EP hardest &middot; §2</text>
+
+        <line x1="620" y1="240" x2="620" y2="268"/>
+        <text class="l" x="636" y="258">the design rule</text>
+
+        <rect class="bc" x="240" y="268" width="760" height="56" rx="8"/>
+        <text class="t" x="620" y="292" text-anchor="middle">TP stays inside the NVLink domain; crossing it pays the IB tax</text>
+        <text class="s" x="620" y="310" text-anchor="middle">this single fact decides the K6 parallelism tuple (not FLOPs) &middot; §3</text>
+
+        <line x1="620" y1="324" x2="620" y2="352"/>
+        <text class="l" x="636" y="342">but the model is idealized</text>
+
+        <rect class="bd" x="220" y="352" width="800" height="56" rx="8"/>
+        <text class="t" x="620" y="376" text-anchor="middle">The ideal M/BW model breaks: the collective also taxes compute &amp; the fabric isn&rsquo;t a clean pipe</text>
+        <text class="s" x="620" y="394" text-anchor="middle">NCCL steals SMs/L2 from the GEMM &middot; congestion / incast / RoCE-lossless / NUMA-NIC affinity &middot; §3</text>
+
+        <line x1="620" y1="408" x2="620" y2="436"/>
+        <text class="l" x="636" y="426">and they co-run</text>
+
+        <rect class="bd" x="220" y="436" width="800" height="56" rx="8"/>
+        <text class="t" x="620" y="460" text-anchor="middle">Collectives never run alone &mdash; TP/PP/EP/DP/CP + KV-transfer share the links</text>
+        <text class="s" x="620" y="478" text-anchor="middle">concurrent-collective contention &middot; every collective is a barrier &rArr; p99 = slowest rank, not mean &middot; §3</text>
+
+        <line x1="620" y1="492" x2="620" y2="520"/>
+        <text class="l" x="636" y="510">problem</text>
+
+        <rect class="bd" x="270" y="520" width="700" height="56" rx="8"/>
+        <text class="t" x="620" y="544" text-anchor="middle">Same TP degree, different physical placement &rarr; 3&times; slower all-reduce</text>
+        <text class="s" x="620" y="562" text-anchor="middle">a ring crossing a slow link / a non-rail-optimized all-to-all &middot; §3</text>
+
+        <line x1="620" y1="576" x2="620" y2="604"/>
+        <text class="l" x="636" y="594">fix (D28)</text>
+
+        <rect class="bs" x="240" y="604" width="760" height="56" rx="8"/>
+        <text class="t" x="620" y="628" text-anchor="middle">D28 &mdash; ring/tree by message size + rail-optimized + topology-aware NCCL</text>
+        <text class="s" x="620" y="646" text-anchor="middle">+ in-network reduction (SHARP) &middot; §3</text>
+
+        <line x1="620" y1="660" x2="620" y2="688"/>
+        <text class="l" x="636" y="678">master sensitivity (D48)</text>
+
+        <rect class="bs" x="240" y="688" width="760" height="56" rx="8"/>
+        <text class="t" x="620" y="712" text-anchor="middle">D48 &mdash; NVL72 enlarges N_dom: IB cliff softens, tuple shifts</text>
+        <text class="s" x="620" y="730" text-anchor="middle">AND the fault blast radius grows ~9&times; (the K22 trade) &middot; §3</text>
+
+        <line x1="620" y1="744" x2="620" y2="772"/>
+        <text class="l" x="636" y="762">policy varies</text>
+
+        <rect class="bs" x="250" y="772" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="796" text-anchor="middle">Rule 11 &mdash; the placement/topology spectrum</text>
+        <text class="s" x="620" y="814" text-anchor="middle">random &rarr; node-local &rarr; rail-optimized &rarr; topology-aware + in-network &middot; §3</text>
+
+        <line x1="620" y1="828" x2="620" y2="856"/>
+
+        <rect class="bc" x="270" y="856" width="700" height="64" rx="8"/>
+        <text class="t" x="620" y="880" text-anchor="middle">Objective: every collective on a tier it can afford</text>
+        <text class="s" x="620" y="898" text-anchor="middle">state the assumed N_dom &mdash; the formula is the invariant &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; parallelism is bounded by who-can-talk-how-fast; topology, not FLOPs, is the master constraint.</li>
+        <li><span class="bp">&#9313;</span> <strong>The hierarchy</strong> &mdash; HBM &gg; NVLink &gg; IB &gg; Ethernet (K1&rsquo;s table).</li>
+        <li><span class="bp">&#9314;</span> <strong>Afford a tier</strong> &mdash; all-reduce/TP &rarr; NVLink; P2P/PP survives IB; all-to-all/EP is the hardest.</li>
+        <li><span class="bc">&#9315;</span> <strong>The design rule</strong> &mdash; TP &le; NVLink domain; crossing pays the IB tax; this decides K6&rsquo;s tuple.</li>
+        <li><span class="bd">&#9316;</span> <strong>The model is idealized (NEW)</strong> &mdash; even on the right tier the collective steals SMs/L2 from the GEMM it hides under (the NCCL channel tax), and the fabric is not a clean <code>M/BW</code> pipe: congestion, all-to-all incast, RoCE-lossless (PFC/ECN/DCQCN) fragility, GPU&harr;NIC NUMA affinity, non-uniform intra-node links.</li>
+        <li><span class="bd">&#9317;</span> <strong>They co-run (NEW)</strong> &mdash; TP/PP/EP/DP/CP + K5 KV-transfer contend on the same NICs/links; every collective is a synchronization barrier &rArr; per-step p99 = the slowest rank, not the mean (jitter-amplified with group size &mdash; the decode-TPOT-p99 story).</li>
+        <li><span class="bd">&#9318;</span> <strong>Problem</strong> &mdash; same TP, different placement &rarr; 3&times; slower all-reduce.</li>
+        <li><span class="bs">&#9319;</span> <strong>D28</strong> &mdash; ring/tree by message size + rail-optimized + topology-aware NCCL + in-network reduction.</li>
+        <li><span class="bs">&#9320;</span> <strong>D48</strong> &mdash; NVL72 enlarges <code>N_dom</code>: IB cliff softens, tuple shifts, blast radius ~9&times; (the K22 trade).</li>
+        <li><span class="bs">&#9321;</span> <strong>Rule 11</strong> &mdash; the placement/topology spectrum, each with its cliff + named system.</li>
+        <li><span class="bc">&#9322;</span> <strong>Objective</strong> &mdash; every collective on an affordable tier; state the assumed <code>N_dom</code> (formula is the invariant).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> every parallelism page (K7&ndash;K11) introduces a collective on a critical path, and whether that collective is free or fatal is decided <em>not</em> by FLOPs but by which physical link it runs over &mdash; the same TP=8 is fine on NVLink and catastrophic across InfiniBand. Without a single owner of &ldquo;which tier does each collective live on&rdquo;, every parallelism decision is a guess. <b>Solution (what the page builds):</b> the bandwidth hierarchy + the per-collective cost model that says which tier each <em>must</em> live on, and the one design rule that decides the K6 tuple.<span class="meta">number: the all-reduce time on NVLink vs across IB on the trace (the ~18&times; cliff) &mdash; cites K1 (BW table + ring primitive) &middot; canonical: llm-bottlenecks.html (interconnect saturation)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where collectives live &mdash; inserted by the parallelism layer; K20 owns the tier they run on</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader needs to see who owns what. <b>Solution:</b> the parallelism layer inserts the collectives (TP &rarr; an all-reduce per block, EP &rarr; two all-to-alls per MoE layer, PP &rarr; P2P between stages, CP &rarr; a ring per step) &mdash; <a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a>/<a href="K9_expert-parallelism.html">K9</a>/<a href="K11_context-parallelism.html">K11</a> own the <em>patterns</em>; <strong>K20 owns which physical tier each runs on</strong> and the topology/placement that decides its real cost. State this before any math.<span class="meta">no number (placement fact) &mdash; cites K7/K8/K9/K11 (the collective patterns), K1 (the ring primitive) &middot; diagram: the collectives annotated on a forward pass, each tagged with its required tier (NVLink / IB / ring)</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; TP=8 on NVLink vs TP=16 across IB</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 <code>&quot;I like cat, why?&quot;</code> through a TP-sharded model. <b>Prefill &amp; decode, TP=8 inside one NVLink domain (~0.9 TB/s):</b> each transformer block runs the sharded QKV/MLP, then one all-reduce recombines the shards; on NVLink that all-reduce hides under the next matmul &rarr; per-token latency is fine. <b>TP=16 spanning two nodes over IB (~50 GB/s):</b> the <em>same</em> all-reduce now crosses InfiniBand &rarr; it explodes ~18&times; &rarr; per-token latency collapses even though FLOPs are unchanged. Show with-vs-without staying inside the NVLink domain explicitly on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 (D28 puts the ring-cost numbers + the ~18&times; cliff in) &middot; diagram: the per-block all-reduce on NVLink (hidden) vs across IB (exposed, ~18&times;) on this trace</span></p>
+
+      <h3 id="pd-asymmetry">Prefill vs decode are different collective regimes (the asymmetry &mdash; mirrors K1/K2&rsquo;s roofline spine)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (curriculum prefill/decode spine, applied to collectives).</span> <b>Problem:</b> &ldquo;the all-reduce&rdquo; is treated as one cost, but prefill and decode hit the <em>same</em> collective in opposite regimes. <b>Solution, derived:</b> the per-block all-reduce message is <code>B&middot;s&middot;d_model&middot;2&nbsp;B</code> &mdash; in <strong>prefill</strong> <code>s</code> is the whole prompt &rArr; a large message &rArr; <em>bandwidth-bound</em>, the ring&rsquo;s <code>M/BW</code> term dominates; in <strong>decode</strong> <code>s=1</code> (one new token) &rArr; a tiny message &rArr; <em>latency-bound</em>, the ring&rsquo;s <code>2(N&minus;1)/N</code> hop term + fixed kernel-launch dominate, and this collective is on the critical path of <em>every token</em>. This asymmetry is <em>why</em> ring-vs-tree (D28) is decided at decode message sizes and why decode p99 is collective-tail-bound, not BW-bound.<span class="meta">number: prefill vs decode all-reduce message size on the trace + which ring term dominates each &mdash; cites K1 (#prefill/#decode + ring primitive), K2 (the decode message is one token of KV-width activation)</span></p>
+
+      <h3 id="derive">The bandwidth hierarchy + which tier each collective must live on (derived &mdash; the page&rsquo;s home)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> &ldquo;the network&rdquo; is treated as one thing; it is a strict hierarchy and each collective belongs to a specific rung. <b>Solution, derived:</b> (a) the <strong>tiers</strong> with order-of-magnitude BW/latency (cite <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s table): HBM (~TB/s, intra-GPU) &rarr; NVLink/NVSwitch (~0.9 TB/s/GPU, intra-domain) &rarr; IB/RoCE (~50 GB/s/NIC, inter-node) &rarr; Ethernet (DC); (b) the <strong>collective costs</strong> from the ring model (cite <a href="K1_serving-fundamentals.html">K1</a>&rsquo;s primitive &mdash; applied, not re-derived): all-reduce <code>&asymp; 2&middot;(N&minus;1)/N&middot;M/BW</code> (TP, per layer, on the critical path &rArr; <em>must</em> be NVLink); all-to-all (EP, bisection-bound, N&sup2; data-dependent payloads &mdash; the hardest); P2P (PP, latency-tolerant &rArr; survives IB); KV-transfer (disaggregation/CP); (c) derive <strong>which tier each must live on</strong> from its critical-path position and volume &mdash; that is the constraint <a href="K6_parallelism-overview.html">K6</a> obeys.<span class="meta">number: the per-collective cost on each tier on the trace &rarr; the tier each lands on &mdash; cites K1 (BW table + ring primitive) &middot; diagram: a tier ladder with each collective placed on its required rung + the IB-tax cliff drawn between NVLink and IB</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">The hierarchy &amp; the design rule (the must-cover map)</h3>
+      <p class="stub"><span class="ps">Stub (the Must-cover list, condensed).</span> intra-GPU HBM &rarr; NVLink/NVSwitch (intra-node, the TP ceiling) &rarr; NVLink domain / NVL72 (the new &ldquo;node&rdquo;) &rarr; IB/RoCE rails (inter-node, the PP/EP-across-nodes regime) &rarr; Ethernet (DC). The collective-cost models + which tier each must live on; rail-optimized topology &amp; why EP all-to-all is the hardest collective; GPUDirect-RDMA for KV handoff (&rarr; <a href="K5_disaggregated-serving.html">K5</a>); <strong>the design rule:</strong> TP stays inside the NVLink domain; everything that must cross it pays the IB tax &rArr; this is the single fact that decides the parallelism tuple in <a href="K6_parallelism-overview.html">K6</a>.<span class="meta">no new number &mdash; cites K1 (BW table), K6 (the tuple this constrains), K5 (KV-transport tier) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the bandwidth tier ladder</strong>HBM &rarr; NVLink/NVSwitch &rarr; NVLink-domain/NVL72 &rarr; IB/RoCE rails &rarr; Ethernet; each collective (TP all-reduce, EP all-to-all, PP P2P, CP ring, KV-transfer) placed on its rung; the IB-tax cliff highlighted. Drawn after arc approval.</div>
+
+      <h3 id="idealized">The <code>M/BW</code> model is idealized &mdash; two ways the real cost is higher</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (NEW &mdash; page-level consideration, not a new catalog D-number).</span> The &sect;2 derivation prices every collective at the ideal <code>M/BW</code>. Two production realities make it strictly worse, each Problem&rarr;Solution:
+        <br><b>(a) The collective is not free even when &ldquo;overlapped&rdquo;.</b> <em>Problem:</em> NCCL all-reduce/all-to-all kernels consume SMs + L2 bandwidth that the GEMM needs &rarr; an all-reduce hidden under the next matmul still <em>slows that matmul</em> (the comm&ndash;compute SM-contention tax) &mdash; so &ldquo;it hides on NVLink&rdquo; is necessary but not sufficient. <em>Solution:</em> tune the NCCL channel/SM count (<code>NCCL_MIN/MAX_NCHANNELS</code>) so the collective takes just enough SMs to stay hidden without starving compute. <em>Rule of two:</em> <a href="K7_tensor-parallelism.html">K7</a>/D37 &amp; <a href="K9_expert-parallelism.html">K9</a>/D30 own the <em>overlap technique</em>; K20 owns <em>the SM-contention tax that bounds how much can overlap</em>.
+        <br><b>(b) The fabric is not a clean pipe.</b> <em>Problem:</em> IB/RoCE fat-trees suffer static-routing (ECMP) hash collisions, congestion, and all-to-all <strong>incast</strong> (many senders &rarr; one receiver &rarr; switch-buffer overflow &rarr; drops/retransmit storms); RoCE specifically needs lossless config (PFC/ECN/DCQCN) and is fragile vs native IB; GPUDirect needs GPU&harr;NIC PCIe/NUMA affinity or it bounces through host RAM; not every intra-node link is NVLink (PCIe-only nodes / NVLink &ldquo;islands&rdquo;). <em>Solution:</em> adaptive routing + congestion control, RoCE DCQCN tuning (or pay for native IB), NUMA-aware NIC&harr;GPU pinning, and treat real achieved BW (not spec) in the cost model.<span class="meta">numbers: SM-contention slowdown of the overlapped GEMM (% of a decode step); incast/congestion achieved-BW vs ideal <code>M/BW</code> on the trace &mdash; cites K1 (BW table + ring primitive), K5 (KV-transfer shares the fabric) &middot; real: NCCL channel tuning, NCCL/IB adaptive routing, RoCEv2 DCQCN, GPUDirect-RDMA NUMA affinity + URLs &middot; canonical: llm-bottlenecks.html (interconnect saturation)</span></p>
+
+      <h3 id="co-run">Collectives don&rsquo;t run alone &mdash; concurrent contention + the barrier tail</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (NEW &mdash; page-level consideration, not a new catalog D-number).</span>
+        <br><b>(a) Concurrent-collective interference.</b> <em>Problem:</em> a frontier deployment runs TP all-reduce (NVLink) inside DP replicas <em>while</em> EP all-to-all + PP P2P + (under <a href="K5_disaggregated-serving.html">K5</a>) the KV-transfer all hit the <em>same</em> IB rails simultaneously &rarr; they contend for the same NICs/links, so a collective&rsquo;s real cost depends on what else is in flight, not just its own <code>M/BW</code>. <em>Solution:</em> dedicate rails to specific collectives, NCCL stream priorities, fabric traffic classes/QoS. <em>Rule of two:</em> <a href="K6_parallelism-overview.html">K6</a> picks the tuple; K20 models the link contention <em>between</em> the chosen axes&rsquo; collectives (and K5&rsquo;s KV-transfer as one more flow on the same wires).
+        <br><b>(b) Every collective is a barrier &rArr; p99 = the slowest rank.</b> <em>Problem:</em> a collective synchronizes all ranks, so per-step latency is the <em>max</em> over ranks, not the mean; jitter sources (a noisy shared link, thermal throttle on one GPU, an ECC scrub, OS jitter, an unlucky NCCL channel) get amplified as group size grows &mdash; and at decode this barrier is on the critical path <em>every token</em>, so it directly sets TPOT p99. <em>Solution:</em> bound the tail at the source (in-domain, rail-optimized, contention-isolated, jitter-monitored), not just the average. <em>Rule of two:</em> <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a> owns collective <em>faults</em> (a dead/stuck rank); K20 owns the <em>tail/jitter of a healthy collective</em>.<span class="meta">numbers: TPOT p99/p50 spread vs group size from the barrier-max model; the per-token cost of one contended rail on the trace &mdash; cites K1 (#decode + ring primitive, the SLI list), K5 (KV-transfer as a co-tenant flow) &middot; canonical: llm-bottlenecks.html (interconnect saturation)</span></p>
+
+      <h3 id="d28" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D28 &mdash; NCCL collective-cost &amp; topology / rail-aware placement</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> same TP degree, different physical placement &rarr; one is 3&times; slower on the all-reduce (a ring crossing a slow link, or a non-rail-optimized all-to-all oversubscribing a switch). <b>Solution:</b> ring-vs-tree all-reduce by message size, rail-optimized placement (each GPU&rsquo;s NIC on its own rail so all-to-all doesn&rsquo;t oversubscribe), topology-aware NCCL communicators, in-network reduction. <b>Crossover:</b> ring (BW-optimal, large <code>M</code>) vs tree (latency-optimal, small <code>M</code>); placement that keeps the heaviest collective on the fastest tier.<span class="meta">number: ring vs tree all-reduce time at the trace&rsquo;s message size; the 3&times; placement penalty &mdash; cites K1 (ring/tree primitive) &middot; real: NCCL topology detection, NVIDIA SHARP, rail-optimized DGX/SuperPOD + URLs</span></p>
+
+      <h3 id="d48" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D48 &mdash; the NVL72-era domain-size shift (the curriculum&rsquo;s master sensitivity)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> every tuple, every &ldquo;must use PP across nodes&rdquo;, every EP ceiling is <em>dated</em> to the NVLink-domain size; GB200 NVL72 makes the &ldquo;node&rdquo; 72 GPUs not 8 &rarr; TP/EP that needed IB now fit in-domain &rarr; the IB cliff softens, the optimal tuple shifts, <strong>and the fault blast radius grows ~9&times;</strong> (<a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a>). <b>Solution:</b> every parallelism derivation must <em>state its assumed <code>N_dom</code></em> and treat it as the variable; the curriculum&rsquo;s invariant is the <em>formula</em> (TP &le; <code>N_dom</code>; cross-domain pays IB), the <em>number</em> is hardware-dated. <b>Crossover:</b> at <code>N_dom</code>, max in-domain TP/EP = <code>N_dom</code>; as <code>N_dom</code> grows, PP-across-domains recedes but per-fault blast radius grows &rarr; resilience now trades against parallelism efficiency.<span class="meta">number: the tuple at N_dom=8 vs N_dom=72 on the trace + the ~9&times; blast-radius growth &mdash; cites K1 (BW), K22 (blast radius) &middot; real: NVIDIA GB200 NVL72, GH200 + URLs &middot; cross-link L1 (its tuple depends entirely on the assumed N_dom)</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the placement/topology spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> naive random placement (collectives cross slow links unpredictably) &rarr; node-local (TP within a node) &rarr; rail-optimized (NIC-per-rail; all-to-all doesn&rsquo;t oversubscribe) &rarr; topology-aware + in-network reduction (SHARP; SoTA). Each: what it places on, the two-sided cliff, the named system.<span class="meta">number: the collective-cost delta across the four placements on the trace &mdash; cites K1 (ring primitive) &middot; real: random, node-local, rail-optimized DGX/SuperPOD, NVIDIA SHARP + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Assumed <code>N_dom</code>:</b> the D48 master variable &mdash; every tuple is stated relative to it. <b>Ring vs tree:</b> the D28 message-size crossover. <b>Placement policy:</b> the rule-11 spectrum. <b>Which collective on which tier:</b> the derived constraint (all-reduce/NVLink, P2P/IB-ok, all-to-all/hardest). <b>Collective message dtype:</b> reducing/exchanging in FP8 halves <code>M</code> &rarr; ~halves the collective time (ties <a href="K14_quantization.html">K14</a>); cliff = low-precision reduction error, so gate on eval. <b>NCCL channel/SM count:</b> the comm&ndash;compute SM-contention knob from &sect;3 (<a href="#idealized">idealized-model</a>) &mdash; too few channels = collective not hidden, too many = GEMM starved. Each with its chosen value, reason, and cliff on each side.<span class="meta">numbers: per-knob crossover (composes with D28 / D48 / rule-11 / the idealized-model + co-run sections) &middot; cites K14 (FP8 collective)</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Treat the network as one flat fabric</b> &mdash; disq: ignores the order-of-magnitude IB-tax cliff &rarr; TP across IB collapses; <em>wins</em> never (it is the naive baseline this page refutes). (b) <b>More TP across nodes to fit a bigger model</b> &mdash; disq: the per-layer all-reduce crosses IB &rarr; ~18&times; slower; <em>wins</em> never &mdash; use PP across domains instead (the K6/K8 escape). (c) <b>Slower Ethernet instead of IB/RoCE for inter-node</b> &mdash; disq: even PP P2P struggles; <em>wins</em> only for embarrassingly-parallel DP-replica traffic with no cross-replica collective. (d) <b>Designing the switch/NIC silicon</b> &mdash; disq: that is hardware engineering, not serving topology; <em>out of scope</em> &mdash; name the parts, flag the boundary, do not cover.<span class="meta">number: the crossover disqualifying each (IB-tax for (a)/(b); Ethernet collective cost for (c)) &mdash; cites K1 (BW table), K6/K8 (the PP escape) &middot; contrast L1 (tuple depends on N_dom)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Interconnect saturation</b> &mdash; TP all-reduce / EP all-to-all exceeds the NVLink-domain BW &rarr; the collective is the bottleneck, every GPU in the group idles; first move: keep it in-domain / rail-optimize (llm-bottlenecks.html &mdash; interconnect saturation). <b>TP-across-IB collapse</b> &mdash; TP exceeded <code>N_dom</code> &rarr; ~18&times; per-token latency; first move: cap TP at <code>N_dom</code>, switch to PP (llm-bottlenecks.html). <b>Non-rail-optimized all-to-all</b> &mdash; oversubscribes a switch &rarr; the slowest rank gates EP; first move: rail-aware placement (llm-bottlenecks.html &mdash; hot-expert/all-to-all). <b>NVL72 blast-radius surprise</b> &mdash; bigger domain &rarr; a single fault takes down ~9&times; more GPUs (gpu-failure-modes.html &mdash; GPU-group blast radius; the D48/K22 trade). <b>Stale topology assumption</b> &mdash; a derivation that hard-coded <code>N_dom=8</code> is wrong on NVL72 (gpu-failure-modes.html &mdash; version/hardware-mismatch). <b>Degraded (not dead) interconnect &mdash; silent BW loss (NEW)</b> &mdash; an NVLink lane CRC-replaying down to lower BW, IB symbol-error rate climbing, or NCCL routing around a dead link at reduced bisection &rarr; throughput drops ~30% with <em>nothing crashing</em> (the interconnect analog of D50&rsquo;s compute SDC); first move: alert on NVLink replay / IB symbol-error / NCCL-route-change counters, not just on dead processes (gpu-failure-modes.html &mdash; degraded-link silent BW loss). <em>Rule of two:</em> <a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a>/D50 owns compute SDC + dead/stuck rank; K20 owns <em>degraded-link</em> detection. <b>Communicator cold-start (NEW)</b> &mdash; <code>ncclCommInitRank</code> + the topology all-gather is seconds; a group reformed after a K22 fault must rebuild its communicator before serving &rarr; this adds to the <a href="K21_fast-model-loading-and-cold-start.html">K21</a> cold-start / K22 fast-reformation budget (K20 owns the comm-setup cost; K21/K22 own the budget it feeds).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (interconnect saturation, TP-across-IB, all-to-all), llm/canonicals/gpu-failure-modes.html (NVL72 blast radius, stale-topology, degraded-link silent BW loss); cross-link K22/D50, K21 &middot; <b>ACTION: seed/extend these canonical entries (incl. the new degraded-link entry) in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> NVIDIA NCCL (topology detection, ring/tree all-reduce, communicators, channel/SM tuning, adaptive routing), NVIDIA SHARP (in-network reduction), NVLink / NVSwitch / NVL72 &amp; GH200 (the domain), InfiniBand vs RoCEv2 + DCQCN (the lossless-fabric choice &amp; its fragility), rail-optimized DGX / SuperPOD reference topology, GPUDirect-RDMA + NUMA-aware NIC&harr;GPU pinning (the KV-handoff path for K5), DCGM / NVLink-replay &amp; IB-symbol-error counters (degraded-link detection). Each: which tier / which placement or realism consideration it realises + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> (its tuple depends entirely on the assumed <code>N_dom</code> &mdash; D48/D28 load-bearing); <a href="../scenarios/L3-long-context-serving.html">L3</a> (the CP ring over the fabric &mdash; D28). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html">K1</a> &mdash; the BW table + the collective-cost primitive; K20 derives <em>which tier</em> from these.</li>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; K20 is the master constraint K6&rsquo;s selection obeys.</li>
+        <li><a href="K7_tensor-parallelism.html">K7</a>/<a href="K8_pipeline-parallelism.html">K8</a>/<a href="K9_expert-parallelism.html">K9</a>/<a href="K11_context-parallelism.html">K11</a> &mdash; each cites the tier its collective lives on (TP/NVLink, PP/IB, EP/all-to-all, CP/ring); K7/D37 &amp; K9/D30 own the overlap technique, K20 owns the SM-contention tax that bounds it.</li>
+        <li><a href="K5_disaggregated-serving.html">K5</a> &mdash; the KV-transport tier + the GPUDirect-RDMA path; K5&rsquo;s KV-transfer is also a co-tenant flow on the same NICs in the concurrent-contention section.</li>
+        <li><a href="K22_fault-tolerance-multi-gpu-inference.html">K22</a> &mdash; domain size = blast radius; the D48 resilience trade (NVL72 enlarges it); K22/D50 owns compute SDC + dead/stuck rank, K20 owns degraded-link silent-BW-loss detection.</li>
+        <li><a href="K14_quantization.html">K14</a> &mdash; FP8 collective message dtype halves <code>M</code> (the knob in &sect;3).</li>
+        <li><a href="K21_fast-model-loading-and-cold-start.html">K21</a> &mdash; communicator init/reformation cost feeds K21&rsquo;s cold-start &amp; K22&rsquo;s fast-reformation budget.</li>
+        <li><strong>Out of scope (named, not covered):</strong> training-collective overlap in backprop (training-side &mdash; the primitive is shared, K20 covers serving collectives); switch/NIC hardware internals (named, not designed); physical network cabling (DC-eng layer).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

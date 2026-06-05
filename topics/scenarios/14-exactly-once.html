@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exactly-Once Payment Processing — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Exactly-Once Payment Processing</h1>
+      <p class="hero-subtitle">When a network hiccup can double-charge a customer $50, how do you build a payment pipeline that processes every transaction exactly once &mdash; even when components crash and retry?</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are designing the core payment processing pipeline for an e-commerce platform. Every payment involves three atomic operations:</p>
+      <ol class="full-width">
+        <li><strong>Debit</strong> the customer's account (reduce their balance).</li>
+        <li><strong>Credit</strong> the merchant's account (increase their balance).</li>
+        <li><strong>Record</strong> the transaction in the ledger (audit trail).</li>
+      </ol>
+
+      <div>
+        <h3>Scale</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Payment rate</td><td>1,000 payments/sec</td></tr>
+              <tr><td>Daily volume</td><td>86.4 million payments/day</td></tr>
+              <tr><td>Average payment amount</td><td>$50</td></tr>
+              <tr><td>Daily transaction value</td><td>$4.32 billion/day</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>The Non-Negotiable Requirements</h3>
+        <ul>
+          <li><strong>Never double-charge a customer.</strong> If a payment is processed twice, the customer loses $50 they should not have been charged. At scale, even a tiny duplicate rate is catastrophic.</li>
+          <li><strong>Never lose a payment.</strong> If the customer is debited but the merchant is not credited, money vanishes. The ledger must be consistent.</li>
+          <li><strong>Survive crashes and retries.</strong> Networks drop packets. Consumers crash. Kafka redelivers messages. The system must handle all of these without corrupting financial data.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>Let us quantify the cost of duplicates to understand why "mostly correct" is unacceptable for payments.</p>
+
+      <div>
+        <h3>Cost of Duplicate Processing</h3>
+        <pre class="line-numbers"><code class="language-text">Payments per day:           86,400,000
+Average payment:            $50
+
+If 0.01% are duplicated (1 in 10,000):
+  Duplicates per day:       8,640
+  Double-charged amount:    8,640 x $50 = $432,000/day
+
+If 0.1% are duplicated (1 in 1,000):
+  Duplicates per day:       86,400
+  Double-charged amount:    86,400 x $50 = $4,320,000/day
+
+If 1% are duplicated:
+  Double-charged amount:    $43,200,000/day</code></pre>
+      </div>
+
+      <div>
+        <h3>How Often Do Failures Actually Happen?</h3>
+        <p>At 1,000 payments/sec, even rare events happen frequently:</p>
+        <pre class="line-numbers"><code class="language-text">Network packet loss rate:  ~0.01% (typical cloud)
+  = 0.1 payments/sec affected = 8,640/day
+
+Consumer crash rate:       ~1 crash per hour (aggressive but realistic)
+  Each crash redelivers the last batch (~100 messages)
+  = 24 x 100 = 2,400 redeliveries/day
+
+Kafka redelivery (ack lost): ~0.001%
+  = 0.01/sec = 864/day
+
+Total events that could cause duplicates: ~12,000/day</code></pre>
+        <p>Without idempotency protection, each of these events could produce a duplicate charge. The system <em>will</em> encounter these failures daily.</p>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <strong>Even 0.01% duplicates cost $432,000 per day.</strong> This is not a rounding error. Customers will notice, dispute charges, lose trust, and regulators will intervene. The duplicate rate must be effectively zero.
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Failure Scenarios                                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="failure-scenarios">
+    <div class="container">
+      <h2>Three Failure Scenarios That Cause Duplicates</h2>
+      <p>Before designing solutions, let us understand exactly how duplicates arise. Each scenario is a different point in the pipeline where a failure causes a retry, and the retry produces a duplicate.</p>
+
+      <div>
+        <h3>Scenario 1: Producer Retry &rarr; Duplicate Message in Kafka</h3>
+        <pre class="line-numbers"><code class="language-text">Timeline:
+  T1: Producer sends payment P1 to Kafka.
+  T2: Kafka writes P1 to the partition log. Success.
+  T3: Kafka sends ACK back to producer.
+  T4: ACK is lost in the network (packet drop, timeout).
+  T5: Producer waits for ACK, times out, assumes failure.
+  T6: Producer retries: sends P1 again.
+  T7: Kafka writes P1 (again) to the partition log.
+
+Result: Kafka now has TWO copies of payment P1.
+Consumer will process P1 twice = double charge.</code></pre>
+      </div>
+
+      <div>
+        <h3>Scenario 2: Consumer Crash &rarr; Kafka Redelivery</h3>
+        <pre class="line-numbers"><code class="language-text">Timeline:
+  T1: Consumer reads payment P1 from Kafka.
+  T2: Consumer processes P1: debits customer $50. Balance: $500 → $450.
+  T3: Consumer crashes BEFORE committing its Kafka offset.
+  T4: Consumer restarts.
+  T5: Kafka sees no offset commit for P1. Redelivers P1.
+  T6: Consumer reads P1 again.
+  T7: Consumer processes P1 again: debits customer $50. Balance: $450 → $400.
+
+Result: Customer debited twice. Balance should be $450 but is $400.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Scenario 3: Partial Processing &rarr; Inconsistent State</h3>
+        <pre class="line-numbers"><code class="language-text">Timeline:
+  T1: Consumer reads payment P1 from Kafka.
+  T2: Consumer debits customer $50. Balance: $500 → $450. Success.
+  T3: Consumer tries to credit merchant $50. Merchant service is down.
+  T4: Consumer retries credit later. Also retries debit (defensive retry).
+  T5: Debit executes again: $450 → $400.
+  T6: Credit executes: merchant receives $50.
+
+Result: Customer charged $100 instead of $50.
+  Merchant received $50. $50 has vanished.</code></pre>
+      </div>
+
+      <p class="full-width">Each scenario involves a different component (producer, consumer, downstream service), but the root cause is the same: <strong>a retry re-executes an operation that already succeeded</strong>.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 700 200" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#2563eb"/>
+            </marker>
+            <marker id="arrowGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#94a3b8"/>
+            </marker>
+          </defs>
+
+          <!-- Payment API -->
+          <rect x="10" y="70" width="120" height="55" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="70" y="93" text-anchor="middle" font-weight="600" fill="#2563eb">Payment API</text>
+          <text x="70" y="110" text-anchor="middle" fill="#64748b" font-size="10">sends payment</text>
+
+          <!-- Arrow API -> Kafka -->
+          <line x1="130" y1="97" x2="185" y2="97" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+
+          <!-- Kafka -->
+          <rect x="190" y="70" width="130" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="255" y="93" text-anchor="middle" font-weight="600" fill="#334155">Kafka</text>
+          <text x="255" y="110" text-anchor="middle" fill="#64748b" font-size="10">payments topic</text>
+
+          <!-- Arrow Kafka -> Consumer -->
+          <line x1="320" y1="97" x2="375" y2="97" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+
+          <!-- Payment Consumer -->
+          <rect x="380" y="60" width="130" height="75" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="445" y="83" text-anchor="middle" font-weight="600" fill="#2563eb">Payment</text>
+          <text x="445" y="99" text-anchor="middle" font-weight="600" fill="#2563eb">Consumer</text>
+          <text x="445" y="120" text-anchor="middle" fill="#64748b" font-size="10">no idempotency</text>
+
+          <!-- Arrow Consumer -> Debit DB -->
+          <line x1="445" y1="135" x2="410" y2="170" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+
+          <!-- Arrow Consumer -> Credit DB -->
+          <line x1="445" y1="135" x2="490" y2="170" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)"/>
+
+          <!-- Debit DB -->
+          <rect x="560" y="60" width="120" height="35" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="620" y="82" text-anchor="middle" fill="#1e40af" font-size="11">No dedup</text>
+
+          <!-- Debit DB -->
+          <rect x="355" y="172" width="100" height="28" rx="6" fill="#fef2f2" stroke="#fca5a5" stroke-width="1"/>
+          <text x="405" y="190" text-anchor="middle" fill="#ef4444" font-size="11">Debit DB</text>
+
+          <!-- Credit DB -->
+          <rect x="470" y="172" width="100" height="28" rx="6" fill="#fef2f2" stroke="#fca5a5" stroke-width="1"/>
+          <text x="520" y="190" text-anchor="middle" fill="#ef4444" font-size="11">Credit DB</text>
+
+          <!-- Warning annotation -->
+          <text x="620" y="112" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">No idempotency.</text>
+          <text x="620" y="128" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">No transactions.</text>
+          <text x="620" y="144" text-anchor="middle" fill="#ef4444" font-size="11">Every failure = duplicate</text>
+        </svg>
+      </div>
+
+      <ol class="full-width">
+        <li>Payment API receives a payment request, publishes to Kafka.</li>
+        <li>Consumer reads from Kafka, debits the customer's account in the database.</li>
+        <li>Consumer credits the merchant's account in the database.</li>
+        <li>Consumer commits its Kafka offset.</li>
+      </ol>
+      <p class="full-width">No idempotency checks. No transactional guarantees across the debit and credit. Every failure scenario above will produce duplicates or inconsistencies.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr><th>Failure</th><th>What Happens</th><th>Impact</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Producer ACK lost</td><td>Duplicate message in Kafka</td><td>Consumer processes payment twice</td></tr>
+            <tr><td>Consumer crash after debit</td><td>Kafka redelivers, debit re-executes</td><td>Customer double-charged</td></tr>
+            <tr><td>Consumer crash between debit and credit</td><td>Debit succeeded, credit did not</td><td>Money vanishes (debit without credit)</td></tr>
+            <tr><td>Credit service temporarily down</td><td>Consumer retries entire flow</td><td>Debit re-executes on retry</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="full-width">At 1,000 payments/sec with a conservative 0.1% failure rate, that is <strong>1 problematic payment every second</strong>, or 86,400 per day. Each one is a potential double-charge or lost payment.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Idempotent Producer + Consumer Idempotency Key   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Idempotency at Every Layer</h2>
+
+      <div>
+        <h3>Fixing Scenario 1: Kafka Idempotent Producer</h3>
+        <p>Kafka provides a built-in mechanism for producer-side deduplication. When you enable <code>enable.idempotence=true</code>, Kafka assigns each producer a unique <strong>Producer ID (PID)</strong> and each message a <strong>sequence number</strong>. The broker tracks the last sequence number for each (PID, partition) pair.</p>
+
+        <pre class="line-numbers"><code class="language-text">How it works:
+
+  Producer sends:  { PID: 42, seq: 7, payload: "payment P1" }
+  Kafka writes it: partition log now has (PID=42, seq=7, P1)
+  Kafka sends ACK.
+
+  ACK is lost. Producer retries:
+  Producer sends:  { PID: 42, seq: 7, payload: "payment P1" }  (same seq!)
+  Kafka checks:    PID=42, last seq for this PID = 7. Already seen!
+  Kafka responds:  ACK (but does NOT write a duplicate)
+
+Result: Kafka topic has exactly one copy of P1, even though the producer sent it twice.</code></pre>
+
+        <div class="callout callout-info">
+          <strong>Cost:</strong> Enabling idempotent producers has near-zero performance overhead. It is a one-line configuration change. There is no reason not to enable it for any Kafka producer.
+        </div>
+      </div>
+
+      <div>
+        <h3>Fixing Scenario 2: Consumer-Side Idempotency Key</h3>
+        <p>Even with an idempotent producer, the consumer can still process a message twice (if it crashes after processing but before committing its offset). The fix: make the consumer itself idempotent.</p>
+
+        <p>Every payment has a unique <code>payment_id</code> assigned by the upstream API. The consumer uses this as an <strong>idempotency key</strong>:</p>
+
+        <pre class="line-numbers"><code class="language-python">def process_payment(payment):
+    payment_id = payment['payment_id']
+
+    with db.transaction() as txn:
+        # Step 1: Check if already processed
+        if txn.exists("processed_payments", payment_id):
+            log.info(f"Payment {payment_id} already processed. Skipping.")
+            return  # idempotent: no-op on retry
+
+        # Step 2: Debit customer
+        txn.execute("""
+            UPDATE accounts
+            SET balance = balance - %s
+            WHERE account_id = %s
+        """, [payment['amount'], payment['customer_id']])
+
+        # Step 3: Credit merchant
+        txn.execute("""
+            UPDATE accounts
+            SET balance = balance + %s
+            WHERE account_id = %s
+        """, [payment['amount'], payment['merchant_id']])
+
+        # Step 4: Record in ledger
+        txn.execute("""
+            INSERT INTO transactions (payment_id, customer_id, merchant_id, amount, ts)
+            VALUES (%s, %s, %s, %s, NOW())
+        """, [payment_id, payment['customer_id'],
+              payment['merchant_id'], payment['amount']])
+
+        # Step 5: Mark as processed (idempotency record)
+        txn.execute("""
+            INSERT INTO processed_payments (payment_id, processed_at)
+            VALUES (%s, NOW())
+        """, [payment_id])
+
+        # All five steps commit atomically.
+        txn.commit()</code></pre>
+      </div>
+
+      <div>
+        <h3>Why This Works for Scenario 2</h3>
+        <pre class="line-numbers"><code class="language-text">Normal flow:
+  T1: Consumer reads P1 from Kafka.
+  T2: BEGIN transaction.
+  T3: Check processed_payments → not found → proceed.
+  T4: Debit customer: $500 → $450.
+  T5: Credit merchant: $1000 → $1050.
+  T6: Insert into transactions ledger.
+  T7: Insert into processed_payments: {payment_id: "abc123"}.
+  T8: COMMIT. All changes are now durable.
+  T9: Commit Kafka offset.
+
+Crash-and-retry flow:
+  T1: Consumer reads P1, starts transaction.
+  T2: Debit customer: $500 → $450.
+  T3: CRASH before COMMIT.
+  T4: Transaction rolls back automatically. Customer balance returns to $500.
+  T5: Consumer restarts, Kafka redelivers P1.
+  T6: Consumer reads P1, starts new transaction.
+  T7: Check processed_payments → not found (previous insert was rolled back).
+  T8: Process normally: debit, credit, record, mark processed.
+  T9: COMMIT. Success.
+
+Result: Payment processed exactly once. No double-charge.</code></pre>
+      </div>
+
+      <div>
+        <h3>What About Scenario 3?</h3>
+        <p>Notice that in the code above, the debit and credit happen in the <strong>same database transaction</strong>. This works only if both accounts are in the same database. If the merchant's account is in a different service (which is common in microservices), we need a different approach. That leads us to Iteration 2.</p>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <strong>Critical subtlety:</strong> The idempotency check (step 3) and the idempotency record (step 5) MUST be in the same database transaction as the business logic (steps 4-6). If they are separate, a crash between the business logic and the idempotency record creates a window where a retry would re-execute the business logic.
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: The Outbox Pattern                               -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: The Outbox Pattern for Cross-Service Consistency</h2>
+
+      <div class="full-width">
+        <h3>The Problem: Dual Writes</h3>
+        <p>In a microservices architecture, the customer account and merchant account are likely in different services with different databases. The consumer cannot use a single DB transaction to update both. It must write to its own database AND publish a message to the merchant service. This is the <strong>dual write problem</strong>:</p>
+
+        <pre class="line-numbers"><code class="language-text">The dual write problem:
+
+  Step 1: Write to local DB (debit customer).     → succeeds
+  Step 2: Publish to Kafka (credit merchant).      → fails (network error)
+
+  Result: Customer debited, merchant never credited. Money lost.
+
+  OR:
+
+  Step 1: Publish to Kafka (credit merchant).      → succeeds
+  Step 2: Write to local DB (debit customer).      → fails (DB error)
+
+  Result: Merchant credited, customer never debited. Free money.
+
+No matter which order you do them, a failure between the two steps
+leaves the system inconsistent. You cannot make two separate systems
+(DB and Kafka) atomically consistent without a coordination protocol.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>The Outbox Pattern</h3>
+        <p>The insight: instead of writing to the DB <em>and</em> Kafka, write everything to the DB in one transaction. Include an <strong>outbox table</strong> that acts as a local message queue. A separate process reads the outbox and publishes to Kafka.</p>
+
+        <svg viewBox="0 0 780 440" style="width:100%;max-width:780px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#2563eb"/>
+            </marker>
+            <marker id="arrowGray2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#94a3b8"/>
+            </marker>
+            <marker id="arrowGreen2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#16a34a"/>
+            </marker>
+          </defs>
+
+          <!-- Kafka: payments -->
+          <rect x="20" y="20" width="150" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="95" y="42" text-anchor="middle" font-weight="600" fill="#334155">Kafka</text>
+          <text x="95" y="58" text-anchor="middle" fill="#64748b" font-size="10">payments topic</text>
+
+          <!-- Arrow Kafka -> Consumer -->
+          <line x1="95" y1="70" x2="95" y2="100" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+
+          <!-- Payment Consumer -->
+          <rect x="20" y="105" width="150" height="50" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="95" y="127" text-anchor="middle" font-weight="600" fill="#2563eb">Payment Consumer</text>
+          <text x="95" y="144" text-anchor="middle" fill="#64748b" font-size="10">reads + processes</text>
+
+          <!-- Arrow Consumer -> DB (single txn label) -->
+          <line x1="95" y1="155" x2="95" y2="185" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue2)"/>
+          <text x="160" y="175" fill="#2563eb" font-size="10" font-weight="600">single DB transaction</text>
+
+          <!-- Payment Database box -->
+          <rect x="20" y="190" width="350" height="180" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="195" y="212" text-anchor="middle" font-weight="700" fill="#2563eb">Payment Database</text>
+
+          <!-- accounts table -->
+          <rect x="35" y="225" width="150" height="35" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="110" y="240" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="600">accounts</text>
+          <text x="110" y="254" text-anchor="middle" fill="#64748b" font-size="10">customer balance updated</text>
+
+          <!-- processed_payments table -->
+          <rect x="200" y="225" width="155" height="35" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="277" y="240" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="600">processed_payments</text>
+          <text x="277" y="254" text-anchor="middle" fill="#64748b" font-size="10">idempotency record</text>
+
+          <!-- outbox table -->
+          <rect x="35" y="275" width="320" height="40" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1"/>
+          <text x="195" y="292" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">outbox</text>
+          <text x="195" y="306" text-anchor="middle" fill="#64748b" font-size="10">{merchant_id, amount, event_type: "credit"}</text>
+
+          <!-- transactions table -->
+          <rect x="35" y="330" width="320" height="28" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="195" y="349" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="600">transactions (ledger)</text>
+
+          <!-- Arrow from outbox to Outbox Relay -->
+          <line x1="195" y1="370" x2="195" y2="410" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen2)"/>
+          <text x="240" y="395" fill="#16a34a" font-size="10" font-weight="600">separate process</text>
+
+          <!-- Outbox Relay -->
+          <rect x="120" y="412" width="150" height="28" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="195" y="431" text-anchor="middle" font-weight="600" fill="#16a34a">Outbox Relay / CDC</text>
+
+          <!-- Arrow Relay -> Kafka merchant-credits -->
+          <line x1="270" y1="426" x2="430" y2="426" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen2)"/>
+
+          <!-- Kafka: merchant-credits -->
+          <rect x="435" y="400" width="155" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="512" y="422" text-anchor="middle" font-weight="600" fill="#334155">Kafka</text>
+          <text x="512" y="438" text-anchor="middle" fill="#64748b" font-size="10">merchant-credits topic</text>
+
+          <!-- Arrow Kafka -> Merchant Service -->
+          <line x1="590" y1="425" x2="625" y2="425" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray2)"/>
+
+          <!-- Merchant Service -->
+          <rect x="630" y="400" width="135" height="50" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="697" y="422" text-anchor="middle" font-weight="600" fill="#2563eb">Merchant</text>
+          <text x="697" y="438" text-anchor="middle" font-weight="600" fill="#2563eb">Service</text>
+
+          <!-- Annotation: atomicity boundary -->
+          <rect x="12" y="183" width="366" height="195" rx="10" fill="none" stroke="#2563eb" stroke-width="2" stroke-dasharray="6,3"/>
+          <text x="385" y="285" fill="#2563eb" font-size="11" font-weight="600">Atomicity</text>
+          <text x="385" y="300" fill="#2563eb" font-size="11" font-weight="600">boundary</text>
+          <text x="385" y="315" fill="#64748b" font-size="10">all-or-nothing</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>The Consumer Code</h3>
+        <pre class="line-numbers"><code class="language-python">def process_payment(payment):
+    payment_id = payment['payment_id']
+
+    with db.transaction() as txn:
+        # Idempotency check
+        if txn.exists("processed_payments", payment_id):
+            return
+
+        # Debit customer (local to this service's DB)
+        txn.execute("""
+            UPDATE accounts SET balance = balance - %s
+            WHERE account_id = %s
+        """, [payment['amount'], payment['customer_id']])
+
+        # Write to outbox (NOT directly to Kafka)
+        txn.execute("""
+            INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload)
+            VALUES (%s, 'merchant', %s, 'credit', %s)
+        """, [uuid4(), payment['merchant_id'],
+              json.dumps({
+                  'payment_id': payment_id,
+                  'merchant_id': payment['merchant_id'],
+                  'amount': payment['amount']
+              })])
+
+        # Record transaction and idempotency key
+        txn.execute("""
+            INSERT INTO transactions (payment_id, customer_id, amount, status)
+            VALUES (%s, %s, %s, 'debited')
+        """, [payment_id, payment['customer_id'], payment['amount']])
+
+        txn.execute("""
+            INSERT INTO processed_payments (payment_id, processed_at)
+            VALUES (%s, NOW())
+        """, [payment_id])
+
+        txn.commit()
+        # At this point, the debit AND the outbox entry are atomically committed.</code></pre>
+      </div>
+
+      <div>
+        <h3>The Outbox Relay</h3>
+        <p>A separate process (or use Debezium with Kafka Connect for zero custom code) reads new rows from the outbox table and publishes them to Kafka:</p>
+        <pre class="line-numbers"><code class="language-python">def relay_outbox_events():
+    while True:
+        rows = db.query("""
+            SELECT * FROM outbox
+            WHERE published = FALSE
+            ORDER BY created_at
+            LIMIT 100
+        """)
+
+        for row in rows:
+            kafka_producer.send(
+                topic=f"{row.aggregate_type}-events",
+                key=row.aggregate_id,
+                value=row.payload
+            )
+            db.execute("""
+                UPDATE outbox SET published = TRUE WHERE id = %s
+            """, [row.id])
+
+        time.sleep(0.1)  # poll interval</code></pre>
+
+        <div class="callout callout-info">
+          <strong>Why Debezium is better:</strong> Instead of polling the outbox table, Debezium uses Change Data Capture (CDC) to stream database changes directly to Kafka. It reads the database's transaction log (WAL in Postgres, binlog in MySQL), so it captures outbox inserts in real-time with no polling delay and no extra load on the database.
+        </div>
+      </div>
+
+      <div>
+        <h3>The Merchant Service</h3>
+        <p>The merchant service consumes from the <code>merchant-events</code> Kafka topic and applies its own idempotency check:</p>
+        <pre class="line-numbers"><code class="language-python">def process_merchant_credit(event):
+    payment_id = event['payment_id']
+
+    with db.transaction() as txn:
+        # Merchant-side idempotency check
+        if txn.exists("processed_credits", payment_id):
+            return  # already credited, skip
+
+        txn.execute("""
+            UPDATE merchant_accounts SET balance = balance + %s
+            WHERE merchant_id = %s
+        """, [event['amount'], event['merchant_id']])
+
+        txn.execute("""
+            INSERT INTO processed_credits (payment_id, credited_at)
+            VALUES (%s, NOW())
+        """, [payment_id])
+
+        txn.commit()</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Failure Recovery Trace                                        -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="failure-trace">
+    <div class="container">
+      <h2>Failure Recovery: Step-by-Step Trace</h2>
+      <p>Let us trace through every possible crash point and verify that no duplicate or lost payment occurs.</p>
+
+      <div class="full-width">
+        <h3>Happy Path</h3>
+        <pre class="line-numbers"><code class="language-text">Step 1: Payment event {payment_id: "abc123", customer: C1, merchant: M1, amount: $50}
+        arrives in Kafka topic "payments".
+
+Step 2: Consumer reads event.
+
+Step 3: BEGIN transaction.
+
+Step 4: Check processed_payments for "abc123" → NOT FOUND → proceed.
+
+Step 5: Debit C1: balance $500 → $450.
+
+Step 6: Insert into outbox: {merchant: M1, amount: $50, payment_id: "abc123"}.
+
+Step 7: Insert into processed_payments: {payment_id: "abc123"}.
+
+Step 8: COMMIT transaction. All three writes are now durable.
+
+Step 9: Commit Kafka offset for this message.
+
+Step 10: Outbox relay reads the outbox row, publishes to "merchant-events" topic.
+
+Step 11: Merchant consumer reads event, checks processed_credits → NOT FOUND.
+
+Step 12: Credits M1: balance $1000 → $1050. Inserts processed_credits record. COMMIT.
+
+Final state: C1 balance = $450, M1 balance = $1050. Correct.</code></pre>
+      </div>
+
+      <div>
+        <h3>Crash at Step 5 (During Debit, Before Commit)</h3>
+        <pre class="line-numbers"><code class="language-text">Step 5: Debit C1 executes in-memory but...
+        Consumer process crashes.
+        Transaction was never committed → automatic rollback.
+        C1 balance remains $500.
+        Outbox row was never written.
+        processed_payments record was never written.
+
+Recovery:
+  Consumer restarts. Kafka redelivers "abc123".
+  Step 4: Check processed_payments → NOT FOUND (rollback erased it).
+  Processing proceeds normally from scratch.
+
+Result: Payment processed exactly once. No double-charge.</code></pre>
+      </div>
+
+      <div>
+        <h3>Crash at Step 9 (After DB Commit, Before Kafka Offset Commit)</h3>
+        <pre class="line-numbers"><code class="language-text">Step 8: DB transaction committed successfully.
+        C1 debited. Outbox row written. Idempotency record saved.
+Step 9: Consumer crashes before committing Kafka offset.
+
+Recovery:
+  Consumer restarts. Kafka redelivers "abc123" (offset not committed).
+  Step 4: Check processed_payments → FOUND ("abc123" exists).
+  Consumer skips this message. No re-processing.
+
+Result: Payment processed exactly once. Idempotency key saved us.</code></pre>
+      </div>
+
+      <div>
+        <h3>Crash at Step 10 (Outbox Relay Fails)</h3>
+        <pre class="line-numbers"><code class="language-text">Step 8: DB committed. Outbox row exists with published=FALSE.
+Step 10: Relay crashes before publishing to Kafka.
+
+Recovery:
+  Relay restarts. Queries outbox WHERE published = FALSE.
+  Finds the row. Publishes to "merchant-events".
+  Marks published = TRUE.
+
+  Merchant consumer processes the credit normally.
+
+Result: Credit arrives late but is not lost. No duplicate.</code></pre>
+      </div>
+
+      <div>
+        <h3>Crash at Step 12 (Merchant Consumer Crashes After Credit)</h3>
+        <pre class="line-numbers"><code class="language-text">Step 11: Merchant consumer reads event.
+Step 12: Credits M1, but crashes before committing Kafka offset.
+
+Recovery:
+  Kafka redelivers the event to merchant consumer.
+  Step 11: Check processed_credits → FOUND ("abc123" exists).
+  Consumer skips. No double credit.
+
+Result: Merchant credited exactly once.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <strong>The pattern:</strong> Every crash scenario is covered by the combination of (1) database transactions that make writes atomic, and (2) idempotency keys that prevent reprocessing on retry. These two mechanisms, applied consistently at every service boundary, guarantee exactly-once processing.
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Kafka Transactions                               -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Kafka Transactions (Alternative Approach)</h2>
+      <p>If your pipeline is Kafka-to-Kafka (read from one topic, process, write to another topic), Kafka provides built-in <strong>exactly-once semantics (EOS)</strong> using transactions.</p>
+
+      <div>
+        <h3>How Kafka Transactions Work</h3>
+        <p>A Kafka transaction allows you to atomically: (1) consume messages from input topics, (2) produce messages to output topics, and (3) commit consumer offsets &mdash; all as a single atomic operation.</p>
+
+        <pre class="line-numbers"><code class="language-python">from kafka import KafkaConsumer, KafkaProducer
+
+producer = KafkaProducer(
+    transactional_id="payment-processor-1",  # enables transactions
+    enable_idempotence=True
+)
+producer.init_transactions()
+
+consumer = KafkaConsumer(
+    'payments',
+    group_id='payment-processors',
+    enable_auto_commit=False,  # we commit offsets inside the transaction
+    isolation_level='read_committed'  # only read committed messages
+)
+
+for message in consumer:
+    payment = deserialize(message.value)
+
+    producer.begin_transaction()
+    try:
+        # Process: produce result to output topic
+        producer.send('merchant-credits', value=serialize({
+            'payment_id': payment['payment_id'],
+            'merchant_id': payment['merchant_id'],
+            'amount': payment['amount']
+        }))
+
+        # Commit consumer offset as part of the transaction
+        producer.send_offsets_to_transaction(
+            {TopicPartition('payments', message.partition):
+             OffsetAndMetadata(message.offset + 1)},
+            consumer.group_id
+        )
+
+        producer.commit_transaction()
+    except Exception:
+        producer.abort_transaction()</code></pre>
+      </div>
+
+      <div>
+        <h3>What Happens on Failure</h3>
+        <pre class="line-numbers"><code class="language-text">If crash before commit_transaction():
+  - No messages are published to merchant-credits (transaction aborted).
+  - Consumer offset is not committed.
+  - On restart, Kafka redelivers the message.
+  - Consumer processes it again from scratch.
+  - No duplicate because the previous output was never committed.
+
+If crash after commit_transaction():
+  - Transaction was committed. Output is in merchant-credits.
+  - Consumer offset was committed.
+  - On restart, consumer picks up from the next message.
+  - No duplicate, no lost message.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Outbox Pattern vs Kafka Transactions</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Dimension</th><th>Outbox Pattern</th><th>Kafka Transactions</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Atomicity scope</td><td>DB + Kafka (via outbox relay)</td><td>Kafka-to-Kafka only</td></tr>
+              <tr><td>DB integration</td><td>Natural (writes to same DB)</td><td>Requires separate DB writes outside the Kafka transaction</td></tr>
+              <tr><td>Latency</td><td>Relay adds ~100ms</td><td>Sub-millisecond (native Kafka)</td></tr>
+              <tr><td>Complexity</td><td>Outbox table + relay process</td><td>Kafka configuration only</td></tr>
+              <tr><td>Best for</td><td>Services with a database (most services)</td><td>Stream processing (Kafka Streams, Flink)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="full-width">In practice, most payment systems use the outbox pattern because they need to update a database (account balances) as part of processing. Kafka transactions are ideal for pure stream-processing stages where no external database is involved.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 820 520" style="width:100%;max-width:820px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue3" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#2563eb"/>
+            </marker>
+            <marker id="arrowGray3" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#94a3b8"/>
+            </marker>
+            <marker id="arrowGreen3" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L8,3 L0,6" fill="#16a34a"/>
+            </marker>
+          </defs>
+
+          <!-- === LEFT SIDE: Payment Flow === -->
+
+          <!-- Payment API -->
+          <rect x="300" y="10" width="180" height="45" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="390" y="30" text-anchor="middle" font-weight="600" fill="#2563eb">Payment API</text>
+          <text x="390" y="46" text-anchor="middle" fill="#64748b" font-size="10">assigns payment_id</text>
+
+          <!-- Arrow API -> Kafka -->
+          <line x1="390" y1="55" x2="390" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue3)"/>
+          <text x="480" y="70" fill="#2563eb" font-size="10" font-weight="600">idempotent producer</text>
+          <text x="480" y="82" fill="#64748b" font-size="9">enable.idempotence=true</text>
+
+          <!-- Kafka: payments -->
+          <rect x="310" y="82" width="160" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="390" y="100" text-anchor="middle" font-weight="600" fill="#334155">Kafka: payments</text>
+          <text x="390" y="114" text-anchor="middle" fill="#16a34a" font-size="9">deduplicates producer retries</text>
+
+          <!-- Arrow Kafka -> Consumer -->
+          <line x1="390" y1="122" x2="390" y2="148" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray3)"/>
+
+          <!-- Payment Consumer -->
+          <rect x="310" y="152" width="160" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="390" y="176" text-anchor="middle" font-weight="600" fill="#2563eb">Payment Consumer</text>
+
+          <!-- Arrow Consumer -> DB Txn -->
+          <line x1="390" y1="192" x2="390" y2="218" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue3)"/>
+          <text x="505" y="210" fill="#2563eb" font-size="10" font-weight="600">BEGIN TRANSACTION</text>
+
+          <!-- DB Transaction Box -->
+          <rect x="200" y="222" width="380" height="140" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2" stroke-dasharray="6,3"/>
+          <text x="390" y="242" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">Single Atomic Transaction</text>
+
+          <!-- Step 1 -->
+          <rect x="215" y="252" width="170" height="28" rx="4" fill="#dbeafe" stroke="#93c5fd"/>
+          <text x="300" y="270" text-anchor="middle" fill="#1e40af" font-size="10">1. Check processed_payments</text>
+
+          <!-- Step 2 -->
+          <rect x="395" y="252" width="170" height="28" rx="4" fill="#dbeafe" stroke="#93c5fd"/>
+          <text x="480" y="270" text-anchor="middle" fill="#1e40af" font-size="10">2. Debit customer account</text>
+
+          <!-- Step 3 -->
+          <rect x="215" y="290" width="170" height="28" rx="4" fill="#dcfce7" stroke="#86efac"/>
+          <text x="300" y="308" text-anchor="middle" fill="#16a34a" font-size="10">3. Write to outbox table</text>
+
+          <!-- Step 4 -->
+          <rect x="395" y="290" width="170" height="28" rx="4" fill="#dbeafe" stroke="#93c5fd"/>
+          <text x="480" y="308" text-anchor="middle" fill="#1e40af" font-size="10">4. Insert idempotency key</text>
+
+          <!-- COMMIT label -->
+          <text x="390" y="346" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="11">COMMIT</text>
+
+          <!-- Arrow DB -> Outbox Relay -->
+          <line x1="300" y1="362" x2="300" y2="398" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen3)"/>
+
+          <!-- Outbox Relay -->
+          <rect x="210" y="400" width="180" height="40" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="300" y="424" text-anchor="middle" font-weight="600" fill="#16a34a">Outbox Relay / Debezium</text>
+
+          <!-- Arrow Relay -> Kafka merchant-credits -->
+          <line x1="390" y1="420" x2="455" y2="420" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen3)"/>
+
+          <!-- Kafka: merchant-credits -->
+          <rect x="460" y="400" width="170" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="545" y="424" text-anchor="middle" font-weight="600" fill="#334155">Kafka: merchant-credits</text>
+
+          <!-- Arrow Kafka -> Merchant Consumer -->
+          <line x1="630" y1="420" x2="660" y2="420" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray3)"/>
+
+          <!-- Merchant Consumer -->
+          <rect x="665" y="380" width="140" height="80" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="735" y="400" text-anchor="middle" font-weight="600" fill="#2563eb">Merchant</text>
+          <text x="735" y="416" text-anchor="middle" font-weight="600" fill="#2563eb">Consumer</text>
+          <text x="735" y="435" text-anchor="middle" fill="#64748b" font-size="9">1. Check processed_credits</text>
+          <text x="735" y="448" text-anchor="middle" fill="#64748b" font-size="9">2. Credit merchant</text>
+
+          <!-- Annotations on left side -->
+          <rect x="10" y="82" width="140" height="28" rx="6" fill="#dcfce7" stroke="#86efac"/>
+          <text x="80" y="100" text-anchor="middle" fill="#16a34a" font-size="10" font-weight="600">Layer 1: Producer dedup</text>
+          <line x1="150" y1="96" x2="305" y2="96" stroke="#86efac" stroke-width="1" stroke-dasharray="4,3"/>
+
+          <rect x="10" y="222" width="140" height="28" rx="6" fill="#dcfce7" stroke="#86efac"/>
+          <text x="80" y="240" text-anchor="middle" fill="#16a34a" font-size="10" font-weight="600">Layer 2: Idempotent consumer</text>
+          <line x1="150" y1="236" x2="195" y2="236" stroke="#86efac" stroke-width="1" stroke-dasharray="4,3"/>
+
+          <rect x="10" y="400" width="140" height="28" rx="6" fill="#dcfce7" stroke="#86efac"/>
+          <text x="80" y="418" text-anchor="middle" fill="#16a34a" font-size="10" font-weight="600">Layer 3: Outbox pattern</text>
+          <line x1="150" y1="414" x2="205" y2="414" stroke="#86efac" stroke-width="1" stroke-dasharray="4,3"/>
+
+          <rect x="10" y="470" width="140" height="40" rx="6" fill="#dcfce7" stroke="#86efac"/>
+          <text x="80" y="486" text-anchor="middle" fill="#16a34a" font-size="10" font-weight="600">Layer 4: Merchant</text>
+          <text x="80" y="500" text-anchor="middle" fill="#16a34a" font-size="10" font-weight="600">idempotency</text>
+          <line x1="150" y1="490" x2="660" y2="445" stroke="#86efac" stroke-width="1" stroke-dasharray="4,3"/>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Exactly-Once Guarantees at Each Layer</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Layer</th><th>Mechanism</th><th>Prevents</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Producer &rarr; Kafka</td><td>Idempotent producer (PID + sequence number)</td><td>Duplicate messages from producer retries</td></tr>
+              <tr><td>Kafka &rarr; Payment Consumer</td><td>Idempotency key in DB transaction</td><td>Re-processing on consumer crash/restart</td></tr>
+              <tr><td>Payment DB &rarr; Kafka</td><td>Outbox pattern (single DB transaction)</td><td>Dual write inconsistency</td></tr>
+              <tr><td>Kafka &rarr; Merchant Consumer</td><td>Idempotency key in DB transaction</td><td>Re-processing on merchant consumer crash</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Idempotency Key Lifecycle</h3>
+        <pre class="line-numbers"><code class="language-text">How long to keep idempotency records?
+
+  Payment processing window: typically complete within minutes.
+  Kafka consumer retry window: at most a few hours.
+  Safety margin: keep records for 7 days.
+
+  Storage cost:
+    86.4M payments/day x 7 days = 604.8M records
+    Each record: payment_id (16B) + timestamp (8B) + index overhead (~40B) = ~64B
+    Total: 604.8M x 64B = ~38.7 GB
+
+  This fits comfortably in a single database with a B-tree index on payment_id.
+  Older records can be archived or deleted with a daily cleanup job.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ol class="full-width">
+        <li><strong>Exactly-once is achieved by making every step idempotent.</strong> There is no magic "exactly-once" switch. It is the combination of idempotent producers, idempotency keys, and atomic transactions that creates the end-to-end guarantee.</li>
+        <li><strong>The idempotency check and business logic must be in the same transaction.</strong> If they are separate, a crash between them creates a window where retries cause duplicates.</li>
+        <li><strong>The outbox pattern solves dual writes.</strong> Never write to a database and a message broker in two separate operations. Write everything to the database (including outbox events), then relay to the broker.</li>
+        <li><strong>Every service boundary needs its own idempotency.</strong> The payment consumer has its idempotency table. The merchant consumer has its own. Each service is responsible for protecting itself from duplicate deliveries.</li>
+        <li><strong>Do the dollar math.</strong> Abstract failure rates become concrete when translated to dollars. "0.01% duplicate rate" sounds acceptable until you calculate it equals $432,000/day in double-charges.</li>
+        <li><strong>Retries are inevitable.</strong> Networks lose packets. Processes crash. Kafka redelivers. Design for retries from the start, not as an afterthought.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../distributed-transactions.html" class="card topic-card">
+          <h3>Distributed Transactions</h3>
+          <p>Two-phase commit, sagas, and the outbox pattern for cross-service consistency.</p>
+        </a>
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>Kafka internals, delivery guarantees, and consumer group mechanics.</p>
+        </a>
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>How replication affects consistency and the read-your-own-writes problem.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

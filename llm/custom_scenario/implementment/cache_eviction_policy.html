@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cache Eviction &amp; Tier-Demotion Policy &mdash; HBM &rarr; CPU RAM &rarr; SSD Watermarks</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.84rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .code-box { background:#f8fafc; color:#0f172a; border:1px solid #cbd5e1; border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.82rem; line-height:1.5;
+      white-space:pre-wrap; overflow-x:auto; }
+    .code-box .kw { color:#1d4ed8; font-weight:700; }
+    .code-box .cm { color:#64748b; font-style:italic; }
+    .code-box .lt { color:#b45309; }
+    .code-box .fn { color:#15803d; font-weight:700; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .gate-box { background:#fef2f2; border-left:4px solid #dc2626; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .q-box { background:#f5f3ff; border-left:6px solid #7c3aed; border-radius:8px;
+      padding:.7rem 1rem 0.4rem; margin:1rem 0; }
+    .q-box ol { margin:.4rem 0 .6rem 1.1rem; }
+    .q-box li { margin:.3rem 0; }
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+      font-weight:700; padding:.05rem .35rem; border-radius:4px; margin-left:.25rem;
+      vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-fa { color:#b45309; background:#fef3c7; border:1px solid #fcd34d; }
+    .tag-k  { color:#6b21a8; background:#f3e8ff; border:1px solid #d8b4fe; }
+    .iter-head { background:linear-gradient(90deg,#f5f3ff,#f8fafc); border-left:6px solid #7c3aed;
+      border-radius:8px; padding:.6rem 1rem; margin:1.5rem 0 .6rem; }
+    .iter-head h2 { margin:0; }
+    .iter-head .iter-meta { font-size:.85rem; color:#475569; margin-top:.25rem; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+    .var-row td:first-child { font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; }
+    .steps { counter-reset: step; list-style:none; padding-left:0; }
+    .steps > li { position:relative; padding:.35rem 0 .35rem 2.2rem; margin:.2rem 0; border-bottom:1px dashed #e2e8f0; }
+    .steps > li::before { counter-increment: step; content: counter(step); position:absolute; left:0; top:.35rem;
+      width:1.5rem; height:1.5rem; background:#7c3aed; color:#fff; border-radius:50%; text-align:center; font-weight:700; font-size:.82rem; line-height:1.5rem; }
+    .pick { color:#15803d; font-weight:700; }
+    .reject { color:#b91c1c; font-weight:700; }
+    .legend-grid { columns:2; column-gap:1.6rem; list-style:none; padding-left:0; margin:.6rem 0 0; font-size:.86rem; }
+    .legend-grid li { margin:.18rem 0; break-inside:avoid; }
+    .legend-grid .cn { display:inline-block; width:1.25rem; height:1.25rem; line-height:1.25rem; text-align:center;
+      border-radius:50%; background:#1e293b; color:#fff; font-size:.74rem; font-weight:700; margin-right:.35rem; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">&larr; Scenario page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html">kv_store.html</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#scope">Scope &amp; where this sits</a></li>
+          <li><a class="sidebar-section-link" href="#questions">The two questions</a></li>
+          <li><a class="sidebar-section-link" href="#model">1. Mental model &mdash; two demotions, one pin</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#model-diagram">&nbsp;&nbsp;Tier + watermark diagram</a></li>
+          <li><a class="sidebar-section-link" href="#tiers">2. Tier ladder &amp; bandwidths (recap)</a></li>
+          <li><a class="sidebar-section-link" href="#q1">3. Q1 &mdash; HBM &rarr; CPU RAM</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-when">&nbsp;&nbsp;When (trigger)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-who">&nbsp;&nbsp;Who (the victim)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-howmany">&nbsp;&nbsp;How many + HBM watermarks</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q1-vs-q2">&nbsp;&nbsp;HBM vs DRAM: why differ</a></li>
+          <li><a class="sidebar-section-link" href="#q2">4. Q2 &mdash; CPU RAM &rarr; SSD pre-offload</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q2-bucket">&nbsp;&nbsp;Leaky-bucket diagram</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q2-derive">&nbsp;&nbsp;Watermark derivation</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#q2-stat">&nbsp;&nbsp;avg vs median vs max</a></li>
+          <li><a class="sidebar-section-link" href="#loss">5. The loss path</a></li>
+          <li><a class="sidebar-section-link" href="#worked">6. Worked example</a></li>
+          <li><a class="sidebar-section-link" href="#evolution">7. How this evolves</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#evo-3">&nbsp;&nbsp;Iter 3: per-block ref_count</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#evo-3b">&nbsp;&nbsp;Iter 3b: destination + gate</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#evo-5">&nbsp;&nbsp;Iter 5: clean-drop tree</a></li>
+          <li><a class="sidebar-section-link" href="#failures">8. Failure modes</a></li>
+          <li><a class="sidebar-section-link" href="#crosslinks">9. Cross-links</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <section class="topic-hero">
+    <div class="container">
+      <p class="eyebrow">LLM Serving &middot; Distributed KV Cache &middot; impl deep-dive</p>
+      <h1>Cache Eviction &amp; Tier-Demotion Policy</h1>
+      <p class="lead">The mechanics behind <a href="distributed_kv_cache.html#iter1a">distributed_kv_cache.html</a> Iter&nbsp;1a DC6 (non-cascading tier-skip) and DC5 (per-tier victim policy): <strong>exactly when a KV block leaves HBM, who it is, how many leave, and how the DRAM&nbsp;&rarr;&nbsp;SSD pre-offload watermark is sized</strong> so the HBM eviction never blocks on a disk write.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- SCOPE                                                        -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="scope">Scope &amp; where this sits</h2>
+      <p>This is the implementation reference for the <strong>eviction / demotion policy</strong> of the local KV tier hierarchy. It is linked from the scenario page&rsquo;s <a href="distributed_kv_cache.html#iter1a-dc">Iter&nbsp;1a design choices</a> &mdash; <strong>DC5</strong> (per-tier victim rule) and <strong>DC6</strong> (eviction discipline) name the policy; this page builds out the timing, the watermark math, and the failure path that those two design choices only sketch.</p>
+
+      <div class="note-box">
+        <strong>Anchored at Iter&nbsp;1a&rsquo;s LOCAL 3-tier model.</strong> Iter&nbsp;1a&rsquo;s cache lives on one serving task as three <em>local</em> tiers: <strong>HBM</strong> (on-GPU) &rarr; <strong>CPU&nbsp;RAM / DRAM</strong> (host) &rarr; <strong>local NVMe SSD</strong> (host, via GPUDirect Storage). Your two questions &mdash; <code>HBM &rarr; CPU&nbsp;RAM</code> and <code>CPU&nbsp;RAM &rarr; CPU&nbsp;SSD</code> &mdash; are exactly this ladder, so that is the spine of the page. A later iteration <em>reworks</em> the tier model (retires local NVMe, inserts a remote DRAM pool); that evolution is summarised in <a href="#evolution">&sect;7</a>, not the main body. This page is <strong>maintained across iterations</strong>: whenever any iteration changes the eviction policy, this page is updated (per <code>NEW_IMPLEMENTATION_DETAILS.md</code> &sect;0.8).
+      </div>
+
+      <div class="warn-box">
+        <strong>One correction up front &mdash; demotion is pressure-driven, not pass-driven.</strong> A common first guess is <em>&ldquo;evict HBM&rarr;DRAM as soon as a forward pass ends, moving the KV that pass just used.&rdquo;</em> Both halves are backwards:
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Trigger is capacity pressure</strong> (HBM occupancy crosses a high watermark), checked by a background sweep &mdash; <em>not</em> the end of any forward pass. A forward pass ending is not a free-memory event.</li>
+          <li><strong>The KV a pass just used is the <em>hottest</em> set, never the victim.</strong> It was touched at <code>last_access = now</code> with <code>ref_count &gt; 0</code>; under <code>LRU + ref_count</code> it is the <em>last</em> thing evicted, and for a multi-turn conversation it is deliberately <em>kept resident</em> for the next turn. The victim is the <em>coldest</em> block of some <em>other</em>, idle conversation.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- THE TWO QUESTIONS                                            -->
+  <!-- ============================================================ -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="questions">The two questions this page answers</h2>
+      <div class="q-box">
+        <ol>
+          <li><strong>HBM &rarr; CPU&nbsp;RAM</strong> &mdash; <em>when</em> does a block demote, and <em>how many</em> at a time? Is it tied to the end of a forward pass? Does it move the pass&rsquo;s own KV? And since an HBM eviction <strong>cannot wait</strong> for CPU&nbsp;RAM to first offload to SSD, do we <strong>pre-offload</strong> CPU&nbsp;RAM using a watermark &mdash; and how is that watermark chosen?</li>
+          <li><strong>CPU&nbsp;RAM &rarr; CPU&nbsp;SSD</strong> &mdash; <em>when</em>, <em>how frequently</em>, and <em>how many</em> bytes per offload? And what happens when the SSD write cannot keep up?</li>
+        </ol>
+      </div>
+      <p><strong>Short answers, then the derivations:</strong></p>
+      <table class="sheet">
+        <thead><tr><th>Question</th><th>Answer</th><th>Section</th></tr></thead>
+        <tbody>
+          <tr><td><strong>HBM&rarr;DRAM: when?</strong></td><td>On HBM crossing its <strong>high watermark</strong> (pressure), via an async background sweep &mdash; <em>not</em> forward-pass end.</td><td><a href="#q1-when">&sect;3</a></td></tr>
+          <tr><td><strong>HBM&rarr;DRAM: who?</strong></td><td>The <strong>coldest</strong> blocks passing the 3-signal gate (<code>last_access</code> old &and; <code>ref_count==0</code> &and; <code>session_idle</code>) &mdash; never the active pass&rsquo;s KV.</td><td><a href="#q1-who">&sect;3</a></td></tr>
+          <tr><td><strong>HBM&rarr;DRAM: how many?</strong></td><td>A batch down to the <strong>low watermark</strong> (a hysteresis band), not &ldquo;all,&rdquo; not &ldquo;one pass&rsquo;s worth.&rdquo;</td><td><a href="#q1-howmany">&sect;3</a></td></tr>
+          <tr><td><strong>Pre-offload DRAM&rarr;SSD?</strong></td><td><strong>Yes</strong> &mdash; an async watermark-driven trickle keeps DRAM headroom <em>ahead</em> of demand, so the HBM eviction always lands in already-free DRAM.</td><td><a href="#q2">&sect;4</a></td></tr>
+          <tr><td><strong>SSD watermark from what?</strong></td><td>The three inputs you named: <strong>SSD write bandwidth</strong>, the <strong>batch-KV-size statistic</strong>, and the <strong>per-step latency</strong> &mdash; combined as a leaky-bucket headroom.</td><td><a href="#q2-derive">&sect;4</a></td></tr>
+          <tr><td><strong>SSD can&rsquo;t keep up?</strong></td><td>Drop the <strong>coldest</strong> DRAM blocks &rarr; recompute on the rare next access (<strong>RPO=0 floor</strong>). Bounded latency cost, never a correctness loss.</td><td><a href="#loss">&sect;5</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 1. MENTAL MODEL                                              -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="model">1. Mental model &mdash; two demotions, one pin</h2>
+      <p><strong>TL;DR.</strong> Two <em>different</em> events both move bytes downward, and conflating them is what produces the &ldquo;evict on pass-end&rdquo; mistake. One is about a <em>conversation</em> going quiet; the other is about a <em>tier</em> filling up. A single correctness pin (<code>ref_count</code>) sits across both.</p>
+
+      <h4>The two events</h4>
+      <ul>
+        <li><strong>(a) Lifecycle cool-down (per conversation).</strong> A turn finishes (EOS / decode done). Its KV is no longer <em>active</em>, but the conversation may continue, so we want to <em>keep</em> it for the next turn. <code>ref_count</code> drops to 0; the block becomes <em>evictable</em> but is <strong>not</strong> moved yet. It just stops being pinned.</li>
+        <li><strong>(b) Capacity demotion (per tier).</strong> Independently, a tier fills up. When occupancy crosses the tier&rsquo;s high watermark, a background sweep picks the coldest evictable blocks and moves them down one (or more) tiers. <strong>This is the event your Q1 is really about</strong> &mdash; and its trigger is the watermark, not any single pass finishing.</li>
+      </ul>
+      <p>Event (a) makes a block <em>a candidate</em>; event (b) decides <em>if and when</em> a candidate actually moves. A block can sit evictable-but-resident in HBM for a long time if there is no pressure &mdash; that is the whole point of a cache.</p>
+
+      <h4>The one pin that crosses both: <code>ref_count</code></h4>
+      <p><code>ref_count</code> &mdash; <strong>what:</strong> per-block count of live references (active decode slots + shared-prefix users). <strong>used for:</strong> the correctness gate &ldquo;<em>may this block be evicted at all?</em>&rdquo; &mdash; a block with <code>ref_count&nbsp;&gt;&nbsp;0</code> is <strong>pinned, never a victim, regardless of recency</strong>. <strong>updated when:</strong> <code>+1</code> on fresh allocation or prefix-match reuse, <code>&minus;1</code> on EOS / preemption / abort. <strong>by whom:</strong> the CPU scheduler / block-manager (atomic); <em>the GPU never touches it</em> &mdash; the GPU only runs attention over whatever the block table points at.</p>
+      <p>This is why the just-finished pass&rsquo;s KV is safe: during the pass its slots hold <code>ref_count&nbsp;&gt;&nbsp;0</code> and <code>last_access = now</code>. It is simultaneously the most-pinned and most-recent set &mdash; the opposite of a victim.</p>
+
+      <!-- DIAGRAM 1 -->
+      <h3 id="model-diagram">The tier ladder, its watermarks, and the four flows</h3>
+      <p>Static view of the Iter&nbsp;1a local hierarchy. Solid arrows are synchronous (on the request&rsquo;s critical path); dashed-grey arrows are asynchronous background work (hidden from the request); the dashed-red arrow is the loss path.</p>
+
+      <svg viewBox="0 0 1200 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three-tier KV hierarchy with HBM and DRAM watermarks; demotion, pre-offload, drop-to-recompute, and promote-on-hit flows" style="width:100%;height:auto;font-family:'JetBrains Mono',monospace;">
+        <defs>
+          <marker id="ah" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#1e293b"/></marker>
+          <marker id="ahg" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#94a3b8"/></marker>
+          <marker id="ahr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#dc2626"/></marker>
+          <marker id="ahgr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#15803d"/></marker>
+        </defs>
+
+        <!-- HBM tier -->
+        <rect x="80" y="60" width="520" height="150" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+        <text x="100" y="90" font-weight="700" font-size="18" fill="#3730a3">HBM &mdash; on-GPU (TP=8 aggregate)</text>
+        <text x="100" y="113" font-size="13" fill="#475569">~450 GB usable for KV &middot; 3.35 TB/s/GPU</text>
+        <text x="100" y="133" font-size="13" fill="#475569">policy: LRU + ref_count pin (DC5)</text>
+        <!-- HBM watermark lines -->
+        <line x1="360" y1="60" x2="360" y2="210" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+        <line x1="430" y1="66" x2="430" y2="204" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3"/>
+        <line x1="510" y1="66" x2="510" y2="204" stroke="#d97706" stroke-width="1.5" stroke-dasharray="5 3"/>
+        <text x="430" y="200" font-size="11" fill="#dc2626" text-anchor="middle"><tspan font-weight="700">W_lo</tspan></text>
+        <text x="510" y="200" font-size="11" fill="#b45309" text-anchor="middle"><tspan font-weight="700">W_hi</tspan></text>
+        <text x="395" y="80" font-size="11" fill="#15803d" text-anchor="middle">active +</text>
+        <text x="395" y="94" font-size="11" fill="#15803d" text-anchor="middle">pinned</text>
+        <text x="560" y="87" font-size="11" fill="#b45309" text-anchor="middle">free</text>
+
+        <!-- DRAM tier -->
+        <rect x="80" y="280" width="520" height="150" rx="10" fill="#ecfeff" stroke="#0891b2" stroke-width="2"/>
+        <text x="100" y="310" font-weight="700" font-size="18" fill="#155e75">CPU RAM / DRAM &mdash; host</text>
+        <text x="100" y="333" font-size="13" fill="#475569">~800 GB usable &middot; PCIe Gen4 x16 = 25 GB/s</text>
+        <text x="100" y="353" font-size="13" fill="#475569">policy: plain LRU (DC5)</text>
+        <line x1="420" y1="292" x2="420" y2="418" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5 3"/>
+        <text x="420" y="306" font-size="11" fill="#dc2626" text-anchor="middle"><tspan font-weight="700">W_lo</tspan></text>
+        <line x1="490" y1="286" x2="490" y2="424" stroke="#d97706" stroke-width="1.5" stroke-dasharray="5 3"/>
+        <text x="490" y="420" font-size="11" fill="#b45309" text-anchor="middle"><tspan font-weight="700">W_hi(DRAM)</tspan></text>
+        <text x="545" y="307" font-size="11" fill="#b45309" text-anchor="middle">headroom</text>
+        <text x="545" y="321" font-size="11" fill="#b45309" text-anchor="middle">H_DRAM</text>
+
+        <!-- SSD tier -->
+        <rect x="80" y="500" width="520" height="80" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+        <text x="100" y="530" font-weight="700" font-size="18" fill="#334155">Local NVMe SSD &mdash; host</text>
+        <text x="100" y="552" font-size="13" fill="#475569">~7 TB &middot; read 7 GB/s (GDS) &middot; write 3&ndash;5 GB/s</text>
+
+        <!-- Recompute box -->
+        <rect x="760" y="500" width="360" height="80" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+        <text x="780" y="530" font-weight="700" font-size="16" fill="#991b1b">Recompute (re-prefill)</text>
+        <text x="780" y="552" font-size="12" fill="#475569">RPO=0 floor &middot; cost = prefill_time(N)</text>
+
+        <!-- Flow arrows -->
+        <!-- (1) HBM -> DRAM demote -->
+        <line x1="200" y1="210" x2="200" y2="280" stroke="#1e293b" stroke-width="2.4" marker-end="url(#ah)"/>
+        <text x="150" y="250" font-size="13" font-weight="700" fill="#1e293b">&#9312;</text>
+        <!-- (2) DRAM -> SSD pre-offload (async grey) -->
+        <line x1="200" y1="430" x2="200" y2="500" stroke="#94a3b8" stroke-width="2.4" stroke-dasharray="7 4" marker-end="url(#ahg)"/>
+        <text x="150" y="470" font-size="13" font-weight="700" fill="#64748b">&#9313;</text>
+        <!-- (3) DRAM full -> drop -> recompute (red dashed) -->
+        <path d="M 600 405 C 720 405, 780 460, 870 500" fill="none" stroke="#dc2626" stroke-width="2.2" stroke-dasharray="6 4" marker-end="url(#ahr)"/>
+        <text x="720" y="430" font-size="13" font-weight="700" fill="#dc2626">&#9314;</text>
+        <!-- (4) promote on hit DRAM/SSD -> HBM (green solid) -->
+        <path d="M 660 500 C 700 360, 700 300, 600 250" fill="none" stroke="#15803d" stroke-width="2.2" marker-end="url(#ahgr)"/>
+        <text x="690" y="280" font-size="13" font-weight="700" fill="#15803d">&#9315;</text>
+
+        <!-- pinned annotation -->
+        <rect x="760" y="60" width="360" height="150" rx="10" fill="#f0fdf4" stroke="#15803d" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="780" y="88" font-weight="700" font-size="14" fill="#166534">The active pass&rsquo;s KV STAYS here</text>
+        <text x="780" y="112" font-size="12" fill="#475569">ref_count &gt; 0 &amp; last_access = now</text>
+        <text x="780" y="132" font-size="12" fill="#475569">&rArr; hottest set &rArr; pinned, never a victim.</text>
+        <text x="780" y="156" font-size="12" fill="#475569">Multi-turn convs keep their cooled</text>
+        <text x="780" y="174" font-size="12" fill="#475569">(ref_count==0) KV resident until</text>
+        <text x="780" y="192" font-size="12" fill="#475569">pressure forces flow &#9312;.</text>
+      </svg>
+
+      <ul class="legend-grid">
+        <li><span class="cn">1</span><strong>HBM &rarr; DRAM demote</strong> &mdash; on HBM crossing <code>W_hi</code>: copy the coldest evictable blocks down via PCIe (25 GB/s), free their HBM slots down to <code>W_lo</code>. Async copy engine, hidden behind compute.</li>
+        <li><span class="cn">2</span><strong>DRAM &rarr; SSD pre-offload</strong> &mdash; on DRAM crossing <code>W_hi(DRAM)</code>: background trickle writes the coldest DRAM blocks to NVMe (3&ndash;5 GB/s), keeping <code>H_DRAM</code> free <em>ahead</em> of flow &#9312;.</li>
+        <li><span class="cn">3</span><strong>Drop &rarr; recompute</strong> &mdash; if DRAM is full <em>and</em> SSD cannot drain in time: discard the coldest blocks; the rare next access re-prefills from token IDs (RPO=0). Loss path.</li>
+        <li><span class="cn">4</span><strong>Promote on hit</strong> &mdash; next turn of a demoted conv: swap its KV back up into HBM (DRAM&rarr;HBM 25 GB/s, or SSD&rarr;HBM 7 GB/s GDS) before the first decode tick.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 2. TIER LADDER RECAP                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="tiers">2. Tier ladder &amp; bandwidths (recap)</h2>
+      <p>Every number below is <em>given</em> (hardware / BOE) or <em>previously derived</em> on the scenario page; this page only combines them. Sources cited inline.</p>
+      <table class="sheet">
+        <thead><tr><th>Tier</th><th>Capacity (usable)</th><th>Down-write BW</th><th>Up-read BW</th><th>Per-request setup &beta;</th><th>Victim policy</th></tr></thead>
+        <tbody>
+          <tr><td><strong>HBM</strong> (on-GPU)</td><td class="n">~450 GB</td><td class="n">&mdash;</td><td class="n">3.35 TB/s/GPU</td><td class="c">&beta;<sub>HBM</sub> &asymp; ms-scale</td><td>LRU + <code>ref_count</code> pin</td></tr>
+          <tr><td><strong>CPU RAM</strong> (DRAM, host)</td><td class="n">~800 GB</td><td class="c">PCIe 25 GB/s</td><td class="c">PCIe 25 GB/s</td><td class="c">&beta;<sub>DRAM</sub>(N)=N&middot;KV_per_tok/25 GB/s</td><td>plain LRU</td></tr>
+          <tr><td><strong>Local NVMe SSD</strong> (host)</td><td class="n">~7 TB</td><td class="c">3&ndash;5 GB/s (write)</td><td class="c">7 GB/s (GDS read)</td><td class="c">&beta;<sub>SSD</sub>(N)=N&middot;KV_per_tok/7 GB/s</td><td>plain LRU</td></tr>
+          <tr><td><strong>Recompute</strong></td><td class="n">&mdash;</td><td class="n">&mdash;</td><td class="n">&mdash;</td><td class="c">&beta;<sub>cold</sub>(N)=prefill_time(N)</td><td>RPO=0 floor</td></tr>
+        </tbody>
+      </table>
+
+      <div class="ref-box">
+        <strong>Constants used throughout</strong> (all <span class="tag tag-g">[G]</span> or previously <span class="tag tag-d">[D]</span> on <a href="distributed_kv_cache.html">distributed_kv_cache.html</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><code>KV_per_tok = 320 KB/tok</code> = <code>2&middot;n_layers&middot;n_kv_heads&middot;d_head&middot;2 B</code> = <code>2&middot;80&middot;8&middot;128&middot;2</code> (BF16, GQA) <span class="tag tag-d">[D &mdash; K2]</span></li>
+          <li><code>B_PCIe = 25 GB/s</code> (HBM&harr;DRAM, PCIe Gen4 x16) <span class="tag tag-g">[G &mdash; NEW_BOE]</span></li>
+          <li><code>B_ssd_write = 3&ndash;5 GB/s</code> sustained NVMe Gen4 write; <code>B_ssd_read = 7 GB/s</code> via GPUDirect Storage <span class="tag tag-g">[G &mdash; NEW_BOE]</span>. <em>Reads are faster than writes</em> &mdash; this asymmetry is the whole reason the offload (a write) is the binding constraint.</li>
+          <li><code>t_tick</code> = <code>&beta;<sub>per_decode_tok</sub>(TP=8) &asymp; 5.2 ms</code> (decode step) <span class="tag tag-d">[D &mdash; &sect;6.6]</span></li>
+          <li><code>prefill_time(N) = (2&middot;P&middot;N + 4&middot;n_layers&middot;d_model&middot;N&sup2;) / F_sustained</code> &mdash; per-request prefill compute time (linear matmul term + quadratic attention term), with three coefficients reused below:
+            <ul style="margin:.25rem 0 0;">
+              <li><code>F_sustained</code> = <strong>per-task sustained compute throughput</strong> (FLOP/s the TP=8 task actually sustains) = <code>TP &times; GPU_peak_BF16 &times; MFU</code> = <code>8 &times; 989 TFLOP/s &times; 0.40</code> = <code>3.17&times;10&sup1;&#8309; FLOP/s</code>. MFU=40% accounts for kernel-launch + memory-stall + collective-wait losses. <span class="tag tag-d">[D &mdash; defined on distributed_kv_cache.html &sect;1.5 / &sect;6.5]</span></li>
+              <li><code>2&middot;P = 1.4&times;10&sup1;&sup1; FLOP/tok</code> = prefill <em>linear</em> (matmul) coefficient = <code>2 &times;</code> param count <code>P</code> (70 B) <span class="tag tag-d">[D &mdash; &sect;4.1]</span></li>
+              <li><code>4&middot;n_layers&middot;d_model = 4 &times; 80 &times; 8192 = 2.62&times;10&#8310;</code> = prefill <em>quadratic</em> (attention) coefficient <span class="tag tag-d">[D &mdash; &sect;4.1]</span></li>
+            </ul>
+          </li>
+          <li>Evaluated: <code>prefill_time(13K, TP=8) = 0.73 s</code>; <code>prefill_time(256K) = 65.5 s</code> <span class="tag tag-d">[D &mdash; &sect;4.1 / &sect;6.5 table]</span></li>
+          <li>Block = 16 tok = <code>16 &times; 320 KB = 5.12 MB</code>; transfer over PCIe = <code>5.12 MB / 25 GB/s = 205 &micro;s</code> <span class="tag tag-d">[D]</span> <em>(Iter 1a moves whole contiguous slabs; the 16-tok block becomes the unit once paging lands &mdash; <a href="#evolution">&sect;7</a>)</em></li>
+          <li>Per-request KV at workload mean: <code>13K &times; 320 KB = 4.16 GB</code>; median 8K = 2.56 GB; p99 256K = 82 GB <span class="tag tag-d">[D]</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 3. Q1 HBM -> CPU RAM                                         -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="q1">3. Q1 &mdash; HBM &rarr; CPU RAM</h2>
+
+      <h3 id="q1-when">When does a block demote? (the trigger)</h3>
+      <div class="two-col">
+        <div>
+          <h4>The problem, step by step</h4>
+          <ol class="steps" style="counter-reset:step;">
+            <li>Decode is HBM-only: the attention kernel reads a sequence&rsquo;s <em>entire</em> K,V from HBM every tick. There is no &ldquo;decode from DRAM&rdquo; path.</li>
+            <li>So every <em>active</em> slot must hold its full KV in HBM for its whole lifetime &mdash; HBM is the scarce tier.</li>
+            <li>New work (a fresh prefill, a promoted conv) keeps arriving and needs HBM slots.</li>
+            <li>If we wait until HBM is <em>completely</em> full to react, the allocator stalls the GPU while it scrambles to free space &mdash; a bubble on the critical path.</li>
+          </ol>
+        </div>
+        <div>
+          <h4>The solution, step by step</h4>
+          <ol class="steps" style="counter-reset:step;">
+            <li>Set a <strong>high watermark</strong> <code>W_hi</code> below 100% of HBM-for-KV.</li>
+            <li>A background sweep (CPU-side block-manager) checks occupancy every few ticks.</li>
+            <li>When occupancy crosses <code>W_hi</code>, it demotes coldest evictable blocks <em>now</em> &mdash; <strong>ahead</strong> of the allocator actually needing the space.</li>
+            <li>The trigger is therefore <strong>occupancy</strong>, decoupled from any single forward pass finishing. A pass ending frees nothing by itself (multi-turn KV is kept).</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="gate-box">
+        <strong>Direct answer to &ldquo;is it as soon as the forward pass ends?&rdquo; &mdash; No.</strong> Demotion fires on <code>HBM_used &ge; W_hi</code>, evaluated by a background sweep, not on pass completion. Coupling it to pass-end would either fire constantly (every tick is a pass) and thrash, or fire on the wrong signal entirely (a pass can end with HBM nowhere near full).
+      </div>
+
+      <h3 id="q1-who">Who is the victim? (the coldness gate)</h3>
+      <p>The eviction-candidacy test &mdash; the <strong>coldness gate</strong>, reused by every downstream tier &mdash; is a <strong>three-signal AND</strong>. All three must hold; recency alone is not enough.</p>
+      <div class="formula-box">evictable(block) = (last_access old)  AND  (ref_count == 0)  AND  (session_idle)
+                                  recency             not live/shared        conv quiet long enough</div>
+      <table class="sheet">
+        <thead><tr><th>Signal</th><th>What / granularity</th><th>Updated when &middot; by whom</th></tr></thead>
+        <tbody>
+          <tr class="var-row"><td>last_access</td><td>recency timestamp, per block</td><td>stamped <code>= now</code> on every engine step for each block the batch touched; CPU scheduler / block-manager (a CPU-visible proxy &mdash; the GPU&rsquo;s per-tick reads are never individually observed)</td></tr>
+          <tr class="var-row"><td>ref_count</td><td>live-reference count, per block</td><td><code>+1</code> alloc / prefix-reuse, <code>&minus;1</code> EOS / preempt / abort; CPU scheduler (atomic). <strong>The correctness pin.</strong></td></tr>
+          <tr class="var-row"><td>session_idle</td><td>derived predicate, per conversation: <code>now &minus; last_turn_ts &gt; T<sub>idle</sub></code></td><td>backed by <code>last_turn_ts</code>, reset to <code>now</code> when a turn is admitted and again on its decode completion; CPU scheduler / Router. <code>T<sub>idle</sub></code> set well above the inter-turn reading gap so an actively-conversing user is never judged cold.</td></tr>
+        </tbody>
+      </table>
+      <div class="gate-box">
+        <strong>Direct answer to &ldquo;does it move the KV the pass just used?&rdquo; &mdash; No, the opposite.</strong> That KV fails the gate on <em>two</em> of three signals: <code>last_access = now</code> (not old) and <code>ref_count &gt; 0</code> (live). It is the hottest, most-pinned set on the task. The victim is the coldest block of a <em>different</em>, idle conversation &mdash; one whose turn finished long enough ago that all three signals fire.
+      </div>
+
+      <h3 id="q1-howmany">How many leave, and where are the HBM watermarks set?</h3>
+      <p>The HBM demotion is governed by <em>two</em> watermarks, exactly like the DRAM offload in <a href="#q2">&sect;4</a>. The loop is tiny:</p>
+      <div class="formula-box">on each background sweep:
+    if HBM_used &ge; W_hi(HBM):
+        demote coldest evictable blocks (by the &sect;3 gate) until HBM_used &le; W_lo(HBM)
+    # bytes_moved = HBM_used &minus; W_lo(HBM)   &mdash; NOT "all", NOT "one pass's worth"</div>
+
+      <h4>First design choice: why a <em>pair</em> (W_hi and W_lo), not a single line?</h4>
+      <div class="note-box">
+        <p><strong>Problem.</strong> We need a rule for when the background reclaimer runs. The obvious one &mdash; <em>&ldquo;evict whenever <code>HBM_used &ge; T</code>&rdquo;</em> &mdash; has a failure mode.</p>
+        <p><strong>Options:</strong></p>
+        <ul>
+          <li><span class="reject">(a) Single threshold T.</span> Free one block &rarr; drop just below T &rarr; the next allocation crosses T &rarr; fire again. The sweep runs on <em>every</em> tick, each time scanning the LRU order to free one block. Constant CPU + zero batching &mdash; <strong>thrash</strong>.</li>
+          <li><span class="pick">(b) Two thresholds W_hi &gt; W_lo &mdash; CHOSEN.</span> Start at <code>W_hi</code>, free a <em>batch</em> down to <code>W_lo</code>, then stay quiet until <code>W_hi</code> is crossed again. The gap <code>W_hi &minus; W_lo</code> is <strong>hysteresis</strong>: it converts continuous per-tick thrash into occasional batched sweeps, amortising the LRU scan over many freed blocks.</li>
+          <li><span class="reject">(c) Time-based (sweep every &Delta;t regardless of occupancy).</span> Decouples eviction from actual pressure: over-evicts a near-empty cache, under-reacts to a load spike between ticks. Occupancy-triggered watermarks track real pressure.</li>
+        </ul>
+        <p><strong>Why (b):</strong> the same min/low/high-watermark pattern every production background reclaimer uses (Linux <code>kswapd</code>, JVM GC). The band is the knob that trades sweep frequency against how much headroom we hold idle.</p>
+      </div>
+
+      <h4>Second design choice: where do the two HBM watermarks sit? (the derivation)</h4>
+      <p>HBM is a leaky bucket too, but with the roles <em>flipped</em> vs DRAM: here the scarce thing we protect is <strong>free HBM slots</strong> for a <em>critical-path</em> consumer (the GPU allocator &mdash; a new prefill admission or a promoted conv swapping back in), and the &ldquo;drain&rdquo; that refills free space is flow &#9312; demotion at PCIe 25 GB/s, which is <em>fast and always succeeds</em> (DRAM is kept free by Q2). So both watermarks come out near the top of HBM.</p>
+
+      <p><strong>W_hi(HBM)</strong> &mdash; the headroom above it must absorb whatever the allocator grabs during the demotion&rsquo;s reaction time, so the allocator never hits 100% and stalls the GPU:</p>
+      <div class="formula-box">Free_HBM = Cap_HBM_for_KV &minus; W_hi(HBM)  &ge;  R_alloc_peak &times; t_react(HBM)
+
+# Peak HBM allocation rate = compute-bound prefill token rate &times; KV_per_tok:
+R_alloc_peak = F_sustained / (2&middot;P) &times; KV_per_tok
+             = 3.17e15 / 1.4e11 &times; 320 KB
+             = 22 600 tok/s &times; 320 KB  &asymp;  7.2 GB/s                     [D]
+
+# Reaction = one sweep interval (detect) + first block demote:
+t_react(HBM) = t_sweep + block/B_PCIe = ~26 ms (5 ticks) + 205 &micro;s  &asymp;  26 ms
+
+reaction_backlog = 7.2 GB/s &times; 0.026 s  &asymp;  0.19 GB                     [D]
+
+# Slab-granularity floor (Iter 1a reserves a whole contiguous slab on admit):
+Free_HBM = max(reaction_backlog, one mean admission)  =  max(0.19, 4.16)  &asymp;  4.2 GB
+&rArr; W_hi(HBM) &asymp; 450 &minus; ~5 GB (with margin)  &asymp;  445 GB              [D]</div>
+      <p><strong>W_lo(HBM)</strong> &mdash; how far down each sweep frees. The band <code>W_hi &minus; W_lo</code> is sized so the sweep does not immediately re-fire: free enough for <code>k</code> admissions to proceed before the next crossing.</p>
+      <div class="formula-box">band_HBM = W_hi(HBM) &minus; W_lo(HBM) = k &times; mean_admission_KV   (k &asymp; 3)
+         = 3 &times; 4.16 GB  &asymp;  12.5 GB                                    [D]
+&rArr; W_lo(HBM) &asymp; 445 &minus; 12.5  &asymp;  432 GB                            [D]</div>
+      <ul>
+        <li><strong>Reading it:</strong> at 445 GB the sweep fires, frees ~12.5 GB of the coldest idle KV down to 432 GB, then goes quiet. ~3 mean admissions (12.5 GB) can run before it fires again &mdash; so the LRU scan is paid once per ~3 admissions, not once per tick.</li>
+        <li><strong>The inputs are the same three as Q2</strong> &mdash; drain speed (here PCIe, fast), the batch-KV statistic (mean admission for the band), and per-step latency (sets <code>t_react</code>). Because the HBM drain is fast and reliable, the headroom comes out <em>thin</em> (~5 GB of a 450 GB tier); the contrast with DRAM&rsquo;s thick headroom is the whole point of the next table.</li>
+        <li><strong>Tuning note for the implementer:</strong> use the workload&rsquo;s mean admission size for the band, a small safety factor on <code>Free_HBM</code>, and raise <code>k</code> if you observe the sweep firing more than ~once per few admissions in production.</li>
+      </ul>
+
+      <div class="ref-box"><strong>Latency is fully hidden.</strong> The HBM&rarr;DRAM copy runs on an async copy engine: one 5.12 MB block = <code>205 &micro;s</code> over PCIe, and the decode tick is <code>~5.2 ms</code> &mdash; so <strong>~25 blocks drain behind a single tick</strong>. Because the sweep runs <em>ahead</em> of demand (that is what <code>Free_HBM</code> buys), the next forward pass never waits on flow &#9312;. This is why HBM&rarr;DRAM is the easy half; the hard half is keeping DRAM itself free (Q2).</div>
+
+      <h3 id="q1-vs-q2">Why both watermarks on both tiers &mdash; but sized differently</h3>
+      <p>A fair question: if HBM gets a <code>W_hi</code>/<code>W_lo</code> pair, does DRAM? <strong>Yes &mdash; every background reclaimer needs the anti-thrash pair</strong> (the design choice above applies to both tiers). What <em>differs</em> is the headroom <em>thickness</em> and what it defends, and that difference is set by the tier&rsquo;s drain:</p>
+      <table class="sheet">
+        <thead><tr><th>&nbsp;</th><th>HBM watermarks</th><th>DRAM watermarks</th></tr></thead>
+        <tbody>
+          <tr><td><strong>W_hi / W_lo pair?</strong></td><td>Yes (anti-thrash)</td><td>Yes (anti-thrash) &mdash; same pattern</td></tr>
+          <tr><td><strong>What the headroom protects</strong></td><td>free slots for a <em>critical-path</em> consumer (GPU allocator); a miss <em>stalls the GPU</em></td><td>a <em>burst backlog</em> the slow drain cannot remove fast enough</td></tr>
+          <tr><td><strong>Its drain</strong></td><td>demote &rarr; DRAM: <strong>fast (25 GB/s) &amp; always succeeds</strong> (DRAM kept free by Q2)</td><td>write &rarr; SSD: <strong>slow (3&ndash;5 GB/s) &amp; can be overwhelmed</strong> (requirement 1)</td></tr>
+          <tr><td><strong>Headroom size</strong></td><td><strong>thin</strong> &mdash; ~5 GB of 450 GB (drain catches up in ~26 ms)</td><td><strong>thick</strong> &mdash; ~2.5 GB <em>per concurrent prefill stream</em> (must hold <code>backlog(N*)</code>)</td></tr>
+          <tr><td><strong>What W_lo controls</strong></td><td>amortise the LRU sweep over ~3 admissions</td><td>run the SSD writer in efficient batches (avoid start/stop per block)</td></tr>
+          <tr><td><strong>Overflow consequence</strong></td><td>(rare &mdash; drain is fast) GPU stall &rarr; back-pressure</td><td><strong>drop coldest &rarr; recompute</strong> (the loss path, <a href="#loss">&sect;5</a>)</td></tr>
+        </tbody>
+      </table>
+      <div class="gate-box"><strong>One-line answer.</strong> The watermark <em>pair</em> is symmetric (both tiers are background reclaimers, both need hysteresis); the headroom <em>thickness</em> is asymmetric, set by drain speed &times; reliability. HBM&rsquo;s fast, never-failing drain &rArr; a thin headroom whose job is anti-thrash. DRAM&rsquo;s slow, defeatable drain &rArr; a thick headroom whose job is to absorb a burst the disk cannot &mdash; which is exactly what &sect;4 derives.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 4. Q2 CPU RAM -> SSD                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="q2">4. Q2 &mdash; CPU RAM &rarr; SSD pre-offload (the watermark)</h2>
+      <p><strong>TL;DR.</strong> Your instinct is exactly right: an HBM eviction <em>cannot</em> wait for DRAM to free a slot by writing to SSD synchronously (a 4 GB conv at 3.5 GB/s = ~1.1 s of stall). So DRAM runs its <em>own</em> background watermark sweep that pre-offloads cold blocks to SSD <strong>ahead</strong> of demand &mdash; keeping a free headroom <code>H_DRAM</code> that the HBM demotion always lands in. The whole question becomes: <strong>how big must <code>H_DRAM</code> be, and how fast must the SSD writer run?</strong></p>
+
+      <h3 id="q2-bucket">It&rsquo;s a leaky bucket</h3>
+      <p>Model the DRAM headroom as a buffer between a producer and a consumer:</p>
+
+      <svg viewBox="0 0 1100 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Leaky-bucket model: HBM demotion fills DRAM headroom, SSD writer drains it, overflow drops to recompute" style="width:100%;height:auto;font-family:'JetBrains Mono',monospace;">
+        <defs>
+          <marker id="b-ah" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#1e293b"/></marker>
+          <marker id="b-ahr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#dc2626"/></marker>
+        </defs>
+        <!-- producer -->
+        <rect x="40" y="40" width="300" height="70" rx="8" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+        <text x="190" y="70" text-anchor="middle" font-weight="700" font-size="14" fill="#3730a3">Producer: HBM &rarr; DRAM demote</text>
+        <text x="190" y="92" text-anchor="middle" font-size="12.5" fill="#475569">rate R_in (bytes/s of retained KV)</text>
+        <!-- arrow into bucket -->
+        <line x1="190" y1="110" x2="190" y2="160" stroke="#1e293b" stroke-width="2.6" marker-end="url(#b-ah)"/>
+        <!-- bucket -->
+        <path d="M 120 165 L 460 165 L 430 360 L 150 360 Z" fill="#ecfeff" stroke="#0891b2" stroke-width="2.4"/>
+        <!-- fill level (W_hi) -->
+        <path d="M 137 230 L 443 230 L 430 360 L 150 360 Z" fill="#a5f3fc" opacity="0.7"/>
+        <line x1="120" y1="230" x2="470" y2="230" stroke="#d97706" stroke-width="2" stroke-dasharray="6 3"/>
+        <text x="487" y="234" font-size="12.5" fill="#b45309"><tspan font-weight="700">W_hi(DRAM)</tspan></text>
+        <text x="290" y="200" text-anchor="middle" font-size="12.5" fill="#0e7490">H_DRAM</text>
+        <text x="290" y="216" text-anchor="middle" font-size="11" fill="#0e7490">(headroom = the buffer)</text>
+        <text x="290" y="300" text-anchor="middle" font-size="12.5" fill="#155e75">DRAM occupancy</text>
+        <!-- tap out (consumer) -->
+        <line x1="290" y1="360" x2="290" y2="400" stroke="#1e293b" stroke-width="2.6" marker-end="url(#b-ah)"/>
+        <rect x="140" y="400" width="300" height="20" rx="6" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+        <text x="640" y="392" font-size="13" fill="#334155" font-weight="700">Consumer: DRAM &rarr; SSD write</text>
+        <text x="640" y="410" font-size="12.5" fill="#475569">rate R_out = B_ssd_write (3&ndash;5 GB/s)</text>
+        <!-- overflow lip -->
+        <line x1="460" y1="165" x2="560" y2="135" stroke="#dc2626" stroke-width="2.4" marker-end="url(#b-ahr)"/>
+        <rect x="560" y="100" width="300" height="70" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+        <text x="710" y="130" text-anchor="middle" font-weight="700" font-size="14" fill="#991b1b">Overflow: drop coldest</text>
+        <text x="710" y="152" text-anchor="middle" font-size="12.5" fill="#475569">&rarr; recompute (RPO=0)</text>
+        <!-- requirements box -->
+        <rect x="600" y="220" width="460" height="180" rx="8" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+        <text x="620" y="248" font-size="14" font-weight="700" fill="#0f172a">Two requirements</text>
+        <text x="620" y="274" font-size="12.5" fill="#334155">(1) Drain keeps up:  R_out &ge; mean(R_in)</text>
+        <text x="620" y="294" font-size="11.5" fill="#64748b">      else the bucket fills no matter the watermark.</text>
+        <text x="620" y="320" font-size="12.5" fill="#334155">(2) Headroom absorbs bursts:</text>
+        <text x="620" y="340" font-size="12.5" fill="#334155">      H_DRAM &ge; max backlog during a burst</text>
+        <text x="620" y="360" font-size="11.5" fill="#64748b">      = &int;(R_in &minus; R_out) dt over the worst burst.</text>
+        <text x="620" y="386" font-size="11.5" fill="#64748b">If both hold, flow &#9312; always lands in free DRAM.</text>
+      </svg>
+
+      <h3 id="q2-derive">Sizing the watermark from your three inputs</h3>
+      <p>You named the three inputs exactly. Here is how each enters the math:</p>
+      <table class="sheet">
+        <thead><tr><th>Your input</th><th>Symbol</th><th>Role in the watermark</th></tr></thead>
+        <tbody>
+          <tr><td>CPU RAM &rarr; SSD latency / bandwidth</td><td class="c">R_out = B_ssd_write</td><td>the drain rate &mdash; sets requirement (1) and the drain term of (2)</td></tr>
+          <tr><td>batch KV cache size (avg / median / max)</td><td class="c">S = N &middot; KV_per_tok</td><td>the size of one demotion event &mdash; the <em>statistic chosen</em> sets the burst we plan for</td></tr>
+          <tr><td>avg process latency</td><td class="c">t_burst = prefill_time(N)</td><td>how long a burst lasts &mdash; the producer injects at <code>S / t_burst</code> for this long</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Requirement (1) &mdash; the drain must keep up (the floor)</h4>
+      <div class="formula-box">B_ssd_write  &ge;  R_demote_mean        # mean rate retained KV is pushed out of HBM</div>
+      <ul>
+        <li><code>R_demote_mean</code> is the steady-state rate at which <em>kept</em> KV (multi-turn convs cooling and getting displaced) flows down. Its exact value depends on the retained fraction, which a later iteration derives from the demotion flow &mdash; <strong>kept symbolic here, not fabricated.</strong></li>
+        <li>But it is <strong>bounded</strong> by the per-stream KV <em>creation</em> rate, which is fully derivable. For the mean request at B=1: <code>R_create_sustained = (13K + 400)&middot;320 KB / (0.73 s + 400&middot;5.2 ms) = 4.29 GB / 2.81 s &asymp; 1.53 GB/s</code> <span class="tag tag-d">[D]</span>.</li>
+        <li>So at single-stream (Iter&nbsp;1a, B=1): <code>R_demote_mean &le; 1.53 GB/s &Lt; 3.5 GB/s = B_ssd_write</code> &mdash; <strong>the floor holds with margin.</strong> One NVMe keeps up.</li>
+      </ul>
+      <div class="warn-box"><strong>The floor is what eventually breaks &mdash; and it is a known scale lever, not a new design choice.</strong> Requirement (1) scales with concurrent prefill streams: <code>R_demote_mean &le; 1.53 GB/s &times; B_prefill</code>. Past <code>B_prefill &asymp; 3.5 / 1.53 &asymp; 2.3</code> concurrent streams of fully-retained KV, one NVMe&rsquo;s write BW is exceeded. The design already has the three escape valves: (a) the <em>admission gate</em> writes down only KV worth more than recompute (so retained &Lt; created); (b) a 4-NVMe write stripe (the Iter&nbsp;1a DC2 alternative <em>flagged for scale</em>); (c) a later iteration retires local NVMe for a remote pool entirely (<a href="#evolution">&sect;7</a>). This matches the scenario page&rsquo;s &ldquo;SSD-BW saturation under high eviction churn&rdquo; risk &mdash; this page does not introduce a new choice.</div>
+
+      <h4>Requirement (2) &mdash; the headroom must absorb a burst (sizes <code>H_DRAM</code>)</h4>
+      <p>A prefill burst creates KV faster than the drain removes it. The headroom must hold the backlog that builds during the worst burst. For a request of <code>N</code> tokens, the producer injects <code>N&middot;KV_per_tok</code> over <code>prefill_time(N)</code> while the drain removes <code>B_ssd_write &times; prefill_time(N)</code>. The net backlog is the difference:</p>
+      <div class="formula-box"># Backlog a single prefill stream of N tokens can pile up:
+backlog(N) = N&middot;KV_per_tok  &minus;  B_ssd_write &middot; prefill_time(N)
+           = created during the burst  &minus;  drained during the burst
+
+# This is NOT monotonic in N: long prefills are slow, so the drain catches up.
+# Maximise over N to find the worst-case burst we must size for.</div>
+      <p>Substituting the prefill-time formula <code>prefill_time(N) = (2P&middot;N + 4&middot;n_layers&middot;d_model&middot;N&sup2;)/F_sustained</code> with the page constants (<code>2P = 1.4&times;10&sup1;&sup1;</code>, <code>4&middot;80&middot;8192 = 2.62&times;10&#8310;</code>, <code>F_sustained = 3.17&times;10&sup1;&#8309;</code>, <code>B_ssd_write = 3.5&times;10&#8313;</code>, <code>KV_per_tok = 3.2&times;10&#8309;</code>):</p>
+      <div class="formula-box">backlog(N) = 3.2e5&middot;N  &minus;  3.5e9&middot;(1.4e11&middot;N + 2.62e6&middot;N&sup2;)/3.17e15
+           = 3.2e5&middot;N  &minus;  (1.546e5&middot;N + 2.89&middot;N&sup2;)
+           = 1.654e5&middot;N  &minus;  2.89&middot;N&sup2;                          [D]
+
+# d/dN = 0  &rArr;  N* = 1.654e5 / (2&middot;2.89) &asymp; 2.86e4 tok  (&asymp; 28.6 K)
+# backlog(N*) = 1.654e5&middot;28600 &minus; 2.89&middot;28600&sup2; &asymp; 2.37 GB             [D]</div>
+      <p>Plus the detection lag &mdash; the sweep checks the watermark every <code>t_sweep &asymp; 5 ticks &asymp; 26 ms</code>, during which the drainer may not yet have reacted, so add <code>R_peak(N*) &times; t_sweep</code>. At <code>N*</code>, <code>prefill_time(28.6K) &asymp; 1.94 s</code> &rArr; <code>R_peak = 9.15 GB / 1.94 s = 4.72 GB/s</code>, so the lag term is <code>4.72 &times; 0.026 &asymp; 0.12 GB</code>:</p>
+      <div class="formula-box">H_DRAM(per prefill stream)  &asymp;  backlog(N*) + R_peak&middot;t_sweep
+                            &asymp;  2.37 + 0.12  &asymp;  2.5 GB           [D]
+with a 1.5&times; safety factor &rArr;  ~3.7 GB per concurrent prefill stream
+
+At Iter 1a (B=1):  W_hi(DRAM) = 800 GB &minus; 3.7 GB &asymp; 796 GB  (~99.5%)
+General:           H_DRAM &asymp; B_prefill &times; 2.5 GB     (scales with concurrency)</div>
+      <p><strong>W_lo(DRAM)</strong> &mdash; DRAM uses the <em>same</em> <code>W_hi</code>/<code>W_lo</code> pair as HBM (the anti-thrash design choice in <a href="#q1-howmany">&sect;3</a> applies to every background reclaimer). The band sets how long the SSD writer runs once it wakes: free a worthwhile batch so the drive does sequential bursts rather than start/stopping per block.</p>
+      <div class="formula-box">band_DRAM = W_hi(DRAM) &minus; W_lo(DRAM) = drain-run length
+          &asymp; 2 &times; H_DRAM            # a couple of bursts' worth before going quiet
+          &asymp; 2 &times; 3.7 GB &asymp; 7.4 GB  (at B=1)                       [D]
+&rArr; W_lo(DRAM) &asymp; 796 &minus; 7.4 &asymp; 789 GB                            [D]
+
+# Contrast with HBM: there the band amortises an LRU SCAN (CPU cost);
+# here it amortises SSD WRITE setup (sequential-vs-random throughput).</div>
+      <p>So both tiers carry a full pair. The reason the headroom <em>above</em> <code>W_hi(DRAM)</code> (<code>H_DRAM &asymp; 3.7 GB/stream</code>) is so much thicker than HBM&rsquo;s (<code>~5 GB</code> total) is the drain asymmetry tabulated in <a href="#q1-vs-q2">&sect;3</a>: DRAM&rsquo;s drain is slow and can be overwhelmed, so its headroom must hold a real burst; HBM&rsquo;s drain is fast and never fails, so its headroom is just anti-thrash slack.</p>
+
+      <h3 id="q2-stat">The design choice you flagged: avg, median, or max batch size?</h3>
+      <p>This is a real knob, and the answer is <em>different for the two requirements</em> &mdash; which is the whole subtlety:</p>
+      <table class="sheet">
+        <thead><tr><th>Where the size feeds in</th><th>Which statistic</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Requirement (1)</strong> &mdash; sustained drain</td><td><strong>mean</strong></td><td>Steady-state throughput must cover the <em>average</em> demotion rate. Provisioning the drain for the peak wastes drives; provisioning for the median under-serves.</td></tr>
+          <tr><td><strong>Requirement (2)</strong> &mdash; burst headroom</td><td><strong>neither mean nor max &mdash; the size that maximises <code>backlog(N)</code></strong> (here N* &asymp; 28.6 K, a p90-ish request)</td><td>The worst burst is <em>not</em> the largest request. A p99 256 K prefill is <em>slow</em> (65.5 s), so the drain keeps up: <code>backlog(256K) = 82 &minus; 3.5&times;65.5 = 82 &minus; 229 &lt; 0</code> &mdash; no backlog at all. Sizing on &ldquo;max&rdquo; over-provisions DRAM for a whale the disk already absorbs. Sizing on &ldquo;mean&rdquo; (13 K) slightly under-provisions. The true worst case is the medium-large request that is both big <em>and</em> fast.</td></tr>
+        </tbody>
+      </table>
+      <div class="gate-box"><strong>Net rule.</strong> Provision the SSD <em>write throughput</em> for the <strong>mean</strong> demotion rate; size the DRAM <em>headroom</em> for the request that <strong>maximises created-minus-drained</strong> (a medium-large N, derived by maximising <code>backlog(N)</code>), <em>not</em> the largest request. &ldquo;Just use max&rdquo; is the trap the curve&rsquo;s non-monotonicity sets.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 5. LOSS PATH                                                 -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="loss">5. The loss path &mdash; when the SSD can&rsquo;t drain in time</h2>
+      <p>If a sustained surge violates requirement (1) <em>and</em> exhausts <code>H_DRAM</code> faster than the drainer can refill it, DRAM hits 100% with an HBM demotion still inbound. The bucket overflows. The policy is deliberately simple:</p>
+      <ol class="steps" style="counter-reset:step;">
+        <li><strong>Never stall the GPU to wait for a write.</strong> The HBM demotion must land somewhere instantly, so blocking on the SSD write is off the table.</li>
+        <li><strong>Drop the coldest blocks instead of writing them.</strong> The same coldness gate (<code>last_access</code> &and; <code>ref_count==0</code> &and; <code>session_idle</code>) already ranks victims; under overflow, the bottom of that ranking is simply <em>discarded</em>, not written down.</li>
+        <li><strong>The next access re-prefills from token IDs.</strong> A dropped conv that returns pays <code>&beta;<sub>cold</sub> = prefill_time(N)</code> once, then is cached again. The prompt token IDs are durable, so <strong>recompute is always available &mdash; RPO = 0</strong>.</li>
+      </ol>
+      <div class="gate-box"><strong>Direct answer to &ldquo;we will just lose some cache&rdquo; &mdash; yes, and that is correct by design.</strong> Cache loss is a <em>latency</em> event (one extra re-prefill for the unlucky returning conv), never a <em>correctness</em> event. The drop targets the coldest blocks &mdash; the ones least likely to be read back &mdash; so the expected cost is minimised. The blast radius is bounded to the convs dropped during the surge; everything hot stays resident.</div>
+      <div class="note-box"><strong>Why not back-pressure admission instead?</strong> You could refuse new prefills until DRAM drains &mdash; but that converts a cheap, rare, per-conv re-prefill into a queue-wide TTFT spike for <em>every</em> waiting request. Dropping the coldest is strictly more local. (Admission control still exists for <em>throughput</em> protection &mdash; it just is not the tier-pressure release valve.)</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 6. WORKED EXAMPLE                                            -->
+  <!-- ============================================================ -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="worked">6. Worked example &mdash; one task under steady mean load</h2>
+      <p>One Iter&nbsp;1a serving task, B=1, serving the workload-mean request (<code>T<sub>in</sub> = 13 K</code>, <code>T<sub>out</sub> = 400</code>), HBM near its watermark. Trace one demotion end to end.</p>
+      <table class="sheet">
+        <thead><tr><th>Step</th><th>What happens</th><th>Number</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>A new conv&rsquo;s prefill needs an HBM slab; HBM crosses <code>W_hi</code>.</td><td class="n">trigger fires</td></tr>
+          <tr><td>2</td><td>Sweep finds conv&nbsp;X (turn finished 40 s ago, <code>ref_count==0</code>, <code>session_idle</code> true) as coldest. Its 13 K KV = the victim.</td><td class="n">4.16 GB</td></tr>
+          <tr><td>3</td><td>Async copy engine demotes X to DRAM over PCIe &mdash; one contiguous slab at Iter&nbsp;1a (a stream of 16-tok blocks once paging lands at Iter&nbsp;3).</td><td class="n">4.16 GB / 25 GB/s = 166 ms, hidden</td></tr>
+          <tr><td>4</td><td>HBM slot freed for the new prefill; new prefill proceeds. The GPU never waited.</td><td class="n">0 ms stall</td></tr>
+          <tr><td>5</td><td>Meanwhile DRAM occupancy ticked up by 4.16 GB; if it crossed <code>W_hi(DRAM)</code>, the SSD drainer was already running, writing X (or an even-colder conv) down at 3.5 GB/s.</td><td class="n">4.16 GB / 3.5 GB/s = 1.19 s, async</td></tr>
+          <tr><td>6</td><td>Compare the sustained create vs drain: at B=1 create &asymp; 1.53 GB/s &lt; 3.5 GB/s drain &rArr; DRAM does <em>not</em> grow unbounded; the 1.19 s write finishes long before the headroom is threatened.</td><td class="n">floor holds</td></tr>
+          <tr><td>7</td><td>If conv X returns next turn: promote DRAM&rarr;HBM (<code>&beta;<sub>DRAM</sub>(13K) = 166 ms</code>) &mdash; vs <code>&beta;<sub>cold</sub> = 730 ms</code> to re-prefill. The cache saved <strong>4.4&times;</strong> on TTFT.</td><td class="n">166 ms vs 730 ms</td></tr>
+        </tbody>
+      </table>
+      <div class="ref-box"><strong>Reading the trace.</strong> At single-task B=1 the system is comfortably inside both requirements: HBM demotion is hidden (166 ms async, GPU never stalls), and DRAM drains faster than it fills (3.5 &gt; 1.53 GB/s). The watermark headroom (<code>~3.7 GB</code>) exists for the <em>prefill burst</em> case (a fresh 28 K-ish prefill arriving while DRAM is near <code>W_hi</code>), not the steady state. Pressure on requirement (1) only appears as concurrency grows &mdash; the scale lever in <a href="#q2-derive">&sect;4</a>&rsquo;s warn-box.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 7. EVOLUTION                                                 -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="evolution">7. How this policy evolves across iterations</h2>
+      <p>This page is anchored at the Iter&nbsp;1a local model, but the eviction policy changes as later iterations land (and is re-synced here when they do, per <code>NEW_IMPLEMENTATION_DETAILS.md</code> &sect;0.8). The policy moves along <strong>three orthogonal axes</strong>: the eviction <strong>unit</strong> (slab &rarr; block), the demotion <strong>destination</strong> (local SSD &rarr; remote pool), and the <strong>copy semantics</strong> (always-copy &rarr; clean-drop). Below is each iteration&rsquo;s eviction policy <em>in full</em> &mdash; the mechanism, the data-structure delta, and the exact eviction decision.</p>
+
+      <h3 id="evo-1a">Iter 1a &mdash; born: conv/slab-granular, local 3-tier</h3>
+      <ul>
+        <li><strong>Unit:</strong> the whole <em>contiguous per-request slab</em>. There is no sub-slab eviction &mdash; a conversation&rsquo;s KV moves as one block of bytes.</li>
+        <li><strong>State:</strong> <code>ref_count</code>, <code>last_access</code>, and <code>tier_tag</code> are tracked <em>per slab / per conversation</em> (the slab <em>is</em> the conv&rsquo;s KV).</li>
+        <li><strong>Policy:</strong> per-tier rule (HBM = LRU + <code>ref_count</code>; DRAM/SSD = plain LRU), non-cascading tier-skip on the 3-signal coldness gate, async watermark pre-offload. <strong>This is the entire main body above (&sect;3&ndash;&sect;5).</strong></li>
+      </ul>
+      <div class="code-box"><span class="cm"># ITER 1a — the eviction loop is born. Unit = whole conv SLAB; always copies down.</span>
+<span class="kw">on</span> HBM_used &ge; W_hi(HBM), coldest-first <span class="kw">over</span> conv SLABS:
+    <span class="kw">if</span> slab.ref_count &gt; 0:        <span class="cm"># active / shared &mdash; pinned (correctness), never a victim</span>
+        <span class="kw">continue</span>
+    <span class="kw">if</span> <span class="kw">not</span> coldness_gate(slab):    <span class="cm"># last_access old &and; ref_count==0 &and; session_idle</span>
+        <span class="kw">continue</span>
+    <span class="fn">demote</span>(slab, cheapest_adequate_tier)   <span class="cm"># HBM&rarr;DRAM&rarr;SSD, NON-CASCADING tier-skip</span>
+                                           <span class="cm"># ALWAYS copies down &mdash; no clean-drop (each tier holds 1 canonical copy),</span>
+                                           <span class="cm"># no length gate (local tiers always accept the spill)</span></div>
+
+      <h3 id="evo-2">Iter 2 &mdash; P/D split: same policy, run on two pools</h3>
+      <ul>
+        <li><strong>No policy change &mdash; a topology change.</strong> Prefill-pool tasks and decode-pool tasks each run the <em>same</em> local HBM&rarr;DRAM&rarr;SSD eviction independently; nothing about the gate or watermarks changes.</li>
+        <li><strong>New constraint it surfaces:</strong> on a decode task the <em>active-decode set is hard-pinned</em> (<code>ref_count&nbsp;&gt;&nbsp;0</code>) and cannot be evicted mid-decode &mdash; doing so would cost <code>&beta;<sub>DRAM</sub>(N)</code> <em>per token</em>. So eviction fires only on paused / finished convs, exactly as the <code>ref_count</code> pin already guarantees. Still slab-granular (paging is Iter&nbsp;3).</li>
+      </ul>
+
+      <h3 id="evo-3">Iter 3 &mdash; PagedAttention: the eviction <em>unit</em> becomes the 16-token block</h3>
+      <p>This is the iteration your question is about. KV stops being a contiguous slab and becomes a list of fixed <strong>16-token blocks</strong> (5.12 MB each), indexed by <code>BlockTable[seq_id] = [block_id, block_id, &hellip;]</code>; free blocks live on a LIFO free-list. The eviction unit, and every signal, follows the block.</p>
+      <div class="gate-box"><strong>Direct answer: yes &mdash; <code>ref_count</code> moves from per-slab to <em>per-block</em>.</strong> Each physical <code>block_id</code> carries its own <code>ref_count</code> = the number of <code>BlockTable</code> entries (across <em>all</em> sequences) currently pointing at it. The GPU still never touches it; the CPU block-manager maintains it atomically.</div>
+      <ul>
+        <li><strong>What <code>ref_count</code> counts at Iter&nbsp;3.</strong> Most blocks are <em>private</em> to one sequence, so <code>ref_count</code> just toggles <code>0&harr;1</code> with that sequence&rsquo;s life (allocated &rarr; freed on EOS). It is still the <em>liveness / correctness</em> pin: a block any live sequence&rsquo;s table points at cannot be freed. Within-request sharing (copy-on-write for parallel sampling / beam search) already makes <code>ref_count&nbsp;&gt;&nbsp;1</code> possible here; <em>cross-request</em> prefix sharing &mdash; where one block is pointed at by thousands of convs and <code>ref_count</code> becomes large and load-bearing &mdash; arrives at Iter&nbsp;5.</li>
+        <li><strong><code>last_access</code> also goes per-block</strong> (the scheduler stamps every block the batch touched each engine step). <strong><code>session_idle</code> stays per-conversation</strong> &mdash; a block inherits its owning conv&rsquo;s idle predicate (<code>now &minus; last_turn_ts &gt; T<sub>idle</sub></code>); there is no per-block idle clock.</li>
+        <li><strong>The coldness gate now evaluates per block:</strong> <code>evictable(block) = last_access[block] old &and; ref_count[block]==0 &and; session_idle(conv_of(block))</code>. The sweep ranks individual blocks by LRU within the evictable set.</li>
+        <li><strong>New capability the block unit unlocks: partial eviction.</strong> A long sequence&rsquo;s cold <em>early-context</em> blocks can be demoted while its hot <em>tail</em> stays HBM-resident &mdash; impossible with a contiguous slab, which was all-or-nothing. This is why paging makes mid-flight demotion safe.</li>
+        <li><strong>Mechanics:</strong> HBM free-list count <code>&lt; low_watermark</code> &rarr; sweep picks coldest evictable <code>block_id</code>s &rarr; demote each (5.12 MB / 25 GB/s = <strong>205 &micro;s</strong> over PCIe) &rarr; set <code>tier_tag[block_id]=DRAM</code>, push the freed slot to the free-list. Non-cascading tier-skip, <em>per block</em>. The <code>205 &micro;s/block</code> and <code>~25 blocks/tick</code> figures used in &sect;3 become <em>literal</em> here &mdash; the 16-tok block <em>is</em> the demotion quantum.</li>
+      </ul>
+      <div class="code-box"><span class="cm"># ITER 3 — Δ from 1a: the UNIT shrinks slab &rarr; 16-tok BLOCK; ref_count/last_access go per-block. Decision logic unchanged.</span>
+<span class="kw">on</span> HBM free-list &lt; low_watermark, coldest-first <span class="kw">over</span> 16-tok BLOCKS:   <span class="cm"># &larr; was conv SLABS</span>
+    <span class="kw">if</span> block.ref_count &gt; 0:       <span class="cm"># &larr; ref_count now PER-BLOCK (# BlockTable entries pointing at it)</span>
+        <span class="kw">continue</span>
+    <span class="kw">if</span> <span class="kw">not</span> coldness_gate(block):   <span class="cm"># per-block last_access; session_idle still per conv</span>
+        <span class="kw">continue</span>
+    <span class="fn">demote</span>(block, cheapest_adequate_tier)  <span class="cm"># block-granular tier-skip; STILL always copies down</span>
+                                           <span class="cm"># &larr; partial eviction now possible: a conv's cold early blocks spill while its hot tail stays in HBM</span></div>
+
+      <h3 id="evo-3b">Iter 3b &mdash; tier rework: the <em>destination</em> changes + a length-gate admission</h3>
+      <ul>
+        <li><strong>Local NVMe is retired (Q7/DC7).</strong> The cascade becomes <code>HBM &rarr; local DRAM &rarr; remote pool DRAM front &rarr; remote pool NVMe back &rarr; recompute</code> &mdash; no local SSD.</li>
+        <li><strong>The DRAM pre-offload now drains over the network.</strong> &sect;4&rsquo;s DRAM&rarr;down watermark writes to the remote pool via <strong>RDMA (25 GB/s)</strong> instead of local NVMe (3&ndash;5 GB/s). The drain is <em>~7&times; faster</em> and the destination is a shared pool with its own capacity-LRU &mdash; but it is still <strong>async, ahead of demand</strong>: a <em>synchronous</em> RDMA spill would land on the decode step&rsquo;s TPOT, so the trickle stays off the request path exactly as before.</li>
+        <li><strong>Eviction becomes an admission decision for the tier below (Move D).</strong> A block that passes the coldness gate is then length-tested: <code>recompute_cost(N) &gt; transfer_cost(N)</code>? (the ~1.9 K-token crossover, <code>transfer_cost</code> measured against the slowest serving tier). <strong>Worth it &rarr; write down to the pool; not worth it &rarr; discard</strong> (recompute floor). So not every evicted block is written down &mdash; short, cheap-to-recompute convs are dropped rather than shipped across the fabric.</li>
+        <li><strong>Unchanged:</strong> <code>ref_count</code>, the 3-signal coldness gate, and the hysteresis-pair watermarks. What is new is only the <em>destination</em> (pool, not local NVMe) and the <em>length gate</em> on write-down.</li>
+        <li><strong>Pool sizing (now derived &mdash; flagged model):</strong> the posited <code>f_pool</code> fraction is <em>retired</em> (D5); pool size is the outcome of the demotion flow &mdash; a derived per-turn admit-probability <code>p<sub>admit</sub> &asymp; 7%</code> &rarr; <code>W<sub>pool</sub> &asymp; 2.1 PB</code> &rarr; ~36 store tasks (<a href="distributed_kv_cache.html#iter3b-nums">scenario &sect;9b.4</a>; dominant uncertainty = the inter-turn-gap heavy-tail exponent). (Pool-side internal DRAM-front&rarr;NVMe-back demotion lives in <a href="kv_store.html">kv_store.html</a>.)</li>
+      </ul>
+      <div class="code-box"><span class="cm"># ITER 3b — Δ from 3: down-destination local-NVMe &rarr; REMOTE pool; a LENGTH GATE now decides write-down vs discard.</span>
+<span class="kw">on</span> HBM / local-DRAM watermark, coldest-first <span class="kw">over</span> BLOCKS:
+    <span class="kw">if</span> block.ref_count &gt; 0: <span class="kw">continue</span>
+    <span class="kw">if</span> <span class="kw">not</span> coldness_gate(block): <span class="kw">continue</span>
+    <span class="kw">if</span> a LOCAL tier below has room:       <span class="cm"># HBM &rarr; local DRAM: free, ungated (unchanged from Iter 3)</span>
+        <span class="fn">demote</span>(block, DRAM)
+    <span class="kw">else</span>:                                <span class="cm"># &larr; leaving local ENTIRELY (local NVMe retired, DC7) &rarr; the remote pool</span>
+        <span class="kw">if</span> recompute_cost(N) &gt; transfer_cost(N):  <span class="cm"># &larr; LENGTH GATE (Move D), NEW: the pool is networked + scarce</span>
+            <span class="fn">write_down</span>(block, pool)         <span class="cm"># RDMA to L3 front; pool demotes to its L5 NVMe back internally</span>
+        <span class="kw">else</span>:
+            <span class="fn">discard</span>(block)                  <span class="cm"># recompute floor (RPO=0) &mdash; short conv not worth the fabric</span>
+<span class="cm"># Still NO clean-drop: no content hash yet to prove a lower copy is identical (that's Iter 5).</span></div>
+
+      <h4>Walked example &mdash; Iter 3b: the length gate sorts two cold convs</h4>
+      <p>One Iter&nbsp;3b serving task, paged blocks, HBM at <code>W_hi</code> and local DRAM near <code>W_hi(DRAM)</code>. Two conversations go cold in the same sweep &mdash; conv&nbsp;<strong>A</strong> (13 K prior tokens, long) and conv&nbsp;<strong>B</strong> (600 tokens, short). Trace both to their resting place.</p>
+      <table class="sheet">
+        <thead><tr><th>Step</th><th>What happens</th><th>Number</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>HBM crosses <code>W_hi</code>; sweep finds A and B coldest (<code>ref_count==0 &and; session_idle</code>, <code>last_access</code> old).</td><td class="n">A&nbsp;=&nbsp;813 blocks, B&nbsp;=&nbsp;38 blocks</td></tr>
+          <tr><td>2</td><td>Both demote HBM&rarr;<strong>local DRAM</strong> first (async PCIe, hidden) &mdash; the first hop is unchanged from Iter&nbsp;1a.</td><td class="n">A: 4.16 GB/25 = 166 ms · B: 0.19 GB/25 = 8 ms</td></tr>
+          <tr><td>3</td><td>Local DRAM crosses <code>W_hi(DRAM)</code> &rarr; the pre-offload drainer wakes. <strong>Destination is now the remote pool via RDMA (25 GB/s)</strong>, and each conv faces the <strong>length gate</strong> before the wire.</td><td class="n">drain @ 25 GB/s (was 3&ndash;5)</td></tr>
+          <tr><td>4</td><td>Gate, conv A (13 K <strong>&gt;</strong> ~1.9 K crossover): <code>recompute = &beta;<sub>cold</sub>(13K) = 730 ms</code> <strong>&gt;</strong> <code>transfer(7 GB/s) = 594 ms</code> &rArr; <strong>WRITE DOWN</strong> to the pool.</td><td class="n">RDMA 4.16 GB/25 = 166 ms, async</td></tr>
+          <tr><td>5</td><td>Gate, conv B (600 <strong>&lt;</strong> ~1.9 K): <code>recompute = &beta;<sub>cold</sub>(600) &asymp; 27 ms</code> &asymp; <code>transfer &asymp; 27 ms</code> &rArr; no latency win &rArr; <strong>DISCARD</strong> &mdash; don&rsquo;t spend a scarce shared-pool slot on a conv that recomputes in 27 ms.</td><td class="n">0 bytes to pool</td></tr>
+          <tr><td>6</td><td>Local DRAM freed for both; GPU never waited. A <em>synchronous</em> RDMA spill would have landed 166 ms on the triggering decode step&rsquo;s TPOT &mdash; kept async by construction.</td><td class="n">0 ms stall</td></tr>
+          <tr><td>7</td><td>Next turn: A returns &mdash; <em>even if rebalanced to a different task</em> &mdash; and pulls from the shared pool. B returns and recomputes (no pool entry, cheap by the gate&rsquo;s own logic).</td><td class="n">A: 166 ms vs 730 ms (4.4&times;) · B: 27 ms</td></tr>
+        </tbody>
+      </table>
+      <div class="ref-box"><strong>Reading the trace.</strong> The length gate is what keeps cheap-to-recompute short convs <em>out</em> of the scarce shared pool, and the RDMA destination + global pool give the long conv something local NVMe never could: its cache <strong>survives a rebalance to another task</strong>. The first hop (HBM&rarr;local DRAM) and the async discipline are byte-for-byte the Iter&nbsp;1a behaviour &mdash; only the floor destination and the write-down gate are new.</div>
+
+      <h3 id="evo-5">Iter 5 &mdash; prefix caching: clean-drop, reuse-recency retention, and the full decision tree</h3>
+      <ul>
+        <li><strong>Blocks become content-addressed.</strong> <code>block_hash<sub>i</sub> = hash(parent_hash || tokens<sub>i</sub>)</code> &mdash; chained, <em>content-only</em> (no per-user seed). Identical content &rarr; identical hash &rarr; <em>one shared physical block</em>. Now <code>ref_count &Gt; 1</code> is the common case for a popular system-prompt prefix (thousands of convs point at it) &mdash; this is where the per-block <code>ref_count</code> pin from Iter&nbsp;3 truly bites: such a block is read once at prefill, looks <em>old</em> by <code>last_access</code>, but its high <code>ref_count</code> keeps it pinned, where pure LRU would evict it and corrupt every conv whose <code>BlockTable</code> points at it.</li>
+        <li><strong><code>tier_locs</code> bitmap per block</strong> (<code>HBM | DRAM | REMOTE</code>); <code>dirty</code>/<code>clean</code> derived from it. A block is <em>clean</em> when an identical copy provably already exists in a lower tier.</li>
+        <li><strong>Clean-drop (Move B2) &mdash; the new third eviction path.</strong> An HBM eviction can <strong>free a block with no copy-down at all</strong> when <code>tier_locs</code> shows a clean copy below. <em>Impossible before Iter&nbsp;5</em>: without a content hash you cannot prove a lower copy is byte-identical, so you always had to copy down. Content-addressing is what makes the proof free.</li>
+        <li><strong>Reuse-recency keeps hot shared prefixes resident &mdash; no hard pin</strong> (<code>DESIGN_CHOICE_CHANGE.md</code> Change 5). A popular shared prefix is re-hit on essentially every request, so the LRU key (refreshed on cache <em>hit</em> / reuse at admission, not per-token kernel reads) keeps it at the front, and its <code>ref_count</code> rarely reaches 0 &mdash; it stays resident <em>because it is reused</em>, not because it is excluded from the candidate set. The watermark-LRU evicts the released (<code>ref_count==0</code>) tail by measured recency. <strong>Taxonomy (Move E):</strong> <em>shared-prefix</em> blocks (kept by re-hit) vs <em>session-tail</em> blocks (kept by recency) &mdash; reuse-recency + <code>ref_count</code> serve both. (An optional soft retention-priority bias is the documented upgrade, off the main line.)</li>
+      </ul>
+      <p>Putting it together, the Iter&nbsp;5 eviction decision for each candidate block (coldest first) is the page&rsquo;s fullest form (the scheduler-side <code>evictor_loop()</code> that runs it &mdash; <code>_is_clean</code>, the <code>ref_count</code> pin, the length gate &mdash; is <a href="scheduler.html#iter5-algo-evict">scheduler.html &sect;11b.3</a>; the admit-side prefix match that creates the shared blocks is <a href="scheduler.html#iter5-algo-match">&sect;11b.2</a>):</p>
+      <div class="code-box"><span class="cm"># ITER 5 — Δ from 3b: reuse-recency LRU + ref_count (NO hard pin; Change 5) and + CLEAN-DROP (is_clean → free, no copy-down).</span>
+<span class="kw">on</span> HBM_used &ge; W_hi(HBM), <span class="kw">for</span> block <span class="kw">in</span> coldest_first:   <span class="cm"># coldest = reuse-recency order (LRU key = last cache-hit/reuse)</span>
+    <span class="kw">if</span> block.ref_count &gt; 0:                  <span class="cm"># live/shared — the only hard pin (correctness); a hot prefix rarely hits 0</span>
+        <span class="kw">continue</span>                            <span class="cm"># not evictable &mdash; skip</span>
+    <span class="kw">if</span> <span class="kw">not</span> coldness_gate(block):             <span class="cm"># last_access old &and; ref_count==0 &and; session_idle</span>
+        <span class="kw">continue</span>
+    <span class="kw">if</span> block.<span class="fn">is_clean</span>():                    <span class="cm"># tier_locs shows an identical copy below</span>
+        <span class="fn">free</span>(block)                         <span class="cm"># CLEAN-DROP: no copy-down (Move B2)</span>
+    <span class="kw">else</span>:                                   <span class="cm"># dirty: no lower copy yet</span>
+        <span class="kw">if</span> recompute_cost(N) &gt; transfer_cost(N):
+            <span class="fn">write_down</span>(block, pool)          <span class="cm"># admit to the tier below (Move D length gate)</span>
+        <span class="kw">else</span>:
+            <span class="fn">discard</span>(block)                   <span class="cm"># recompute floor (RPO=0)</span></div>
+
+      <h4>Walked example &mdash; Iter 5: one sweep, four outcomes</h4>
+      <p>HBM crosses <code>W_hi</code> on an Iter&nbsp;5 task with prefix caching live. The sweep walks the coldest blocks and each takes a <em>different</em> branch of the tree above &mdash; one trace exercising all four.</p>
+      <table class="sheet">
+        <thead><tr><th>Candidate block</th><th>Signals</th><th>Branch taken</th><th>Outcome</th><th>Number</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Shared system-prompt prefix (<code>block_hash = H<sub>sys</sub></code>)</td>
+            <td><code>ref_count = 1 200</code> (re-hit constantly &rarr; LRU front; rarely reaches 0)</td>
+            <td>step 1: <code>ref_count&gt;0</code></td>
+            <td><strong>SKIP</strong> &mdash; not evictable</td>
+            <td class="n"><code>ref_count</code> <em>bites</em>: pure LRU ignoring it would corrupt 1 200 convs</td>
+          </tr>
+          <tr>
+            <td>Cold conv block, already written to pool earlier</td>
+            <td>gate passes; <code>tier_locs = HBM|REMOTE</code> (clean)</td>
+            <td>step 3: <code>is_clean()</code></td>
+            <td><strong>CLEAN-DROP</strong> &mdash; free, no copy-down</td>
+            <td class="n">0 bytes moved; frees 5.12 MB instantly</td>
+          </tr>
+          <tr>
+            <td>Cold dirty block, long conv (13 K)</td>
+            <td>gate passes; <code>tier_locs = HBM</code> only (no copy below)</td>
+            <td>step 4: dirty, <code>recompute 730 ms &gt; transfer 594 ms</code></td>
+            <td><strong>WRITE DOWN</strong> to pool</td>
+            <td class="n">RDMA 166 ms, async</td>
+          </tr>
+          <tr>
+            <td>Cold dirty block, short conv (600 tok)</td>
+            <td>gate passes; <code>tier_locs = HBM</code> only</td>
+            <td>step 4: dirty, <code>recompute 27 ms &asymp; transfer 27 ms</code></td>
+            <td><strong>DISCARD</strong></td>
+            <td class="n">recompute floor (RPO=0)</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="ref-box"><strong>Reading the trace.</strong> <strong>Clean-drop (row 2) is the cheapest eviction that exists</strong> &mdash; zero bytes moved, an O(1) free-list push &mdash; and it is unlocked <em>purely</em> by content-addressing proving the lower copy is byte-identical; pre-Iter-5 that same block would have been a redundant write-down of 4.16 GB. Row 1 shows why <code>ref_count</code> is a <em>correctness</em> pin, not a recency tiebreak. Rows 3&ndash;4 are the Iter&nbsp;3b length gate, carried forward unchanged. One sweep, four mechanisms, one ranking.</div>
+
+      <h3 id="evo-rest">Iter 6&ndash;10 &mdash; pressure, not policy (with one real upstream role at Iter 10)</h3>
+      <p>From Iter 6 on, the eviction <em>policy</em> stops evolving &mdash; the gate, the tier-skip discipline, the watermark <em>form</em>, and the clean-drop semantics are all settled. What still moves is the <em>pressure</em> on it (how many slots are pinned, how big each pinned region is) and, at Iter 10, the <em>downstream consumer</em> of what it demotes.</p>
+      <ul>
+        <li><strong>Iter 6 (continuous batching)</strong> raises the active batch to <code>B<sub>decode</sub> &asymp; 106</code>, so many more slots are hard-pinned (<code>ref_count&nbsp;&gt;&nbsp;0</code>) at once and steady demotion pressure rises &mdash; but the gate, the tier-skip discipline, and the watermark <em>form</em> are unchanged. The only quantitative knock-on is the one &sect;4 already states: DRAM headroom scales with the number of concurrent prefill streams (<code>H_DRAM &asymp; B_prefill &times; ~2.5 GB</code>).</li>
+        <li><strong>Iter 7 (speculative decoding) &mdash; a small fixed HBM reservation, no policy change.</strong> The <code>~1B</code> draft model takes <code>~10 GB</code> HBM/task, trimming the KV budget <code>G_KV 450 &rarr; ~440 GB</code> (so <code>B<sub>decode</sub> 106 &rarr; ~104</code>, absorbed in headroom). That is a fixed reservation like the weights &mdash; <strong>not an evictable block</strong> &mdash; so it slightly shrinks the cache&rsquo;s capacity but never enters the demotion path. The speculative tail&rsquo;s KV is allocated then, on reject, freed by a <strong>pointer/length reset on the block table</strong> (same tick, no copy-down) &mdash; an instantaneous free, <em>not</em> a demotion, so it adds zero watermark pressure. <a href="scheduler.html#iter7">scheduler &sect;11d</a>.</li>
+        <li><strong>Iter 8 (per-user abuse limits) &mdash; Router-side; if anything, <em>relieves</em> pressure.</strong> The token-bucket + max-concurrent-conv gate (<a href="router.html#iter8">router &sect;8e</a>) rejects abusive requests <em>before</em> they consume a serving slot, so fewer slots get pinned and demotion pressure on the affected tasks drops marginally. Zero eviction-policy change.</li>
+        <li><strong>Iter 9 (context parallelism) &mdash; an unusually large pinned region, on a dedicated sub-pool.</strong> A CP rank holds a <code>~40 GB</code> KV <em>slice</em> of a <code>1 M</code>-context request (320 GB / 8), pinned (<code>ref_count&nbsp;&gt;&nbsp;0</code>) for the request&rsquo;s lifetime like any active-decode block &mdash; the per-task eviction policy is unchanged. The only nuance: a CP slice is a far larger pinned block than a normal conv, so a task serving one has less evictable headroom &mdash; but CP requests run on a <strong>dedicated <code>cp_ring</code> sub-pool</strong> (<a href="router.html#iter9">router &sect;8f</a>), so this does not perturb the common decode pool&rsquo;s watermarks. <a href="scheduler.html#iter9">scheduler &sect;11f</a>.</li>
+        <li><strong>Iter 10 (fault tolerance) &mdash; no policy change, but the demote-to-pool flow becomes load-bearing.</strong> This is the one real connection. The eviction policy&rsquo;s <strong>promote-on-evict branch</strong> (the Iter&nbsp;3b length-gated write-back to the remote pool, &sect;7 <a href="#evo-3b">Iter&nbsp;3b</a>) is exactly what makes a conv <em>pool-resident</em> &mdash; and pool-residency is precisely what lets Iter&nbsp;10&rsquo;s recovery do a <code>pull(N) &asymp; 166 ms</code> instead of a <code>&beta;<sub>cold</sub> 730 ms</code> recompute when a task dies. So the <strong>length gate is now also a recovery-RTO knob</strong>: the convs it admits to the pool are exactly the ones that get the fast recovery path. The policy itself is unchanged (same gate, same clean-drop); what changed is that its output now feeds availability, not just cross-turn cost. <a href="scheduler.html#iter10">scheduler &sect;11g</a> / <a href="kv_store.html#iter9-10">kv_store &sect;1</a>.</li>
+      </ul>
+
+      <div class="note-box"><strong>What does <em>not</em> change &mdash; the invariants.</strong> Across every iteration: the async-watermark discipline (drain ahead of demand, never block the request path on a downward write), the three-signal coldness gate (<code>last_access &and; ref_count==0 &and; session_idle</code>), the hysteresis <code>W_hi</code>/<code>W_lo</code> pair on each tier, and the recompute (RPO=0) floor. Only the <em>unit</em> (slab&rarr;block, Iter&nbsp;3), the <em>destination</em> (local SSD&rarr;remote pool, Iter&nbsp;3b), and the <em>copy semantics</em> (always-copy&rarr;clean-drop, Iter&nbsp;5) evolve &mdash; and from Iter&nbsp;10 the demote-to-pool output additionally backs the fault-tolerance pull-fast-path.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 8. FAILURE MODES                                             -->
+  <!-- ============================================================ -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="failures">8. Failure modes</h2>
+      <p>Every failure degrades latency or cost, <strong>never correctness</strong> &mdash; recompute from token IDs (RPO=0) is the floor on every path.</p>
+      <table class="sheet">
+        <thead><tr><th>Failure</th><th>Blast radius</th><th>Detection</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td><strong>SSD write saturates</strong> &mdash; sustained demotion &gt; <code>B_ssd_write</code> (requirement 1 violated)</td><td>convs dropped during the surge re-prefill on return</td><td>DRAM occupancy pinned at <code>W_hi</code>; NVMe write queue depth rising; drop-rate counter &gt; 0</td><td>drop coldest (RPO=0); the scale levers &mdash; admission gate, write stripe, remote pool (&sect;7); DWPD budget sized to eviction-rate &times; lifetime</td></tr>
+          <tr><td><strong>Watermark set too high</strong> &mdash; <code>H_DRAM</code> too small for the burst</td><td>a single prefill burst overflows; transient drops</td><td>drop-rate spikes correlated with prefill bursts, DRAM never steady</td><td>re-derive <code>H_DRAM</code> against <code>backlog(N*)</code> (&sect;4); raise the band; this is a tuning error, not a design fault</td></tr>
+          <tr><td><strong>Watermark set too low</strong> &mdash; drainer runs constantly</td><td>wasted NVMe write bandwidth &amp; wear; cache holds less than it could</td><td>DRAM occupancy far below capacity; high steady write rate</td><td>raise <code>W_hi</code> toward capacity minus one <code>H_DRAM</code>; widen the hysteresis band</td></tr>
+          <tr><td><strong>Coldness mis-tag</strong> &mdash; <code>T<sub>idle</sub></code> too short, an active conv judged cold</td><td>that conv demotes then immediately promotes back (thrash); extra PCIe traffic</td><td>promote-immediately-after-demote rate per conv</td><td>raise <code>T<sub>idle</sub></code> above the real inter-turn reading gap; <code>ref_count</code> already prevents the <em>correctness</em> hazard</td></tr>
+          <tr><td><strong>ref_count leak</strong> &mdash; a missed <code>&minus;1</code> on abort</td><td>a block pinned forever; slow HBM leak</td><td>HBM free-KV trends down with no matching live slots</td><td>periodic reconciliation sweep against the live-slot set; atomic update discipline (DC5)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 9. CROSS-LINKS                                               -->
+  <!-- ============================================================ -->
+  <section class="section">
+    <div class="container">
+      <h2 id="crosslinks">9. Cross-links</h2>
+      <ul>
+        <li><strong>Out:</strong> <a href="distributed_kv_cache.html#iter1a-dc">distributed_kv_cache.html Iter&nbsp;1a DC5/DC6</a> (the per-tier policy + eviction-discipline design choices this page elaborates); <a href="distributed_kv_cache.html#iter1a-wait">&sect;6.5 wait-time formula</a> (the <code>&beta;</code>-by-tier-residency family and the SSD-vs-recompute crossover reused here); <a href="scheduler.html#iter5-algo-evict">scheduler.html &sect;11b.3</a> (the CPU-side block-manager that owns <code>last_access</code> / <code>ref_count</code> / <code>last_turn_ts</code> and runs the reuse-recency clean-drop sweep this page specs; admit-side prefix match at <a href="scheduler.html#iter5-algo-match">&sect;11b.2</a>); <a href="kv_store.html">kv_store.html</a> (where the demotion <em>destination</em> moves once local NVMe is retired &mdash; and, from <a href="kv_store.html#iter9-10">Iter&nbsp;10</a>, the pool the demote-to-pool flow feeds for the FT recovery fast path); <a href="scheduler.html#iter7">scheduler.html &sect;11d</a> (Iter&nbsp;7 draft-slice reservation + spec-tail rollback-not-demotion) / <a href="scheduler.html#iter9">&sect;11f</a> (Iter&nbsp;9 CP slice) / <a href="scheduler.html#iter10">&sect;11g</a> (Iter&nbsp;10 the recovery consumer of demoted state); <a href="distributed_kv_cache.html#iter9">scenario &sect;15</a> + <a href="distributed_kv_cache.html#iter10">&sect;16</a> (the CP + FT iterations whose policy impact &sect;7 traces); <a href="../../knowledge/K2_kv-cache.html">K2</a> (KV-per-token + paging).</li>
+        <li><strong>In:</strong> <a href="distributed_kv_cache.html#iter1a">scenario Iter&nbsp;1a</a> DC6 links here for the full demotion timing + watermark derivation that the design choice only names.</li>
+        <li><strong>Algorithm + structure names inlined:</strong> the three-signal coldness gate (<code>last_access &and; ref_count==0 &and; session_idle</code>); LRU + <code>ref_count</code> correctness pin; high/low watermark hysteresis band; the leaky-bucket headroom model (<code>R_in</code> / <code>R_out</code> / <code>H_DRAM</code>); <code>backlog(N)</code> maximisation for headroom sizing; drop-coldest-to-recompute (RPO=0) overflow.</li>
+      </ul>
+    </div>
+  </section>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

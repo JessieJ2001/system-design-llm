@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workflow &amp; Durable Execution: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad { color: var(--color-danger); font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Workflow &amp; Durable Execution: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">"Use Airflow" answers a different question than "use Temporal." DAG schedulers (Airflow / Dagster) are for data pipelines &mdash; daily / hourly batch jobs. Durable execution engines (Temporal) are for transactional business workflows &mdash; orders, payments, multi-step retries. State machines (Step Functions) are managed but limited.</p>
+      <p class="hero-meta">Airflow / Dagster / Prefect &bull; Argo Workflows &bull; Temporal / Cadence &bull; AWS Step Functions / GCP Workflows / Azure Logic Apps</p>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <div class="full-width">
+        <svg viewBox="0 0 1240 460" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs><marker id="arW" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker></defs>
+
+          <rect x="470" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="620" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">Need to coordinate steps</text>
+
+          <rect x="470" y="120" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="620" y="146" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">What kind of work?</text>
+          <text x="620" y="164" text-anchor="middle" fill="#64748b" font-size="11">data pipeline / business / saga</text>
+          <line x1="620" y1="76" x2="620" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="20" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="160" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Data engineering DAG</text>
+          <text x="160" y="284" text-anchor="middle" fill="#64748b" font-size="11">daily ETL, hourly load, table refresh</text>
+          <line x1="500" y1="170" x2="280" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="20" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="85" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Airflow</text>
+          <line x1="100" y1="300" x2="85" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="160" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="225" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Dagster /</text>
+          <text x="225" y="382" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Prefect</text>
+          <line x1="220" y1="300" x2="225" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="320" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="460" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">k8s-native batch / CI</text>
+          <text x="460" y="284" text-anchor="middle" fill="#64748b" font-size="11">CI pipelines, ML training jobs</text>
+          <line x1="600" y1="180" x2="500" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="320" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="460" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Argo Workflows</text>
+          <line x1="460" y1="300" x2="460" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="620" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="760" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Business workflow</text>
+          <text x="760" y="284" text-anchor="middle" fill="#64748b" font-size="11">order, signup, refund, multi-step retry</text>
+          <line x1="700" y1="180" x2="730" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="620" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="685" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Temporal</text>
+          <line x1="685" y1="300" x2="685" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="770" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="835" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Step Functions /</text>
+          <text x="835" y="382" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Workflows</text>
+          <line x1="800" y1="300" x2="835" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="930" y="240" width="280" height="60" rx="8" fill="#fef9c3" stroke="#ca8a04"/>
+          <text x="1070" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Simple cron / one-off</text>
+          <text x="1070" y="284" text-anchor="middle" fill="#64748b" font-size="11">avoid frameworks &mdash; use scheduler</text>
+          <line x1="770" y1="180" x2="1010" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+
+          <rect x="930" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1070" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">EventBridge / Cloud Scheduler / k8s CronJob</text>
+          <line x1="1070" y1="300" x2="1070" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arW)"/>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Dimension</th><th>Airflow</th><th>Dagster</th><th>Prefect</th><th>Argo Workflows</th><th>Temporal</th><th>Step Functions</th><th>GCP Workflows</th></tr></thead>
+          <tbody>
+            <tr><td>Family</td><td>DAG scheduler</td><td>DAG + asset-based</td><td>DAG + workflow</td><td>k8s DAG</td><td>Durable execution</td><td>State machine (managed)</td><td>State machine (managed)</td></tr>
+            <tr><td>Workflow definition</td><td>Python DAG</td><td>Python ops/assets</td><td>Python flows</td><td>YAML + container steps</td><td>Code (Java / Go / Python / TS / .NET)</td><td>Amazon States Language (JSON)</td><td>YAML</td></tr>
+            <tr><td>Execution model</td><td>Schedule + DAG run</td><td>Scheduled or asset-driven</td><td>Schedule or run-on-demand</td><td>k8s Pod per step</td><td>Long-running stateful workflows</td><td>State transitions</td><td>State transitions</td></tr>
+            <tr><td>State / durability</td><td>Metadata DB (PG / MySQL)</td><td>Same</td><td>Same (Postgres)</td><td>k8s objects + S3 archive</td><td>History event-sourced (PostgreSQL/Cassandra)</td><td>Managed</td><td>Managed</td></tr>
+            <tr><td>Retries</td><td>Per-task config</td><td>Per-op</td><td>Per-task</td><td>Per-step</td><td>Built-in, exponential, with timeouts</td><td>Per-state retry config</td><td>Per-step</td></tr>
+            <tr><td>Long-lived (days/weeks)</td><td>Possible but awkward</td><td>Same</td><td>Same</td><td>Limited (k8s)</td><td>Native (years)</td><td>1 year max</td><td>1 year max</td></tr>
+            <tr><td>Human-in-the-loop</td><td>Sensor / external task</td><td>Same</td><td>Same</td><td>Suspend / Approve</td><td>Signal API native</td><td>Activity tasks</td><td>Callback</td></tr>
+            <tr><td>Visibility / UI</td><td>Strong UI; per-task logs</td><td>Modern UI; lineage</td><td>Modern UI</td><td>UI (basic)</td><td>Web UI; tctl CLI</td><td>AWS Console</td><td>GCP Console</td></tr>
+            <tr><td>Throughput</td><td>~1k tasks / sec</td><td>Similar</td><td>Similar</td><td>Bound by k8s API</td><td>~10k workflows / sec / shard</td><td>~25k state transitions / sec / region</td><td>~25k / sec</td></tr>
+            <tr><td>Multi-region / DR</td><td>Single region (replicate metadata DB)</td><td>Same</td><td>Cloud version global</td><td>Per-cluster</td><td>Multi-cluster replication</td><td>Single-region; cross-region via SF Express</td><td>Single-region</td></tr>
+            <tr><td>Versioning of workflows</td><td>DAG file = version</td><td>Asset versioning</td><td>Deployment versioning</td><td>Git-based</td><td>First-class workflow versioning</td><td>State machine version</td><td>Limited</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>3 self-host, 2 managed</td><td>3</td><td>2</td><td>3 (k8s familiarity required)</td><td>4 self-host, 1 Temporal Cloud</td><td>1</td><td>1</td></tr>
+            <tr><td>Cost driver</td><td>Scheduler + worker nodes</td><td>Same</td><td>Same; SaaS optional</td><td>k8s nodes</td><td>Frontend + matching + history nodes</td><td>Per-state-transition</td><td>Per-step</td></tr>
+            <tr><td>Cloud equivalents</td><td>MWAA / Composer / Astro</td><td>Dagster Cloud</td><td>Prefect Cloud</td><td>n/a</td><td>Temporal Cloud</td><td>AWS only</td><td>GCP only</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Daily ETL DAG (data pipeline)</td><td>Airflow</td><td>Dagster / Prefect</td><td>Airflow for ecosystem; Dagster for asset-driven; Prefect for cleaner Python</td></tr>
+            <tr><td>Hourly warehouse refresh</td><td>Airflow / Dagster</td><td>dbt + scheduler</td><td>Use the data team's existing scheduler</td></tr>
+            <tr><td>Order processing (long-running, retries)</td><td>Temporal</td><td>Step Functions</td><td>Temporal for code-defined; SF for managed + AWS-only</td></tr>
+            <tr><td>Saga across services</td><td>Temporal</td><td>Step Functions Express</td><td>Same: code-as-workflow vs JSON-as-workflow</td></tr>
+            <tr><td>Multi-step approval (human in loop)</td><td>Temporal Signal</td><td>Step Functions wait-for-callback</td><td>Match cloud + complexity</td></tr>
+            <tr><td>CI / build pipeline</td><td>GitHub Actions / GitLab / Argo Workflows</td><td>Tekton</td><td>Existing CI usually wins</td></tr>
+            <tr><td>ML training pipeline</td><td>Argo Workflows / Kubeflow</td><td>Vertex Pipelines / SageMaker Pipelines</td><td>Cloud-managed if simpler</td></tr>
+            <tr><td>One-off cron</td><td>EventBridge Scheduler / Cloud Scheduler / k8s CronJob</td><td>Airflow</td><td>Don't bring Airflow for one cron</td></tr>
+            <tr><td>Short-lived stateless steps in AWS</td><td>Step Functions Express</td><td>Lambda chain</td><td>SF Express &lt; 5min, &lt; $0.000025 / state transition</td></tr>
+            <tr><td>Long-running with branching</td><td>Step Functions Standard / Temporal</td><td>Argo</td><td>SF Standard for AWS + 1 yr max; Temporal for "forever"</td></tr>
+            <tr><td>Per-tenant workflows (millions)</td><td>Temporal</td><td>SF</td><td>Temporal scales horizontally</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Pattern</th><th>Airflow</th><th>Argo Workflows</th><th>Temporal</th><th>Step Functions</th></tr></thead>
+          <tbody>
+            <tr><td>Many parallel runs</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span> k8s scales</td><td><span class="pat-good">&#10003;&#10003;</span> partitioned</td><td><span class="pat-good">&#10003;&#10003;</span> managed</td></tr>
+            <tr><td>Long-running (weeks+)</td><td><span class="pat-warn">&#9888;</span> awkward</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-good">&#10003;&#10003;</span> native</td><td><span class="pat-warn">&#9888;</span> 1 yr cap</td></tr>
+            <tr><td>Human-in-the-loop</td><td><span class="pat-warn">&#9888;</span> sensor</td><td><span class="pat-good">&#10003;</span> approve</td><td><span class="pat-good">&#10003;&#10003;</span> Signal API</td><td><span class="pat-good">&#10003;</span> callback</td></tr>
+            <tr><td>High throughput (10k/sec)</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-warn">&#9888;</span> k8s API</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span> Express</td></tr>
+            <tr><td>Schedule-driven</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span> CronWorkflow</td><td><span class="pat-warn">&#9888;</span> external scheduler</td><td><span class="pat-good">&#10003;</span> EventBridge</td></tr>
+            <tr><td>Event-driven (S3/Pub/Sub)</td><td><span class="pat-warn">&#9888;</span> sensor</td><td><span class="pat-warn">&#9888;</span> events</td><td><span class="pat-good">&#10003;</span> Signal</td><td><span class="pat-good">&#10003;&#10003;</span> EventBridge</td></tr>
+            <tr><td>Idempotent retries</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td></tr>
+            <tr><td>Compensation / rollback</td><td><span class="pat-warn">&#9888;</span> on_failure</td><td><span class="pat-warn">&#9888;</span> exit handler</td><td><span class="pat-good">&#10003;&#10003;</span> SAGA</td><td><span class="pat-good">&#10003;</span> Catch + Retry</td></tr>
+            <tr><td>Versioning during long runs</td><td><span class="pat-warn">&#9888;</span> DAG file</td><td><span class="pat-warn">&#9888;</span> templates</td><td><span class="pat-good">&#10003;&#10003;</span> first-class</td><td><span class="pat-good">&#10003;</span> versioned</td></tr>
+            <tr><td>Cost predictability</td><td><span class="pat-good">&#10003;</span> nodes</td><td><span class="pat-good">&#10003;</span> nodes</td><td><span class="pat-good">&#10003;</span> nodes / Temporal Cloud per-action</td><td><span class="pat-warn">&#9888;</span> per-state-transition</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend"><span class="pat-good">&#10003;&#10003;</span> excellent <span class="pat-good">&#10003;</span> handles <span class="pat-warn">&#9888;</span> with effort <span class="pat-bad">&#10005;</span> wrong tool</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Airflow</td><td>Scheduler heartbeat / DB churn</td><td>Many small tasks &rarr; metadata DB pressure</td><td>Bigger DB; CeleryExecutor &rarr; KubernetesExecutor; reduce DAG count</td></tr>
+            <tr><td>Argo</td><td>k8s API saturation</td><td>Pod-per-step at high QPS overwhelms API server</td><td>Coalesce steps; emissary executor; sharded clusters</td></tr>
+            <tr><td>Temporal</td><td>History size for huge workflows</td><td>50k events / workflow soft limit; replay slows</td><td>ContinueAsNew; smaller workflows; child workflows</td></tr>
+            <tr><td>Step Functions Standard</td><td>$0.025 / 1000 transitions</td><td>$$ at high transaction count</td><td>SF Express for short / cheap; Temporal for many transitions</td></tr>
+            <tr><td>Cloud Workflows</td><td>Step rate limit</td><td>Throttle on high QPS</td><td>Same as SF Express tradeoff</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <ul>
+        <li><strong>Hand-coded retry / state machine in app &rarr; Temporal:</strong> the most common modernization. Wrap existing code as Temporal Activities; workflow defines orchestration.</li>
+        <li><strong>Airflow &rarr; Dagster / Prefect:</strong> for nicer Python ergonomics + asset lineage. Migrate DAG by DAG; run side-by-side.</li>
+        <li><strong>Cron + scripts &rarr; Airflow:</strong> typical "we outgrew bash" path.</li>
+        <li><strong>Step Functions &rarr; Temporal:</strong> when costs hit (millions of transitions/day) or when you need "forever" workflows.</li>
+        <li><strong>Self-host Temporal &rarr; Temporal Cloud:</strong> Cassandra cluster + history nodes is non-trivial; managed often pays for itself.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Airflow self-host</td><td>Scheduler + workers + metadata DB</td><td>Worker idle cost; DB sized for peak DAG churn</td></tr>
+            <tr><td>MWAA / Composer</td><td>Environment-hours</td><td>Min instance always running; not pay-per-DAG</td></tr>
+            <tr><td>Temporal self-host</td><td>Frontend + history + matching nodes + Cassandra/PG</td><td>Multi-component; 5+ services to operate</td></tr>
+            <tr><td>Temporal Cloud</td><td>Active workflow time + actions</td><td>Convenient; predictable per-action pricing</td></tr>
+            <tr><td>Step Functions Standard</td><td>$0.025 / 1k state transitions</td><td>Long polling = many transitions; $$ adds up</td></tr>
+            <tr><td>Step Functions Express</td><td>Per-execution + duration</td><td>Cheaper for short / synchronous; capped at 5 min</td></tr>
+            <tr><td>Argo Workflows</td><td>k8s nodes + S3 for archive</td><td>Free framework; you pay node cost</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>Airflow for data + Temporal for app</h3>
+          <p>Two distinct workloads, two distinct tools. Don't conflate: Airflow runs nightly batches; Temporal handles transactional business workflows.</p>
+        </div>
+        <div>
+          <h3>Step Functions Express in front of Lambda chains</h3>
+          <p>Replaces hand-rolled "Lambda calls Lambda" with a managed state machine. Better visibility, retries, error handling.</p>
+        </div>
+        <div>
+          <h3>Temporal Signal for human approval</h3>
+          <p>Long-running approval workflow waits via Signal; UI sends signal on click. Workflow proceeds &mdash; no polling, no manual state machine.</p>
+        </div>
+        <div>
+          <h3>Argo for ML training + Vertex/SageMaker for serving</h3>
+          <p>Argo orchestrates training pipelines on GPU pods; trained model deployed to managed serving. k8s expertise on training side, managed simplicity on serving.</p>
+        </div>
+        <div>
+          <h3>dbt + Airflow</h3>
+          <p>Airflow schedules a dbt run; dbt does the SQL transforms. dbt models are first-class assets in lineage.</p>
+        </div>
+        <div>
+          <h3>Outbox + Temporal</h3>
+          <p>App writes business event + outbox row in DB transaction; Temporal worker reads outbox via CDC; runs durable workflow with that event. Avoids dual-write pitfalls.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"We used Airflow for transactional workflows"</h3>
+          <p>Airflow is built for batch / schedule-driven, not for thousands of business workflows running concurrently. Use Temporal.</p>
+        </div>
+        <div>
+          <h3>"We used Step Functions for high QPS"</h3>
+          <p>Standard SF at $0.025/1k transitions = $$. Use Express for short, or Temporal for many.</p>
+        </div>
+        <div>
+          <h3>"We rolled our own state machine"</h3>
+          <p>Initial scope is "just three states", grows to 50, retries become a swamp. Adopt Temporal early.</p>
+        </div>
+        <div>
+          <h3>"Workflows are non-deterministic"</h3>
+          <p>Temporal workflows must be deterministic for replay. Random / now() / IDs generated inline = non-deterministic; move to Activities.</p>
+        </div>
+        <div>
+          <h3>"Forgot ContinueAsNew on long workflows"</h3>
+          <p>Temporal history grows; replay slows. ContinueAsNew checkpoints into a new workflow with reset history.</p>
+        </div>
+        <div>
+          <h3>"Mixed business retries with framework retries"</h3>
+          <p>Temporal retries automatically; if your code also retries, you can get duplicates. Choose one layer to handle retries.</p>
+        </div>
+        <div>
+          <h3>"Used Airflow ExternalTaskSensor everywhere"</h3>
+          <p>Sensors poll; many sensors == many idle workers. Use Datasets / cross-DAG triggers.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>Data pipelines (DAG, schedule-driven): Airflow / Dagster / Prefect.</strong></li>
+          <li><strong>Business workflows (orders, signups, retries, sagas): Temporal.</strong> Step Functions if AWS-only and managed wins.</li>
+          <li><strong>k8s-native CI / ML pipelines: Argo Workflows.</strong></li>
+          <li><strong>Simple cron: don't pick a workflow engine; use the cloud scheduler.</strong></li>
+          <li><strong>Always say which engine handles retries (workflow framework or app code).</strong></li>
+          <li><strong>Temporal workflow code must be deterministic; non-determinism goes in Activities.</strong></li>
+          <li><strong>Long-running with human approval: Temporal Signal or SF callback.</strong></li>
+          <li><strong>For sagas, prefer Temporal's SAGA helper over hand-rolled compensations.</strong></li>
+          <li><strong>Self-host workflow engines have heavy ops; managed almost always justifies cost.</strong></li>
+          <li><strong>If your "workflow" runs in &lt; 1 second, you don't need a workflow engine.</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../technologies.html">All Technologies</a></li>
+        <li><a href="comparison-compute.html">Compute comparison</a></li>
+        <li><a href="comparison-messaging.html">Messaging comparison</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

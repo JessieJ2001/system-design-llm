@@ -1,0 +1,24 @@
+/* ==========================================================================
+   implementment.css — scoped overrides for pages under
+   llm/custom_scenario/implementment/ only.
+
+   Effect: the left sidebar scrolls together with the page content instead of
+   staying fixed in the viewport. Achieved by switching .sidebar from
+   position:fixed (base rule in style.css) to position:absolute, so it is
+   anchored to the document top-left and scrolls away with the page.
+
+   Desktop only (min-width:1025px): the <=1024px off-canvas drawer behavior
+   defined in style.css (translateX + toggle button) is left untouched so the
+   mobile nav keeps working.
+   ========================================================================== */
+@media (min-width: 1025px) {
+  .sidebar {
+    position: absolute;     /* was: fixed — now scrolls with the document */
+    top: 0;
+    left: 0;
+    height: auto;           /* was: 100vh — take natural height */
+    min-height: 100vh;      /* keep the right border running at least one screen */
+    overflow-y: visible;    /* was: auto — no internal scroll; flows with page */
+    overscroll-behavior: auto;
+  }
+}

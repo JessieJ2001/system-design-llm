@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nginx — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-edge.html">Edge Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Nginx</h1>
+    <p class="hero-subtitle">Async, event-driven, single-master multi-worker reverse proxy / web server / load balancer / HTTP cache. Each worker is a single thread with an epoll/kqueue loop handling thousands of connections. Static config (reload-required) but extremely battle-tested. The most-deployed reverse proxy in the world.</p>
+    <p class="hero-meta">async event loop &bull; reverse proxy &bull; L4/L7 &bull; nginx.conf</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <ul>
+      <li>One <strong>master process</strong> + N <strong>worker processes</strong> (one per CPU core typical).</li>
+      <li>Each worker runs an <strong>epoll/kqueue</strong> event loop: many connections per worker, no thread-per-connection.</li>
+      <li>Master handles signals (reload, upgrade); workers do the actual I/O.</li>
+      <li><strong>Reverse proxy</strong> via <code>proxy_pass</code>; load-balance across <code>upstream</code>; supports L4 (stream module) and L7 (http module).</li>
+      <li><strong>HTTP cache</strong> via <code>proxy_cache</code> with a file-system cache zone.</li>
+      <li>Config is static; <code>nginx -s reload</code> spawns new workers, drains old.</li>
+      <li>Modules compiled in (or dynamic in 1.9+); Lua via OpenResty for scripting.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Reverse proxy request</h3>
+      <pre class="line-numbers"><code class="language-text">1. TCP accept on listen port
+2. Parse HTTP/1.1, HTTP/2, HTTP/3 (with module)
+3. Match server block (server_name) + location
+4. Apply rewrite / auth / rate-limit / etc.
+5. proxy_pass to upstream:
+   - DNS resolve (or use defined upstream)
+   - LB algorithm: round-robin / least_conn / ip_hash / hash
+   - keep-alive pool to backend
+6. Stream response back; gzip, header-mutate
+7. Optionally proxy_cache HIT &rarr; skip backend</code></pre>
+    </div>
+    <div>
+      <h3>Static file serving</h3>
+      <pre class="line-numbers"><code class="language-text">1. Request mapped to filesystem path
+2. open() + sendfile() &mdash; zero-copy from disk to socket
+3. AIO + thread pool for disk read on Linux
+4. Range requests handled natively
+5. ~50k req/sec/worker for small static files</code></pre>
+    </div>
+    <div>
+      <h3>HTTP cache</h3>
+      <pre class="line-numbers"><code class="language-text">proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=z:10m max_size=100g;
+
+On request:
+1. Compute cache key (URL + Vary)
+2. Lookup in keys_zone (in-memory)
+3. HIT: serve from cache file
+4. MISS: proxy_pass; on response, store
+5. proxy_cache_lock prevents stampede on miss</code></pre>
+    </div>
+    <div>
+      <h3>Reload (zero-downtime)</h3>
+      <pre class="line-numbers"><code class="language-text">SIGHUP to master
+1. Master parses new config (validates first)
+2. Spawns new workers with new config
+3. Old workers stop accepting new conns
+4. Old workers drain existing conns
+5. Old workers exit when done
+
+For binary upgrade: SIGUSR2 + SIGWINCH</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. "Replication" (HA topology)</h2>
+    <ul>
+      <li>Nginx itself is stateless; HA is "run multiple instances behind a cloud LB or DNS."</li>
+      <li>Active-active: N Nginx in a target group; cloud LB distributes.</li>
+      <li>Active-passive: keepalived + VRRP for VIP failover (on-prem).</li>
+      <li>State (caches, rate-limit counters) is per-instance unless shared (Redis-backed via Nginx Plus or OpenResty Lua).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning / load balancing</h2>
+    <ul>
+      <li><strong>Algorithms</strong>: round-robin (default), least_conn, ip_hash, hash $key, random with two-choices.</li>
+      <li><strong>Sticky sessions</strong>: ip_hash, sticky cookie (Plus), hash on consistent.</li>
+      <li><strong>Health checks</strong>: passive (fail count from real traffic) by default; active checks in Plus or OpenResty.</li>
+      <li><strong>Upstream</strong> blocks define backend pools; weights for traffic split.</li>
+      <li><strong>Slow start</strong>: gradual ramp-up after backend recovery (Plus only).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>Per request: O(1) routing on small server config; O(log N) on large location regex sets.</li>
+      <li>Cache lookup: O(1) on key-zone hash.</li>
+      <li>SSL handshake: TLS-bound; session resumption avoids re-handshake.</li>
+      <li>Concurrent connections per worker: bounded by FD limit + epoll efficiency.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>~50k requests/sec/worker on simple proxy (cached static); fewer with TLS handshake-heavy traffic.</li>
+      <li>~100k+ concurrent connections per worker with sufficient FDs.</li>
+      <li>Latency overhead: ~0.1 ms typical.</li>
+      <li>Memory: ~5 MB / worker + buffers per connection.</li>
+      <li>TLS termination CPU: 30&ndash;70% of workload at high RPS without offload.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use Nginx when&hellip;</h3>
+      <ul>
+        <li>Default L7 reverse proxy / HTTP load balancer.</li>
+        <li>Static file serving + HTTP cache.</li>
+        <li>k8s ingress (Ingress-NGINX).</li>
+        <li>TLS termination + simple routing.</li>
+        <li>Familiar config; large org expertise.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use Nginx when&hellip;</h3>
+      <ul>
+        <li>Need dynamic routing config (no reload) &rarr; Envoy + xDS.</li>
+        <li>Service mesh sidecar &rarr; Envoy / linkerd-proxy.</li>
+        <li>Pure L4 with millions of pps &rarr; cloud NLB / IPVS.</li>
+        <li>Edge compute &rarr; Cloudflare Workers / Fastly.</li>
+        <li>API gateway with quota / billing &rarr; Kong / managed API GW.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li><code>proxy_pass</code> trailing slash semantics &mdash; with vs without slash changes URI.</li>
+      <li>Default 60s idle timeout disconnects WebSocket; bump <code>proxy_read_timeout</code>.</li>
+      <li>DNS resolve cached at startup for upstream blocks unless you use <code>resolver</code> + variable.</li>
+      <li>Buffering: large request/response bodies buffered to disk by default; tune for streaming.</li>
+      <li>Worker connections cap: increase FD ulimit + <code>worker_connections</code>.</li>
+      <li>TLS session reuse: enable <code>ssl_session_cache</code> shared across workers.</li>
+      <li>Reload &mdash; not a graceful drain; clients with long-lived conns may see brief errors.</li>
+      <li>Lua + OpenResty integrates well but adds latency per request.</li>
+      <li>OCSP stapling required for performant TLS.</li>
+      <li><code>$host</code> vs <code>$server_name</code> vs <code>$http_host</code> &mdash; subtle differences.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>Self-host: Nginx (open-source) or Nginx Plus (commercial).</li>
+      <li>Cloud LB analogs: ALB (AWS), GCLB (GCP), Application Gateway (Azure) &mdash; not Nginx but solve same L7 problem.</li>
+      <li>Open-source alternatives: HAProxy, Envoy, Traefik, Caddy.</li>
+      <li>Distros: OpenResty (Nginx + LuaJIT + modules); Tengine (Alibaba fork).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Single instance</td><td>Dev / tiny scale</td><td>One node</td></tr>
+        <tr><td>Active-active behind cloud LB</td><td>HA + horizontal scale</td><td>N Nginx in target group</td></tr>
+        <tr><td>Active-passive with keepalived</td><td>VIP failover (on-prem)</td><td>VRRP between 2 boxes</td></tr>
+        <tr><td>k8s Ingress-NGINX</td><td>k8s-native HTTP routing</td><td>Controller watches Ingress objects</td></tr>
+        <tr><td>Sidecar (in-pod)</td><td>Per-pod TLS/auth</td><td>Pattern superseded by service mesh</td></tr>
+        <tr><td>Edge cache tier</td><td>Reduce origin load</td><td>proxy_cache + tiered with CDN above</td></tr>
+        <tr><td>Nginx Plus with shared zones</td><td>Cross-worker state</td><td>Active health, sticky cookie, etc.</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>L7 reverse proxy in front of app servers.</li>
+      <li>Static file serving + sendfile().</li>
+      <li>SSL termination.</li>
+      <li>WebSocket proxy.</li>
+      <li>HTTP cache (proxy_cache).</li>
+      <li>Rate limiting (req_zone, conn_zone).</li>
+      <li>Authentication via <code>auth_request</code> sub-request to auth service.</li>
+      <li>k8s Ingress.</li>
+      <li>API gateway-ish (with OpenResty + Lua); Kong is built on this.</li>
+      <li>Geo redirection / locale routing.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li><code>worker_processes auto</code> + <code>worker_connections</code>.</li>
+      <li><code>proxy_buffer_size</code>, <code>proxy_buffers</code>.</li>
+      <li><code>keepalive</code> in upstream + <code>proxy_http_version 1.1</code> + <code>proxy_set_header Connection ""</code> for backend connection reuse.</li>
+      <li><code>proxy_cache_path</code> + <code>proxy_cache_key</code> + <code>proxy_cache_use_stale</code>.</li>
+      <li>SSL: <code>ssl_session_cache shared:SSL:50m</code>; OCSP stapling.</li>
+      <li>Limit modules: <code>limit_req_zone</code> / <code>limit_conn_zone</code>.</li>
+      <li><code>resolver</code> for DNS-based upstream.</li>
+      <li>Logging: <code>log_format</code> + <code>access_log</code> with buffer + flush.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>Workers = CPU cores; usually <code>auto</code>.</li>
+      <li>FD limit + worker_connections caps total concurrent.</li>
+      <li>Memory: connections &times; buffers + cache zone size.</li>
+      <li>Disk: if proxy_cache, plan zone size + IOPS for the cache tier.</li>
+      <li>Network: TLS handshake at 1k+ RPS = significant CPU; consider TLS offload tier.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Backend down: Nginx 502; <code>proxy_next_upstream</code> retries another upstream.</li>
+      <li>FD exhaustion: 503 / dropped conns.</li>
+      <li>Cache full: LRU eviction, may evict hot keys if zone too small.</li>
+      <li>DNS resolution fail: upstream unavailable (use <code>resolver</code> with <code>valid=</code>).</li>
+      <li>Reload fail: master keeps old config + workers; check <code>nginx -t</code> first.</li>
+      <li>OOM under burst: tune buffers; raise file limits.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>Nginx is stateless; "backup" = git-versioned config.</li>
+      <li>Cache is rebuildable from origin.</li>
+      <li>DR: deploy in another region behind a global LB.</li>
+      <li>Logs to S3 / log aggregator.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Binary upgrade with SIGUSR2 + SIGWINCH (zero-downtime).</li>
+      <li>Config reload with <code>nginx -t</code> validate &rarr; <code>nginx -s reload</code>.</li>
+      <li>Migrate from Apache: rewrite rules need translation; mod_rewrite &rarr; rewrite directives.</li>
+      <li>Migrate to Envoy: typically when joining a service mesh; rewrite config to xDS YAML.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>TLS termination with modern cipher suites (configurable).</li>
+      <li>HTTP/2 + ALPN.</li>
+      <li>HSTS / CSP / security headers via <code>add_header</code>.</li>
+      <li>Rate limiting + connection limits as DDoS first-line.</li>
+      <li>auth_request for OIDC / JWT validation.</li>
+      <li>WAF: ModSecurity v3 module or commercial.</li>
+      <li>mTLS via <code>ssl_verify_client</code>.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Server blocks per host / SNI.</li>
+      <li>Per-server limits (<code>limit_req_zone</code> keyed by tenant header).</li>
+      <li>No native tenant isolation beyond config.</li>
+      <li>Pattern: per-tenant upstream blocks; routing by header.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>Access log + error log (parse with Goaccess / Filebeat / OpenTelemetry).</li>
+      <li>stub_status / Plus API for live metrics.</li>
+      <li>Prometheus exporter (nginx-prometheus-exporter or VTS module).</li>
+      <li>Active connections, request rate, response time, upstream errors.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Single Nginx for everything (auth, rate-limit, routing, cache, TLS) &rarr; tightly-coupled config.</li>
+      <li>Default 60s idle timeout breaking WebSocket.</li>
+      <li>DNS-resolve at boot; backend IPs change &rarr; stale.</li>
+      <li>VARY: Cookie at proxy_cache &rarr; hit rate near 0.</li>
+      <li>Hot-reloading on every config change in CI &rarr; resource churn.</li>
+      <li>No <code>proxy_cache_lock</code> &rarr; cache stampede.</li>
+      <li>Buffering streaming responses (block until full).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>Self-host: instance hours.</li>
+      <li>Plus: per-instance license fee.</li>
+      <li>Cloud LB above (NLB/ALB) is the additional tier cost.</li>
+      <li>Disk for proxy_cache.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>Nginx</th><th>HAProxy</th><th>Envoy</th><th>Traefik</th></tr></thead>
+      <tbody>
+        <tr><td>Layer</td><td>L4 / L7</td><td>L4 / L7</td><td>L7 (with L4)</td><td>L7</td></tr>
+        <tr><td>Config</td><td>Static reload</td><td>Static reload</td><td>xDS dynamic</td><td>Auto-discovery (k8s/Consul)</td></tr>
+        <tr><td>Throughput</td><td>~50k/sec/worker</td><td>~100k/sec</td><td>~30k/sec/CPU</td><td>~30k/sec</td></tr>
+        <tr><td>Modules / extensibility</td><td>OpenResty Lua / dynamic mods</td><td>Limited</td><td>WASM / Lua filters</td><td>Plugins</td></tr>
+        <tr><td>Pick when</td><td>Default; reverse proxy + static</td><td>Lowest latency, L4-heavy</td><td>Mesh / dynamic config</td><td>k8s / auto-discover</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy uniform</td><td>Many workers + epoll</td><td>Cache-aside via proxy_cache</td><td>Add nodes behind LB</td></tr>
+        <tr><td>Long-lived connections (WS, SSE)</td><td>Each worker handles thousands</td><td>Tune <code>proxy_read_timeout</code>, FD limits</td><td>Dedicated WS tier</td></tr>
+        <tr><td>Sticky sessions</td><td>ip_hash / cookie</td><td>hash $cookie</td><td>Avoid sticky; redesign stateless</td></tr>
+        <tr><td>Hot path / low latency</td><td>~0.1ms overhead</td><td>Avoid Lua / heavy modules on hot path</td><td>Move logic out of Nginx</td></tr>
+        <tr><td>TLS-heavy</td><td>CPU-bound at scale</td><td>Session resumption + TLS 1.3</td><td>Offload TLS to LB tier</td></tr>
+        <tr><td>Bursty</td><td>limit_req w/ burst &amp; nodelay</td><td>Tune burst</td><td>Dedicated rate-limit service</td></tr>
+        <tr><td>Streaming response</td><td>Buffering on by default</td><td>proxy_buffering off</td><td>Different proxy</td></tr>
+        <tr><td>Many vhosts</td><td>Server blocks scale</td><td>Use map directive</td><td>Generated config</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>nginx.org documentation.</li>
+      <li>"Nginx HTTP Server" book.</li>
+      <li>OpenResty docs for Lua extensibility.</li>
+      <li>Production: ~30%+ of all websites; many CDNs are Nginx-based.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-edge.html">Edge comparison</a></li>
+    <li><a href="../load-balancing.html">Load Balancing (concept)</a></li>
+    <li><a href="../proxies.html">Proxies (concept)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

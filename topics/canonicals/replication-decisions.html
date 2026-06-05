@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Replication &amp; Consistency Decisions — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Replication &amp; Consistency Decisions</h1>
+      <p class="hero-subtitle">Single-leader vs multi-leader vs leaderless × sync vs async vs quorum × per-key vs cross-key. The decision matrix that tells you which topology survives your consistency requirement, and what it costs. This is the source-of-truth page; scenarios cite this when picking a replication topology.</p>
+      <p class="hero-meta">~12 min reference</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>The Three Axes</h2>
+
+      <p>Replication topology is a choice across three orthogonal axes. Pick one value per axis; the combination determines the consistency guarantees you can offer and the failure modes you accept.</p>
+
+      <h3>Axis 1: Topology — who can write?</h3>
+      <ul>
+        <li><strong>Single-leader.</strong> One node accepts writes; followers replicate. Simplest model; clearest consistency story.</li>
+        <li><strong>Multi-leader.</strong> Multiple nodes accept writes; conflicts resolved at merge. Used for cross-region active-active.</li>
+        <li><strong>Leaderless.</strong> Any node accepts writes; consistency via quorums + read-repair. Cassandra / Dynamo style.</li>
+      </ul>
+
+      <h3>Axis 2: Synchrony — when does the write return success?</h3>
+      <ul>
+        <li><strong>Synchronous.</strong> Wait for all replicas (or a quorum) before ack. Strong durability; high write latency.</li>
+        <li><strong>Asynchronous.</strong> Ack after the leader commits; replicas catch up later. Low latency; potential data loss on leader failure.</li>
+        <li><strong>Quorum.</strong> Wait for some subset (R + W &gt; N) before ack. Tunable durability vs latency.</li>
+      </ul>
+
+      <h3>Axis 3: Per-key vs cross-key consistency</h3>
+      <ul>
+        <li><strong>Per-key strong.</strong> A single key's reads/writes are linearizable; cross-key has no joint ordering. Most NoSQL systems.</li>
+        <li><strong>Cross-key (transactional) strong.</strong> Multi-key writes are serializable. Spanner, CockroachDB, classic RDBMSes.</li>
+      </ul>
+
+      <p>Most discussions conflate these axes. Be explicit about all three.</p>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The Topology Matrix</h2>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Topology</th><th>Writes</th><th>Read consistency</th><th>Write latency</th><th>Failure mode</th></tr></thead>
+        <tbody>
+          <tr><td><a href="#single-async">Single-leader, async</a></td><td>Leader only</td><td>Read-from-leader: linearizable. Read-from-follower: eventual.</td><td>Low (leader commit)</td><td>Leader loss → up to async-lag of writes lost</td></tr>
+          <tr><td><a href="#single-sync">Single-leader, sync (or quorum)</a></td><td>Leader only</td><td>Linearizable from leader; reads from quorum survive failover</td><td>Higher (wait for replicas)</td><td>Quorum loss → no writes; read still possible</td></tr>
+          <tr><td><a href="#multi-leader-async">Multi-leader, async</a></td><td>Multiple regions</td><td>Per-region linearizable; cross-region eventual + conflict resolution</td><td>Low (local commit)</td><td>Conflicts on heal; per-region partition tolerance</td></tr>
+          <tr><td><a href="#leaderless-quorum">Leaderless, quorum (R+W&gt;N)</a></td><td>Any node</td><td>Quorum-based; tunable; read-repair on conflict</td><td>Medium (W replicas)</td><td>Sloppy quorum + hinted handoff during partition</td></tr>
+          <tr><td><a href="#chain">Chain replication</a></td><td>Head only</td><td>Strong; reads from tail</td><td>Highest (full chain)</td><td>Any node death stalls the chain until reformed</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Per-Topology Detail</h2>
+
+      <h3 id="single-async">Single-leader, async replication</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> One leader per shard. Writes go to leader, which commits locally (WAL) and acks the client. A background process ships the WAL to followers. Followers apply asynchronously.</li>
+        <li><strong>Wins.</strong> Lowest write latency (only leader-commit on the path). Simplest model — one writable node, clearest "where does the truth live" story. Read scaling for free (followers serve reads). Operationally well-understood — every modern OLTP DB ships with this mode.</li>
+        <li><strong>Loses.</strong> Writes that haven't replicated yet are lost on leader crash (RPO &gt; 0). Reads-from-followers are eventual (lag from ms to seconds). Failover requires new-leader election; the new leader may not have all writes. Single leader is the write-throughput ceiling per shard.</li>
+        <li><strong>Pick when.</strong> Read-heavy; some write loss on rare leader crash is acceptable; you want simplicity over strong durability; and you want read-replica fan-out for scaling reads.</li>
+        <li><strong>Real implementations.</strong> MySQL master/slave, Postgres streaming replication, MongoDB primary/secondaries (default), Redis async replication. Most "managed DB with read replicas" services.</li>
+        <li><strong>Surfaces.</strong> <a href="failure-modes.html#leader-loss">leader-loss</a> (RPO &gt; 0); <a href="failure-modes.html#replica-divergence">replica divergence</a> on long lag; <a href="bottlenecks.html#coordinator-bottleneck">coordinator bottleneck</a> if writes saturate one leader.</li>
+      </ul>
+
+      <h3 id="single-sync">Single-leader, synchronous (or quorum) replication</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Leader waits for at least one replica (sync) or a quorum (semi-sync; e.g., 2-of-3 acked) before returning success. WAL streamed synchronously to replicas.</li>
+        <li><strong>Wins.</strong> RPO = 0 within the quorum: no committed write is lost on single-node failure. Failover is clean — new leader elected from up-to-date replicas; no data loss. Linearizable reads from leader. Quorum reads survive any single replica being stale.</li>
+        <li><strong>Loses.</strong> Higher write latency (must wait for at least one replica RTT — typ. 2× single-leader async). Writes block when quorum is unreachable (CP behavior under partition); application must handle write failures. Write throughput limited by slowest in-quorum replica.</li>
+        <li><strong>Pick when.</strong> No write loss tolerated (financial, transactional, audit); willing to pay the latency cost; willing to block on partition rather than serve stale.</li>
+        <li><strong>Real implementations.</strong> Postgres <code>synchronous_standby_names</code>, Aurora (sync to 4-of-6 storage nodes), most consensus-backed systems (Raft within a shard: Spanner, CockroachDB, etcd, FoundationDB).</li>
+        <li><strong>Surfaces.</strong> <a href="failure-modes.html#network-partition">network partition</a> blocks writes (CP); <a href="bottlenecks.html#network-rtt-bound">network-RTT-bound</a> writes when replicas are far apart.</li>
+      </ul>
+
+      <h3 id="multi-leader-async">Multi-leader, async (per-region active-active)</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Each region has its own leader. Writes commit locally and replicate asynchronously to other regions. Conflicts on the same key from different regions are resolved by:
+          <ul>
+            <li><strong>Last-writer-wins (LWW)</strong> — newest timestamp wins. Simple; loses writes silently.</li>
+            <li><strong>Per-record region-of-truth</strong> — each record assigned to one region; cross-region updates rejected or routed.</li>
+            <li><strong>CRDT</strong> — data structure that converges deterministically (counters, sets, OR-set, etc.). No data loss; restricted to merge-friendly types.</li>
+            <li><strong>Application-merge</strong> — surface the conflict to the app for resolution. Powerful, complex.</li>
+          </ul>
+        </li>
+        <li><strong>Wins.</strong> Local write latency in every region (no cross-region wait). Survives entire-region loss with bounded data loss (RPO = replication lag). User-perceived latency is low globally. Each region operates independently during partition.</li>
+        <li><strong>Loses.</strong> Cross-region eventual consistency only — bounded staleness, typ. seconds. Conflicts on partition heal must be resolved (LWW silently loses; CRDT restricts data shapes; app-merge is complex). Cross-region read-your-writes is hard. Operationally complex (each conflict-resolution strategy has its own bugs).</li>
+        <li><strong>Pick when.</strong> Multi-region active-active; latency-sensitive writes from many regions; per-dataset CAP audit says AP with bounded staleness is acceptable for this dataset.</li>
+        <li><strong>Real implementations.</strong> DynamoDB Global Tables (LWW); Cassandra cross-DC replication; Riak (vector clocks + app-merge); Cosmos DB; CockroachDB / Spanner partial multi-leader within Raft groups.</li>
+        <li><strong>Surfaces.</strong> <a href="failure-modes.html#network-partition">network partition</a> with divergent writes; <a href="failure-modes.html#replica-divergence">replica divergence</a>; <a href="failure-modes.html#clock-skew">clock skew</a> matters for LWW.</li>
+      </ul>
+
+      <h3 id="leaderless-quorum">Leaderless, quorum-based</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Any of N replicas can accept writes. A write succeeds when W replicas ack (W ≤ N); a read queries R replicas and reconciles (R ≤ N). With R + W &gt; N, every read sees at least one replica that saw the latest write. Read-repair on conflict; periodic anti-entropy scrubbing closes drift.</li>
+        <li><strong>Wins.</strong> No leader = no leader-loss outage. Tunable consistency: pick W and R per workload (e.g., W=1 for max-availability writes; W=N for max-durability). Naturally horizontally scalable. Sloppy quorum (hinted handoff) keeps writes accepted during partition.</li>
+        <li><strong>Loses.</strong> No global write ordering — concurrent writes to the same key need version vectors / vector clocks to merge. Read amp on quorum reads (R replicas per read). Read-repair adds latency variance. Application sometimes sees temporary inconsistency before reconciliation.</li>
+        <li><strong>Pick when.</strong> Write-heavy with no single hotspot per key; tolerable to lose strict ordering across keys; want availability over linearizability; AP is the right CAP choice for the dataset.</li>
+        <li><strong>Real implementations.</strong> Cassandra (per-key), DynamoDB (per-key), Riak, ScyllaDB. The Dynamo paper's classic model.</li>
+        <li><strong>Surfaces.</strong> <a href="failure-modes.html#replica-divergence">replica divergence</a> handled by read-repair; <a href="bottlenecks.html#tail-latency">tail latency</a> on R-of-N quorum reads.</li>
+      </ul>
+
+      <h3 id="chain">Chain replication</h3>
+      <ul>
+        <li><strong>Mechanism.</strong> Replicas arranged in a chain: head accepts writes, propagates to middle nodes, tail acks. Reads come from the tail (so reads see only fully-replicated writes).</li>
+        <li><strong>Wins.</strong> Strong consistency without full Paxos complexity — the chain order itself defines the commit order. Tail-reads are always up-to-date and don't need quorum coordination. Operationally simpler than Paxos for some workloads.</li>
+        <li><strong>Loses.</strong> Highest write latency (full chain traversal — N nodes for N-replica chain). Any chain-member death stalls writes until the chain is reformed (typ. seconds; reformation needs a consensus configuration service). Less battle-tested than Raft/Paxos in production.</li>
+        <li><strong>Pick when.</strong> Want strong consistency with a simpler invariant than full consensus; chain-length latency is acceptable; the workload has a configuration service available for reformations. Rarely the right choice for new systems vs Raft.</li>
+        <li><strong>Real implementations.</strong> Some research systems; Microsoft FaRM; certain internal Dropbox / AWS systems. Not common as a default for new builds.</li>
+        <li><strong>Surfaces.</strong> <a href="failure-modes.html#leader-loss">node-loss stalls</a> until reformation.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Consistency Models</h2>
+
+      <p>Each topology supports different consistency models. State the model your design offers — vague terms hide gaps.</p>
+
+      <div class="table-responsive"><table>
+        <thead><tr><th>Model</th><th>What it guarantees</th><th>Typical topology</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Linearizable (strong)</strong></td><td>Operations appear instantaneous; global total order; any read after a write sees the write</td><td>Single-leader sync; consensus per key (Raft, Paxos)</td></tr>
+          <tr><td><strong>Sequential</strong></td><td>All operations appear in some total order; not necessarily real-time</td><td>Single-leader async (reads from leader)</td></tr>
+          <tr><td><strong>Causal</strong></td><td>Causally-related operations seen in order; concurrent ops may be seen in any order</td><td>Vector clocks; CRDTs; multi-leader with HLC</td></tr>
+          <tr><td><strong>Read-your-writes (RYW)</strong></td><td>A client's reads see its own previous writes</td><td>Sticky session to leader, or write-cookie tracking</td></tr>
+          <tr><td><strong>Monotonic reads</strong></td><td>A client's reads don't go backward in time</td><td>Sticky session to one replica</td></tr>
+          <tr><td><strong>Bounded staleness</strong></td><td>Reads at most T seconds (or N versions) stale</td><td>Async replication with monitoring; capped lag</td></tr>
+          <tr><td><strong>Eventual</strong></td><td>If writes stop, replicas converge</td><td>Async replication; gossip; CRDTs</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Per-dataset CAP, not per-system</h3>
+      <p>Real systems mix consistency models per dataset. <em>"Inventory: linearizable per-key (CP). User profile: bounded-staleness ≤ 5s (AP). Social-graph cache: eventual (AP)."</em> Don't pick one CAP setting for the whole system; per-dataset is the staff+ move.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Decision Heuristics</h2>
+
+      <ol>
+        <li><strong>How much write loss is tolerated?</strong> Zero → sync. Any → async OK.</li>
+        <li><strong>Is RYW required across regions?</strong> Yes → single-leader (writes to home region) or per-record region-of-truth. No → multi-leader async with conflict resolution.</li>
+        <li><strong>Are there cross-key transactions?</strong> Yes → cross-key strong (Spanner / CockroachDB / RDBMS). No → per-key strong is enough (Cassandra, DynamoDB).</li>
+        <li><strong>Is global linearizability required?</strong> Yes → single-leader sync per shard, plus consensus for shard placement. No → leaderless quorum or multi-leader.</li>
+        <li><strong>What's the partition behavior?</strong> CP-on-partition → block writes (single-leader sync, Spanner). AP-on-partition → accept divergence + reconcile (multi-leader async, Cassandra, DynamoDB).</li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Common Combinations</h2>
+
+      <ul>
+        <li><strong>Postgres / MySQL with read replicas.</strong> Single-leader, async. RYW from primary, eventual from replicas. The default OLTP shape.</li>
+        <li><strong>Aurora / Cloud Spanner.</strong> Single-leader (per shard), sync. Strong consistency; higher write latency. The default for managed transactional systems.</li>
+        <li><strong>Cassandra / DynamoDB.</strong> Leaderless (per-key), tunable quorum. AP by default; CP achievable with quorum-style settings. Default for write-heavy NoSQL.</li>
+        <li><strong>CockroachDB / Spanner.</strong> Per-shard Raft (single-leader sync within Raft group); cross-shard transactions via 2PC over Raft groups. Cross-key strong consistency at scale.</li>
+        <li><strong>DynamoDB Global Tables.</strong> Multi-leader async, LWW conflict resolution. Per-region writes; eventual cross-region.</li>
+        <li><strong>Kafka.</strong> Single-leader (per partition), sync to in-sync replicas. Strong durability per partition; no cross-partition ordering.</li>
+        <li><strong>Redis.</strong> Single-leader, async (default). RYW from primary; replicas best-effort. Cluster mode shards by key.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Anti-Patterns</h2>
+
+      <ul>
+        <li><strong>"Eventually consistent" without bounded staleness.</strong> Eventual is "if writes stop, replicas converge" — but writes don't stop. Quantify the bound: <em>"≤ 5 s replication lag at p99."</em></li>
+        <li><strong>Linearizable across regions without measuring write latency.</strong> Cross-region consensus adds 60–200 ms per write. If your write SLO is &lt; that, you can't have linearizable writes across regions.</li>
+        <li><strong>Multi-leader with LWW for non-LWW-friendly data.</strong> "Last-writer-wins" silently loses concurrent updates. For counters, use CRDTs. For records, prefer per-record region-of-truth or app-merge.</li>
+        <li><strong>Read replicas as a substitute for cache.</strong> Read replicas have minutes of replication lag at high write loads; they are also expensive (full-instance cost). Use a cache for hot reads; replicas for read scaling and failover.</li>
+        <li><strong>Treating Cassandra as ACID.</strong> Cassandra offers per-key consistency at best; cross-key transactions require lightweight transactions (LWT) which are slow.</li>
+        <li><strong>One CAP setting for the whole system.</strong> Per-dataset CAP audit is the staff+ move; system-wide CAP is the senior move.</li>
+        <li><strong>Sync replication everywhere.</strong> Pays write latency for datasets that don't need it. Match synchrony to durability requirement per dataset.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="../cap-theorem.html">CAP Theorem</a> — the constraint that bounds these choices under partition.</li>
+        <li><a href="../database-replication.html">Database Replication</a> — deeper-derivation page (existing).</li>
+        <li><a href="bottlenecks.html#cross-region">bottlenecks#cross-region</a> — what you pay for cross-region replication.</li>
+        <li><a href="failure-modes.html#network-partition">failure-modes#network-partition</a> and <a href="failure-modes.html#leader-loss">#leader-loss</a> and <a href="failure-modes.html#replica-divergence">#replica-divergence</a>.</li>
+        <li><a href="storage-engines.html">Storage Engines</a> — engine and replication interact (LSM with leaderless quorum is the Cassandra shape; B-tree with single-leader sync is the Aurora shape).</li>
+        <li><a href="sharding-strategies.html">Sharding Strategies</a> — replication topology applies per shard.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

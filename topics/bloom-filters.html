@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bloom Filters — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- 1. Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Bloom Filters</h1>
+      <p class="hero-subtitle">A space-efficient probabilistic data structure that answers set membership queries with absolute certainty on negatives and a tunable probability of false positives — the backbone of fast "is this item in the set?" checks across databases, caches, and network security.</p>
+      <p class="hero-meta">~20 min read</p>
+    </div>
+  </section>
+
+  <!-- 2. What Is It? -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>A Bloom filter is a space-efficient probabilistic data structure used to test whether an element is a member of a set. It can tell you one of two things: <strong>"definitely not in the set"</strong> or <strong>"probably in the set."</strong> False positives are possible — the filter may say "yes" when the element was never inserted — but false negatives are impossible. If the filter says "no," the element is guaranteed to be absent.</p>
+
+      <p>Under the hood, a Bloom filter is just a <strong>bit array of m bits</strong>, all initialized to 0, paired with <strong>k independent hash functions</strong>. To insert an element, you hash it with each of the k functions, obtaining k bit positions, and set those bits to 1. To query an element, you hash it the same way and check the k positions: if <em>all</em> are 1, the element is "probably" in the set; if <em>any</em> is 0, the element is definitely not.</p>
+
+      <h3>The Bit Array: Understanding the Core Data Structure</h3>
+      <p>A <strong>bit array</strong> (also called a bit vector or bitset) is simply a contiguous block of memory where each individual <em>bit</em> &mdash; not byte &mdash; is addressable. An array of <code>m</code> bits uses only <code>m/8</code> bytes of memory. For example, a 1,000-bit array uses just 125 bytes. This is the foundation of a Bloom filter's space efficiency.</p>
+
+      <p>Here is exactly how the two operations work on the bit array:</p>
+      <ul>
+        <li><strong>INSERT item x:</strong> Compute <code>hash(x)</code> to get a position <code>p</code> in the range <code>[0, m-1]</code>. Set <code>bit[p] = 1</code>. (With multiple hash functions, you repeat this for each hash function, setting <code>k</code> positions.)</li>
+        <li><strong>QUERY item x:</strong> Compute <code>hash(x)</code> to get position <code>p</code>. Check <code>bit[p]</code>:
+          <ul>
+            <li>If <code>bit[p] == 1</code> &rarr; item <strong>MIGHT</strong> be in the set. This could be a <strong>false positive</strong>: another item's hash also mapped to position <code>p</code> and set that bit.</li>
+            <li>If <code>bit[p] == 0</code> &rarr; item is <strong>DEFINITELY NOT</strong> in the set. There are <strong>no false negatives</strong> possible &mdash; if <code>x</code> had been inserted, <code>bit[p]</code> would have been set to 1.</li>
+          </ul>
+        </li>
+      </ul>
+      <p>This asymmetry &mdash; certainty on negatives, uncertainty on positives &mdash; is the defining property of a Bloom filter.</p>
+
+      <p>The magic is in the space savings. Storing 1 million URLs in a hash set might require 50&ndash;100 MB of memory. A Bloom filter can answer "is this URL in the set?" using only <strong>1.2 MB</strong> at a 1% false positive rate. The trade-off is clear: you give up the ability to retrieve actual elements and accept a small, quantifiable probability of false positives in exchange for dramatic memory reduction.</p>
+
+      <div class="callout callout-info">
+        <p><strong>How do we "know" the false positive rate is 1%?</strong> The 1% isn't measured &mdash; it's a <em>design target you choose up front</em>, and then you size the filter to hit it exactly. The Bloom filter's false positive rate is fully determined by three numbers you set at construction time: <code>m</code> (bits in the array), <code>n</code> (items you plan to insert), and <code>k</code> (number of hash functions). Given these, the math gives you a closed-form FPR with no measurement needed.</p>
+        <p style="margin-top:0.75rem;">The derivation (proven in the <a href="#assumptions-model">Assumptions &amp; Model</a> section below): with <code>k</code> hash functions distributing each insert uniformly across <code>m</code> bits, after <code>n</code> inserts the probability that any specific bit is <em>still</em> 0 is approximately <code>e<sup>-kn/m</sup></code>. A false positive requires all <code>k</code> bits a queried item hashes to be 1 &mdash; probability <code>(1 - e<sup>-kn/m</sup>)<sup>k</sup></code>. Picking the optimal <code>k = (m/n) &times; ln(2)</code> and solving for <code>m</code> at target FPR <code>p</code> gives:</p>
+        <p style="text-align:center; font-family:var(--font-mono); font-size:1.05rem; margin:0.75rem 0;">
+          m = &minus;n &times; ln(p) / (ln 2)<sup>2</sup> &asymp; 9.585 &times; n &nbsp; <span style="color:#64748b;">(for p = 1%)</span>
+        </p>
+        <p style="margin-top:0.75rem;">So for n = 1,000,000 URLs at p = 1%: m &asymp; 9.585 million bits = ~1.2 MB. The "1.2 MB" and "1%" aren't independent observations &mdash; one is derived from the other. If you want 0.1% FPR instead, plug it in: m &asymp; 14.4 &times; n &asymp; 1.8 MB. If you want 0.01%: m &asymp; 19.2 &times; n &asymp; 2.4 MB. <strong>Each 10&times; reduction in FPR costs ~4.8 extra bits per element</strong> &mdash; a logarithmic price you pay for an exponential improvement in accuracy.</p>
+        <p style="margin-top:0.75rem;">The catch: this guarantee only holds if (a) your hash functions are independent and uniform (in practice, MurmurHash3 / xxHash with the Kirschner&ndash;Mitzenmacher double-hashing trick is close enough), and (b) you don't insert more than <code>n</code> items. Overfilling causes the actual FPR to climb sharply &mdash; at 2&times; capacity you'd see ~15&ndash;20% FPR instead of 1%.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Animated Diagram -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Animated Diagram: Bloom Filter in Action</h2>
+      <div class="animation-container" id="bloom-animation-container">
+        <canvas id="bloomCanvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+      </div>
+      <p class="animation-description">Watch elements being inserted into the bit array via k=3 hash functions, then see queries: all bits set = "maybe yes" (true positive or false positive), any bit 0 = "definitely no" (true negative).</p>
+    </div>
+  </section>
+
+  <!-- 4. How It Works -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+      <ol>
+        <li><strong>Initialize the bit array.</strong> Create an array of <code>m</code> bits, all set to 0. Choose a value of m based on the expected number of elements <code>n</code> and the desired false positive rate <code>p</code>.</li>
+        <li><strong>Choose k hash functions.</strong> Select <code>k</code> independent hash functions, each mapping an input to one of the m bit positions uniformly. In practice, you can use two hash functions h<sub>1</sub> and h<sub>2</sub> and derive k hashes via <code>g<sub>i</sub>(x) = h<sub>1</sub>(x) + i &times; h<sub>2</sub>(x)</code> (the Kirschner-Mitzenmacher optimization).</li>
+        <li><strong>Insert an element.</strong> Feed the element to all k hash functions. For each of the k resulting positions, set that bit to 1. If it is already 1, leave it. Note: bits are never set back to 0 in a standard Bloom filter.</li>
+        <li><strong>Query an element.</strong> Feed the element to all k hash functions. Check each of the k bit positions:
+          <ul>
+            <li>If <strong>any bit is 0</strong> &rarr; the element was <strong>definitely never inserted</strong>. (A 0 bit cannot have been set by a previous insert of this element.)</li>
+            <li>If <strong>all bits are 1</strong> &rarr; the element is <strong>probably in the set</strong>. The bits could have been set by other elements' insertions (a false positive).</li>
+          </ul>
+        </li>
+        <li><strong>Understand the false positive mechanism.</strong> As more elements are inserted, more bits flip to 1. Eventually, for a queried element that was never inserted, all k of its hash positions may coincidentally already be 1 — set by various other elements. This is the false positive.</li>
+      </ol>
+
+      <h3>Worked Example: Multiple Hash Functions in Action</h3>
+      <p>Let's trace through a complete example with <code>m = 10</code> bits and <code>k = 3</code> hash functions (h<sub>1</sub>, h<sub>2</sub>, h<sub>3</sub>). We start with all bits at 0:</p>
+
+      <h4>Step 1: Insert "apple"</h4>
+      <p>Compute the three hash positions: h<sub>1</sub>("apple") = 2, h<sub>2</sub>("apple") = 5, h<sub>3</sub>("apple") = 8. Set bits 2, 5, and 8 to 1.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th></tr></thead>
+        <tbody><tr><td><strong>Bit</strong></td><td>0</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td></tr></tbody>
+      </table></div>
+
+      <h4>Step 2: Insert "banana"</h4>
+      <p>h<sub>1</sub>("banana") = 0, h<sub>2</sub>("banana") = 5, h<sub>3</sub>("banana") = 7. Set bits 0, 5, and 7. Note that bit 5 is <em>already</em> 1 from "apple" &mdash; it stays 1.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th></tr></thead>
+        <tbody><tr><td><strong>Bit</strong></td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td></tr></tbody>
+      </table></div>
+
+      <h4>Step 3: Query "apple" (True Positive)</h4>
+      <p>Compute hashes: h<sub>1</sub>("apple") = 2, h<sub>2</sub>("apple") = 5, h<sub>3</sub>("apple") = 8. Check bits: bit[2] = 1, bit[5] = 1, bit[8] = 1. <strong>All bits are 1 &rarr; "Probably in set."</strong> This is correct &mdash; "apple" <em>was</em> inserted. This is a <strong>true positive</strong>.</p>
+
+      <h4>Step 4: Query "cherry" (True Negative)</h4>
+      <p>Compute hashes: h<sub>1</sub>("cherry") = 2, h<sub>2</sub>("cherry") = 7, h<sub>3</sub>("cherry") = 9. Check bits: bit[2] = 1, bit[7] = 1, bit[9] = <strong>0</strong>. One bit is 0 &rarr; <strong>"Definitely NOT in set."</strong> We can be 100% certain because if "cherry" had been inserted, bit[9] would have been set to 1.</p>
+
+      <h4>Step 5: Query "date" (False Positive!)</h4>
+      <p>Compute hashes: h<sub>1</sub>("date") = 0, h<sub>2</sub>("date") = 2, h<sub>3</sub>("date") = 8. Check bits: bit[0] = 1 (set by "banana"), bit[2] = 1 (set by "apple"), bit[8] = 1 (set by "apple"). <strong>All bits are 1 &rarr; "Probably in set."</strong> But "date" was <strong>never inserted</strong>! This is a <strong>false positive</strong>. The bits at positions 0, 2, and 8 were coincidentally set by other elements ("apple" and "banana").</p>
+
+      <div class="callout-assumptions">
+        <h4>Key Insight: Why False Positives Happen</h4>
+        <p>A false positive occurs when a queried item's hash positions happen to overlap entirely with bits that were set by <em>other</em> items. As more items are inserted, more bits flip to 1, and these coincidental overlaps become more likely. This is why the false positive rate increases as the filter fills up &mdash; and why sizing the filter correctly is critical.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5. When to Use / When NOT to Use -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use When</h4>
+          <ul>
+            <li><strong>Avoiding expensive lookups:</strong> "Is this URL malicious?" — check the Bloom filter before hitting the full database (Google Safe Browsing).</li>
+            <li><strong>Username/email uniqueness pre-checks:</strong> quickly reject "definitely available" without a DB round-trip.</li>
+            <li><strong>Deduplication:</strong> "Have we already crawled/recommended this item?" — web crawlers, content recommendation engines.</li>
+            <li><strong>Cache miss avoidance:</strong> check if a key could possibly exist before querying a cache or database, saving network hops.</li>
+            <li><strong>Database query optimization:</strong> LSM-tree storage engines (Cassandra, LevelDB, RocksDB) use Bloom filters on each SSTable to skip disk reads for keys that are not in that table.</li>
+            <li><strong>Network-level filtering:</strong> distributed systems can exchange compact Bloom filters to summarize what data each node holds.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use When</h4>
+          <ul>
+            <li><strong>False positives are unacceptable:</strong> if a false "yes" causes an incorrect financial transaction, medical decision, or security bypass, use an exact data structure.</li>
+            <li><strong>You need deletion:</strong> standard Bloom filters cannot remove elements — once a bit is set, unsetting it could invalidate other elements. Use a Counting Bloom filter or Cuckoo filter instead.</li>
+            <li><strong>You need to retrieve actual elements:</strong> Bloom filters store no data about the elements themselves. Use a hash map or hash set.</li>
+            <li><strong>The set is very small:</strong> for a few hundred elements, a simple hash set is simpler, equally fast, and requires negligible memory.</li>
+            <li><strong>You need exact counts:</strong> Bloom filters answer membership, not "how many times." Use a Count-Min Sketch or HyperLogLog for frequency/cardinality estimation.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Classic vs. Modern Approaches -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+      <h3>Standard Bloom Filter (1970, Burton Howard Bloom)</h3>
+      <p>The original and most widely deployed variant. Simple, fast, and well-understood. Limitations: no deletion, false positive rate is fixed at construction time, and space efficiency is about 44% worse than the information-theoretic optimum.</p>
+
+      <h3>Counting Bloom Filter</h3>
+      <p>Replaces each bit with a small counter (typically 4 bits). Insertion increments k counters; deletion decrements them. This supports removal at the cost of ~4x more memory. Overflow is rare but possible — a 4-bit counter overflows at 16 collisions on a single position.</p>
+
+      <h4>Why Standard Bloom Filters Can't Delete</h4>
+      <p>In a standard Bloom filter, you cannot set a bit back to 0 when deleting an item because <strong>other items might share that bit</strong>. If "apple" and "banana" both hash to position 5, clearing bit 5 when deleting "apple" would make the filter falsely report that "banana" is not in the set &mdash; introducing a <strong>false negative</strong>, which violates the fundamental guarantee.</p>
+
+      <h4>The Solution: Replace Bits with Counters</h4>
+      <p>Instead of storing a single bit (0 or 1) at each position, store a small counter (typically 4 bits, supporting values 0&ndash;15). Insert increments the counters at the k hash positions. Delete decrements them. A position is considered "set" if its counter is greater than 0.</p>
+
+      <h4>Worked Example: Counting Bloom Filter Operations</h4>
+      <p>Using <code>m = 6</code> counter positions, <code>k = 2</code> hash functions:</p>
+
+      <p><strong>Insert "apple":</strong> h<sub>1</sub> = 1, h<sub>2</sub> = 4. Increment counters at positions 1 and 4.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+        <tbody><tr><td><strong>Counter</strong></td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td></tr></tbody>
+      </table></div>
+
+      <p><strong>Insert "banana":</strong> h<sub>1</sub> = 1, h<sub>2</sub> = 3. Increment counters at positions 1 and 3. Counter at position 1 goes from 1 to <strong>2</strong> (shared by both "apple" and "banana").</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+        <tbody><tr><td><strong>Counter</strong></td><td>0</td><td style="background:#fef3c7;font-weight:bold;">2</td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td style="background:#dbeafe;">1</td><td>0</td></tr></tbody>
+      </table></div>
+
+      <p><strong>Delete "apple":</strong> h<sub>1</sub> = 1, h<sub>2</sub> = 4. Decrement counters at positions 1 and 4.</p>
+      <div class="table-responsive"><table>
+        <thead><tr><th>Index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+        <tbody><tr><td><strong>Counter</strong></td><td>0</td><td style="background:#dbeafe;font-weight:bold;">1</td><td>0</td><td style="background:#dbeafe;">1</td><td style="background:#fef2f2;font-weight:bold;">0</td><td>0</td></tr></tbody>
+      </table></div>
+
+      <p><strong>Query "apple":</strong> Check positions 1 and 4. Counter[1] = 1 (still &gt; 0, because "banana" shares this position), but Counter[4] = <strong>0</strong>. Zero found &rarr; <strong>"Definitely NOT in set."</strong> Correct! The deletion worked without introducing a false negative for "banana."</p>
+
+      <p><strong>Query "banana":</strong> Check positions 1 and 3. Counter[1] = 1, Counter[3] = 1. Both &gt; 0 &rarr; <strong>"Probably in set."</strong> Correct!</p>
+
+      <h4>Counter Overflow</h4>
+      <p>With 4-bit counters (maximum value 15), what happens if 16 or more items hash to the same position? The counter overflows. In practice, with a properly sized filter, the probability of any single counter exceeding 15 is approximately 1.37 &times; 10<sup>&minus;15</sup> &mdash; negligible for all practical purposes.</p>
+
+      <p><strong>Tradeoff:</strong> 4 bits per counter vs. 1 bit per position means a counting Bloom filter uses <strong>4x the memory</strong> of a standard Bloom filter. For a filter that needs 1.2 MB as a standard Bloom filter, the counting variant would use ~4.8 MB.</p>
+
+      <h3>Cuckoo Filter (Fan et al., 2014)</h3>
+      <p>Stores fingerprints in a cuckoo hash table instead of setting individual bits. Supports <strong>deletion</strong>, achieves better space efficiency than Bloom filters when the target false positive rate is below ~3%, and has better data locality (cache-friendly lookups). Trade-off: insertion can fail when the table is too full (typically at ~95% load), and a failed insert requires rebuilding.</p>
+
+      <h4>Data Structure</h4>
+      <p>A cuckoo filter consists of an array of <strong>buckets</strong>, each holding <code>B</code> slots (typically B = 4). Each slot stores a <strong>fingerprint</strong> &mdash; a short hash (e.g., 8 bits) of the original item. The fingerprint is <em>not</em> the full item, which is why the filter is space-efficient but can produce false positives (two different items might have the same fingerprint).</p>
+
+      <h4>Insertion Algorithm: Step by Step</h4>
+      <ol>
+        <li><strong>Compute fingerprint:</strong> <code>f = fingerprint(x)</code> (e.g., an 8-bit hash of x).</li>
+        <li><strong>Compute two candidate bucket positions:</strong> <code>i<sub>1</sub> = hash(x) mod table_size</code> and <code>i<sub>2</sub> = i<sub>1</sub> XOR hash(f) mod table_size</code>.</li>
+        <li><strong>Try bucket i<sub>1</sub>:</strong> If <code>bucket[i<sub>1</sub>]</code> has an empty slot, store <code>f</code> there. Done.</li>
+        <li><strong>Try bucket i<sub>2</sub>:</strong> If <code>bucket[i<sub>2</sub>]</code> has an empty slot, store <code>f</code> there. Done.</li>
+        <li><strong>Both full &mdash; evict:</strong> Pick one bucket (say i<sub>1</sub>). Evict an existing fingerprint <code>f<sub>old</sub></code> from that bucket. Store <code>f</code> in <code>f<sub>old</sub></code>'s slot.</li>
+        <li><strong>Relocate the evicted fingerprint:</strong> Compute <code>f<sub>old</sub></code>'s alternate bucket: <code>i<sub>alt</sub> = i<sub>1</sub> XOR hash(f<sub>old</sub>)</code>. Try to insert <code>f<sub>old</sub></code> there.</li>
+        <li><strong>Repeat if needed:</strong> If the alternate bucket is also full, evict again. Continue up to <code>MAX_KICKS</code> (e.g., 500) times.</li>
+        <li><strong>If MAX_KICKS exceeded:</strong> The filter is too full &mdash; it needs to be rebuilt with a larger table.</li>
+      </ol>
+
+      <h4>Why XOR for the Alternate Position?</h4>
+      <p>The formula <code>i<sub>2</sub> = i<sub>1</sub> XOR hash(f)</code> has a critical property: it is <strong>symmetric</strong>. Given <em>either</em> bucket position and the fingerprint, you can compute the <em>other</em> bucket position: <code>i<sub>1</sub> = i<sub>2</sub> XOR hash(f)</code>. This means during eviction, you don't need to store the original item &mdash; you only need the fingerprint and the current bucket position to find the alternate bucket. This is what makes the cuckoo eviction chain work without keeping the original data.</p>
+
+      <h4>Lookup and Deletion</h4>
+      <p><strong>Lookup:</strong> Compute <code>f</code>, <code>i<sub>1</sub></code>, and <code>i<sub>2</sub></code>. Check if <code>f</code> exists in either <code>bucket[i<sub>1</sub>]</code> or <code>bucket[i<sub>2</sub>]</code>. If found, return "probably in set." If not found in either, return "definitely not in set." This checks at most <strong>2 memory locations</strong>, compared to <code>k</code> locations (often 7&ndash;13) for a Bloom filter.</p>
+      <p><strong>Deletion:</strong> Compute <code>f</code>, <code>i<sub>1</sub></code>, <code>i<sub>2</sub></code>. Find <code>f</code> in <code>bucket[i<sub>1</sub>]</code> or <code>bucket[i<sub>2</sub>]</code>. Remove it. Done. Unlike counting Bloom filters, there is no counter overflow risk.</p>
+
+      <h4>Why Better Space Efficiency</h4>
+      <p>A cuckoo filter with 8-bit fingerprints achieves approximately 3% false positive rate using about <strong>12 bits per item</strong>. A counting Bloom filter achieving the same FP rate requires approximately <strong>17 bits per item</strong>. This makes cuckoo filters roughly <strong>30% more space-efficient</strong> than counting Bloom filters for the same functionality (membership test with deletion support).</p>
+
+      <h3>Quotient Filter</h3>
+      <p>Stores fingerprints in an open-addressing hash table using quotienting. <strong>Cache-friendly</strong> because it stores data contiguously in memory, making it faster on modern CPUs than Bloom filters for large datasets. Supports deletion and merging, but is more complex to implement.</p>
+
+      <h4>How Quotienting Works</h4>
+      <p>A quotient filter splits each hash value into two parts:</p>
+      <ul>
+        <li><strong>Quotient q</strong> = the upper bits of the hash. This is the <strong>bucket index</strong> &mdash; it tells you <em>where</em> to look in the array.</li>
+        <li><strong>Remainder r</strong> = the lower bits of the hash. This is <strong>what gets stored</strong> in that bucket.</li>
+      </ul>
+      <p>For example, with a 16-bit hash and an 8-bit quotient: the hash <code>0xA3F7</code> splits into quotient <code>0xA3</code> (bucket 163) and remainder <code>0xF7</code> (stored at that bucket). To query, compute the hash, extract the quotient to find the bucket, then check if the remainder is stored there.</p>
+
+      <h4>Why It's Cache-Friendly</h4>
+      <p>All data lives in a <strong>single contiguous array</strong>. When you look up a key, you access a small range of consecutive memory locations (the target bucket and its neighbors). Bloom filters, by contrast, access <code>k</code> random positions scattered across the bit array, causing cache misses on every lookup for large filters. On modern CPUs where cache misses cost 100+ nanoseconds, this locality advantage is significant.</p>
+
+      <h4>Key Advantages Over Bloom Filters</h4>
+      <ul>
+        <li><strong>Deletion:</strong> Supported natively (remove the remainder from its bucket), similar to counting Bloom filters but without the 4x memory overhead.</li>
+        <li><strong>Merging:</strong> Two quotient filters can be merged into one by merging their sorted arrays &mdash; useful for combining filters from different data partitions.</li>
+        <li><strong>Resizing:</strong> To double the size, add one more bit to the quotient. Each existing slot splits into two possible positions. This is not possible with Bloom filters, which must be rebuilt from scratch.</li>
+        <li><strong>Cache-friendly:</strong> Sequential array access pattern performs well on modern hardware.</li>
+      </ul>
+
+      <p><strong>Tradeoff:</strong> Quotient filters use slightly more space per item than standard Bloom filters (roughly 10&ndash;15 bits vs. ~10 bits), and are more complex to implement. They excel when you need merge, resize, or deletion capabilities combined with good cache performance.</p>
+
+      <h4>Comparison of Probabilistic Filter Variants</h4>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Feature</th><th>Bloom Filter</th><th>Counting Bloom</th><th>Cuckoo Filter</th><th>Quotient Filter</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Space per item (at ~1% FP)</strong></td><td>~10 bits</td><td>~40 bits</td><td>~12 bits</td><td>~10&ndash;15 bits</td></tr>
+          <tr><td><strong>Deletion</strong></td><td>No</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td><strong>Merging</strong></td><td>No</td><td>No</td><td>No</td><td>Yes</td></tr>
+          <tr><td><strong>Resizing</strong></td><td>No (rebuild)</td><td>No (rebuild)</td><td>Limited</td><td>Yes</td></tr>
+          <tr><td><strong>Cache-friendly</strong></td><td>No (random access)</td><td>No (random access)</td><td>Moderate (2 lookups)</td><td>Yes (sequential)</td></tr>
+          <tr><td><strong>Insertion failure</strong></td><td>Never</td><td>Never</td><td>Possible at &gt;95% load</td><td>Never (with overflow)</td></tr>
+          <tr><td><strong>Complexity</strong></td><td>Simple</td><td>Simple</td><td>Moderate</td><td>Complex</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>XOR Filter (Graf &amp; Lemire, 2020)</h3>
+      <p>An <strong>immutable</strong> filter built from a set of elements in one batch. Cannot support insertions after construction, but achieves the best space efficiency of any practical filter — about 1.23 bits per element at typical false positive rates, compared to ~10 bits for a Bloom filter at 1% FP. Ideal for static sets like IP blocklists or dictionary lookups.</p>
+
+      <h3>HyperLogLog (Related: Cardinality Estimation)</h3>
+      <p>Not a membership filter, but a related probabilistic structure worth knowing. HyperLogLog estimates the <em>number of distinct elements</em> (cardinality) in a stream using only ~12 KB of memory for billions of elements, with ~0.8% standard error. Used by Redis (<code>PFCOUNT</code>), Presto, and BigQuery.</p>
+    </div>
+  </section>
+
+  <!-- 7. Assumptions & Model -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Assumptions</h4>
+        <ul>
+          <li><strong>Hash functions are independent and uniform:</strong> each hash function maps inputs to bit positions with equal probability across all m positions, and the outputs of different hash functions are independent. In practice, this is approximated using strong hash functions like MurmurHash3 or xxHash with the Kirschner-Mitzenmacher double-hashing trick.</li>
+          <li><strong>Acceptable false positive rate is known upfront:</strong> the filter must be sized at construction time. You cannot shrink the FP rate after the fact without rebuilding with a larger m.</li>
+          <li><strong>The set does not require deletion:</strong> standard Bloom filters are insert-only. Deleting an element would require clearing bits that may be shared with other elements.</li>
+          <li><strong>Number of elements is approximately known:</strong> if significantly more elements are inserted than planned for, the FP rate degrades rapidly. Under-sizing by 2x can increase the FP rate from 1% to 15%+.</li>
+        </ul>
+      </div>
+
+      <h3>The Math</h3>
+      <p>Given a bit array of <code>m</code> bits and <code>n</code> inserted elements with <code>k</code> hash functions:</p>
+      <p><strong>Optimal number of hash functions:</strong></p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.1rem; margin: 1.25rem 0;">
+        k = (m / n) &times; ln(2) &asymp; 0.693 &times; (m / n)
+      </p>
+      <p><strong>False positive probability:</strong></p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.1rem; margin: 1.25rem 0;">
+        p = (1 &minus; e<sup>&minus;kn/m</sup>)<sup>k</sup>
+      </p>
+      <p>Intuitively: after inserting n elements, the probability that a specific bit is still 0 is approximately <code>e<sup>-kn/m</sup></code>. A false positive requires all k queried bits to be 1, each with probability <code>(1 - e<sup>-kn/m</sup>)</code>, giving the formula above.</p>
+
+      <h4>Worked Example: Computing the False Positive Rate</h4>
+      <p>Suppose we have a bit array of <code>m = 1,000</code> bits (just 125 bytes &mdash; tiny!) and we want to store <code>n = 100</code> items.</p>
+      <p><strong>Step 1: Find optimal k.</strong></p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.05rem; margin: 0.75rem 0;">
+        k = (m / n) &times; ln(2) = (1000 / 100) &times; 0.693 = 10 &times; 0.693 = 6.93 &asymp; <strong>7 hash functions</strong>
+      </p>
+      <p><strong>Step 2: Compute the false positive rate.</strong></p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.05rem; margin: 0.75rem 0;">
+        FP = (1 &minus; e<sup>&minus;kn/m</sup>)<sup>k</sup> = (1 &minus; e<sup>&minus;7&times;100/1000</sup>)<sup>7</sup> = (1 &minus; e<sup>&minus;0.7</sup>)<sup>7</sup>
+      </p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.05rem; margin: 0.75rem 0;">
+        = (1 &minus; 0.497)<sup>7</sup> = (0.503)<sup>7</sup> = <strong>0.0082 &asymp; 0.82%</strong>
+      </p>
+      <p>So with just <strong>125 bytes of memory</strong> and 7 hash functions, we can test membership of 100 items with only a 0.82% false positive rate. That means roughly 1 in 122 queries for non-existent items will incorrectly return "probably in set."</p>
+
+      <h4>How Parameters Affect the False Positive Rate</h4>
+      <p>The table below shows how changing m, n, and k affects the FP rate. Notice a crucial pattern:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>m (bits)</th><th>n (items)</th><th>m/n ratio</th><th>k (optimal)</th><th>FP Rate</th><th>Memory</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1,000</td><td>100</td><td>10</td><td>7</td><td>0.82%</td><td>125 bytes</td></tr>
+          <tr><td>2,000</td><td>100</td><td>20</td><td>14</td><td>0.007%</td><td>250 bytes</td></tr>
+          <tr><td>1,000</td><td>200</td><td>5</td><td>3</td><td>9.8%</td><td>125 bytes</td></tr>
+          <tr><td>10,000</td><td>1,000</td><td>10</td><td>7</td><td>0.82%</td><td>1.25 KB</td></tr>
+          <tr><td>1,000,000</td><td>100,000</td><td>10</td><td>7</td><td>0.82%</td><td>122 KB</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Key insight:</strong> The false positive rate depends on the <strong>ratio m/n</strong> (bits per element), not the absolute values of m or n. Doubling both m and n keeps the same FP rate. This means a Bloom filter scales linearly &mdash; 10x more elements requires 10x more bits to maintain the same FP rate.</p>
+      <p>Also notice that doubling m (while keeping n fixed) dramatically reduces the FP rate &mdash; from 0.82% to 0.007% in the table above. This is because the FP rate decreases <em>exponentially</em> with the bits-per-element ratio.</p>
+
+      <h4>When Assumptions Break Down</h4>
+      <p>If the hash functions are correlated (e.g., using CRC32 which has known collision patterns), the actual FP rate can exceed the theoretical rate significantly. If the number of elements exceeds the designed capacity, the FP rate grows exponentially — at 2x capacity, you may see 15&ndash;20% false positives instead of the designed 1%.</p>
+    </div>
+  </section>
+
+  <!-- 8. Sizing & Tradeoffs -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+      <h3>How to Size a Bloom Filter</h3>
+      <p>Given <code>n</code> elements and desired false positive rate <code>p</code>:</p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.05rem; margin: 1rem 0;">
+        m = &minus;n &times; ln(p) / (ln 2)<sup>2</sup> bits
+      </p>
+      <p style="text-align:center; font-family: var(--font-mono); font-size: 1.05rem; margin: 1rem 0;">
+        k = (m / n) &times; ln(2)
+      </p>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+      <p>In production, filter sizing is never arbitrary &mdash; it derives from a service-level objective. Each example below starts with a business constraint and derives the Bloom filter parameters from the formulas above.</p>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h4>1. URL Shortener Deduplication</h4>
+        <p><strong>SLO:</strong> False positive rate &lt; 0.1% &nbsp;|&nbsp; <strong>Dataset:</strong> 1 billion shortened URLs</p>
+        <p><strong>Why this FPR:</strong> A false positive means a newly submitted URL is incorrectly flagged as &ldquo;already shortened,&rdquo; returning a stale short code. At 0.1%, only 1 in 1,000 submissions triggers a needless DB lookup &mdash; acceptable for a high-throughput shortening service.</p>
+        <ul>
+          <li><code>n = 1,000,000,000</code>, <code>p = 0.001</code></li>
+          <li><code>m = &minus;1B &times; ln(0.001) / (ln 2)&sup2; = &minus;1B &times; (&minus;6.908) / 0.4805 &asymp; 14.38B bits &asymp; 1.80 GB</code></li>
+          <li><code>k = (14.38 / 1) &times; 0.693 &asymp; 9.97 &rarr; <strong>10 hash functions</strong></code></li>
+          <li><strong>Result:</strong> ~1.80 GB filter with 10 hashes &mdash; fits in a single application server&rsquo;s memory. Compared to storing 1B URLs at ~60 bytes each (60 GB), this is a <strong>33x reduction</strong>.</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h4>2. Email Spam Filter</h4>
+        <p><strong>SLO:</strong> False positive rate &lt; 0.01% &nbsp;|&nbsp; <strong>Dataset:</strong> 100 million known spam signatures</p>
+        <p><strong>Why this FPR:</strong> A false positive means a legitimate email is flagged as spam. Even 0.01% means ~10,000 wrongly flagged emails per 100M checks &mdash; already at the edge of user tolerance for a mail provider.</p>
+        <ul>
+          <li><code>n = 100,000,000</code>, <code>p = 0.0001</code></li>
+          <li><code>m = &minus;100M &times; ln(0.0001) / (ln 2)&sup2; = &minus;100M &times; (&minus;9.210) / 0.4805 &asymp; 1.917B bits &asymp; 239.6 MB</code></li>
+          <li><code>k = (19.17) &times; 0.693 &asymp; 13.28 &rarr; <strong>13 hash functions</strong></code></li>
+          <li><strong>Result:</strong> ~240 MB memory budget with 13 hashes. At 19.2 bits per element, this is the price of the stringent 0.01% FPR. Each halving of FPR from here adds only ~1.44 bits/element (~7.5% more memory).</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h4>3. Database Query Optimizer (LSM-Tree / SSTable)</h4>
+        <p><strong>SLO:</strong> False positive rate &lt; 1% &nbsp;|&nbsp; <strong>Dataset:</strong> 10 million row keys per SSTable</p>
+        <p><strong>Why this FPR:</strong> A false positive causes an unnecessary disk read of an SSTable block. At 1%, ~1 in 100 point queries reads a block that doesn&rsquo;t contain the key. With 7 SSTables per level, the expected wasted reads per query is only 0.07 &mdash; negligible compared to the guaranteed hit.</p>
+        <ul>
+          <li><code>n = 10,000,000</code>, <code>p = 0.01</code></li>
+          <li><code>m = &minus;10M &times; ln(0.01) / (ln 2)&sup2; = &minus;10M &times; (&minus;4.605) / 0.4805 &asymp; 95.85M bits &asymp; 12.0 MB</code></li>
+          <li><code>k = (9.585) &times; 0.693 &asymp; 6.64 &rarr; <strong>7 hash functions</strong></code></li>
+          <li><strong>Result:</strong> ~12 MB per SSTable filter. For an LSM-tree with 50 SSTables, total Bloom filter memory is ~600 MB &mdash; a worthwhile investment to avoid thousands of random disk seeks per second. This is exactly the approach used by LevelDB, RocksDB, and Cassandra.</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h4>4. CDN Content Deduplication</h4>
+        <p><strong>SLO:</strong> False positive rate &lt; 0.5%, memory budget &lt; 1 GB &nbsp;|&nbsp; <strong>Dataset:</strong> 500 million content hashes</p>
+        <p><strong>Why this FPR:</strong> A false positive means the CDN thinks it already has a piece of content and skips fetching from origin &mdash; serving stale or missing content. At 0.5%, the re-fetch cost is manageable; the memory ceiling of 1 GB is a hard infrastructure constraint.</p>
+        <ul>
+          <li><code>n = 500,000,000</code>, <code>p = 0.005</code></li>
+          <li><code>m = &minus;500M &times; ln(0.005) / (ln 2)&sup2; = &minus;500M &times; (&minus;5.298) / 0.4805 &asymp; 5.512B bits &asymp; 689 MB</code></li>
+          <li><code>k = (11.024) &times; 0.693 &asymp; 7.64 &rarr; <strong>8 hash functions</strong></code></li>
+          <li><strong>Result:</strong> ~689 MB fits within the 1 GB memory budget with room for growth. At 11 bits per element, the filter can absorb up to ~725M elements before exceeding 1 GB &mdash; providing a <strong>45% growth margin</strong> before infrastructure changes are needed.</li>
+        </ul>
+      </div>
+
+      <h3>Sizing Reference Table</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Elements (n)</th>
+            <th>FP Rate (p)</th>
+            <th>Bits (m)</th>
+            <th>Memory</th>
+            <th>Hash Functions (k)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>100K</td><td>1%</td><td>958K</td><td>117 KB</td><td>7</td></tr>
+          <tr><td>1M</td><td>1%</td><td>9.6M</td><td>1.2 MB</td><td>7</td></tr>
+          <tr><td>1M</td><td>0.1%</td><td>14.4M</td><td>1.8 MB</td><td>10</td></tr>
+          <tr><td>10M</td><td>1%</td><td>95.9M</td><td>12 MB</td><td>7</td></tr>
+          <tr><td>10M</td><td>0.01%</td><td>191.7M</td><td>24 MB</td><td>13</td></tr>
+          <tr><td>100M</td><td>1%</td><td>958.5M</td><td>120 MB</td><td>7</td></tr>
+          <tr><td>1B</td><td>1%</td><td>9.6B</td><td>1.2 GB</td><td>7</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Key insight:</strong> halving the FP rate costs only ~44% more memory (adding about 1.44 bits per element). Reducing FP rate from 1% to 0.1% adds ~50% more memory, not 10x — this is remarkably efficient.</p>
+
+      <!-- Interactive FPR vs Bits-per-Element Graph -->
+      <h3>Interactive: False Positive Rate vs. Bits per Element</h3>
+      <p>This graph shows how the false positive rate <code>p = (1 &minus; e<sup>&minus;kn/m</sup>)<sup>k</sup></code> varies with bits per element <code>(m/n)</code> for different hash function counts <code>k</code>. Hover over any point to see the exact FPR.</p>
+      <div style="position: relative; max-width: 720px; margin: 1.5rem auto;">
+        <canvas id="fprCanvas" width="720" height="420" style="width: 100%; border: 1px solid var(--border-color, #ddd); border-radius: 8px; cursor: crosshair;"></canvas>
+        <div id="fprTooltip" style="display:none; position:absolute; pointer-events:none; background:rgba(30,30,30,0.92); color:#fff; padding:8px 12px; border-radius:6px; font-size:0.85rem; font-family:var(--font-mono, monospace); line-height:1.5; z-index:10; white-space:nowrap;"></div>
+      </div>
+      <script>
+      (function() {
+        var canvas = document.getElementById('fprCanvas');
+        var ctx = canvas.getContext('2d');
+        var tooltip = document.getElementById('fprTooltip');
+
+        var W = canvas.width, H = canvas.height;
+        var pad = { top: 30, right: 30, bottom: 55, left: 70 };
+        var plotW = W - pad.left - pad.right;
+        var plotH = H - pad.top - pad.bottom;
+
+        // Parameters
+        var bpeMin = 1, bpeMax = 25; // bits per element range
+        var kValues = [1, 3, 5, 7, 10, 13];
+        var colors = ['#e74c3c', '#e67e22', '#f1c40f', '#2ecc71', '#3498db', '#9b59b6'];
+        var numPoints = 200;
+
+        // FPR formula: p = (1 - e^(-k / bpe))^k  (since bpe = m/n, kn/m = k/bpe)
+        function fpr(k, bpe) {
+          return Math.pow(1 - Math.exp(-k / bpe), k);
+        }
+
+        // Log scale for Y axis: FPR from 1e-6 to 1
+        var yMin = 1e-6, yMax = 1;
+        function yToCanvas(p) {
+          if (p <= 0) p = 1e-10;
+          var logMin = Math.log10(yMin), logMax = Math.log10(yMax);
+          var frac = (Math.log10(p) - logMin) / (logMax - logMin);
+          return pad.top + plotH * (1 - frac);
+        }
+        function xToCanvas(bpe) {
+          return pad.left + plotW * (bpe - bpeMin) / (bpeMax - bpeMin);
+        }
+        function canvasToX(cx) {
+          return bpeMin + (cx - pad.left) / plotW * (bpeMax - bpeMin);
+        }
+
+        function drawGraph() {
+          ctx.clearRect(0, 0, W, H);
+
+          // Background
+          ctx.fillStyle = '#fafbfc';
+          ctx.fillRect(pad.left, pad.top, plotW, plotH);
+
+          // Grid lines - horizontal (FPR powers of 10)
+          ctx.strokeStyle = '#e0e0e0';
+          ctx.lineWidth = 0.5;
+          for (var exp = -6; exp <= 0; exp++) {
+            var y = yToCanvas(Math.pow(10, exp));
+            ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+          }
+          // Sub-grid for log scale
+          ctx.strokeStyle = '#f0f0f0';
+          for (var exp = -6; exp < 0; exp++) {
+            for (var sub = 2; sub <= 9; sub++) {
+              var y = yToCanvas(sub * Math.pow(10, exp));
+              ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+            }
+          }
+
+          // Grid lines - vertical
+          ctx.strokeStyle = '#e0e0e0';
+          for (var bpe = 5; bpe <= bpeMax; bpe += 5) {
+            var x = xToCanvas(bpe);
+            ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+          }
+
+          // Axes
+          ctx.strokeStyle = '#333';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + plotH); ctx.lineTo(pad.left + plotW, pad.top + plotH); ctx.stroke();
+
+          // Y-axis labels
+          ctx.fillStyle = '#333';
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'middle';
+          for (var exp = -6; exp <= 0; exp++) {
+            var y = yToCanvas(Math.pow(10, exp));
+            var label = exp === 0 ? '100%' : exp === -1 ? '10%' : exp === -2 ? '1%' : '0.' + '0'.repeat(-exp - 2) + '1%';
+            ctx.fillText(label, pad.left - 8, y);
+          }
+
+          // X-axis labels
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'top';
+          for (var bpe = 5; bpe <= bpeMax; bpe += 5) {
+            ctx.fillText(bpe, xToCanvas(bpe), pad.top + plotH + 8);
+          }
+
+          // Axis titles
+          ctx.font = '12px JetBrains Mono, monospace';
+          ctx.fillStyle = '#555';
+          ctx.textAlign = 'center';
+          ctx.fillText('Bits per element (m/n)', pad.left + plotW / 2, H - 8);
+
+          ctx.save();
+          ctx.translate(14, pad.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('False Positive Rate', 0, 0);
+          ctx.restore();
+
+          // Draw curves
+          ctx.lineWidth = 2.5;
+          for (var ki = 0; ki < kValues.length; ki++) {
+            var k = kValues[ki];
+            ctx.strokeStyle = colors[ki];
+            ctx.beginPath();
+            var started = false;
+            for (var i = 0; i <= numPoints; i++) {
+              var bpe = bpeMin + (bpeMax - bpeMin) * i / numPoints;
+              var p = fpr(k, bpe);
+              if (p < yMin) p = yMin;
+              var x = xToCanvas(bpe);
+              var y = yToCanvas(p);
+              if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+            }
+            ctx.stroke();
+
+            // Label at right end
+            var endP = fpr(k, bpeMax);
+            if (endP < yMin) endP = yMin;
+            var labelY = yToCanvas(endP);
+            ctx.fillStyle = colors[ki];
+            ctx.font = 'bold 11px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('k=' + k, pad.left + plotW + 4, labelY);
+          }
+        }
+
+        drawGraph();
+
+        // Hover interaction
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var scaleY = H / rect.height;
+          var cx = (e.clientX - rect.left) * scaleX;
+          var cy = (e.clientY - rect.top) * scaleY;
+
+          if (cx < pad.left || cx > pad.left + plotW || cy < pad.top || cy > pad.top + plotH) {
+            tooltip.style.display = 'none';
+            drawGraph();
+            return;
+          }
+
+          var bpe = canvasToX(cx);
+
+          // Redraw and add vertical guide
+          drawGraph();
+          ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath(); ctx.moveTo(cx, pad.top); ctx.lineTo(cx, pad.top + plotH); ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Draw dots on curves
+          var lines = '<strong>m/n = ' + bpe.toFixed(1) + ' bits/elem</strong><br>';
+          for (var ki = 0; ki < kValues.length; ki++) {
+            var k = kValues[ki];
+            var p = fpr(k, bpe);
+            var y = yToCanvas(Math.max(p, yMin));
+            ctx.fillStyle = colors[ki];
+            ctx.beginPath(); ctx.arc(cx, y, 5, 0, 2 * Math.PI); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+            var pStr = p >= 0.01 ? (p * 100).toFixed(2) + '%' : p >= 0.0001 ? (p * 100).toFixed(4) + '%' : p.toExponential(2);
+            lines += '<span style="color:' + colors[ki] + '">&#9679;</span> k=' + k + ': FPR = ' + pStr + '<br>';
+          }
+
+          tooltip.innerHTML = lines;
+          tooltip.style.display = 'block';
+          // Position tooltip
+          var tipX = (e.clientX - rect.left) + 16;
+          var tipY = (e.clientY - rect.top) - 20;
+          if (tipX + 220 > rect.width) tipX = (e.clientX - rect.left) - 230;
+          if (tipY < 0) tipY = 10;
+          tooltip.style.left = tipX + 'px';
+          tooltip.style.top = tipY + 'px';
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+          drawGraph();
+        });
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Sizing a Bloom filter in production is not a one-time calculation &mdash; it is a capacity planning exercise tied to your service&rsquo;s SLOs. Follow this process:</p>
+
+      <h4>Step 1: Define the FPR SLO from Business Impact</h4>
+      <p>Quantify the cost of a false positive in your system. If a false positive triggers a database lookup costing 5 ms, and your p99 latency SLO is 50 ms, then you can tolerate at most ~1% FPR before the expected wasted-lookup latency erodes your budget. If a false positive causes user-visible errors (e.g., spam filter blocking legitimate email), target FPR &le; 0.01%.</p>
+
+      <h4>Step 2: Project Dataset Growth</h4>
+      <p>Use historical growth rates to project <code>n</code> at 6, 12, and 24 months. Size the filter for the 24-month projection (or 2&ndash;3x current size, whichever is larger). Under-sizing by 2x can degrade FPR from 1% to 15%+ &mdash; a catastrophic violation of any SLO.</p>
+
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Planning Horizon</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Current</td><td>Baseline: measure actual <code>n</code> and verify FPR matches theory</td></tr>
+          <tr><td>6 months</td><td>Ensure filter capacity covers projected <code>n</code> with &lt; 50% fill ratio</td></tr>
+          <tr><td>12 months</td><td>Plan rebuild or resize; validate memory budget with infrastructure team</td></tr>
+          <tr><td>24 months</td><td>Design for this <code>n</code> at initial deployment to avoid emergency resizes</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Step 3: Derive Filter Parameters</h4>
+      <p>With <code>n</code> (projected) and <code>p</code> (from SLO), compute <code>m</code> and <code>k</code> using the standard formulas. Then validate against infrastructure constraints:</p>
+      <ul>
+        <li><strong>Memory ceiling:</strong> Does <code>m</code> fit in your per-instance memory budget? If not, consider partitioning the filter across shards.</li>
+        <li><strong>Hash computation cost:</strong> Each query computes <code>k</code> hashes. At <code>k = 13</code>, ensure the per-query hash overhead stays under your CPU budget (typically &lt; 1 &mu;s with MurmurHash3).</li>
+        <li><strong>Rebuild time:</strong> Rebuilding a 1 GB filter from 500M elements takes seconds, not minutes. Factor this into your maintenance window.</li>
+      </ul>
+
+      <h4>Step 4: Monitor and Alert</h4>
+      <p>Deploy with monitoring on three signals:</p>
+      <ul>
+        <li><strong>Fill ratio</strong> (% of bits set to 1): Alert at 50%. At 50% fill, the theoretical FPR assumptions hold; beyond that, degradation accelerates non-linearly.</li>
+        <li><strong>Measured FPR</strong>: Sample queries with known-negative keys periodically. If measured FPR exceeds the SLO by &gt; 20%, trigger an automated rebuild at larger capacity.</li>
+        <li><strong>Element count vs. designed capacity</strong>: Alert when <code>n</code> reaches 70% of designed capacity to give the team lead time for a planned resize.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 9. Scaling Journey -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>No Filter</h4>
+          <p>Every membership check hits the database directly. At low scale, the DB handles it fine. A simple <code>SELECT EXISTS</code> query adds 1&ndash;5 ms per check. No need for probabilistic structures.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>Single Bloom Filter</h4>
+          <p>As read volume grows, add a Bloom filter in front of the DB. A single in-memory filter (a few hundred KB) eliminates 99% of unnecessary lookups. Rebuild periodically from the source of truth. Simple, single-process deployment.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>Partitioned Filters</h4>
+          <p>Data is now sharded across multiple DB nodes. Each shard maintains its own Bloom filter. Queries are routed to the correct shard's filter first. Filters are rebuilt asynchronously during compaction cycles. This is exactly how Cassandra and LevelDB operate — one Bloom filter per SSTable.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Distributed / Cuckoo Filters</h4>
+          <p>Filters are distributed across a cluster with synchronization protocols. Consider migrating to Cuckoo filters if deletion is needed (e.g., users opting out). Use layered filters: a small hot filter in L1 cache, a larger filter in shared memory, and per-SSTable filters on disk. XOR filters for static datasets (blocklists).</p>
+        </div>
+      </div>
+
+      <h4>Migration Signals</h4>
+      <ul>
+        <li><strong>Stage 1 &rarr; 2:</strong> DB read latency increases under load; cache miss rate is high because most lookups are for non-existent keys.</li>
+        <li><strong>Stage 2 &rarr; 3:</strong> Single filter grows too large for one machine's memory, or the dataset is already sharded.</li>
+        <li><strong>Stage 3 &rarr; 4:</strong> Need for deletion support, or the FP rate of aging filters becomes operationally problematic.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 10. What Can Go Wrong -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Filter Undersized — False Positive Rate Explodes</h3>
+      <p><strong>What happened:</strong> A team sized their Bloom filter for 1M elements but organic growth pushed the actual count to 3M. The false positive rate jumped from the designed 1% to over 20%, causing one in five legitimate requests to take the slow path (hitting the database unnecessarily).</p>
+      <p><strong>Root cause:</strong> No monitoring on filter fill ratio, and the sizing was based on a static estimate with no growth margin.</p>
+      <p><strong>Blast radius:</strong> Database load increased 4x from false-positive-driven queries. Tail latency (p99) degraded from 50 ms to 800 ms.</p>
+      <p><strong>Mitigation:</strong> Emergency filter rebuild with 4x larger capacity. Added monitoring on fill ratio (percentage of bits set to 1) with an alert at 50% fill.</p>
+      <p><strong>Prevention:</strong> Size filters for 2&ndash;3x expected capacity. Monitor fill ratio continuously. Automate periodic rebuilds.</p>
+
+      <h3>2. Poor Hash Function Choice — Correlated Collisions</h3>
+      <p><strong>What happened:</strong> An implementation used CRC32 as its hash family, with different seeds. CRC32 has known correlation patterns — certain input distributions caused the k hash outputs to cluster, dramatically increasing the effective FP rate to 8&ndash;10% instead of the theoretical 0.5%.</p>
+      <p><strong>Root cause:</strong> CRC32 is not a strong hash function; its output distribution is non-uniform for structured inputs (e.g., sequential IDs, URLs with common prefixes).</p>
+      <p><strong>Mitigation:</strong> Switched to MurmurHash3 with the double-hashing technique. FP rate dropped to the expected 0.5%.</p>
+      <p><strong>Prevention:</strong> Always use cryptographic or high-quality non-cryptographic hash functions (MurmurHash3, xxHash, SipHash). Validate empirical FP rate against theoretical rate in staging.</p>
+
+      <h3>3. No Deletion — Stale Positives Accumulate</h3>
+      <p><strong>What happened:</strong> A recommendation system used a Bloom filter to track "articles already shown to user." Over months, the filter accumulated so many entries that it approached saturation — the FP rate climbed to 30%, causing the system to incorrectly skip a third of fresh content, leading to a measurable drop in user engagement.</p>
+      <p><strong>Root cause:</strong> Standard Bloom filters cannot delete entries. Old articles that were no longer relevant still occupied bit positions.</p>
+      <p><strong>Mitigation:</strong> Replaced with a rotating pair of Bloom filters (current week + previous week), discarding the oldest filter weekly.</p>
+      <p><strong>Prevention:</strong> For use cases with element expiry, use time-bucketed filters, counting Bloom filters with periodic rebuild, or Cuckoo filters that support deletion.</p>
+    </div>
+  </section>
+
+  <!-- 11. Operating in Production -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Metric</th><th>What It Tells You</th><th>Alert Threshold</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>fill_ratio</code></td><td>Percentage of bits set to 1. Directly correlates with FP rate.</td><td>Alert &gt; 50%, page &gt; 70%</td></tr>
+          <tr><td><code>actual_fp_rate</code></td><td>Measured FP rate from sampled queries (compare filter result to ground truth).</td><td>Alert if &gt; 2x theoretical rate</td></tr>
+          <tr><td><code>query_latency_p99</code></td><td>Time for a single filter lookup. Should be sub-microsecond for in-memory filters.</td><td>Alert &gt; 10 &mu;s</td></tr>
+          <tr><td><code>elements_inserted</code></td><td>Track how many elements have been inserted vs. designed capacity.</td><td>Alert &gt; 80% of designed n</td></tr>
+          <tr><td><code>rebuild_lag</code></td><td>Time since last filter rebuild from source of truth.</td><td>Alert &gt; 24 hours (depends on use case)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Config</th><th>Description</th><th>Recommended</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>bit_array_size (m)</code></td><td>Total bits in the filter. Determines memory usage and FP rate ceiling.</td><td>Use the formula: m = -n&times;ln(p)/(ln2)^2. Over-provision by 2&ndash;3x.</td></tr>
+          <tr><td><code>hash_function_count (k)</code></td><td>Number of hash functions. Too few or too many both increase FP rate.</td><td>Use optimal k = (m/n) &times; ln(2). Round to nearest integer.</td></tr>
+          <tr><td><code>hash_function_choice</code></td><td>Which hash function family to use.</td><td>MurmurHash3 (general purpose), xxHash (speed-optimized), SipHash (security-sensitive).</td></tr>
+          <tr><td><code>rebuild_interval</code></td><td>How often to rebuild the filter from ground truth.</td><td>Depends on mutation rate. Hourly to daily for most use cases.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>FP rate too high?</strong></p>
+        <p>&rarr; Check <code>fill_ratio</code>. If &gt;50%, the filter is overfull.<br>
+        &nbsp;&nbsp;&rarr; Check <code>elements_inserted</code> vs. designed capacity. If over capacity, rebuild with larger m.<br>
+        &nbsp;&nbsp;&rarr; If fill ratio is normal, check hash function quality. Measure empirical distribution of bit positions — should be uniform.</p>
+        <p><strong>Latency spike on queries?</strong></p>
+        <p>&rarr; Check if filter is being accessed from disk (should be in memory).<br>
+        &nbsp;&nbsp;&rarr; Check if k is too large (each query does k memory lookups). Verify k is optimal.<br>
+        &nbsp;&nbsp;&rarr; Check for cache-line misses — a large filter may span many cache lines. Consider a Quotient filter for better locality.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 12. Interactions & Pitfalls -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Bloom Filters + Caching</h3>
+      <p>Place a Bloom filter in front of the cache to avoid "negative cache misses" — when a client requests a key that doesn't exist anywhere in the system. Without the filter, every such request passes through the cache (miss) and hits the database (miss) — wasting resources. The Bloom filter short-circuits: if the key is definitely not in the set, return a 404 immediately. <strong>Pitfall:</strong> if you cache the Bloom filter result itself, a false positive gets cached and repeated for the TTL duration.</p>
+
+      <h3>Bloom Filters + Databases (LSM Trees)</h3>
+      <p>LSM-tree storage engines (Cassandra, LevelDB, RocksDB) attach a Bloom filter to each SSTable (sorted string table) on disk. When a read request arrives, the engine checks each SSTable's Bloom filter. If the filter says "no," the engine skips that SSTable entirely — avoiding an expensive disk seek. A typical LSM tree has 5&ndash;10 levels of SSTables; without Bloom filters, a single point read could require 5&ndash;10 disk reads. <strong>Pitfall:</strong> during compaction (merging SSTables), the Bloom filters must be rebuilt. If compaction is delayed, you accumulate SSTables with overlapping key ranges and the Bloom filter checks become the bottleneck.</p>
+
+      <h3>Bloom Filters + CDN</h3>
+      <p>Before fetching content from the origin server, a CDN edge node can check a Bloom filter to determine if the content exists at all. This avoids "origin shield storms" where thousands of edge nodes simultaneously request a 404 object from the origin. <strong>Pitfall:</strong> the Bloom filter at the edge must be periodically synchronized with the origin. Stale filters miss newly added content (acceptable) but may also retain references to deleted content (false positives become stale content served).</p>
+
+      <h3>Bloom Filters + Rate Limiting</h3>
+      <p>Use a Bloom filter to quickly check "has this IP been seen in the last N minutes?" before engaging the more expensive rate-limiting logic (sliding window counters, token buckets). If the IP is definitely new, apply a default policy. <strong>Pitfall:</strong> false positives mean a new IP gets flagged as "previously seen" — if your rate limiter is more lenient to known IPs, this is harmless. But if "previously seen" triggers stricter limits, false positives penalize innocent users.</p>
+    </div>
+  </section>
+
+  <!-- 13. Cost Considerations -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <p><strong>Bloom filters are remarkably cheap.</strong> The dominant cost driver is <strong>memory</strong>, and the memory requirements are tiny.</p>
+        <ul>
+          <li><strong>1M elements at 1% FP:</strong> 1.2 MB — fits in L3 cache of any modern CPU. Essentially free.</li>
+          <li><strong>100M elements at 1% FP:</strong> 120 MB — one small Redis instance or a fraction of application memory.</li>
+          <li><strong>1B elements at 1% FP:</strong> 1.2 GB — a single mid-size VM (~$30/month on AWS).</li>
+        </ul>
+        <p><strong>Comparison to alternatives:</strong> storing 1M URLs as strings (average 60 bytes each) requires ~60 MB in a hash set — <strong>50x</strong> the memory of the Bloom filter. At 1B elements, the hash set would need ~60 GB.</p>
+        <p><strong>The real cost is false positives.</strong> Each false positive triggers an unnecessary downstream operation (database query, API call, disk read). Quantify the per-false-positive cost:</p>
+        <ul>
+          <li>If a false positive costs 5 ms of DB query time, and you do 10M queries/day at 1% FP rate, that is 100K unnecessary queries/day = ~140 extra CPU-hours/day on the database.</li>
+          <li>Reducing FP from 1% to 0.1% costs ~0.6 MB more memory but saves 90K DB queries/day.</li>
+        </ul>
+        <p><strong>Cost of NOT having a Bloom filter:</strong> every membership check hits the full data store. For a read-heavy workload doing 10M lookups/day where 90% are for non-existent keys, you save 9M pointless DB queries/day — potentially worth hundreds of dollars/month in database costs at scale.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 14. Real-World Examples -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Google Chrome Safe Browsing</h3>
+      <p>Chrome maintains a local Bloom filter (or prefix-based filter) of known malicious URLs. When you navigate to a URL, the browser checks the filter locally — if it says "definitely not malicious," no network request is needed. Only when the filter says "maybe" does Chrome query Google's servers for the full hash. This keeps browsing fast (no round-trip for 99%+ of URLs) and private (Google only sees the URLs that match the filter). The filter is updated periodically in the background, roughly every 30 minutes.</p>
+
+      <h3>Apache Cassandra &amp; LevelDB — SSTable Lookups</h3>
+      <p>Cassandra attaches a Bloom filter to every SSTable. When a read request arrives for a specific partition key, Cassandra checks each SSTable's Bloom filter before reading from disk. With the default 1% FP rate (configurable via <code>bloom_filter_fp_chance</code>), Cassandra avoids ~99% of unnecessary disk reads. For tables with many SSTables (before compaction), this can mean the difference between 1 disk read and 50+. LevelDB and RocksDB use the same technique.</p>
+
+      <h3>Medium — Deduplicating Article Recommendations</h3>
+      <p>Medium uses Bloom filters to avoid re-recommending articles a user has already seen. Each user has a per-user Bloom filter tracking seen article IDs. When generating a recommendation feed, the system checks each candidate article against the user's filter. False positives (skipping an unseen article) are acceptable — there are always more articles to show. This approach uses a fraction of the memory that a per-user hash set would require, making it feasible to maintain filters for millions of users.</p>
+
+      <h3>Bitcoin SPV (Simplified Payment Verification) Nodes</h3>
+      <p>Lightweight Bitcoin clients (SPV nodes) use Bloom filters to request only the transactions relevant to their wallet from full nodes. The SPV node sends a Bloom filter describing its addresses/keys, and the full node uses it to filter the blockchain — sending back only matching transactions. This avoids downloading the entire blockchain (~500 GB+). The false positive rate provides a degree of privacy: the full node cannot determine exactly which addresses the SPV node cares about, because some matches are false positives.</p>
+    </div>
+  </section>
+
+  <!-- 15. Code Example -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>A minimal Python Bloom filter implementation demonstrating insertion, querying, and false positive behavior:</p>
+      <pre class="line-numbers"><code class="language-python">import math, mmh3  # mmh3 = MurmurHash3 bindings
+
+class BloomFilter:
+    """Bloom filter: FP rate ≈ (1 - e^(-kn/m))^k"""
+
+    def __init__(self, expected_n, fp_rate=0.01):
+        # Optimal sizing: m = -n*ln(p) / (ln2)^2
+        self.m = int(-expected_n * math.log(fp_rate) / (math.log(2) ** 2))
+        # Optimal hash count: k = (m/n) * ln(2)
+        self.k = int((self.m / expected_n) * math.log(2))
+        self.bits = [0] * self.m
+        self.n = 0  # elements inserted
+
+    def _hashes(self, item):
+        """Generate k hash positions using double hashing."""
+        h1 = mmh3.hash(str(item), seed=0) % self.m
+        h2 = mmh3.hash(str(item), seed=42) % self.m
+        return [(h1 + i * h2) % self.m for i in range(self.k)]
+
+    def insert(self, item):
+        for pos in self._hashes(item):
+            self.bits[pos] = 1
+        self.n += 1
+
+    def query(self, item):
+        """Returns False = definitely not in set.
+           Returns True  = probably in set (may be FP)."""
+        return all(self.bits[pos] for pos in self._hashes(item))
+
+    @property
+    def fill_ratio(self):
+        return sum(self.bits) / self.m
+
+# --- Demo ---
+bf = BloomFilter(expected_n=1000, fp_rate=0.01)
+for url in ["google.com", "github.com", "example.org"]:
+    bf.insert(url)
+
+print(bf.query("google.com"))   # True  (true positive)
+print(bf.query("unknown.com"))  # False (true negative, usually)
+print(f"Filter: m={bf.m} bits, k={bf.k} hashes, fill={bf.fill_ratio:.2%}")</code></pre>
+    </div>
+  </section>
+
+  <!-- 16. How to Validate Your Design -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Measure Actual FP Rate vs. Theoretical</h3>
+      <p>Insert <code>n</code> known elements, then query <code>n</code> elements that are <em>definitely not</em> in the set. Count how many return true (false positives). The measured rate should match <code>(1 - e<sup>-kn/m</sup>)<sup>k</sup></code> within statistical variance. If it is significantly higher, investigate your hash function quality or filter sizing. Run this test at 25%, 50%, 75%, and 100% of designed capacity to verify the FP curve matches the theoretical prediction.</p>
+
+      <h3>Benchmark Query Performance</h3>
+      <p>Use a benchmarking tool (Python's <code>timeit</code>, or a dedicated benchmark harness like Google Benchmark for C++) to measure single-query latency. For an in-memory filter with <code>k=7</code>, expect <strong>sub-microsecond</strong> lookups on modern hardware. Test with both positive and negative queries — they should have similar latency. Use <code>perf</code> or <code>valgrind --tool=cachegrind</code> to check cache behavior for large filters.</p>
+
+      <h3>Test at Capacity Limits</h3>
+      <p>Deliberately insert 2x and 5x the designed capacity and measure the FP rate degradation. This validates your alerting thresholds and helps you understand the failure mode. At 2x capacity, FP rate should be around 15&ndash;20% for a filter designed for 1%. At 5x, it approaches 100% — the filter becomes useless.</p>
+
+      <h3>Chaos Testing</h3>
+      <p>Inject failures relevant to your Bloom filter deployment: corrupt random bits in the filter (simulating memory errors), delay filter rebuild processes (simulating stale filters), and introduce hash function collisions (simulating adversarial inputs). Tools like <strong>toxiproxy</strong> can inject latency on the network path to a remote filter service. Verify that the system degrades gracefully — falling back to direct database queries when the filter is unavailable or suspected of being corrupt.</p>
+    </div>
+  </section>
+
+  <!-- 17. Interview Questions -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you use a Bloom filter to speed up database queries?</summary>
+        <div class="answer">
+          <p>The core idea is to place a Bloom filter in front of the database to short-circuit queries for non-existent keys. In an LSM-tree database like Cassandra, each SSTable on disk has an associated Bloom filter. When a read request arrives, the engine checks the Bloom filter of each SSTable. If the filter returns "definitely not here," the engine skips reading that SSTable from disk entirely. Since a single read might otherwise require checking 5&ndash;20 SSTables across multiple levels, Bloom filters can reduce disk reads by 95%+.</p>
+          <p>For a custom application, you would maintain a Bloom filter of all primary keys in your database. Before issuing a <code>SELECT</code> query, check the filter. If the key is definitely absent, return a 404/empty result immediately without touching the database. This is especially effective when the majority of queries are for non-existent keys (e.g., a username availability check where most attempted usernames are not taken).</p>
+          <p>Size the filter using <code>m = -n &times; ln(p) / (ln 2)^2</code>. For 10M rows at 0.1% FP rate, you need ~18 MB — trivial compared to the cost of 10M unnecessary disk seeks.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> What happens to the Bloom filter during database compaction? How do you handle filter rebuilds during schema migrations?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the false positive rate formula and derive why optimal k = (m/n) &times; ln(2).</summary>
+        <div class="answer">
+          <p>After inserting one element, each of its k hash positions is set to 1. The probability that a specific bit is still 0 after one hash is <code>(1 - 1/m)</code>. After inserting n elements (each setting k bits), the probability a specific bit is 0 is <code>(1 - 1/m)^(kn) &asymp; e^(-kn/m)</code> for large m.</p>
+          <p>A false positive occurs when a queried element (not in the set) has all k of its hash positions already set to 1. Each position is independently 1 with probability <code>f = 1 - e^(-kn/m)</code>, so the false positive probability is <code>p = f^k = (1 - e^(-kn/m))^k</code>.</p>
+          <p>To find the optimal k, take the derivative of <code>ln(p) = k &times; ln(1 - e^(-kn/m))</code> with respect to k and set it to zero. Substituting <code>f = 1 - e^(-kn/m)</code>, the minimum occurs when <code>f = 1/2</code> — i.e., exactly half the bits are set. Solving <code>1 - e^(-kn/m) = 1/2</code> gives <code>k = (m/n) &times; ln(2) &asymp; 0.693 &times; (m/n)</code>. At this optimal k, the FP rate simplifies to <code>p = (1/2)^k = (0.6185)^(m/n)</code>.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> What is the information-theoretic lower bound for a membership filter? How close does a Bloom filter come to it? (Answer: a Bloom filter uses 1.44x the optimal space.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Bloom filter vs. Cuckoo filter — when would you choose each?</summary>
+        <div class="answer">
+          <p><strong>Choose Bloom filter when:</strong> you need a battle-tested, simple, insert-only filter with well-understood behavior. Bloom filters are the right default choice when deletion is not required and the target FP rate is above ~3%. They are simpler to implement and have no risk of insertion failure.</p>
+          <p><strong>Choose Cuckoo filter when:</strong> (1) You need <strong>deletion support</strong> — Cuckoo filters can remove elements, which standard Bloom filters cannot. (2) Your target FP rate is <strong>below ~3%</strong> — at low FP rates, Cuckoo filters are more space-efficient because their space per element is constant (~12 bits for 0.1% FP) while Bloom filters need more bits per element as the FP rate decreases. (3) You need <strong>faster lookups</strong> — Cuckoo filters check at most 2 memory locations per query, while Bloom filters check k locations (often 7&ndash;13), making Cuckoo filters more cache-friendly.</p>
+          <p><strong>Trade-offs:</strong> Cuckoo filter insertion can fail when the table exceeds ~95% occupancy, requiring a rebuild with a larger table. Bloom filter insertion never fails. Cuckoo filters also have a maximum capacity for duplicate fingerprints, so inserting the same element many times can cause issues. For static, immutable datasets, an XOR filter dominates both — 1.23 bits per element with zero insertion failure risk.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How does a Cuckoo filter handle collisions? What is the maximum load factor before insertion failure?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a URL shortener that checks for duplicates using a Bloom filter.</summary>
+        <div class="answer">
+          <p>When a user submits a long URL, we want to check if we have already shortened it (to return the existing short URL rather than creating a duplicate). The naive approach queries the database every time, but 70%+ of submissions may be new URLs — wasting DB reads.</p>
+          <p><strong>Design:</strong> Maintain a Bloom filter of all long URLs already in the system. On submission: (1) Hash the long URL and check the Bloom filter. (2) If the filter says "definitely not" &rarr; generate a new short code, insert into DB, add to Bloom filter, return the new short URL. (3) If the filter says "maybe yes" &rarr; query the database to confirm. If found, return existing short URL. If not found (false positive), treat as new.</p>
+          <p><strong>Sizing:</strong> For 100M shortened URLs at 0.1% FP rate: m = 18 MB, k = 10. This fits easily in application memory. The 0.1% FP rate means only 1 in 1000 new URL submissions triggers a (cheap) unnecessary database lookup.</p>
+          <p><strong>Rebuild strategy:</strong> Persist the Bloom filter to disk alongside the database. On application restart, reload the filter. Periodically rebuild from the database to correct any drift. For horizontal scaling, each application instance can maintain its own filter — false positives are harmless (just an extra DB check), and new insertions propagate via a shared message bus or periodic rebuild.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How would you handle URL deletions/expiration in this design? What if the URL shortener needs to support custom short codes?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does Cassandra use Bloom filters, and what are the tuning knobs?</summary>
+        <div class="answer">
+          <p>Cassandra's storage engine is based on LSM trees. Data is written to an in-memory memtable, then flushed to immutable SSTables on disk. Over time, a single partition key's data may be spread across many SSTables. Without Bloom filters, reading a single row could require checking every SSTable — potentially dozens of disk reads.</p>
+          <p>Cassandra builds a Bloom filter for each SSTable at flush/compaction time. The filter contains the partition keys present in that SSTable. On a read, Cassandra checks each SSTable's Bloom filter: if it says "no," the SSTable is skipped entirely. This reduces disk I/O from O(number of SSTables) to O(1) in the common case.</p>
+          <p><strong>Tuning:</strong> The key configuration is <code>bloom_filter_fp_chance</code>, set per table (default 0.01 = 1%). For read-heavy tables with many SSTables, lowering it to 0.001 (0.1%) reduces unnecessary disk reads at the cost of more memory per SSTable. For write-heavy tables where reads are rare, raising it to 0.1 (10%) saves memory. Cassandra also lets you disable Bloom filters entirely (<code>bloom_filter_fp_chance = 1.0</code>) for tables that are always scanned sequentially.</p>
+          <p>The memory cost is significant at scale: with millions of partition keys per SSTable and dozens of SSTables, Bloom filter memory can total hundreds of MB. Cassandra stores filters in off-heap memory to avoid GC pressure. Operators should monitor <code>BloomFilterFalsePositives</code> and <code>BloomFilterFalseRatio</code> metrics via JMX.</p>
+          <p class="follow-up"><strong>Follow-up:</strong> What happens to Bloom filters during compaction? How does the choice of compaction strategy (STCS vs. LCS) affect Bloom filter efficiency?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>When would a Bloom filter's false positive rate become operationally problematic?</summary>
+        <div class="answer">
+          <p>A Bloom filter's FP rate becomes problematic when the <strong>cost of a false positive exceeds the savings from true negatives</strong>. Consider three scenarios:</p>
+          <p><strong>Scenario 1: Database query optimization.</strong> At 1% FP rate with 10M queries/day, you get 100K unnecessary DB queries. If each costs 5 ms, that is 500 seconds of DB time — manageable. But if the FP rate climbs to 20% (due to an overfull filter), you get 2M unnecessary queries = 10,000 seconds of DB time per day. The filter is now causing more harm than it prevents, because the database is spending more time serving false-positive queries than it saves from true negatives.</p>
+          <p><strong>Scenario 2: Security filtering.</strong> For Google Safe Browsing, a false positive means a legitimate URL is flagged as potentially malicious and sent to Google for verification. At 0.01% FP, this happens rarely and adds only a small latency. At 1%, every 100th page load triggers an extra network round-trip — noticeable to users and a privacy concern (more URLs sent to Google). At 10%, the feature becomes unusable.</p>
+          <p><strong>Scenario 3: Recommendation deduplication.</strong> At 1% FP, 1 in 100 fresh articles is incorrectly skipped. With a large content pool, this is invisible. At 20%, one in five recommendations is skipped — users notice repetitive or sparse feeds, and engagement metrics drop. The fix is not just resizing the filter but also implementing rotation (expiring old entries).</p>
+          <p><strong>Rule of thumb:</strong> alert when the measured FP rate exceeds 2x the theoretical rate, and page when it exceeds 5x or when the fill ratio exceeds 70% (at which point the filter is approaching saturation).</p>
+          <p class="follow-up"><strong>Follow-up:</strong> How would you design a system that gracefully degrades when its Bloom filter becomes unreliable?</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 18. Key Takeaways -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li>Bloom filters answer "is this element in the set?" with a one-sided error: <strong>false positives are possible, false negatives are impossible.</strong></li>
+        <li>They are remarkably space-efficient: ~10 bits per element at 1% FP rate, compared to 50&ndash;100+ bytes for storing actual elements.</li>
+        <li>Optimal sizing follows precise math: <code>m = -n &times; ln(p) / (ln 2)^2</code> bits, <code>k = (m/n) &times; ln(2)</code> hash functions.</li>
+        <li>Standard Bloom filters are <strong>insert-only</strong> — no deletion. Use Counting Bloom filters or Cuckoo filters when deletion is needed.</li>
+        <li>The most common production failure is <strong>under-sizing</strong>: when the actual element count exceeds designed capacity, the FP rate degrades rapidly. Always over-provision by 2&ndash;3x.</li>
+        <li>Monitor the <strong>fill ratio</strong> (fraction of bits set to 1) as the primary health indicator. Alert at 50%, page at 70%.</li>
+        <li>Bloom filters are used in practice everywhere: Google Safe Browsing, Cassandra/LevelDB SSTable lookups, web crawler deduplication, CDN content checks, and Bitcoin SPV nodes.</li>
+        <li>For static/immutable sets, <strong>XOR filters</strong> are the state of the art — 1.23 bits per element, beating Bloom filters by ~8x in space efficiency.</li>
+        <li>The real cost of a Bloom filter is not the memory — it is the <strong>downstream cost of false positives</strong>. Always quantify what a false positive costs your system.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 19. Further Reading -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="caching.html">Caching</a> — Bloom filters are commonly paired with caches to avoid negative cache lookups and reduce origin load.</li>
+        <li><a href="database-sharding.html">Database Sharding</a> — Per-shard Bloom filters help route queries to the correct shard and skip irrelevant shards entirely.</li>
+        <li><a href="sql-vs-nosql.html">SQL vs. NoSQL</a> — LSM-tree-based NoSQL databases (Cassandra, RocksDB) rely heavily on Bloom filters for read performance.</li>
+        <li><a href="consistent-hashing.html">Consistent Hashing</a> — Another hash-based technique for distributing data; often used alongside Bloom filters in distributed storage systems.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> — Bloom filters can serve as a fast first-pass check for rate limiting ("has this IP been seen recently?").</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Prev/Next Navigation -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="blob-storage.html" class="prev">Blob Storage</a>
+      <a href="load-balancing.html" class="next">Load Balancing</a>
+    </nav>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+  // ===== Bloom Filter Animation =====
+  (function () {
+    const canvas = document.getElementById('bloomCanvas');
+    const container = document.getElementById('bloom-animation-container');
+
+    // Bloom filter state
+    const M = 16; // bit array size for visualization
+    const K = 3;  // hash functions
+    const bits = new Array(M).fill(0);
+
+    // Elements to insert and query
+    const elements = [
+      { name: '"cat"', hashes: [1, 5, 13], type: 'insert' },
+      { name: '"dog"', hashes: [3, 7, 11], type: 'insert' },
+      { name: '"cat"', hashes: [1, 5, 13], type: 'query-positive' },  // true positive
+      { name: '"bird"', hashes: [2, 9, 14], type: 'query-negative' }, // true negative
+      { name: '"fox"', hashes: [1, 7, 13], type: 'query-fp' },       // false positive (bits set by cat+dog)
+    ];
+
+    const PHASE_DURATION = 4; // seconds per element
+    const TOTAL_CYCLE = elements.length * PHASE_DURATION + 2; // +2s pause at end
+
+    // Snapshot bit state at each phase for correct rendering
+    const bitSnapshots = [];
+    const tempBits = new Array(M).fill(0);
+    for (let i = 0; i < elements.length; i++) {
+      bitSnapshots.push(tempBits.slice());
+      if (elements[i].type === 'insert') {
+        elements[i].hashes.forEach(h => { tempBits[h] = 1; });
+      }
+    }
+    bitSnapshots.push(tempBits.slice()); // final state
+
+    function drawBloomAnimation(ctx, time, w, h) {
+      const cycleTime = time % TOTAL_CYCLE;
+      const phaseIndex = Math.min(Math.floor(cycleTime / PHASE_DURATION), elements.length - 1);
+      const phaseProgress = (cycleTime - phaseIndex * PHASE_DURATION) / PHASE_DURATION;
+
+      // Get current bit state
+      const currentBits = bitSnapshots[phaseIndex].slice();
+      const elem = elements[phaseIndex];
+
+      // If we're in an insert phase and progressed enough, show bits being set
+      if (elem.type === 'insert' && phaseProgress > 0.4) {
+        elem.hashes.forEach(h => { currentBits[h] = 1; });
+      }
+
+      // If we're past all phases, show final state
+      if (cycleTime >= elements.length * PHASE_DURATION) {
+        const finalBits = bitSnapshots[bitSnapshots.length - 1];
+        drawStaticState(ctx, w, h, finalBits, 'Animation complete — reset to replay');
+        return;
+      }
+
+      // Layout
+      const bitY = h * 0.45;
+      const bitW = Math.min(36, (w - 80) / M);
+      const bitH = 36;
+      const startX = (w - M * bitW) / 2;
+      const elementY = 50;
+
+      // Title
+      drawLabel(ctx, w / 2, 16, 'Bloom Filter Visualization (m=16, k=3)', {
+        fontSize: 14, bold: true, color: '#1e293b', baseline: 'top'
+      });
+
+      // Draw the current element being processed
+      let actionText = '';
+      let actionColor = '#2563eb';
+      if (elem.type === 'insert') {
+        actionText = 'INSERT ' + elem.name;
+        actionColor = '#2563eb';
+      } else if (elem.type === 'query-positive') {
+        actionText = 'QUERY ' + elem.name;
+        actionColor = '#0891b2';
+      } else if (elem.type === 'query-negative') {
+        actionText = 'QUERY ' + elem.name;
+        actionColor = '#0891b2';
+      } else if (elem.type === 'query-fp') {
+        actionText = 'QUERY ' + elem.name;
+        actionColor = '#0891b2';
+      }
+
+      drawLabel(ctx, w / 2, elementY, actionText, {
+        fontSize: 16, bold: true, color: actionColor, baseline: 'middle'
+      });
+
+      // Draw hash function arrows
+      const arrowStartY = elementY + 20;
+      if (phaseProgress > 0.15 && phaseProgress < 0.85) {
+        const arrowAlpha = phaseProgress < 0.3 ? (phaseProgress - 0.15) / 0.15 : (phaseProgress > 0.7 ? (0.85 - phaseProgress) / 0.15 : 1);
+        ctx.save();
+        ctx.globalAlpha = arrowAlpha;
+        elem.hashes.forEach((h, i) => {
+          const targetX = startX + h * bitW + bitW / 2;
+          const labelX = w / 2 + (i - 1) * 80;
+          // Hash function label
+          drawLabel(ctx, labelX, arrowStartY + 8, 'h' + (i + 1) + '→' + h, {
+            fontSize: 11, color: actionColor, bold: true
+          });
+          // Arrow from label to bit
+          drawArrow(ctx, labelX, arrowStartY + 22, targetX, bitY - bitH / 2 - 4, {
+            color: actionColor, width: 1.5, headSize: 6
+          });
+        });
+        ctx.restore();
+      }
+
+      // Draw bit array
+      for (let i = 0; i < M; i++) {
+        const bx = startX + i * bitW;
+        const isTarget = elem.hashes.includes(i);
+        let fillColor = currentBits[i] ? '#dbeafe' : '#ffffff';
+        let borderColor = '#94a3b8';
+        let textColor = currentBits[i] ? '#1e293b' : '#94a3b8';
+
+        // Highlight target positions
+        if (isTarget && phaseProgress > 0.15 && phaseProgress < 0.85) {
+          if (elem.type === 'insert') {
+            borderColor = '#2563eb';
+            fillColor = phaseProgress > 0.4 ? '#bfdbfe' : '#fff7ed';
+          } else {
+            // Query — check if bit is set
+            if (currentBits[i]) {
+              borderColor = '#16a34a';
+              fillColor = '#dcfce7';
+            } else {
+              borderColor = '#dc2626';
+              fillColor = '#fef2f2';
+            }
+          }
+        }
+
+        drawBox(ctx, bx + 1, bitY - bitH / 2, bitW - 2, bitH, {
+          color: borderColor, fill: fillColor, text: currentBits[i] ? '1' : '0',
+          textColor: textColor, fontSize: 13, radius: 4
+        });
+
+        // Bit index below
+        drawLabel(ctx, bx + bitW / 2, bitY + bitH / 2 + 4, '' + i, {
+          fontSize: 9, color: '#94a3b8', baseline: 'top'
+        });
+      }
+
+      // Result text at bottom
+      const resultY = h - 50;
+      if (phaseProgress > 0.55) {
+        const resultAlpha = Math.min(1, (phaseProgress - 0.55) / 0.2);
+        ctx.save();
+        ctx.globalAlpha = resultAlpha;
+
+        if (elem.type === 'insert') {
+          drawLabel(ctx, w / 2, resultY, 'Bits at positions [' + elem.hashes.join(', ') + '] set to 1', {
+            fontSize: 13, bold: true, color: '#2563eb'
+          });
+        } else if (elem.type === 'query-positive') {
+          drawStatusBadge(ctx, w / 2, resultY - 10, 'ALL BITS = 1', 'success');
+          drawLabel(ctx, w / 2, resultY + 12, 'Result: "Probably in set" — TRUE POSITIVE (cat was inserted)', {
+            fontSize: 12, color: '#16a34a', bold: true
+          });
+        } else if (elem.type === 'query-negative') {
+          drawStatusBadge(ctx, w / 2, resultY - 10, 'BIT AT POSITION 2 = 0', 'danger');
+          drawLabel(ctx, w / 2, resultY + 12, 'Result: "Definitely NOT in set" — TRUE NEGATIVE', {
+            fontSize: 12, color: '#dc2626', bold: true
+          });
+        } else if (elem.type === 'query-fp') {
+          drawStatusBadge(ctx, w / 2, resultY - 10, 'ALL BITS = 1', 'warning');
+          drawLabel(ctx, w / 2, resultY + 12, 'Result: "Probably in set" — FALSE POSITIVE! (fox was never inserted)', {
+            fontSize: 12, color: '#d97706', bold: true
+          });
+        }
+        ctx.restore();
+      }
+
+      // Phase indicator dots
+      const dotY = h - 14;
+      for (let i = 0; i < elements.length; i++) {
+        ctx.save();
+        ctx.fillStyle = i === phaseIndex ? '#2563eb' : '#cbd5e1';
+        ctx.beginPath();
+        ctx.arc(w / 2 + (i - (elements.length - 1) / 2) * 18, dotY, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawStaticState(ctx, w, h, finalBits, message) {
+      const bitY = h * 0.45;
+      const bitW = Math.min(36, (w - 80) / M);
+      const bitH = 36;
+      const startX = (w - M * bitW) / 2;
+
+      drawLabel(ctx, w / 2, 16, 'Bloom Filter Visualization (m=16, k=3)', {
+        fontSize: 14, bold: true, color: '#1e293b', baseline: 'top'
+      });
+
+      for (let i = 0; i < M; i++) {
+        const bx = startX + i * bitW;
+        drawBox(ctx, bx + 1, bitY - bitH / 2, bitW - 2, bitH, {
+          color: finalBits[i] ? '#2563eb' : '#94a3b8',
+          fill: finalBits[i] ? '#dbeafe' : '#ffffff',
+          text: finalBits[i] ? '1' : '0',
+          textColor: finalBits[i] ? '#1e293b' : '#94a3b8',
+          fontSize: 13, radius: 4
+        });
+        drawLabel(ctx, bx + bitW / 2, bitY + bitH / 2 + 4, '' + i, {
+          fontSize: 9, color: '#94a3b8', baseline: 'top'
+        });
+      }
+
+      drawLabel(ctx, w / 2, h - 40, message, {
+        fontSize: 13, bold: true, color: '#64748b'
+      });
+    }
+
+    const animation = createAnimation(canvas, drawBloomAnimation, { height: 350 });
+    setupControls(container, animation);
+  })();
+  </script>
+
+</body>
+</html>

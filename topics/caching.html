@@ -1,0 +1,2255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caching — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="consistent-hashing.html">Consistent Hashing</a></li>
+        <li><a href="database-replication.html">DB Replication</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Caching</h1>
+      <p class="hero-subtitle">Store frequently accessed data closer to the consumer so you can serve it faster and reduce load on your origin data store.</p>
+      <span class="hero-meta">25 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>
+        A <strong>cache</strong> is a temporary storage layer that sits between the consumer of data and the authoritative source of that data. Its entire purpose is speed: by keeping a copy of recently or frequently requested data in a faster medium (RAM instead of disk, local memory instead of a network call), a cache lets you serve responses in microseconds instead of milliseconds, or milliseconds instead of seconds.
+      </p>
+      <p>
+        Caches appear at every layer of a modern system. Your CPU has L1/L2/L3 caches. Your browser has a local cache for static assets. Your CDN is a geographically distributed cache. Your application server might hold an in-process cache in a hash map, and you probably also have a dedicated caching service like Redis or Memcached sitting between your app and your database. Each layer trades a small amount of memory and consistency for a large reduction in latency and backend load.
+      </p>
+      <p>
+        Caching patterns split into two orthogonal axes: how <strong>reads</strong> are served, and how <strong>writes</strong> propagate. A real system picks one from each side (e.g., "cache-aside reads + write-around writes" is a common combo).
+      </p>
+      <p><strong>Read patterns:</strong></p>
+      <ul>
+        <li><strong>Cache-aside (lazy loading)</strong> &mdash; The application checks the cache first. On a miss, it fetches from the database, writes the result into the cache, and returns it. The cache never talks directly to the database. This is the default in most production systems.</li>
+        <li><strong>Read-through</strong> &mdash; The cache itself is responsible for fetching from the database on a miss. The application only ever talks to the cache. Simpler app code, but requires a cache that knows how to load from your data source (e.g., a library or a cache-as-a-service like DAX).</li>
+        <li><strong>Refresh-ahead</strong> &mdash; The cache proactively reloads keys before they expire, based on a configurable threshold (e.g., refresh when 80&percnt; of the TTL has passed). Avoids miss latency for predictably hot keys, at the cost of refreshing keys that may never be read again.</li>
+      </ul>
+      <p><strong>Write patterns:</strong></p>
+      <ul>
+        <li><strong>Write-through</strong> &mdash; Every write goes to both the cache and the database synchronously. Guarantees cache&ndash;DB consistency, but write latency = max(cache, DB).</li>
+        <li><strong>Write-behind (write-back)</strong> &mdash; Writes go to the cache immediately and the cache asynchronously flushes to the database in the background, often coalescing many writes into one. Fastest writes, but the cache crashing before flush means lost data.</li>
+        <li><strong>Write-around</strong> &mdash; Writes go directly to the database, skipping the cache. The cache is only populated by subsequent reads (then it caches normally and serves hits like any other entry). The win comes from <em>not</em> writing data into the cache that no one is about to ask for &mdash; useful when writes vastly outnumber reads or when reads usually arrive long after the write (logs, audit records, large blobs that may never be fetched).</li>
+        <li><strong>Write-invalidate</strong> &mdash; A common variant pairing any write strategy with cache eviction: on write, <code>DEL</code> the affected key(s) from cache. The next read repopulates from the DB. This is what "cache-aside writes" almost always means in practice.</li>
+      </ul>
+      <p>The Cache Invalidation Strategies section below has full request flows, pros/cons, and a side-by-side comparison table for the most common combinations.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Animated Diagram: Cache Hit vs. Cache Miss</h2>
+      <div class="animation-container" id="cache-animation-container">
+        <canvas id="cache-canvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">
+          Green path: cache hit (fast). Orange path: cache miss (slow &mdash; data fetched from DB, then stored in cache for next time).
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How It Works</h2>
+      <p>The most common pattern in practice is <strong>cache-aside</strong>. Here is the step-by-step flow:</p>
+      <ol>
+        <li><strong>Application receives a request</strong> for data identified by a key (e.g., <code>user:12345</code>).</li>
+        <li><strong>Application checks the cache</strong> using the key. This is a fast O(1) lookup in Redis or an in-process hash map.</li>
+        <li><strong>Cache hit:</strong> If the key exists and has not expired, the cached value is returned immediately. Total latency: sub-millisecond for local cache, 1-2 ms for Redis over the network.</li>
+        <li><strong>Cache miss:</strong> If the key is not found (or has expired), the application queries the primary data store (e.g., PostgreSQL).</li>
+        <li><strong>Database responds</strong> with the data. Total latency for this step: 5-50 ms depending on query complexity and database load.</li>
+        <li><strong>Application writes the result into the cache</strong> with a TTL (time-to-live). For example, <code>SET user:12345 "{...}" EX 300</code> stores the data for 5 minutes.</li>
+        <li><strong>Application returns the data</strong> to the caller. Subsequent requests for the same key within the TTL window will be served from cache (step 3).</li>
+      </ol>
+      <p>
+        The key insight is that step 6 is what "warms" the cache. The first request after a TTL expiry or a cold start pays the full database cost, but every subsequent request benefits from the cache. If 95% of your requests are cache hits, you have effectively reduced your database load by 95%.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Caching When</h4>
+          <ul>
+            <li><strong>Read-heavy workloads:</strong> Your read-to-write ratio is 10:1 or higher. Classic examples: user profiles, product catalogs, news feeds.</li>
+            <li><strong>Expensive computations:</strong> Aggregations, recommendations, or complex joins that take hundreds of milliseconds. Cache the result instead of recomputing.</li>
+            <li><strong>Latency-sensitive paths:</strong> Your SLA requires p99 &lt; 50 ms, but your database p99 is 200 ms. A cache brings it under 5 ms.</li>
+            <li><strong>Repeated access patterns:</strong> A small subset of data (hot set) receives the majority of requests. Zipfian distributions are common in practice.</li>
+            <li><strong>Protecting a fragile backend:</strong> Your database is at capacity. Caching offloads read traffic and prevents cascading failures.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use Caching When</h4>
+          <ul>
+            <li><strong>Data changes every request:</strong> If the data is different for every read (e.g., real-time stock prices in a trading system), caching adds complexity with no benefit.</li>
+            <li><strong>Strong consistency is required for every read:</strong> Financial account balances, inventory counts during checkout &mdash; stale data can cause real money loss.</li>
+            <li><strong>Write-heavy with no read benefit:</strong> If you write 100x more than you read, the cache is constantly invalidated before anyone reads it.</li>
+            <li><strong>Data is too large to fit in memory:</strong> If your working set is 500 GB and your cache budget is 16 GB, the hit rate will be too low to justify the cost.</li>
+            <li><strong>Debugging is a priority over performance:</strong> Caches add a layer of indirection. In early-stage systems, simplicity may matter more than speed.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>LRU (Least Recently Used) &mdash; The Classic</h3>
+      <p>
+        LRU evicts the item that was accessed least recently. It works well when access patterns have strong temporal locality &mdash; if you used something recently, you are likely to use it again soon. Most introductory caching discussions focus on LRU, and Redis defaults to an approximated LRU policy (<code>allkeys-lru</code>).
+      </p>
+
+      <h4>Why O(1) for Both Get and Put</h4>
+      <p>
+        A naive approach might store cached items in an array sorted by access time. Getting an item is O(n) (scan the array), and every access requires moving the item to the front &mdash; also O(n). This is far too slow for a cache handling millions of requests per second.
+      </p>
+      <p>
+        The trick is combining two data structures: a <strong>hash map</strong> for O(1) key lookup, and a <strong>doubly linked list</strong> for O(1) reordering. The hash map stores <code>key &rarr; pointer to the list node</code>. The linked list maintains items in access order: the most recently used item is at the <strong>head</strong>, and the least recently used is at the <strong>tail</strong>.
+      </p>
+      <ul>
+        <li><strong>get(key)</strong>: Look up the key in the hash map (O(1)). If found, unlink the node from its current position in the list and move it to the head (O(1) pointer surgery &mdash; no traversal needed because we have a direct pointer to the node). Return the value.</li>
+        <li><strong>put(key, value)</strong>: If the key exists, update its value and move it to the head. If the key is new and the cache is full, remove the node at the <strong>tail</strong> (that is the least recently used item), delete it from the hash map, then insert the new node at the head and add it to the hash map. Every step is O(1).</li>
+      </ul>
+
+      <h4>Step-by-Step Example: Cache of Size 3</h4>
+      <p>Let's trace through 10 operations on an LRU cache with capacity 3. The list is shown head &rarr; tail (left = most recent, right = least recent).</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Operation</th><th>Result</th><th>List (head &rarr; tail)</th><th>Explanation</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td><code>put(A, 10)</code></td><td>&mdash;</td><td>[A]</td><td>Cache empty, insert A at head.</td></tr>
+          <tr><td>2</td><td><code>put(B, 20)</code></td><td>&mdash;</td><td>[B, A]</td><td>Insert B at head. A shifts toward tail.</td></tr>
+          <tr><td>3</td><td><code>put(C, 30)</code></td><td>&mdash;</td><td>[C, B, A]</td><td>Insert C at head. Cache is now full (3/3).</td></tr>
+          <tr><td>4</td><td><code>get(A)</code></td><td>10 (hit)</td><td>[A, C, B]</td><td>A found. Move A to head. B is now the LRU item.</td></tr>
+          <tr><td>5</td><td><code>put(D, 40)</code></td><td>&mdash;</td><td>[D, A, C]</td><td>Cache full &rarr; <strong>evict B</strong> (tail). Insert D at head.</td></tr>
+          <tr><td>6</td><td><code>get(B)</code></td><td>miss</td><td>[D, A, C]</td><td>B was evicted in step 5. Cache unchanged.</td></tr>
+          <tr><td>7</td><td><code>get(C)</code></td><td>30 (hit)</td><td>[C, D, A]</td><td>C found. Move C to head. A is now the LRU item.</td></tr>
+          <tr><td>8</td><td><code>put(E, 50)</code></td><td>&mdash;</td><td>[E, C, D]</td><td>Cache full &rarr; <strong>evict A</strong> (tail). Insert E at head.</td></tr>
+          <tr><td>9</td><td><code>get(D)</code></td><td>40 (hit)</td><td>[D, E, C]</td><td>D found. Move D to head.</td></tr>
+          <tr><td>10</td><td><code>put(C, 99)</code></td><td>&mdash;</td><td>[C, D, E]</td><td>C exists &rarr; update value to 99, move C to head. No eviction.</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        Notice: in step 5, B is evicted even though it was accessed more recently than C (step 2 vs step 3). LRU doesn't care that B might be accessed frequently in the future &mdash; it only tracks <em>recency</em>. This is LRU's fundamental weakness.
+      </p>
+
+      <p>
+        <strong>Limitation &mdash; scan pollution:</strong> LRU is blind to frequency. A one-time full scan of your data (e.g., a batch job or analytics query) can evict the entire hot working set, causing a burst of cache misses. This is called <em>cache pollution</em>. For example, if a batch job reads 10,000 keys sequentially, every one of those keys enters the cache and pushes out a hot key &mdash; even though those batch keys will never be accessed again.
+      </p>
+
+      <h3>LFU (Least Frequently Used)</h3>
+      <p>
+        Where LRU tracks <em>when</em> an item was last accessed, LFU tracks <em>how many times</em> each item has been accessed and evicts the item with the lowest count. This makes LFU resistant to scan pollution: a batch job that touches 10,000 keys once each won't evict a hot key that has been accessed 500 times.
+      </p>
+
+      <h4>The Naive Approach (and Why It's Slow)</h4>
+      <p>
+        The simplest LFU implementation stores a frequency counter with each item and, on eviction, scans all items to find the one with the lowest count. This is O(n) per eviction &mdash; unacceptable for a high-throughput cache.
+      </p>
+      <p>
+        You could use a min-heap keyed by frequency to get O(log n) eviction. But every <code>get()</code> call must increment the frequency and re-heapify, which is also O(log n). For a cache serving millions of requests per second, even O(log n) per access is costly.
+      </p>
+
+      <h4>The O(1) LFU Trick: Frequency Buckets</h4>
+      <p>
+        The key insight (from the paper by Shah, Mitra, and Matani, 2010) is to group items by their frequency into <strong>buckets</strong>. Each bucket is a doubly linked list of all items with the same frequency. The buckets themselves are linked in order of frequency. We also keep a pointer to the <strong>minimum frequency bucket</strong>.
+      </p>
+      <p>The data structures:</p>
+      <ul>
+        <li><strong>Hash map</strong>: <code>key &rarr; (value, frequency, pointer to node in bucket list)</code></li>
+        <li><strong>Frequency buckets</strong>: a linked list of buckets, where bucket <em>f</em> contains a doubly linked list of all items with frequency <em>f</em></li>
+        <li><strong>min_freq</strong>: an integer tracking the current minimum frequency</li>
+      </ul>
+
+      <p><strong>Operations:</strong></p>
+      <ul>
+        <li><strong>get(key)</strong>: Look up key in hash map (O(1)). Remove the node from its current frequency bucket <em>f</em>. Insert it into bucket <em>f+1</em> (create the bucket if needed). If bucket <em>f</em> is now empty and <em>f</em> == min_freq, increment min_freq. All O(1).</li>
+        <li><strong>put(key, value)</strong>: If full, go to the min_freq bucket. Remove the item at the <strong>tail</strong> of that bucket's list (least recently used <em>among</em> the least frequently used). Insert the new item into bucket 1. Set min_freq = 1. All O(1).</li>
+      </ul>
+
+      <h4>Step-by-Step Example: O(1) LFU, Capacity 3</h4>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Operation</th><th>Result</th><th>Buckets (freq: [items])</th><th>min_freq</th><th>Explanation</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td><code>put(A, 10)</code></td><td>&mdash;</td><td>1: [A]</td><td>1</td><td>New item, freq=1.</td></tr>
+          <tr><td>2</td><td><code>put(B, 20)</code></td><td>&mdash;</td><td>1: [B, A]</td><td>1</td><td>New item, freq=1.</td></tr>
+          <tr><td>3</td><td><code>put(C, 30)</code></td><td>&mdash;</td><td>1: [C, B, A]</td><td>1</td><td>Cache full (3/3).</td></tr>
+          <tr><td>4</td><td><code>get(A)</code></td><td>10</td><td>1: [C, B] &nbsp; 2: [A]</td><td>1</td><td>A moves from bucket 1 to bucket 2.</td></tr>
+          <tr><td>5</td><td><code>get(A)</code></td><td>10</td><td>1: [C, B] &nbsp; 3: [A]</td><td>1</td><td>A moves from bucket 2 to bucket 3.</td></tr>
+          <tr><td>6</td><td><code>get(B)</code></td><td>20</td><td>1: [C] &nbsp; 2: [B] &nbsp; 3: [A]</td><td>1</td><td>B moves to bucket 2.</td></tr>
+          <tr><td>7</td><td><code>put(D, 40)</code></td><td>&mdash;</td><td>1: [D] &nbsp; 2: [B] &nbsp; 3: [A]</td><td>1</td><td>Cache full. min_freq=1 &rarr; <strong>evict C</strong> (tail of bucket 1). Insert D into bucket 1.</td></tr>
+          <tr><td>8</td><td><code>get(D)</code></td><td>40</td><td>2: [D, B] &nbsp; 3: [A]</td><td>2</td><td>D moves to bucket 2. Bucket 1 now empty and was min_freq &rarr; min_freq becomes 2.</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        Notice in step 7: C is evicted instead of B, even though both had frequency 1. Among items with the same frequency, LFU breaks ties using LRU order (tail of the bucket = least recently used). This gives us <strong>LFU with LRU tiebreaking</strong> &mdash; the best of both worlds within a frequency tier.
+      </p>
+      <p>
+        <strong>Limitation:</strong> LFU has a "frequency inertia" problem. An item that was heavily accessed in the past accumulates a high count, making it nearly impossible to evict &mdash; even if it's no longer popular. Some implementations decay frequencies over time (halving all counts periodically) to address this.
+      </p>
+
+      <h3>ARC (Adaptive Replacement Cache)</h3>
+      <p>
+        The problem with choosing between LRU and LFU is that neither works best for all workloads. LRU handles temporal locality well but suffers from scan pollution. LFU handles frequency well but can't adapt when popular items change. What if the cache could <em>automatically</em> figure out which strategy is working better and lean into it?
+      </p>
+      <p>
+        That's exactly what ARC does. Introduced by Megiddo and Modha (IBM, 2003), ARC maintains <strong>four</strong> lists with a total budget of <em>c</em> items (the cache capacity):
+      </p>
+      <ul>
+        <li><strong>T1</strong> (recency): LRU list of items that have been accessed <strong>exactly once</strong> recently. These are "newcomers."</li>
+        <li><strong>T2</strong> (frequency): LRU list of items that have been accessed <strong>at least twice</strong> recently. These are "proven valuable."</li>
+        <li><strong>B1</strong> (ghost list for T1): Stores only the <em>keys</em> (not values) of items recently evicted from T1. This is ARC's memory of "recency evictions."</li>
+        <li><strong>B2</strong> (ghost list for T2): Stores only the keys of items recently evicted from T2. This is ARC's memory of "frequency evictions."</li>
+      </ul>
+      <p>
+        Only T1 and T2 hold actual data. Together they hold exactly <em>c</em> items: <code>|T1| + |T2| = c</code>. B1 and B2 are metadata-only and cost almost nothing.
+      </p>
+
+      <h4>The Adaptive Parameter <code>p</code></h4>
+      <p>
+        ARC maintains a parameter <strong>p</strong> that controls the <em>target size</em> of T1. The target size of T2 is <code>c - p</code>. Initially, <code>p = 0</code> (give all space to frequency). The key: <strong>p adapts based on which ghost list gets hit</strong>:
+      </p>
+      <ul>
+        <li><strong>Hit in B1</strong> (we evicted a recency item and now it's needed again): This means the recency list was too small. <strong>Increase p</strong> &mdash; give more space to T1. Specifically, <code>p = min(c, p + max(1, |B2|/|B1|))</code>.</li>
+        <li><strong>Hit in B2</strong> (we evicted a frequency item and now it's needed again): This means the frequency list was too small. <strong>Decrease p</strong> &mdash; give more space to T2. Specifically, <code>p = max(0, p - max(1, |B1|/|B2|))</code>.</li>
+      </ul>
+      <p>
+        The adaptation rate is proportional to the <em>relative</em> sizes of the ghost lists. If B2 is much larger than B1, a hit in B1 causes a big increase in p (aggressive shift toward recency). This self-tuning is what makes ARC so powerful.
+      </p>
+
+      <h4>Walkthrough: ARC with Capacity 4</h4>
+      <p>Workload: access keys A, B, C, D, then a scan (E, F, G), then return to B, C.</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Access</th><th>T1</th><th>T2</th><th>B1</th><th>B2</th><th>p</th><th>What happens</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1-4</td><td>A,B,C,D</td><td>[D,C,B,A]</td><td>[]</td><td>[]</td><td>[]</td><td>0</td><td>All new items go to T1. Cache full.</td></tr>
+          <tr><td>5</td><td>E</td><td>[E,D,C,B]</td><td>[]</td><td>[A]</td><td>[]</td><td>0</td><td>Evict A from T1 tail &rarr; A's key goes to B1.</td></tr>
+          <tr><td>6</td><td>F</td><td>[F,E,D,C]</td><td>[]</td><td>[B,A]</td><td>[]</td><td>0</td><td>Evict B from T1 &rarr; B's key goes to B1.</td></tr>
+          <tr><td>7</td><td>G</td><td>[G,F,E,D]</td><td>[]</td><td>[C,B,A]</td><td>[]</td><td>0</td><td>Evict C from T1 &rarr; C's key goes to B1.</td></tr>
+          <tr><td>8</td><td>B</td><td>[G,F,E]</td><td>[B]</td><td>[C,A]</td><td>[]</td><td>1</td><td><strong>B found in B1!</strong> p increases (0&rarr;1). Evict D from T1. B is fetched again, goes to T2 (it's now a "proven" item).</td></tr>
+          <tr><td>9</td><td>C</td><td>[G,F]</td><td>[C,B]</td><td>[A]</td><td>[]</td><td>2</td><td><strong>C found in B1!</strong> p increases (1&rarr;2). Evict E from T1. C goes to T2.</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        After the scan (E, F, G), ARC detected that its recency list was too small when B and C were re-requested (ghost hits in B1). It increased <code>p</code> from 0 to 2, giving more space to T1. Meanwhile, B and C &mdash; the items that proved they'd be needed again &mdash; are promoted to T2 where they are protected from scan eviction. A pure LRU cache would have lost all of A-D to the scan and kept the useless E, F, G.
+      </p>
+      <p>
+        <strong>Used in:</strong> ZFS file system, IBM storage controllers. Not common in web caching due to patent concerns (now expired).
+      </p>
+
+      <h3>W-TinyLFU (Window Tiny Least Frequently Used)</h3>
+      <p>
+        W-TinyLFU is the algorithm behind <strong>Caffeine</strong>, the dominant in-process caching library in the Java ecosystem. It combines the best of LRU and LFU while using minimal memory. To understand it, we first need to understand the data structure at its core.
+      </p>
+
+      <h4>Count-Min Sketch: Approximate Frequency Counting</h4>
+      <p>
+        The problem: we need to know how often each item has been accessed, but storing an exact counter for every item ever seen would use unbounded memory. If you've seen 100 million distinct keys, that's 100 million counters.
+      </p>
+      <p>
+        A <strong>Count-Min Sketch</strong> is a probabilistic data structure that estimates frequencies using fixed memory, regardless of how many distinct items you see. It trades perfect accuracy for bounded space.
+      </p>
+      <p><strong>What it looks like in memory:</strong> A 2D array of counters with <em>d</em> rows and <em>w</em> columns, plus <em>d</em> independent hash functions (one per row). In Caffeine's implementation, d = 4 rows and w is sized to the cache capacity. Each counter is just 4 bits (values 0-15), so for a cache of 10,000 items the sketch uses only 10,000 &times; 4 &times; 4 bits = 20 KB.</p>
+      <p><strong>How insertion works:</strong> To record an access to item X, hash X with each of the <em>d</em> hash functions to get <em>d</em> column indices. Increment the counter at each of those <em>d</em> positions.</p>
+      <p><strong>How query works:</strong> To estimate the frequency of item X, hash X with the same <em>d</em> hash functions. Read the counter at each position. Return the <strong>minimum</strong> of those <em>d</em> values. (This is the "Min" in Count-Min &mdash; the minimum is the least over-counted estimate.)</p>
+
+      <h4>Count-Min Sketch Example (d=3 rows, w=6 columns)</h4>
+      <p>Let's insert three items: A (twice), B (once), C (once).</p>
+      <p>Hash functions map: A &rarr; columns [1, 3, 5], B &rarr; columns [0, 3, 4], C &rarr; columns [2, 4, 5].</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>Row</th><th>Col 0</th><th>Col 1</th><th>Col 2</th><th>Col 3</th><th>Col 4</th><th>Col 5</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>h1</td><td>1 (B)</td><td>2 (A&times;2)</td><td>1 (C)</td><td>0</td><td>0</td><td>0</td></tr>
+          <tr><td>h2</td><td>0</td><td>0</td><td>0</td><td>3 (A&times;2+B)</td><td>2 (B+C)</td><td>0</td></tr>
+          <tr><td>h3</td><td>0</td><td>0</td><td>0</td><td>0</td><td>1 (C)</td><td>3 (A&times;2+C)</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        Query frequency of A: read h1[1]=2, h2[3]=3, h3[5]=3. Minimum = <strong>2</strong>. Correct! (A was inserted twice.)<br>
+        Query frequency of B: read h1[0]=1, h2[3]=3, h3[4]=1. Minimum = <strong>1</strong>. Correct!<br>
+        Notice h2[3] is 3 (overcounted due to collisions), but taking the minimum across rows recovers the correct answer. The Count-Min Sketch <strong>never undercounts</strong>, but may overcount due to hash collisions. More rows (more hash functions) reduce the chance of overcounting.
+      </p>
+
+      <h4>How W-TinyLFU Works</h4>
+      <p>The cache is split into two regions:</p>
+      <ul>
+        <li><strong>Window cache (1% of total)</strong>: A small LRU region where <em>all</em> new items enter first. This gives brand-new items a chance to prove themselves without immediately competing against established items.</li>
+        <li><strong>Main cache (99% of total)</strong>: A segmented LRU (SLRU) divided into a "probation" segment (20%) and a "protected" segment (80%). Items in probation that are accessed again get promoted to protected.</li>
+      </ul>
+      <p><strong>The admission filter:</strong> When an item is evicted from the window cache, it doesn't automatically enter the main cache. Instead, W-TinyLFU compares the incoming item's estimated frequency (from the Count-Min Sketch) against the main cache's <em>eviction victim</em> (the LRU item in the probation segment). If the incoming item's frequency is <strong>higher</strong>, it replaces the victim. If <strong>lower</strong>, the incoming item is <em>rejected</em> and discarded.</p>
+      <p>
+        This admission filter is the key insight: instead of always admitting new items and hoping the eviction policy sorts things out, W-TinyLFU only admits items that have earned entry through demonstrated frequency. A one-time scan of 10,000 keys will enter the tiny window, but when evicted from the window, each key's frequency (1) will likely be lower than any established item in the main cache. The scan items are rejected at the gate &mdash; main cache is unaffected.
+      </p>
+      <p>
+        <strong>Periodic reset:</strong> To prevent stale frequency counts from keeping old items forever, the Count-Min Sketch halves all counters periodically (when the total count reaches a threshold). This acts as a decay mechanism, letting the sketch adapt to changing access patterns.
+      </p>
+      <p>
+        <strong>Performance:</strong> Caffeine (W-TinyLFU) consistently achieves near-optimal hit rates across diverse workloads, often 5-10% higher than LRU. It is the default caching library for Spring Boot, Apache Druid, and many other Java-based systems.
+      </p>
+
+      <h3>CLOCK (Second-Chance Algorithm)</h3>
+      <p>
+        LRU gives great eviction decisions, but it has a hidden cost: every single access requires updating the linked list (moving the accessed node to the head). Under high concurrency, this means every read must acquire a lock on the list, serializing access and creating contention. CLOCK is an approximation of LRU that avoids this overhead.
+      </p>
+
+      <h4>The Circular Buffer</h4>
+      <p>
+        A <strong>circular buffer</strong> (or ring buffer) is an array that wraps around: when you reach the end, you continue from the beginning. Imagine the cache slots arranged in a circle, with a "clock hand" pointer that sweeps around the circle. Unlike a regular array, there is no "beginning" or "end" &mdash; only the current position of the hand.
+      </p>
+      <p>
+        Each slot in the circular buffer holds: the cached item, and a <strong>reference bit</strong> (a single bit: 0 or 1). The reference bit is set to 1 whenever the item is accessed. That's the only bookkeeping on access &mdash; no linked list to update, no lock contention.
+      </p>
+
+      <h4>How CLOCK Eviction Works (Second-Chance)</h4>
+      <p>When the cache is full and we need to evict, the clock hand sweeps around the buffer:</p>
+      <ol>
+        <li>Look at the item under the hand. Check its reference bit.</li>
+        <li>If the reference bit is <strong>1</strong> (item was accessed recently): clear it to 0. The item gets a "second chance." Advance the hand to the next slot.</li>
+        <li>If the reference bit is <strong>0</strong> (item was NOT accessed since the last sweep): <strong>evict this item</strong>. Insert the new item in this slot with reference bit = 1. Stop.</li>
+        <li>If the hand completes a full revolution without finding a 0-bit, it means every item was accessed recently. On this second pass, all bits have been cleared to 0, so the hand will evict the next item it encounters.</li>
+      </ol>
+
+      <h4>Step-by-Step CLOCK Example: 4 Slots</h4>
+      <p>Hand starts at slot 0 (marked with &darr;). R = reference bit.</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>Step</th><th>Action</th><th>Slot 0</th><th>Slot 1</th><th>Slot 2</th><th>Slot 3</th><th>Hand</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>Insert A</td><td>A, R=1</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&darr;1</td></tr>
+          <tr><td>2</td><td>Insert B</td><td>A, R=1</td><td>B, R=1</td><td>&mdash;</td><td>&mdash;</td><td>&darr;2</td></tr>
+          <tr><td>3</td><td>Insert C</td><td>A, R=1</td><td>B, R=1</td><td>C, R=1</td><td>&mdash;</td><td>&darr;3</td></tr>
+          <tr><td>4</td><td>Insert D</td><td>A, R=1</td><td>B, R=1</td><td>C, R=1</td><td>D, R=1</td><td>&darr;0</td></tr>
+          <tr><td>5</td><td>Access B</td><td>A, R=1</td><td>B, R=1</td><td>C, R=1</td><td>D, R=1</td><td>&darr;0</td></tr>
+          <tr><td>6a</td><td>Insert E: sweep</td><td>A, R=0</td><td>B, R=0</td><td>C, R=0</td><td>D, R=0</td><td>&darr;0</td></tr>
+          <tr><td>6b</td><td>Insert E: evict A</td><td><strong>E, R=1</strong></td><td>B, R=0</td><td>C, R=0</td><td>D, R=0</td><td>&darr;1</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        In step 6, the hand makes a full revolution (6a): every slot has R=1, so each gets cleared to R=0 and receives a "second chance." On the second pass (6b), slot 0 (A) now has R=0, so A is <strong>evicted</strong> and replaced by E. Notice that B was accessed in step 5 (R=1) but still got its bit cleared &mdash; if nothing accesses B before the hand reaches it again, B will be evicted next.
+      </p>
+      <p>
+        <strong>Why CLOCK approximates LRU:</strong> Items that are accessed frequently keep getting their reference bit set back to 1, so the hand skips over them. Items that haven't been accessed are left with R=0 and get evicted. The net effect is similar to LRU (recently used items survive) but without the per-access linked list overhead. CLOCK's per-access cost is O(1) &mdash; just set a bit &mdash; with no lock contention.
+      </p>
+
+      <h3>CLOCK-Pro</h3>
+      <p>
+        Basic CLOCK only considers <em>recency</em> (was the item accessed since the last sweep?). CLOCK-Pro (Jiang, Chen, Zhang, 2005) extends CLOCK to also consider <strong>reuse distance</strong> &mdash; the number of distinct items accessed between two consecutive accesses to the same item. An item with a short reuse distance (accessed frequently) is more valuable than one with a long reuse distance.
+      </p>
+      <p>
+        CLOCK-Pro classifies pages as <strong>hot</strong> (short reuse distance, likely to be accessed again soon) or <strong>cold</strong> (long reuse distance). It uses three clock hands sweeping the same circular buffer:
+      </p>
+      <ul>
+        <li><strong>Hand-hot</strong>: Scans for hot pages that have become cold (their reference bit was 0 for too long). Demotes them to cold.</li>
+        <li><strong>Hand-cold</strong>: Scans for cold pages to evict. Cold pages with R=0 are evicted. Cold pages with R=1 are promoted to hot (they've proven they have short reuse distance).</li>
+        <li><strong>Hand-test</strong>: Tracks "test" entries (metadata for recently evicted cold pages, similar to ARC's ghost lists). If a test entry is accessed, the corresponding page is re-admitted as hot.</li>
+      </ul>
+      <p>
+        The result is an eviction policy that adapts to both recency and frequency patterns, using only a circular buffer and a few bits per entry &mdash; no linked lists, no hash maps of frequency counters. This makes CLOCK-Pro attractive for systems where per-operation overhead matters (e.g., OS page caches).
+      </p>
+      <p>
+        <strong>Used in:</strong> Linux kernel (a variant), NetBSD. Attractive when you need a high-performance eviction policy with low per-operation overhead.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 6b. Cache Invalidation Strategies ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cache Invalidation Strategies</h2>
+      <p>
+        Caching is easy. <em>Invalidation</em> &mdash; knowing when to remove or update stale data &mdash; is the hard part. Phil Karlton famously said there are only two hard things in computer science: cache invalidation and naming things. Here are the main strategies, each with a different tradeoff between consistency, latency, and complexity.
+      </p>
+
+      <h3>Cache-Aside (Lazy Loading)</h3>
+      <p>
+        The application manages the cache explicitly. On read: check cache &rarr; if miss, read from DB &rarr; fill cache. On write: update DB &rarr; invalidate (delete) cache entry. The cache is never written to directly on writes &mdash; it's only filled on reads.
+      </p>
+      <p><strong>Request flow (read):</strong></p>
+      <div class="flow-diagram" data-flow='{
+        "participants":[
+          {"name":"Client","color":"slate"},
+          {"name":"App","color":"blue"},
+          {"name":"Cache","color":"amber"},
+          {"name":"DB","color":"green"}
+        ],
+        "steps":[
+          {"from":"Client","to":"App","label":"GET /user/42"},
+          {"from":"App","to":"Cache","label":"GET user:42"},
+          {"from":"Cache","to":"App","label":"MISS","style":"dashed"},
+          {"from":"App","to":"DB","label":"SELECT * FROM users WHERE id=42"},
+          {"from":"DB","to":"App","label":"{name:\"Alice\", age:30}","style":"dashed"},
+          {"from":"App","to":"Cache","label":"SET user:42 \"{...}\" EX 300"},
+          {"from":"App","to":"Client","label":"200 OK + data","style":"dashed"}
+        ]}'></div>
+      <p><strong>Request flow (write):</strong></p>
+      <div class="flow-diagram" data-flow='{
+        "participants":[
+          {"name":"App","color":"blue"},
+          {"name":"Cache","color":"amber"},
+          {"name":"DB","color":"green"}
+        ],
+        "steps":[
+          {"from":"App","to":"DB","label":"UPDATE users SET age=31 WHERE id=42"},
+          {"from":"App","to":"Cache","label":"DEL user:42","detail":"invalidate, do not write"}
+        ]}'></div>
+      <p><strong>Why delete instead of update?</strong> Deleting is simpler and avoids race conditions. If two concurrent writes try to update the cache, the cache might end up with the wrong value (the slower write overwrites the faster one). Deletion ensures the next read fetches fresh data from the DB.</p>
+      <p><strong>Aren't the DB write and cache <code>DEL</code> atomic?</strong> No &mdash; and this is the source of cache-aside's eventual-consistency window. They are two independent operations against two independent systems (your DB and your cache, e.g. Postgres and Redis), with no shared transaction. The app code looks like:</p>
+      <pre><code class="language-python">db.execute("UPDATE users SET age=31 WHERE id=42")  # step 1
+cache.delete("user:42")                             # step 2</code></pre>
+      <p>Between step 1 and step 2 &mdash; even if just for a millisecond &mdash; another request can hit the cache and read the old value. Worse, several things can break the pair entirely:</p>
+      <ul>
+        <li><strong>App crashes between the two calls</strong> &rarr; DB has new value, cache still has old. The stale entry persists until its TTL expires.</li>
+        <li><strong>Cache is down</strong> when the <code>DEL</code> fires &rarr; same outcome. The DB write must not fail just because the cache is unreachable (that would defeat the resilience benefit), so the app typically logs and moves on.</li>
+        <li><strong>Concurrent reader interleaves</strong>: reader misses cache &rarr; reads old value from a replica &rarr; writer commits new value &rarr; writer deletes cache &rarr; reader fills cache with the <em>old</em> value it already fetched. Now the cache holds stale data with no pending invalidation.</li>
+      </ul>
+      <p>Because there's no cross-system transaction, production systems mitigate (not eliminate) this with: a TTL safety net so stale entries self-heal, delete-after-commit ordering, or a CDC/outbox pattern that drains DB changes into cache invalidations reliably. If you need true atomicity, you've left cache-aside territory &mdash; that's what write-through is for.</p>
+      <p><strong>Pros:</strong> Simple to implement &mdash; the application controls all cache logic, no special cache infrastructure needed. Resilient to cache failures (a dead cache just means slower reads, not broken writes). Only data that is actually read gets cached, so memory is used efficiently.</p>
+      <p><strong>Cons:</strong> The first read after a write or eviction is always a cache miss (higher tail latency). Cache logic is duplicated across every read path in the app, which can drift over time. Vulnerable to the <em>thundering herd</em> problem &mdash; if a hot key expires, many concurrent requests can hit the DB simultaneously. Brief inconsistency window between DB write and cache delete if they aren't atomic.</p>
+      <p><strong>Mitigating the thundering herd</strong> (see <a href="#what-can-go-wrong">What Can Go Wrong</a> for full implementations):</p>
+      <ul>
+        <li><strong>Lease / single-flight lock</strong> &mdash; on miss, the first request acquires a short-lived lock (Redis <code>SET NX EX</code>) and is the only one to query the DB. Others wait and retry the cache. Reduces N concurrent DB queries to 1.</li>
+        <li><strong>Request coalescing in-process</strong> &mdash; within a single app server, a <code>singleflight</code>-style helper deduplicates concurrent calls for the same key so only one goroutine/thread hits the DB; the rest await its result. Eliminates intra-host duplication even without a distributed lock.</li>
+        <li><strong>Probabilistic / early recomputation (XFetch)</strong> &mdash; just before the TTL expires, one request is statistically chosen to refresh the entry while others still serve the cached value. Avoids the synchronized-cliff at TTL boundary.</li>
+        <li><strong>TTL jitter</strong> &mdash; instead of a fixed TTL like 300s, use <code>300s &plusmn; random(30s)</code>. Spreads expirations across time so 200 servers don't all miss at the same instant.</li>
+        <li><strong>Stale-while-revalidate</strong> &mdash; serve the stale value past TTL while a single background task refreshes it. Readers never block on a miss for a hot key.</li>
+        <li><strong>Pre-warm / refresh-ahead</strong> &mdash; a background job repopulates known-hot keys before they expire. Best for a small set of well-known hot keys (homepage, trending list).</li>
+        <li><strong>Negative caching</strong> &mdash; if the DB returns "not found," cache that fact briefly so a flood of misses for a non-existent key doesn't slam the DB either.</li>
+      </ul>
+      <p><strong>Best for:</strong> Read-heavy workloads with tolerable staleness (user profiles, product catalogs, social feeds). The default choice when in doubt &mdash; it's what most production systems use.</p>
+
+      <h3>Write-Through</h3>
+      <p>
+        Every write goes to <strong>both</strong> the cache and the database, synchronously. The write is only considered successful when both are complete.
+      </p>
+      <p><strong>Request flow:</strong></p>
+      <div class="flow-diagram" data-flow='{
+        "participants":[
+          {"name":"App","color":"blue"},
+          {"name":"Cache","color":"amber"},
+          {"name":"DB","color":"green"}
+        ],
+        "steps":[
+          {"from":"App","to":"Cache","label":"SET user:42 \"{age:31}\""},
+          {"from":"Cache","to":"DB","label":"UPDATE users SET age=31","detail":"cache layer forwards the write"},
+          {"from":"DB","to":"Cache","label":"OK","style":"dashed"},
+          {"from":"Cache","to":"App","label":"success (both written)","style":"dashed"}
+        ]}'></div>
+      <p><strong>Pros:</strong> Cache is always consistent with the database. Reads never get stale data. Simple mental model.</p>
+      <p><strong>Cons:</strong> Every write pays the latency of both cache + DB (higher write latency). If the DB is slow, writes are slow. Also, you may cache data that is rarely read (wasteful memory usage).</p>
+      <p><strong>Best for:</strong> Systems where read-after-write consistency is critical and write volume is moderate (e.g., user account settings).</p>
+
+      <h3>Write-Behind (Write-Back)</h3>
+      <p>
+        Writes go to the cache <strong>immediately</strong>. The cache asynchronously flushes changes to the database in the background, often batching multiple writes together.
+      </p>
+      <p><strong>Request flow:</strong></p>
+      <div class="flow-diagram" data-flow='{
+        "participants":[
+          {"name":"App","color":"blue"},
+          {"name":"Cache","color":"amber"},
+          {"name":"DB","color":"green"}
+        ],
+        "steps":[
+          {"from":"App","to":"Cache","label":"SET user:42 \"{age:31}\""},
+          {"from":"Cache","to":"App","label":"success (immediately)","style":"dashed"},
+          {"note":"Later: every N seconds or when buffer is full","span":["Cache","DB"]},
+          {"from":"Cache","to":"DB","label":"batch write all dirty entries","style":"async"}
+        ]}'></div>
+      <p><strong>Pros:</strong> Extremely fast writes (cache-speed). Can coalesce multiple writes to the same key (e.g., 100 increments to a counter become a single <code>+100</code> write to DB). Reduces DB write load.</p>
+      <p><strong>Cons:</strong> <strong>Risk of data loss</strong> if the cache crashes before flushing to DB. Reads from the DB directly will see stale data until the flush completes.</p>
+      <p><strong>Best for:</strong> Write-heavy workloads where some data loss is acceptable (analytics counters, gaming leaderboards, activity feeds).</p>
+
+      <h3>Write-Around</h3>
+      <p>
+        Writes go <strong>only</strong> to the database, bypassing the cache entirely. The cache is only populated on reads (like cache-aside).
+      </p>
+      <p><strong>"May or may not be invalidated" &mdash; what does that mean?</strong> Write-around is a family of patterns, not one fixed rule. Some implementations explicitly delete the cache entry on write (same as cache-aside on writes); others skip the cache entirely and let the stale entry sit until its TTL expires. The "pure" form does no invalidation &mdash; and yes, that means readers can see stale data for up to one TTL after a write. Teams accept this when staleness is cheap and write throughput is precious.</p>
+      <p><strong>Isn't write-around-with-invalidation just cache-aside?</strong> The read path is identical (check cache &rarr; miss &rarr; load from DB &rarr; fill). The distinction is in <em>intent and emphasis</em> on the write path. Cache-aside <strong>requires</strong> a <code>DEL</code> after every DB write &mdash; it's part of the contract, and forgetting it is a bug that causes stale reads. Write-around <strong>treats invalidation as optional</strong> and is happy to leave the stale entry in place, relying on TTL to clean up. So if you always invalidate, you've effectively implemented cache-aside; the "write-around" label is most meaningful in its pure (no-invalidation) form, where you're explicitly choosing to bypass cache logic on writes for speed.</p>
+      <p><strong>Why are writes fast?</strong> Compared to write-through, the write path touches only the DB &mdash; no synchronous cache update, no extra network hop, no waiting on two systems. Compared to cache-aside, you also skip the <code>DEL</code> round-trip to the cache. The write latency is exactly one DB write, nothing more.</p>
+      <p><strong>Why is it suited to write-heavy, rarely-re-read data?</strong> The cache only earns its keep when an entry is read multiple times before it changes. For data like log entries or audit records &mdash; written constantly, almost never read &mdash; populating the cache on every write would burn memory and bandwidth on entries no one will ever request. Write-around says: don't speculate. Let reads pull data into the cache only when someone actually wants it. If the same key <em>is</em> read soon after a write, you eat one cache miss; that's a fine trade when the read-to-write ratio is low.</p>
+      <p><strong>Request flow:</strong></p>
+      <div class="flow-diagram" data-flow='{
+        "participants":[
+          {"name":"App","color":"blue"},
+          {"name":"Cache","color":"amber"},
+          {"name":"DB","color":"green"}
+        ],
+        "steps":[
+          {"from":"App","to":"DB","label":"UPDATE users SET age=31"},
+          {"from":"DB","to":"App","label":"OK","style":"dashed"},
+          {"note":"Cache untouched — stale until TTL expires","span":["Cache","Cache"]}
+        ]}'></div>
+      <p><strong>Pros:</strong> Fast writes (only DB). Cache doesn't get polluted with data that may never be read.</p>
+      <p><strong>Cons:</strong> If the written data is immediately read, it's a cache miss (higher read latency). Stale data risk if TTL is long.</p>
+      <p><strong>Best for:</strong> Write-heavy data that is rarely re-read immediately (e.g., log entries, audit trails).</p>
+
+      <h3>Side-by-Side Comparison</h3>
+      <p>Same axes across all four strategies. Pick the row that matches what your workload cares about most.</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Cache-Aside</th>
+            <th>Write-Through</th>
+            <th>Write-Behind</th>
+            <th>Write-Around</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Write path</strong></td>
+            <td>DB, then <code>DEL</code> cache</td>
+            <td>Cache + DB (sync)</td>
+            <td>Cache only (DB async)</td>
+            <td>DB only (cache untouched)</td>
+          </tr>
+          <tr>
+            <td><strong>Read path</strong></td>
+            <td>Check cache &rarr; miss &rarr; DB &rarr; fill</td>
+            <td>Check cache &rarr; miss &rarr; DB &rarr; fill</td>
+            <td>Check cache &rarr; miss &rarr; DB &rarr; fill</td>
+            <td>Check cache &rarr; miss &rarr; DB &rarr; fill</td>
+          </tr>
+          <tr>
+            <td><strong>Write latency</strong></td>
+            <td>DB + 1 cache op</td>
+            <td>DB + cache (slowest)</td>
+            <td>Cache only (fastest)</td>
+            <td>DB only</td>
+          </tr>
+          <tr>
+            <td><strong>Read-after-write</strong></td>
+            <td>Miss (refilled from DB)</td>
+            <td>Hit (already in cache)</td>
+            <td>Hit (just written to cache)</td>
+            <td>Miss (and may be stale if old entry left)</td>
+          </tr>
+          <tr>
+            <td><strong>Consistency</strong></td>
+            <td>Eventually consistent &mdash; brief window between DB write and cache <code>DEL</code> where readers can see the old value; converges on next miss</td>
+            <td>Strong (cache = DB)</td>
+            <td>Weak (DB lags cache)</td>
+            <td>Stale until TTL or eviction</td>
+          </tr>
+          <tr>
+            <td><strong>Data loss risk</strong></td>
+            <td>None (DB is source of truth)</td>
+            <td>None</td>
+            <td><strong>Yes</strong> &mdash; if cache crashes before flush</td>
+            <td>None</td>
+          </tr>
+          <tr>
+            <td><strong>Cache memory use</strong></td>
+            <td>Only what's read (efficient)</td>
+            <td>Everything written (may waste memory)</td>
+            <td>Everything written</td>
+            <td>Only what's read (efficient)</td>
+          </tr>
+          <tr>
+            <td><strong>App complexity</strong></td>
+            <td>Medium (logic in app)</td>
+            <td>Low (cache layer handles it)</td>
+            <td>Low for app, high for cache infra</td>
+            <td>Low</td>
+          </tr>
+          <tr>
+            <td><strong>Best for</strong></td>
+            <td>Read-heavy, tolerable staleness (default choice)</td>
+            <td>Read-after-write critical, moderate writes</td>
+            <td>Write-heavy, lossy data OK (counters, leaderboards)</td>
+            <td>Write-heavy, rarely re-read (logs, audit)</td>
+          </tr>
+          <tr>
+            <td><strong>Main risk</strong></td>
+            <td>Thundering herd on hot key expiry</td>
+            <td>Slow writes if DB is slow; wasted memory</td>
+            <td>Cache crash &rarr; lost writes</td>
+            <td>Stale reads until TTL</td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+
+      <h3>TTL-Based Expiry vs. Event-Driven Invalidation</h3>
+      <p>These are two complementary approaches to keeping the cache fresh:</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>Aspect</th><th>TTL-Based Expiry</th><th>Event-Driven Invalidation</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>How it works</strong></td><td>Each cache entry has a time-to-live. After TTL seconds, the entry is automatically removed. Next read triggers a DB fetch.</td><td>When data changes in the DB, an event (Kafka message, Redis pub/sub, webhook) is published. Subscribers invalidate or update the relevant cache entries.</td></tr>
+          <tr><td><strong>Staleness window</strong></td><td>Up to TTL seconds (e.g., 5 minutes)</td><td>Near-zero (limited by event propagation delay, typically milliseconds)</td></tr>
+          <tr><td><strong>Complexity</strong></td><td>Very low. Just set <code>EX 300</code> on cache writes.</td><td>High. Requires event infrastructure (Kafka/pub-sub), consumers on every cache node, handling of failures and retries.</td></tr>
+          <tr><td><strong>When to use</strong></td><td>When staleness of a few minutes is acceptable. Start here &mdash; it covers 90% of use cases.</td><td>When near-real-time consistency matters (e.g., price changes, inventory, user permissions).</td></tr>
+          <tr><td><strong>Best practice</strong></td><td>Always add jitter: <code>TTL = base + random(0, base * 0.1)</code> to avoid synchronized expiry storms.</td><td>Always use TTL <em>as a safety net</em> alongside events. If the event is lost, the TTL ensures eventual refresh.</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>
+        In practice, most production systems use <strong>both</strong>: event-driven invalidation for critical data (prices, permissions) with a TTL safety net, and TTL-only for less critical data (user profiles, product descriptions).
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Temporal locality:</strong> Data accessed recently is likely to be accessed again soon. This is the foundational assumption of all caching. If your access pattern is uniformly random with no repetition, caching provides zero benefit.</li>
+          <li><strong>Zipfian access distribution:</strong> A small fraction of keys receive a disproportionate share of traffic. In practice, web workloads often follow a Zipfian distribution where the top 10-20% of keys account for 80%+ of reads.</li>
+          <li><strong>Cache is faster than origin:</strong> The cache medium (RAM, SSD, local process memory) must be meaningfully faster than the origin (database, remote API, disk). If your "cache" is on the same disk as your database, the benefit disappears.</li>
+          <li><strong>Data is tolerant of staleness:</strong> Cached data may be slightly out of date. The system must tolerate serving data that is up to TTL seconds old. If every read must reflect the latest write, caching is counterproductive.</li>
+        </ul>
+        <h4>When These Assumptions Break</h4>
+        <ul>
+          <li><strong>Uniform random access:</strong> If every key is equally likely to be requested (e.g., a hash-based lookup across a very large keyspace with no hot keys), cache hit rates will be proportional to (cache size / total keys) and will be very low.</li>
+          <li><strong>Write-heavy workloads:</strong> If data changes faster than it is read, TTLs expire or invalidations fire before anyone reads the cached value. The cache churns without providing value.</li>
+          <li><strong>Adversarial access patterns:</strong> An attacker deliberately requesting uncacheable keys (unique, random IDs) will bypass the cache entirely and hit the origin directly. This is a cache-busting attack.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>Working Set Analysis</h3>
+      <p>
+        The first step in cache sizing is identifying your <strong>working set</strong> &mdash; the subset of data that accounts for most of the read traffic. If your database holds 10 million records but 80% of reads hit the top 50,000 records, your working set is 50K records. Cache those 50K, and you capture 80% of reads.
+      </p>
+
+      <h3>Hit-Rate Curves</h3>
+      <p>
+        The relationship between cache size and hit rate follows a curve of diminishing returns. Going from no cache to caching 1% of your data might give you a 50% hit rate (if traffic is highly skewed). Doubling to 2% might give you 65%. Doubling again to 4% gives 75%. Eventually, each doubling yields only 1-2% more hits. Plot your own hit-rate curve by replaying production access logs against different cache sizes.
+      </p>
+
+      <h3>The Square-Root Rule</h3>
+      <p>
+        A useful rule of thumb for cache sizing: if the total number of unique items is <em>N</em>, a cache of size <em>sqrt(N)</em> is often a reasonable starting point for Zipfian workloads. For <em>N</em> = 10,000,000 items, this gives sqrt(10M) = ~3,162 items. In practice, you will likely need more than this, but it gives a lower bound.
+      </p>
+
+      <h3>SLO-Driven Cache Sizing</h3>
+      <p>Cache size is not a guess &mdash; it's derived from your <strong>latency SLO</strong> and <strong>traffic profile</strong>. The framework:</p>
+      <ol>
+        <li><strong>Define the SLO:</strong> "p99 read latency &lt; X ms."</li>
+        <li><strong>Measure uncached latency:</strong> What's the DB p99? (e.g., 50ms)</li>
+        <li><strong>Measure cached latency:</strong> What's the cache p99? (e.g., 2ms for Redis)</li>
+        <li><strong>Compute required hit rate:</strong> To meet the SLO, what fraction of requests must hit the cache?</li>
+        <li><strong>Size the cache to achieve that hit rate</strong> using your access distribution.</li>
+      </ol>
+
+      <h4>The Hit Rate Formula</h4>
+      <p>For a p99 SLO, you need <strong>at least 99% of requests</strong> to complete within the target. If cache hit latency = L<sub>hit</sub> and cache miss latency = L<sub>miss</sub>, and your SLO target = L<sub>SLO</sub>:</p>
+      <ul>
+        <li>If L<sub>hit</sub> &lt; L<sub>SLO</sub> and L<sub>miss</sub> &gt; L<sub>SLO</sub>: then every cache miss potentially violates the SLO.</li>
+        <li>Required hit rate h &ge; 1 - (target percentile violation budget). For p99 &lt; L<sub>SLO</sub>, you can tolerate at most 1% of requests being misses (if misses always exceed the SLO).</li>
+        <li>More precisely: <strong>h &ge; 1 - (SLO violation budget / P(miss exceeds SLO))</strong>.</li>
+      </ul>
+
+      <div class="callout callout-info">
+        <h4>Example 1: Product Catalog API</h4>
+        <p><strong>SLO:</strong> p99 read latency <strong>&lt; 20ms</strong>. Traffic: 50,000 reads/s. DB p99 = 45ms. Redis p99 = 1.5ms. Database: 10M products, avg 2 KB each.</p>
+        <p><strong>Step 1: Required hit rate.</strong> Every cache miss (45ms) violates the 20ms SLO. For p99, at most 1% of requests can violate. So hit rate must be &ge; <strong>99%</strong>.</p>
+        <p><strong>Step 2: Items to cache for 99% hit rate.</strong> Assuming Zipfian access distribution with s=1.0 (typical for product catalogs), a 99% hit rate on 10M items requires caching the top ~200,000 items. (For Zipf with s=1.0: hit rate &approx; (cache_size/total)^(1-1/s) &mdash; more precisely, h = H(k,s)/H(N,s) where H is the generalized harmonic number and k = cache size. In practice, you simulate with your access logs.)</p>
+        <p><strong>Step 3: Memory.</strong> 200K items &times; 2 KB = 400 MB raw data. With Redis overhead (2&times;): <strong>800 MB</strong>. Add 25% growth headroom: <strong>1 GB Redis instance</strong>.</p>
+        <p><strong>Step 4: Verify DB load.</strong> Miss rate = 1% &times; 50K = 500 misses/s hitting DB. Plus 500 writes/s = 1,000 QPS on DB &mdash; easily handled by a single PostgreSQL instance. Without the cache: 50,500 QPS &mdash; would require read replicas.</p>
+        <p><strong>Step 5: TTL.</strong> 500 writes/s across 10M products = any given product updated once per 20,000s (5.5 hours). TTL = 5 minutes gives at most 5 minutes of staleness. For a product catalog, this is acceptable.</p>
+        <p><strong>Cost:</strong> AWS ElastiCache r6g.large (13 GB) = $146/month. Avoids needing 3-4 read replicas ($600-800/month). <strong>Net savings: ~$500/month.</strong></p>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Example 2: Session Store for Authentication</h4>
+        <p><strong>SLO:</strong> p99 auth check <strong>&lt; 5ms</strong> (on the critical path of every API request). Traffic: 100,000 requests/s. DB p99 = 30ms. Redis p99 = 0.8ms. Active sessions: 2M, session size: 500 bytes.</p>
+        <p><strong>Step 1: Required hit rate.</strong> DB latency (30ms) massively exceeds the 5ms SLO. Every miss violates. For p99: hit rate &ge; <strong>99%</strong>. But since this is on the critical path of every request, you probably want p99.9: hit rate &ge; <strong>99.9%</strong>.</p>
+        <p><strong>Step 2: Items to cache.</strong> For 99.9% hit rate: you need essentially <em>all active sessions</em> in cache. Sessions have a natural TTL (expiry), so cache = all active sessions = 2M.</p>
+        <p><strong>Step 3: Memory.</strong> 2M &times; 500B = 1 GB raw. Redis overhead: <strong>2 GB</strong>. With headroom: <strong>3 GB Redis</strong>.</p>
+        <p><strong>Step 4: What about cold starts?</strong> After a Redis restart, cache is empty &mdash; 100% miss rate. All 100K RPS hit DB at 30ms &mdash; SLO violated for every request. Mitigation: cache warming script that loads all sessions from DB on startup (~2M &times; 500B = 1GB, takes ~30s at 100MB/s). During warm-up: route traffic through a backup Redis replica.</p>
+        <p><strong>Cost:</strong> ElastiCache r6g.medium (6.4 GB) with replica = $150/month. This is non-negotiable &mdash; without cache, you'd need a DB that can serve 100K reads/s at &lt;5ms, costing $2,000+/month.</p>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Example 3: Social Media Feed (Relaxed SLO, Cost-Optimized)</h4>
+        <p><strong>SLO:</strong> p95 feed load <strong>&lt; 200ms</strong> (users tolerate some slowness). Traffic: 20,000 reads/s. DB p95 = 150ms (complex join query). Redis p95 = 3ms. Users: 50M, feeds cached as JSON: avg 10 KB. Active users (daily): 5M.</p>
+        <p><strong>Step 1: Required hit rate.</strong> DB p95 = 150ms &lt; 200ms SLO. So even cache misses don't always violate the SLO! We have more flexibility. For p95: we can tolerate 5% being over 200ms. Since only some DB calls exceed 200ms (say 30% of them), we need: miss_rate &times; 0.30 &le; 0.05, so miss_rate &le; 16.7%. Hit rate &ge; <strong>83%</strong>.</p>
+        <p><strong>Step 2: Items to cache for 83% hit rate.</strong> 5M daily active users with Zipfian access: caching 500K feeds (10% of DAU) achieves ~85% hit rate. Why? The most active 10% of users generate ~85% of feed requests (power law).</p>
+        <p><strong>Step 3: Memory.</strong> 500K feeds &times; 10 KB = 5 GB raw. Redis overhead: <strong>10 GB</strong>. With headroom: <strong>13 GB</strong>.</p>
+        <p><strong>Step 4: Could we cache less?</strong> 200K feeds (4% of DAU): ~70% hit rate. Miss rate = 30%, SLO violation = 30% &times; 30% = 9% &gt; 5%. Doesn't meet p95 SLO. 300K feeds: ~77% hit rate. 23% &times; 30% = 6.9% &mdash; still over. 500K is the minimum.</p>
+        <p><strong>Cost:</strong> ElastiCache r6g.xlarge (26 GB) = $290/month. Alternatively: cache only 200K feeds (4 GB, $150/month) and accept the SLO miss, adding read replicas to reduce DB p95. <strong>The SLO drives the cost tradeoff.</strong></p>
+      </div>
+
+      <!-- Interactive cache hit rate graph -->
+      <div class="animation-container">
+        <canvas id="cache-hitrate-graph"></canvas>
+        <div class="animation-description">
+          Cache hit rate vs. cache size (as % of total items) for different Zipf skew parameters. Higher skew (s) means more concentrated access &mdash; a smaller cache achieves higher hit rates. Hover to see values. The horizontal lines show example SLO-derived hit rate requirements.
+        </div>
+      </div>
+      <script>
+      (function() {
+        const canvas = document.getElementById('cache-hitrate-graph');
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+        let hoverX = -1;
+
+        function harmonicApprox(k, s) {
+          // Approximate generalized harmonic number H(k,s) for Zipf
+          if (s === 1) return Math.log(k) + 0.5772;
+          return (Math.pow(k, 1-s) - 1) / (1 - s) + 1;
+        }
+
+        function hitRate(cacheFrac, s, N) {
+          const k = Math.max(1, Math.floor(cacheFrac * N));
+          return Math.min(1, harmonicApprox(k, s) / harmonicApprox(N, s));
+        }
+
+        function resize() {
+          const rect = canvas.parentElement.getBoundingClientRect();
+          const w = rect.width - 32;
+          const h = 340;
+          canvas.width = w * dpr;
+          canvas.height = h * dpr;
+          canvas.style.width = w + 'px';
+          canvas.style.height = h + 'px';
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+
+        function draw() {
+          const W = parseFloat(canvas.style.width);
+          const H = parseFloat(canvas.style.height);
+          ctx.clearRect(0, 0, W, H);
+          const pad = { top: 30, right: 30, bottom: 55, left: 65 };
+          const gw = W - pad.left - pad.right;
+          const gh = H - pad.top - pad.bottom;
+          const N = 10000000;
+
+          // Axes
+          ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + gh); ctx.lineTo(pad.left + gw, pad.top + gh); ctx.stroke();
+
+          // Y labels (hit rate 0-100%)
+          ctx.fillStyle = '#64748b'; ctx.font = '12px system-ui, sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+          for (let y = 0; y <= 100; y += 20) {
+            const py = pad.top + gh - (y / 100) * gh;
+            ctx.fillText(y + '%', pad.left - 8, py);
+            if (y > 0) { ctx.strokeStyle = '#f1f5f9'; ctx.beginPath(); ctx.moveTo(pad.left, py); ctx.lineTo(pad.left + gw, py); ctx.stroke(); }
+          }
+          ctx.fillStyle = '#1e293b'; ctx.font = '600 12px system-ui, sans-serif';
+          ctx.save(); ctx.translate(14, pad.top + gh / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.fillText('Cache Hit Rate', 0, 0); ctx.restore();
+
+          // X labels (cache size as % of N, log scale 0.001% to 10%)
+          ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.font = '12px system-ui, sans-serif'; ctx.fillStyle = '#64748b';
+          const xLabels = [0.001, 0.01, 0.1, 1, 10];
+          xLabels.forEach(pct => {
+            const logMin = Math.log10(0.001); const logMax = Math.log10(10);
+            const px = pad.left + ((Math.log10(pct) - logMin) / (logMax - logMin)) * gw;
+            ctx.fillText(pct < 1 ? pct + '%' : pct + '%', px, pad.top + gh + 8);
+            ctx.strokeStyle = '#f1f5f9'; ctx.beginPath(); ctx.moveTo(px, pad.top); ctx.lineTo(px, pad.top + gh); ctx.stroke();
+          });
+          ctx.fillStyle = '#1e293b'; ctx.font = '600 12px system-ui, sans-serif';
+          ctx.fillText('Cache Size (% of total items, log scale)', pad.left + gw / 2, pad.top + gh + 35);
+
+          // SLO requirement lines
+          const sloLines = [
+            { rate: 99, label: 'p99 SLO (99%)', color: '#dc2626' },
+            { rate: 83, label: 'p95 relaxed (83%)', color: '#d97706' }
+          ];
+          sloLines.forEach(slo => {
+            const py = pad.top + gh - (slo.rate / 100) * gh;
+            ctx.strokeStyle = slo.color; ctx.lineWidth = 1; ctx.setLineDash([6, 4]);
+            ctx.beginPath(); ctx.moveTo(pad.left, py); ctx.lineTo(pad.left + gw, py); ctx.stroke();
+            ctx.setLineDash([]); ctx.fillStyle = slo.color; ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText(slo.label, pad.left + 6, py - 12);
+          });
+
+          // Curves for different Zipf s values
+          const curves = [
+            { s: 0.7, color: '#94a3b8', label: 's=0.7 (uniform-ish)' },
+            { s: 1.0, color: '#2563eb', label: 's=1.0 (typical)' },
+            { s: 1.2, color: '#0891b2', label: 's=1.2 (skewed)' },
+            { s: 1.5, color: '#16a34a', label: 's=1.5 (very skewed)' }
+          ];
+
+          const logMin = Math.log10(0.001); const logMax = Math.log10(10);
+          curves.forEach(c => {
+            ctx.strokeStyle = c.color; ctx.lineWidth = 2; ctx.setLineDash([]);
+            ctx.beginPath();
+            for (let i = 0; i <= 300; i++) {
+              const logPct = logMin + (i / 300) * (logMax - logMin);
+              const pct = Math.pow(10, logPct);
+              const hr = hitRate(pct / 100, c.s, N);
+              const px = pad.left + (i / 300) * gw;
+              const py = pad.top + gh - hr * gh;
+              if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            }
+            ctx.stroke();
+          });
+
+          // Legend
+          const lx = pad.left + gw - 190; const ly = pad.top + gh - 90;
+          curves.forEach((c, i) => {
+            ctx.strokeStyle = c.color; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(lx, ly + i * 18); ctx.lineTo(lx + 20, ly + i * 18); ctx.stroke();
+            ctx.fillStyle = '#1e293b'; ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+            ctx.fillText(c.label, lx + 26, ly + i * 18);
+          });
+
+          // Hover
+          if (hoverX >= pad.left && hoverX <= pad.left + gw) {
+            const frac = (hoverX - pad.left) / gw;
+            const logPct = logMin + frac * (logMax - logMin);
+            const pct = Math.pow(10, logPct);
+
+            ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+            ctx.beginPath(); ctx.moveTo(hoverX, pad.top); ctx.lineTo(hoverX, pad.top + gh); ctx.stroke(); ctx.setLineDash([]);
+
+            const tooltipW = 230; const tooltipH = 82;
+            let tx = hoverX + 12; if (tx + tooltipW > W - 10) tx = hoverX - tooltipW - 12;
+            ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.roundRect(tx, pad.top + 10, tooltipW, tooltipH, 6); ctx.fill(); ctx.stroke();
+
+            ctx.fillStyle = '#1e293b'; ctx.font = '600 12px system-ui, sans-serif'; ctx.textAlign = 'left';
+            const items = Math.round(pct / 100 * N);
+            ctx.fillText('Cache: ' + (pct < 1 ? pct.toFixed(3) : pct.toFixed(1)) + '% (' + items.toLocaleString() + ' items)', tx + 10, pad.top + 26);
+            ctx.font = '11px system-ui, sans-serif';
+            curves.forEach((c, i) => {
+              const hr = hitRate(pct / 100, c.s, N);
+              ctx.fillStyle = c.color;
+              ctx.fillText(c.label + ': ' + (hr * 100).toFixed(1) + '%', tx + 10, pad.top + 42 + i * 14);
+            });
+          }
+        }
+
+        canvas.addEventListener('mousemove', function(e) { hoverX = e.clientX - canvas.getBoundingClientRect().left; draw(); });
+        canvas.addEventListener('mouseleave', function() { hoverX = -1; draw(); });
+        resize();
+        window.addEventListener('resize', resize);
+      })();
+      </script>
+
+      <h3>Key Tradeoffs</h3>
+      <ul>
+        <li><strong>Memory vs. hit rate:</strong> More memory = higher hit rate, but with diminishing returns (see curve above). The slope flattens &mdash; doubling cache from 1 GB to 2 GB might only improve hit rate from 92% to 95%.</li>
+        <li><strong>TTL vs. freshness:</strong> Short TTLs keep data fresh but lower hit rates and increase DB load. Long TTLs improve hit rates but increase staleness. <strong>Choose TTL based on your staleness tolerance SLO</strong> (e.g., "product prices must be &lt; 5 minutes stale").</li>
+        <li><strong>Consistency vs. performance:</strong> Write-through caching keeps cache consistent but adds write latency. Cache-aside with TTL is faster but allows stale reads.</li>
+        <li><strong>SLO drives everything:</strong> A stricter latency SLO requires a higher hit rate, which requires a larger cache, which costs more. Quantify the tradeoff: what's the cost of a larger cache vs. the cost of SLO violations?</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>No Cache</h4>
+          <p>Your database handles all reads directly. With a few hundred users, a single PostgreSQL instance can serve reads in 5-10 ms. Adding a cache at this stage is premature optimization. Focus on correct data modeling and indexing.</p>
+          <p><strong>Signal to evolve:</strong> Database CPU consistently above 60%, or p99 read latency exceeding your SLA.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>Local In-Process Cache</h4>
+          <p>Add a simple in-memory cache in your application (e.g., Python <code>functools.lru_cache</code>, Java Caffeine, Go <code>sync.Map</code>). No network hop, sub-microsecond reads. Works well for single-server deployments.</p>
+          <p><strong>Limitation:</strong> Each app server has its own cache. Cold starts after deployments. No sharing between instances.</p>
+          <p><strong>Signal to evolve:</strong> You have multiple app servers with inconsistent caches, or your working set exceeds available process memory.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>Single Redis / Memcached</h4>
+          <p>Deploy a dedicated caching service. All app servers share the same cache. Consistent view of cached data. Redis adds persistence options, pub/sub for invalidation, and data structures beyond simple key-value.</p>
+          <p><strong>Limitation:</strong> Single point of failure. Memory limited to one machine (typically 64-256 GB). Network latency (~1 ms) per cache call.</p>
+          <p><strong>Signal to evolve:</strong> Cache memory exhausted, single Redis CPU at 80%+, or availability requirements demand redundancy.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Redis Cluster + Multi-Tier</h4>
+          <p>Redis Cluster shards data across multiple nodes. Add a local L1 cache (in-process, small, short TTL) in front of Redis (L2) for the hottest keys. A CDN (L3) caches static and semi-static content at the edge.</p>
+          <p><strong>Architecture:</strong> Client &rarr; CDN &rarr; L1 (local) &rarr; L2 (Redis Cluster) &rarr; Database. Each layer filters traffic so the next layer sees less load.</p>
+          <p><strong>Migration pitfall:</strong> Moving from single Redis to Redis Cluster requires key slot awareness. Keys with <code>{hash_tag}</code> prefixes must be planned in advance for multi-key operations.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 9b. Scaling the Cache Tier ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling the Cache Tier</h2>
+      <p>The Scaling Journey above ends at "Redis Cluster + multi-tier" without explaining <em>why</em> a single cache node runs out or <em>how</em> the cache itself scales. A cache that can't keep up with traffic is just a slower database, so this matters.</p>
+
+      <h3>Why One Cache Node Runs Out</h3>
+      <p>A single Redis node has three independent ceilings, and you hit whichever comes first:</p>
+      <ul>
+        <li><strong>CPU / throughput.</strong> Redis executes commands on a <strong>single thread</strong> (detailed in "Redis vs. Memcached" below). A simple GET/SET workload tops out around <strong>100,000&ndash;120,000 ops/sec</strong> on one core. Pipelining and multi-key commands push higher, but the per-core ceiling is real and you cannot add cores to escape it.</li>
+        <li><strong>Network bandwidth.</strong> Cost = <code>value_size &times; ops/sec</code>. A 10 KB value at 100K ops/sec = 1 GB/s = <strong>8 Gbps</strong>, which saturates a 10 GbE NIC <em>before</em> the CPU ceiling.</li>
+        <li><strong>Memory.</strong> The working set must fit in RAM on one box &mdash; typically 64&ndash;256 GB. Beyond that, you must partition.</li>
+      </ul>
+
+      <h3>Replication &mdash; Scale Reads, Survive Failure</h3>
+      <p>One primary plus <code>N</code> read replicas. Reads fan out across all <code>N+1</code> nodes (<code>(N+1)&times;</code> read throughput); writes go to the primary and propagate asynchronously. <strong>Buys:</strong> read scaling and automatic failover. <strong>Costs:</strong> replication lag (a replica may serve slightly stale data), and writes still bottleneck on the single primary. Right when the read:write ratio is high and the <em>entire</em> working set still fits one box.</p>
+
+      <h3>Sharding &mdash; Scale Writes and Memory</h3>
+      <p>Partition the keyspace across <code>M</code> independent shards; each shard owns <code>1/M</code> of the keys and serves its own reads and writes. This gives <code>M&times;</code> throughput <em>and</em> <code>M&times;</code> memory &mdash; the only technique here that scales writes. The key&rarr;shard mapping is the design decision: <code>hash(key) % M</code> remaps almost every key when <code>M</code> changes, so production systems use <a href="consistent-hashing.html">consistent hashing</a>, where adding or removing a shard moves only ~<code>1/M</code> of keys. Redis Cluster implements exactly this with 16,384 hash slots.</p>
+      <p>But sharding balances load <strong>only if traffic is spread evenly across keys</strong>. Real traffic is not &mdash; it is Zipfian, and the head of that distribution breaks the assumption. That is the hot key problem.</p>
+    </div>
+  </section>
+
+  <!-- ===== 9c. The Hot Key Problem ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>The Hot Key Problem</h2>
+      <p>A <strong>hot key</strong> is a single key whose request rate is a large fraction of total traffic: a celebrity profile, a viral post, a feature-flag config read on every request. Sharding deterministically maps one key to one shard &mdash; that is the entire point of a stable key&rarr;shard function. So a hot key concentrates its load on <strong>exactly one node, no matter how many shards you add</strong>. Adding shards cannot help, by construction. <a href="consistent-hashing.html">Consistent hashing</a> solves rebalancing, not skew &mdash; it still sends every request for a given key to the same node.</p>
+
+      <p><strong>This is not the thundering herd.</strong> The thundering herd (next section) is a <em>miss</em> storm: an expired key sends every server to the <em>database</em>. The hot key problem is a <em>hit</em> storm: the data is cached, hit rate &asymp; 100%, the database is idle &mdash; yet one cache node melts. Different failure, different fix. Leases and request coalescing solve the herd; they do <strong>nothing</strong> for a hot key that is always a hit.</p>
+
+      <div class="callout callout-info">
+        <h4>Worked Example: A Post Goes Viral</h4>
+        <p><strong>Setup:</strong> social app, 500,000 cache reads/sec, 10 shards via consistent hashing, value size 5 KB.</p>
+        <p><strong>Uniform baseline:</strong> 500K / 10 = <strong>50K ops/sec/shard</strong>. Network: 50K &times; 5 KB = 250 MB/s = 2 Gbps. Comfortable on every shard.</p>
+        <p><strong>Spike:</strong> one post <code>post:9f3</code> goes viral and alone draws 200K reads/sec (40% of all traffic). Consistent hashing maps it to shard 7.</p>
+        <p><strong>Shard 7 load:</strong> its share of the <em>other</em> 300K traffic (300K / 10 = 30K) <strong>+</strong> the 200K hot reads = <strong>230K ops/sec</strong>. Single-thread ceiling &asymp; 120K &rarr; shard 7 is saturated. Its p99 climbs to seconds, and <em>every other key that hashes to shard 7</em> is now slow too (noisy neighbor).</p>
+        <p><strong>The tell:</strong> the other 9 shards sit at ~30K ops/sec (fine), cache hit rate is ~100%, and the database is idle. The cache tier itself is the bottleneck &mdash; a signature no DB-side mitigation will fix.</p>
+      </div>
+
+      <h3>Detecting Hot Keys</h3>
+      <ul>
+        <li><strong><code>redis-cli --hotkeys</code></strong> &mdash; samples the keyspace; requires an LFU <code>maxmemory-policy</code> so Redis tracks per-key access frequency.</li>
+        <li><strong>Client/proxy top-K</strong> &mdash; a Count-Min sketch or heavy-hitters counter on the cache client samples keys and flags any exceeding, say, 1% of traffic (here, 5K ops/sec). Cheap and always-on.</li>
+        <li><strong>Per-shard p99</strong> &mdash; a latency spike isolated to one shard while hit rate stays ~100% is the hot-key signature, distinct from a herd (which shows DB load).</li>
+      </ul>
+
+      <h3>Mitigations (Read-Hot Keys)</h3>
+      <p>The unifying idea: sharding spreads <em>distinct</em> keys; it cannot spread a <em>single</em> key. To spread one key you must <strong>copy it</strong>.</p>
+      <ul>
+        <li><strong>1. Promote to L1 (local in-process cache).</strong> The highest-leverage fix, and exactly why the Scaling Journey's top tier has an L1. Each of the 200 app servers caches <code>post:9f3</code> in process memory with a 1s TTL. The 200K reads/sec are now served with zero network hops; Redis sees at most <strong>~200 refreshes/sec</strong> (one per server per second). <strong>Tradeoff:</strong> up to 1s of cross-server staleness. <strong>Cost:</strong> one 5 KB object per server &mdash; trivial. Best for read-heavy, staleness-tolerant data.</li>
+        <li><strong>2. Hot-key replication (key splitting).</strong> Store the value under <code>K</code> replica keys <code>post:9f3#0 &hellip; post:9f3#K&minus;1</code>; consistent hashing scatters them across shards, so a reader picking a random replica spreads the load: 200K / 20 = <strong>10K ops/sec/shard</strong>.
+          <ul>
+            <li><strong>A write only has to reach all <code>K</code> replicas <em>eventually</em></strong> &mdash; you choose where that cost lands:
+              <ul>
+                <li><strong>Synchronous fan-out</strong> &mdash; <code>K&times;</code> write amplification, smallest skew. Still not atomic: Redis Cluster has no cross-slot transaction, so the <code>K</code> writes land at different instants and a reader can catch a half-updated set.</li>
+                <li><strong>Async / pub-sub propagation</strong> &mdash; the writer does <strong>1 op</strong> (update one replica, or publish once); a subscriber fans it to the other <code>K&minus;1</code>. While that hop is in flight (pub-sub delivery, typically a few ms) the replicas hold different values &mdash; a <strong>bounded divergence window</strong>: the span over which the <code>K</code> copies disagree, capped by the propagation delay, so it self-heals within that fixed bound rather than staying stale indefinitely. The natural fit, since a cache is already only eventually consistent with the DB &mdash; a second eventual hop changes nothing fundamental.</li>
+                <li><strong>Short-TTL lazy refill</strong> &mdash; the writer touches nothing; each replica expires and refills from the DB on its next miss, so staleness &le; TTL. Cheapest writes.</li>
+              </ul>
+            </li>
+            <li><strong>Read-heavy keys only</strong> &mdash; write amplification or divergence grows with <code>K</code>.</li>
+          </ul>
+        </li>
+        <li><strong>3. Replicas of the hot shard.</strong> Leave the keyspace alone; attach read replicas to the <em>entire</em> hot shard and round-robin reads across primary + replicas (<code>(N+1)&times;</code> read capacity). In the example, shard 7's 230K ops/sec split across primary + 3 replicas &asymp; 57K each &mdash; under the ceiling. How it differs from key-splitting (#2):
+          <ul>
+            <li><strong>What gets copied</strong> &mdash; #2 duplicates <em>one key</em>; #3 mirrors the shard's <em>whole keyspace</em>, including cold keys you don't care about.</li>
+            <li><strong>Hardware</strong> &mdash; #2 reuses the existing <code>M</code> shards (no new nodes); #3 adds <code>N</code> dedicated nodes that do nothing but mirror shard 7.</li>
+            <li><strong>Layer</strong> &mdash; #2 is app-managed (your code builds <code>key#i</code> and fans out writes); #3 is the cache's built-in primary/replica replication, transparent to the app.</li>
+            <li><strong>Writes</strong> &mdash; #2 needs app-side write fan-out; #3 needs none (one write, auto-replicated) but every write still serializes on the single primary, so it stays write-bound.</li>
+            <li><strong>When</strong> &mdash; #3 when the shard is hot diffusely (or for several keys) or you also want failover redundancy; #2 when one known key is hot and you want no extra hardware.</li>
+          </ul>
+        </li>
+        <li><strong>4. Isolate known-hot keys.</strong> Route them to a dedicated cache tier so a viral spike can't starve unrelated keys sharing its shard.</li>
+      </ul>
+<pre class="line-numbers"><code class="language-python">import random, json
+
+K = 20  # replica fan-out for a known hot key
+
+def read_hot(r, key, fetch_fn, ttl=60):
+    replica = f"{key}#{random.randrange(K)}"      # pick one of K copies at random
+    val = r.get(replica)
+    if val is not None:
+        return json.loads(val)
+    data = fetch_fn()                             # miss path — protect with a lease
+    pipe = r.pipeline()
+    for i in range(K):                            # warm all K replicas
+        pipe.set(f"{key}#{i}", json.dumps(data), ex=ttl)
+    pipe.execute()
+    return data
+
+def write_hot(r, key, data, ttl=60):
+    # synchronous fan-out variant: simplest, K x write amplification.
+    # alternatives: write one replica + propagate the rest async/via pub-sub,
+    # or skip this entirely and let a short ttl + read_hot refill from the DB.
+    pipe = r.pipeline()
+    for i in range(K):                            # write fan-out: every replica
+        pipe.set(f"{key}#{i}", json.dumps(data), ex=ttl)
+    pipe.execute()</code></pre>
+
+      <h3>Write-Hot Keys Are Different</h3>
+      <p>Replication mitigations all assume the value is mostly read. A key <em>written</em> 100K/sec &mdash; a global view counter, a "likes" tally &mdash; cannot be fixed by copying, because every copy must converge. Decompose it instead: keep <code>N</code> sub-counters <code>likes:9f3#0 &hellip; #N&minus;1</code>, increment a random one (writes spread <code>N</code>-way), and sum all <code>N</code> on read (one fan-in). Or batch increments in the app and flush periodically, or use an approximate/CRDT counter. The principle mirrors the read case: spread a single key by copying for reads, by <strong>decomposing</strong> for writes.</p>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Thundering Herd (Facebook Memcache, 2013)</h3>
+      <p>
+        <strong>What happened:</strong> When a popular cache key expired, hundreds of application servers simultaneously detected the miss and all queried the database for the same data. The database was overwhelmed by the sudden spike.
+      </p>
+      <p>
+        <strong>Root cause:</strong> All servers used the same TTL for the same key. When the TTL expired, the cache miss was replicated across the entire fleet at the same instant.
+      </p>
+      <p>
+        <strong>Blast radius:</strong> Database CPU spiked to 100%, causing cascading failures across dependent services. Response times went from 5 ms to 10+ seconds.
+      </p>
+
+      <h4>Timeline: How the Thundering Herd Unfolds</h4>
+      <p>Consider a cache key <code>trending_posts</code> with TTL = 300s, served by 200 app servers:</p>
+      <div class="table-responsive">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Event</th><th>DB Connections</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>T + 0s</td><td>Key <code>trending_posts</code> is cached. All 200 servers serve from cache.</td><td>0</td></tr>
+          <tr><td>T + 300s</td><td>TTL expires. Key is evicted from cache.</td><td>0</td></tr>
+          <tr><td>T + 300.001s</td><td>Server 1 gets a request, checks cache &mdash; MISS. Starts DB query.</td><td>1</td></tr>
+          <tr><td>T + 300.002s</td><td>Servers 2-15 also get requests. Each checks cache &mdash; MISS. Each starts its own DB query.</td><td>15</td></tr>
+          <tr><td>T + 300.010s</td><td>50 more servers have detected the miss. All querying DB for the <em>same data</em>.</td><td>65</td></tr>
+          <tr><td>T + 300.050s</td><td>180 of 200 servers are now querying the DB simultaneously.</td><td>180</td></tr>
+          <tr><td>T + 300.100s</td><td>DB connection pool exhausted. Queries start timing out. CPU at 100%.</td><td>200 (saturated)</td></tr>
+          <tr><td>T + 300.200s</td><td>Server 1's query finally completes. It fills the cache. But 199 other queries are still in-flight.</td><td>199</td></tr>
+          <tr><td>T + 301s</td><td>DB recovers. But dependent services have already timed out, triggering retries. Cascading failure begins.</td><td>decreasing</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>The core problem: between T+300.001s and T+300.200s, <strong>200 servers did the exact same DB query</strong>. Only one query was needed.</p>
+
+      <h4>Mitigation 1: Locking / Leases (Redis SETNX)</h4>
+      <p>
+        The first server to detect a cache miss acquires a short-lived distributed lock. All other servers that detect the same miss are told to wait and retry.
+      </p>
+<pre class="line-numbers"><code class="language-python">import redis, time, json
+
+r = redis.Redis()
+
+def get_with_lease(key: str, fetch_fn, ttl=300, lease_ttl=5):
+    """Get from cache with thundering herd protection."""
+    # 1. Try the cache first
+    value = r.get(key)
+    if value is not None:
+        return json.loads(value)
+
+    # 2. Cache miss — try to acquire a lease
+    lease_key = f"lease:{key}"
+    acquired = r.set(lease_key, "1", nx=True, ex=lease_ttl)
+
+    if acquired:
+        # 3a. We got the lease — we are the only one fetching from DB
+        data = fetch_fn()
+        r.set(key, json.dumps(data), ex=ttl)
+        r.delete(lease_key)
+        return data
+    else:
+        # 3b. Another server holds the lease — wait and retry
+        for _ in range(50):  # retry up to 50 times
+            time.sleep(0.1)  # 100ms between retries
+            value = r.get(key)
+            if value is not None:
+                return json.loads(value)
+        # Fallback: lease holder may have crashed. Fetch ourselves.
+        return fetch_fn()</code></pre>
+      <p>
+        The <code>nx=True</code> flag (SETNX: "SET if Not eXists") ensures only one server acquires the lease. The <code>ex=lease_ttl</code> ensures the lease auto-expires if the holder crashes, preventing deadlocks.
+      </p>
+
+      <h4>Mitigation 2: Probabilistic Early Recomputation</h4>
+      <p>
+        Instead of waiting for the TTL to expire (hard cliff), each request has a small probability of refreshing the cache <em>before</em> the TTL expires. The probability increases as the TTL approaches zero, making it nearly certain that <em>some</em> server will refresh the key before the stampede.
+      </p>
+      <p>The formula (from the "Optimal Probabilistic Cache Stampede Prevention" paper):</p>
+      <p><code>should_refresh = (current_time - (expiry_time - TTL * beta * ln(random()))) > expiry_time</code></p>
+      <p>Where <code>beta</code> controls how early the refresh can happen (typically 1.0). Let's trace through:</p>
+      <ul>
+        <li>If the key has 200s remaining out of 300s TTL: probability of refresh is near 0%.</li>
+        <li>If the key has 30s remaining: probability is ~5% per request.</li>
+        <li>If the key has 5s remaining: probability is ~30% per request.</li>
+        <li>With 100 requests/sec, a key with 30s remaining will be refreshed within ~0.2 seconds. The TTL never actually expires.</li>
+      </ul>
+<pre class="line-numbers"><code class="language-python">import math, random, time
+
+def should_early_recompute(expiry_time: float, ttl: float, beta: float = 1.0) -> bool:
+    """Return True if we should refresh the cache early."""
+    remaining = expiry_time - time.time()
+    if remaining <= 0:
+        return True  # already expired
+    # XFetch algorithm: probability increases as remaining decreases
+    threshold = remaining - (ttl * beta * math.log(random.random()))
+    return threshold <= 0</code></pre>
+
+      <h4>Mitigation 3: Request Coalescing (Singleflight)</h4>
+      <p>
+        If multiple goroutines/threads request the same key at the same time, only one actually executes the fetch. The rest wait for the result. This is called the "singleflight" pattern (named after Go's <code>golang.org/x/sync/singleflight</code> package).
+      </p>
+<pre class="line-numbers"><code class="language-python">import threading
+
+class Singleflight:
+    """Ensure only one fetch per key runs at a time."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, threading.Event] = {}
+        self._results: dict[str, any] = {}
+
+    def do(self, key: str, fetch_fn):
+        with self._lock:
+            if key in self._in_flight:
+                # Another thread is already fetching this key — wait for it
+                event = self._in_flight[key]
+            else:
+                # We are the first — register and proceed
+                event = threading.Event()
+                self._in_flight[key] = event
+                event = None  # signal that WE should fetch
+
+        if event is not None:
+            event.wait()  # block until the fetcher is done
+            return self._results.get(key)
+
+        # We are the fetcher
+        try:
+            result = fetch_fn()
+            self._results[key] = result
+            return result
+        finally:
+            with self._lock:
+                self._in_flight[key].set()  # wake up all waiters
+                del self._in_flight[key]</code></pre>
+      <p>
+        With singleflight, 200 concurrent cache misses for the same key result in <strong>1 DB query</strong> instead of 200. The other 199 threads wait for the result.
+      </p>
+
+      <p>
+        <strong>Facebook's solution:</strong> Facebook combined leases with staggered TTLs. They introduced a <em>lease</em> in their Memcache deployment: the first server to detect a miss gets a lease token, and all subsequent servers that detect the same miss are told to wait and retry (or serve slightly stale data if available). This reduced their peak DB load by over 10x during cache expiry events.
+      </p>
+
+      <h3>2. Cache Poisoning</h3>
+      <p>
+        <strong>What happened:</strong> A bug in the application wrote incorrect data to the cache with a long TTL. Every subsequent read returned the wrong value. Because the cache was trusted and the TTL was 24 hours, the bad data persisted for an entire day before being detected.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No validation on cache writes. The application serialized a partially constructed object due to a race condition and stored it in Redis.
+      </p>
+      <p>
+        <strong>Blast radius:</strong> All users saw corrupted data for the affected keys. Customer support tickets spiked.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Validate data before caching. Use shorter TTLs as a safety net (even if it costs hit rate). Implement cache versioning &mdash; include a version number in the key (e.g., <code>v3:user:12345</code>) so you can invalidate all old entries by incrementing the version. Monitor cache contents with periodic consistency checks against the database.
+      </p>
+
+      <h3>3. Cold Start After Fleet Restart</h3>
+      <p>
+        <strong>What happened:</strong> A Redis cluster was restarted for a maintenance upgrade. When it came back online, the cache was empty. All traffic hit the database directly, overwhelming it. The database became so slow that cache fill operations timed out, creating a vicious cycle where the cache could never warm up.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No cache warming strategy. The system relied on organic traffic to fill the cache, but the database could not handle the full un-cached load.
+      </p>
+      <p>
+        <strong>Mitigation:</strong> Rate-limited the traffic to the database. Manually ran a cache warming script that pre-loaded the top 10,000 most-accessed keys.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Use Redis persistence (RDB snapshots or AOF) so the cache survives restarts. Implement a cache warming pipeline that pre-loads the working set before cutting over traffic. Use circuit breakers on the database to prevent overload during cold starts.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Description</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>cache_hit_rate</code></td>
+            <td>Percentage of requests served from cache. The single most important cache metric.</td>
+            <td>Alert if &lt; 85% (warn) or &lt; 70% (critical)</td>
+          </tr>
+          <tr>
+            <td><code>eviction_rate</code></td>
+            <td>Number of items evicted per second due to memory pressure.</td>
+            <td>Alert if &gt; 100/sec sustained for 5 min. Indicates cache is undersized.</td>
+          </tr>
+          <tr>
+            <td><code>memory_usage</code></td>
+            <td>Current memory used vs. <code>maxmemory</code>. Track fragmentation ratio too.</td>
+            <td>Alert if &gt; 90% of maxmemory. Page if &gt; 95%.</td>
+          </tr>
+          <tr>
+            <td><code>p99_latency</code></td>
+            <td>99th percentile latency for cache GET operations.</td>
+            <td>Alert if &gt; 5 ms (for Redis over local network). Investigate slow commands.</td>
+          </tr>
+          <tr>
+            <td><code>connection_count</code></td>
+            <td>Number of active client connections to Redis.</td>
+            <td>Alert if approaching <code>maxclients</code> (default 10,000).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Symptom: High latency on reads</strong></p>
+        <ol>
+          <li>Check <code>cache_hit_rate</code>. If low (&lt; 80%), proceed to step 2. If high, the problem is not the cache &mdash; check your database or network.</li>
+          <li>Check <code>eviction_rate</code>. If high, the cache is too small &mdash; increase <code>maxmemory</code> or add nodes.</li>
+          <li>If eviction rate is normal but hit rate is low, check TTLs. Are they too short? Are keys being invalidated too aggressively?</li>
+          <li>Check for <strong>hot keys</strong> using <code>redis-cli --hotkeys</code>. A single extremely hot key can saturate one Redis shard.</li>
+          <li>Check for <strong>large keys</strong> using <code>redis-cli --bigkeys</code>. Serializing/deserializing a 10 MB value is slow.</li>
+          <li>Check <code>slowlog</code> with <code>SLOWLOG GET 10</code>. Look for expensive commands like <code>KEYS *</code> or <code>SMEMBERS</code> on large sets.</li>
+        </ol>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Config</th>
+            <th>What It Does</th>
+            <th>Recommended Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>maxmemory-policy</code></td>
+            <td>Determines what happens when memory is full. Options: <code>allkeys-lru</code>, <code>volatile-lru</code>, <code>allkeys-lfu</code>, <code>noeviction</code>.</td>
+            <td><code>allkeys-lru</code> for general caching. <code>allkeys-lfu</code> if you have frequency-skewed workloads.</td>
+          </tr>
+          <tr>
+            <td><code>maxmemory</code></td>
+            <td>Maximum memory Redis will use. After this, eviction kicks in (or writes are rejected if <code>noeviction</code>).</td>
+            <td>75-80% of available system RAM. Leave room for OS, fragmentation, and fork overhead.</td>
+          </tr>
+          <tr>
+            <td>TTL strategy</td>
+            <td>How long cached items live before expiring. Set per-key or per-category.</td>
+            <td>5-15 minutes for user-facing data. 1-24 hours for rarely changing reference data. Always add random jitter.</td>
+          </tr>
+          <tr>
+            <td>Connection pool size</td>
+            <td>Number of persistent connections each app server maintains to Redis.</td>
+            <td>10-50 per app server. Too few = connection contention. Too many = wasted file descriptors on Redis.</td>
+          </tr>
+          <tr>
+            <td><code>tcp-keepalive</code></td>
+            <td>Interval for TCP keepalive probes. Detects dead connections.</td>
+            <td>60 seconds. Prevents connection leaks from dead clients.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Cache + Database Replication Lag</h3>
+      <p>
+        You invalidate a cache key after writing to the primary database. The application re-reads the data, but the read goes to a replica that hasn't received the write yet. The stale data from the replica is written back into the cache. Now your cache is stale until the next TTL expiry, even though the primary has the correct data.
+      </p>
+      <p>
+        <strong>Fix:</strong> After a write, either read from the primary for a short grace period (equal to your max replication lag), or use a "local write-through" that updates the cache directly from the write payload without re-reading from any database.
+      </p>
+
+      <h3>Cache + CDN Double-Caching</h3>
+      <p>
+        Your API response is cached in Redis with a 5-minute TTL. The CDN also caches the HTTP response for 10 minutes based on <code>Cache-Control</code> headers. After you invalidate the Redis cache, the CDN still serves the old response for up to 10 more minutes. Effective staleness: up to 15 minutes instead of 5.
+      </p>
+      <p>
+        <strong>Fix:</strong> Coordinate TTLs across layers. The outer layer (CDN) should have a shorter or equal TTL to the inner layer (Redis). Use CDN purge APIs for critical invalidations. Consider using <code>stale-while-revalidate</code> headers for graceful freshness.
+      </p>
+
+      <h3>Cache + Rate Limiting</h3>
+      <p>
+        A rate limiter returns HTTP 429 (Too Many Requests) to a client. If this response is cached (by an intermediate proxy, CDN, or application cache), all subsequent requests &mdash; including legitimate ones from other clients &mdash; may receive the cached 429. Legitimate traffic is blocked.
+      </p>
+      <p>
+        <strong>Fix:</strong> Never cache 4xx or 5xx error responses. Set <code>Cache-Control: no-store</code> on all error responses. If using a CDN, configure it to never cache responses with non-2xx status codes.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <p><strong>Dominant cost driver:</strong> Memory. Caching is fundamentally about trading RAM (expensive) for reduced database load (also expensive). The ROI depends on how much database cost you offset.</p>
+
+        <h4>Approximate Cloud Costs (AWS ElastiCache / Redis)</h4>
+        <ul>
+          <li><strong>Small (6.5 GB):</strong> <code>cache.r6g.large</code> &mdash; ~$200/month. Suitable for 1K-100K users with a small working set.</li>
+          <li><strong>Medium (26 GB):</strong> <code>cache.r6g.xlarge</code> &mdash; ~$400/month. Handles working sets up to ~10-15 GB of data.</li>
+          <li><strong>Large (52 GB):</strong> <code>cache.r6g.2xlarge</code> &mdash; ~$800/month. For large catalogs or session stores.</li>
+          <li><strong>Cluster (3 shards, 3 replicas each):</strong> 9 &times; <code>cache.r6g.xlarge</code> &mdash; ~$3,600/month. For 10M+ user scale with high availability.</li>
+        </ul>
+
+        <h4>Optimization Tips</h4>
+        <ul>
+          <li><strong>Compression:</strong> Compress values before storing in Redis (gzip, snappy, zstd). Typical 3-5x size reduction for JSON. Trades CPU for memory.</li>
+          <li><strong>Serialization:</strong> Use compact formats (MessagePack, Protobuf) instead of JSON. 30-50% size reduction.</li>
+          <li><strong>Key design:</strong> Short key names save memory. <code>u:12345</code> instead of <code>user_profile:12345</code>. At millions of keys, this adds up.</li>
+          <li><strong>Reserved instances:</strong> AWS offers 1-year and 3-year reserved pricing for ElastiCache at 30-55% discount.</li>
+        </ul>
+
+        <h4>Cost of NOT Caching</h4>
+        <p>Without caching, your database must handle all read traffic directly. If you serve 50,000 reads/sec and each read costs $0.000001 in DB compute, that is $4,320/month in DB cost alone. A $400/month Redis instance that absorbs 80% of those reads saves ~$3,000/month in DB load reduction &mdash; an 8x ROI even before you account for improved latency and user experience.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 13b. Redis vs. Memcached ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Redis vs. Memcached</h2>
+      <p>
+        These are the two open-source in-memory key&ndash;value stores that dominate production caching. Both serve sub-millisecond <code>GET</code>/<code>SET</code> from RAM over TCP, both are horizontally scalable, and both are battle-tested at hyperscale (Redis at Twitter/GitHub/Stack Overflow, Memcached at Facebook/YouTube/Wikipedia). They differ sharply in <em>everything else</em> &mdash; data model, threading, persistence, replication, eviction, and what kind of workload they're optimized for. Picking the wrong one means either over-paying for features you don't use, or hitting a wall at scale because the simple choice can't grow with you.
+      </p>
+
+      <h3>Origins and Philosophy</h3>
+      <p>
+        <strong>Memcached</strong> (2003, Brad Fitzpatrick at LiveJournal) was designed to do one thing exceptionally well: cache opaque bytes, indexed by string key, distributed across a fleet of cheap commodity boxes. Every design decision &mdash; multi-threaded architecture, slab allocator, no persistence, no replication, no data structures &mdash; flows from "be the fastest, simplest possible cache and let the application handle everything else." The protocol is a few text commands. The codebase is small and stable.
+      </p>
+      <p>
+        <strong>Redis</strong> (2009, Salvatore Sanfilippo) was designed as a "data structure server" &mdash; a remote, in-memory home for the kinds of data structures you'd otherwise build in your application: lists, hashes, sets, sorted sets, bitmaps, HyperLogLogs, geo indexes, streams. Caching is one use case; the broader pitch is "treat shared mutable state as a service." Redis added persistence, replication, clustering, scripting, transactions, and pub/sub on top of that core abstraction.
+      </p>
+
+      <h3>Detailed Comparison</h3>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Redis</th>
+            <th>Memcached</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Data model</strong></td>
+            <td>Strings, hashes, lists, sets, sorted sets (skiplists), streams, bitmaps, HyperLogLog, geo indexes, JSON (RedisJSON), time series (RedisTimeSeries), bloom filters (RedisBloom)</td>
+            <td>Opaque byte blobs, keyed by string. Up to 1 MB per value (configurable). No structure on the server side &mdash; if you need a list, you fetch the blob, mutate it client-side, and write it back.</td>
+          </tr>
+          <tr>
+            <td><strong>Threading model</strong></td>
+            <td>Single-threaded command processing per shard (one event loop, no locks, deterministic ordering). Multi-threaded I/O since 6.0 for network read/write &amp; TLS. ~100K&ndash;200K ops/sec/core. Scale across cores by running multiple shards.</td>
+            <td>Multi-threaded from day one. A single instance saturates all CPU cores on one box. ~1M+ ops/sec on modern hardware. No locks held across requests &mdash; each thread handles its own connections.</td>
+          </tr>
+          <tr>
+            <td><strong>Memory allocator</strong></td>
+            <td>jemalloc (default). Per-key overhead of ~80&ndash;90 bytes for bookkeeping (pointers, expiration, ref count). Memory fragmentation can become an issue with mixed value sizes; <code>activedefrag</code> helps.</td>
+            <td>Custom <strong>slab allocator</strong>. Memory pre-divided into slab classes by size (96 B, 120 B, 152 B, ... up to 1 MB). Eliminates fragmentation, but mis-sized data wastes space (a 100 B value in the 120 B slab wastes 20 B).</td>
+          </tr>
+          <tr>
+            <td><strong>Persistence</strong></td>
+            <td><strong>RDB</strong>: periodic point-in-time snapshots (binary). <strong>AOF</strong>: append-only log of every write, replayed on restart. Can run both. Survives restart with most/all data intact.</td>
+            <td><strong>None.</strong> Restart = empty cache. Cold-start storms must be handled by the application (warmup script, gradual ramp, dual-cache during deploy).</td>
+          </tr>
+          <tr>
+            <td><strong>Replication / HA</strong></td>
+            <td>Built-in async master&ndash;replica replication. <strong>Redis Sentinel</strong> for automatic failover. <strong>Redis Cluster</strong> for sharded HA across 1,000+ nodes with consistent hashing across 16,384 slots.</td>
+            <td>None native. Sharding is purely client-side (consistent hashing in the client library, e.g., libmemcached, mcrouter). HA is "kill the dead node, clients fail over to others, lost data is gone."</td>
+          </tr>
+          <tr>
+            <td><strong>Eviction policies</strong></td>
+            <td>8 policies: <code>noeviction</code>, <code>allkeys-lru</code>, <code>allkeys-lfu</code>, <code>allkeys-random</code>, <code>volatile-lru</code>, <code>volatile-lfu</code>, <code>volatile-ttl</code>, <code>volatile-random</code>. LRU/LFU are sampled approximations (default sample size 5).</td>
+            <td>LRU only. Per slab class: when a slab fills, the oldest item in <em>that slab class</em> is evicted. Means a slab-class imbalance can evict hot items even when total memory isn't full.</td>
+          </tr>
+          <tr>
+            <td><strong>TTL / expiration</strong></td>
+            <td>Per-key TTL. <code>EXPIRE</code>, <code>PEXPIRE</code>, <code>EXPIREAT</code>. Lazy + active expiration (samples 20 keys / 100 ms looking for expired ones).</td>
+            <td>Per-key TTL set on <code>SET</code>. Lazy expiration only (checked on access). Background "lru crawler" reclaims expired items.</td>
+          </tr>
+          <tr>
+            <td><strong>Atomicity / transactions</strong></td>
+            <td><code>MULTI</code>/<code>EXEC</code> for command batching. <code>WATCH</code> for optimistic concurrency. Lua scripts run atomically server-side. Functions (Redis 7+).</td>
+            <td>Atomic single-key ops only (<code>add</code>, <code>cas</code> for compare-and-swap, <code>incr</code>/<code>decr</code>). No multi-key transactions.</td>
+          </tr>
+          <tr>
+            <td><strong>Pub/Sub &amp; messaging</strong></td>
+            <td>Native pub/sub (fire-and-forget). Streams (Kafka-like log with consumer groups, since 5.0). Used as a lightweight message bus.</td>
+            <td>None. Use a real broker (Kafka, NATS, RabbitMQ).</td>
+          </tr>
+          <tr>
+            <td><strong>Max value size</strong></td>
+            <td>512 MB per string. Lists/sets/hashes can hold 2&sup3;&sup2;&minus;1 elements.</td>
+            <td>1 MB default (configurable up to ~128 MB, but discouraged &mdash; large values fragment slabs).</td>
+          </tr>
+          <tr>
+            <td><strong>Network protocol</strong></td>
+            <td>RESP (REdis Serialization Protocol). Binary-safe text framing. RESP3 (Redis 6+) adds richer types and push notifications.</td>
+            <td>Text protocol (simple ASCII commands) <em>and</em> binary protocol (more efficient). Both supported.</td>
+          </tr>
+          <tr>
+            <td><strong>Scripting / extensibility</strong></td>
+            <td>Lua scripts (atomic). Redis Modules (C extensions): RedisJSON, RediSearch, RedisGraph, RedisBloom, RedisTimeSeries, etc. Functions in Redis 7+.</td>
+            <td>None. The server is intentionally inert.</td>
+          </tr>
+          <tr>
+            <td><strong>Memory efficiency</strong></td>
+            <td>Higher per-key overhead (~80 B). Hashes with &lt; 128 fields are stored compactly as ziplists (much denser). Big variance based on data type.</td>
+            <td>Very efficient for fixed-size string blobs. Slab allocator means predictable memory usage; no fragmentation.</td>
+          </tr>
+          <tr>
+            <td><strong>Throughput on one box</strong></td>
+            <td>~100K&ndash;200K ops/sec/core. To use 16 cores, run 16 shards (or more). Multi-shard adds operational complexity.</td>
+            <td>~1M+ ops/sec on a single instance with all cores busy. Less ops complexity for raw throughput on one box.</td>
+          </tr>
+          <tr>
+            <td><strong>Operational complexity</strong></td>
+            <td>Higher. Persistence config, replication topology, Sentinel quorum, Cluster slot management, backup/restore, slowlog, AOF rewriting, defrag &mdash; all knobs you may need to touch.</td>
+            <td>Very low. <code>memcached -m 4096</code> and you're done. Sharding is in the client.</td>
+          </tr>
+          <tr>
+            <td><strong>Managed offerings</strong></td>
+            <td>AWS ElastiCache for Redis, Google Memorystore for Redis, Azure Cache for Redis, Upstash, Redis Cloud (official).</td>
+            <td>AWS ElastiCache for Memcached, Google Memorystore for Memcached, Azure has no first-party Memcached.</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <h3>The Threading Difference, Visualized</h3>
+      <p>
+        The single biggest architectural difference is the threading model, and it shapes what each is good at:
+      </p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Workload</th><th>Memcached (multi-threaded, 16 cores)</th><th>Redis (single-threaded, 1 core)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Many concurrent simple <code>GET</code>s on one box</td>
+            <td>Saturates 16 cores: ~16M ops/sec</td>
+            <td>Saturates 1 core: ~150K ops/sec. Need 16 shards to match.</td>
+          </tr>
+          <tr>
+            <td>One slow command (e.g., <code>KEYS *</code>, big <code>HGETALL</code>)</td>
+            <td>Blocks one thread; other threads keep serving</td>
+            <td>Blocks the entire instance &mdash; every other client stalls until it completes</td>
+          </tr>
+          <tr>
+            <td>Atomic multi-step ops on shared state</td>
+            <td>Hard &mdash; needs CAS retries from clients</td>
+            <td>Easy &mdash; pipeline / Lua / <code>MULTI</code> are naturally atomic</td>
+          </tr>
+        </tbody>
+      </table></div>
+      <p>
+        Redis turns the single-threaded model from a weakness into a feature: there are no locks, no race conditions inside the server, and atomic ops like <code>INCR</code>, <code>ZADD</code>, or a Lua script are <em>actually</em> atomic without any cooperation from the client. Memcached pays for its multi-core throughput with a much weaker consistency model (single-key CAS only).
+      </p>
+
+      <h3>What "Redis is single-threaded" really means</h3>
+      <p>
+        A common misconception: people hear "single-threaded" and assume Redis is slow. It isn't &mdash; it's <em>per-instance</em> single-threaded for command processing, which is exactly what gives it deterministic ordering and lock-free semantics. To scale beyond one core, you run multiple Redis processes (shards) on the same machine and shard keys across them. Redis Cluster handles this in production: 16,384 hash slots distributed across nodes, clients route directly to the correct shard via <code>CRC16(key) mod 16384</code>.
+      </p>
+      <p>
+        Modern Redis (6.0+) <em>does</em> use multiple threads &mdash; but only for network I/O (reading bytes from sockets, parsing protocol, writing responses, TLS). The actual command execution is still serialized through one thread per shard. This typically buys 2&ndash;3&times; throughput on network-bound workloads without changing the consistency model.
+      </p>
+
+      <h3>Decision Guide</h3>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Pick this</th><th>If your workload is...</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Memcached</strong></td>
+            <td>Pure cache. Small (&lt; 1 MB) opaque blobs. Hit ratio is what matters; losing the cache on restart is fine. Want to saturate every core on one box. Don't need replication, persistence, or atomic multi-step ops. Examples: HTML fragment cache, rendered template cache, session blob cache, page-cache layer in front of a CMS.</td>
+          </tr>
+          <tr>
+            <td><strong>Redis</strong></td>
+            <td>Anything that needs structure or guarantees: leaderboards (sorted sets), rate limiters (atomic counters with TTL), feeds (sorted sets keyed by timestamp), distributed locks (<code>SET NX EX</code>), pub/sub fan-out, job queues (lists or streams), session stores you don't want to lose on restart, geo-fenced lookups, real-time analytics, durable counters, idempotency keys.</td>
+          </tr>
+          <tr>
+            <td><strong>Both</strong></td>
+            <td>Some teams run Memcached for a simple HTML/blob layer in front of the app, and Redis behind it for application state (sessions, leaderboards, pub/sub). The split lets each tool do what it's best at.</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <h3>Where Each One Hurts</h3>
+      <p><strong>Redis pain points:</strong></p>
+      <ul>
+        <li><strong>One slow command kills throughput</strong> &mdash; <code>KEYS *</code>, <code>SMEMBERS</code> on a million-element set, big Lua scripts. Use <code>SCAN</code>, <code>SSCAN</code>, etc., and watch <code>SLOWLOG</code>.</li>
+        <li><strong>Cluster operations are not transparent</strong> &mdash; multi-key ops require all keys hash to the same slot (use <code>{tag}</code> hash tags). Lua scripts can only touch keys on one slot.</li>
+        <li><strong>Memory accounting is sneaky</strong> &mdash; <code>maxmemory</code> only counts dataset; replication buffers, AOF buffers, client output buffers are extra. OOM kills happen with <code>maxmemory</code> set "correctly."</li>
+        <li><strong>Persistence + replication interactions</strong> &mdash; <code>BGSAVE</code> forks the process, doubling memory in the worst case (copy-on-write). Has to be planned for.</li>
+        <li><strong>Single-shard write throughput ceiling</strong> &mdash; one shard maxes around 100&ndash;200K writes/sec. Past that, you're sharding.</li>
+      </ul>
+      <p><strong>Memcached pain points:</strong></p>
+      <ul>
+        <li><strong>No persistence, no replication</strong> &mdash; cold restart = thundering herd to the database. You build the durability story yourself.</li>
+        <li><strong>Slab calcification</strong> &mdash; if your value-size distribution changes over time, slabs configured for the old distribution waste memory. Modern Memcached supports slab rebalancing but it's not free.</li>
+        <li><strong>No data structures</strong> &mdash; want to atomically push to a list? Fetch the whole list, append, write back, hope nobody else did the same. Use Redis instead.</li>
+        <li><strong>1 MB value limit</strong> by default &mdash; raising it is possible but discouraged.</li>
+        <li><strong>Sharding is client-side</strong> &mdash; consistent hashing implementations vary across libraries, leading to subtle re-sharding pain when you add nodes.</li>
+      </ul>
+
+      <h3>Modern Alternatives Worth Knowing</h3>
+      <ul>
+        <li><strong>DragonflyDB</strong> &mdash; Redis-protocol-compatible, multi-threaded command execution, claims 10&ndash;25&times; single-box throughput. Rewrites the data structures to be lock-friendly. Worth evaluating for write-heavy workloads.</li>
+        <li><strong>KeyDB</strong> &mdash; A multi-threaded fork of Redis maintained by Snap. Drop-in replacement; ~5&times; throughput on multi-core boxes. (Snap was acquired by Redis Labs in 2022; future is unclear.)</li>
+        <li><strong>Garnet</strong> (Microsoft) &mdash; Cache server compatible with the Redis protocol, written in C#, optimized for tiered storage (hot in RAM, cold on SSD). Designed for cloud-native workloads.</li>
+        <li><strong>Hazelcast / Ignite</strong> &mdash; JVM-based distributed in-memory data grids. Different ecosystem, but solve overlapping problems.</li>
+        <li><strong>Mcrouter</strong> &mdash; Facebook's Memcached protocol router that adds replication, failover, and pool management on top of vanilla Memcached. Lets you keep Memcached's simplicity while getting some HA story.</li>
+      </ul>
+
+      <div class="callout callout-info">
+        <p><strong>Bottom line:</strong> If you're starting today and don't have specific reasons to pick Memcached, choose <strong>Redis</strong>. The richer feature set rarely hurts and frequently saves you from rebuilding leaderboards, queues, locks, or rate limiters yourself. Pick Memcached when you specifically need its multi-threaded throughput on a single box and your data is genuinely just opaque blobs &mdash; this is most common in classic web-app HTML caching at very large scale (Facebook's pattern).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Redis at Twitter</h3>
+      <p>
+        Twitter uses one of the largest Redis deployments in the world, with thousands of Redis instances serving the timeline cache, user sessions, and rate limiting. Each tweet view requires assembling data from multiple services (user profile, tweet content, engagement counts, media URLs). Caching the assembled timeline in Redis reduces fan-out reads from O(N services) to O(1). Twitter open-sourced their Redis cluster management tool, <em>Twemproxy</em>, for consistent hashing across Redis instances.
+      </p>
+
+      <h3>Memcached at Facebook (TAO)</h3>
+      <p>
+        Facebook's TAO (The Associations and Objects) system is a distributed cache built on top of Memcached and MySQL. It caches the social graph &mdash; objects (users, posts, pages) and associations (friendships, likes, comments). TAO handles billions of reads per second with a hit rate above 96%. Facebook's 2013 paper "Scaling Memcache at Facebook" is one of the most important papers on distributed caching, introducing lease-based thundering herd mitigation, regional cache pools, and the cold-cluster warming problem.
+      </p>
+
+      <h3>Caffeine in Java Services</h3>
+      <p>
+        Caffeine is the standard in-process cache for Java applications, used at companies like Okta, Confluent, and Spring Boot's default cache provider. Its W-TinyLFU admission policy consistently outperforms Guava Cache (LRU-based) by 5-15% in hit rate on real-world traces. Caffeine is also used inside Apache Cassandra for row caching and in Apache Spark for broadcast variable caching.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example: LRU Cache in Python</h2>
+      <p>A simple LRU cache using a dictionary (which preserves insertion order in Python 3.7+) and a maximum size limit. The animation on the right traces through the same operations as the step-by-step table from the LRU section above, using the same keys (A, B, C, D, E) and capacity of 3.</p>
+
+      <!-- Side-by-side: code (left, scrollable) + animation (right, sticky) -->
+      <div class="code-animation-container" id="lru-code-animation-container">
+        <div class="code-panel">
+<pre class="line-numbers"><code class="language-python">class LRUCache:
+    """A simple Least Recently Used cache."""
+
+    def __init__(self, capacity: int):        # Step: create cache
+        self.capacity = capacity
+        self.cache: dict = {}  # ordered dict (Python 3.7+)
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str):
+        if key in self.cache:                 # Step: lookup in hash map
+            self.hits += 1
+            # Move to end (most recently used)
+            self.cache[key] = self.cache.pop(key)  # Step: move to head
+            return self.cache[key]
+        self.misses += 1                      # Step: cache miss
+        return None
+
+    def put(self, key: str, value, ttl_seconds: float = 300):
+        import time
+        if key in self.cache:
+            del self.cache[key]               # Step: remove old position
+        elif len(self.cache) >= self.capacity:
+            # Evict least recently used (first item)
+            evicted_key = next(iter(self.cache))  # Step: find LRU item
+            del self.cache[evicted_key]           # Step: evict LRU
+        self.cache[key] = {                   # Step: insert at head
+            "value": value,
+            "expires_at": time.time() + ttl_seconds,
+        }
+
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+
+
+# Usage: cache-aside pattern
+cache = LRUCache(capacity=1000)
+
+def get_user(user_id: str) -> dict:
+    cached = cache.get(f"user:{user_id}")     # Step: check cache
+    if cached is not None:
+        return cached["value"]                # Cache hit — return
+
+    # Cache miss — fetch from database
+    user = db.query(f"SELECT * FROM users WHERE id = {user_id}")
+    cache.put(f"user:{user_id}", user, ttl_seconds=300)  # Fill cache
+    return user</code></pre>
+        </div>
+        <div class="animation-panel">
+          <div id="lru-animation-container" class="animation-wrapper">
+            <canvas id="lru-canvas"></canvas>
+            <div class="animation-controls"></div>
+          </div>
+        </div>
+      </div>
+
+      <style>
+        .code-animation-container {
+          display: flex;
+          gap: 1.5rem;
+          align-items: flex-start;
+        }
+        .code-animation-container .code-panel {
+          flex: 1;
+          overflow-y: auto;
+          max-height: 500px;
+        }
+        .code-animation-container .animation-panel {
+          flex: 1;
+          position: sticky;
+          top: 1rem;
+          align-self: flex-start;
+        }
+        @media (max-width: 768px) {
+          .code-animation-container {
+            flex-direction: column-reverse;
+          }
+          .code-animation-container .animation-panel {
+            position: static;
+            width: 100%;
+          }
+          .code-animation-container .code-panel {
+            max-height: none;
+          }
+        }
+      </style>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Load Testing</h3>
+      <p>
+        Use <strong>k6</strong> or <strong>Locust</strong> to simulate realistic read traffic against your cached endpoint. Key things to measure:
+      </p>
+      <ul>
+        <li>Hit rate under load &mdash; does it match your expected working set analysis?</li>
+        <li>p50, p95, p99 latency for cache hits vs. cache misses</li>
+        <li>Database QPS with and without the cache &mdash; verify the expected load reduction</li>
+        <li>Behavior during cache warm-up: how long until hit rate stabilizes?</li>
+      </ul>
+      <p>
+        Generate traffic with a <strong>Zipfian distribution</strong> (not uniform random) to simulate realistic access patterns. Most load testing tools support custom distributions or you can pre-generate a key list following a Zipfian curve.
+      </p>
+
+      <h3>Chaos Testing</h3>
+      <p>
+        Inject failures to validate your system degrades gracefully:
+      </p>
+      <ul>
+        <li><strong>Kill a cache node:</strong> Does the application fall back to the database? Does it recover when the cache comes back? Use <strong>toxiproxy</strong> to simulate a Redis outage.</li>
+        <li><strong>Simulate full cache eviction:</strong> Run <code>FLUSHALL</code> on a staging Redis and observe the thundering herd on the database. Verify your circuit breaker trips before the DB dies.</li>
+        <li><strong>Add network latency:</strong> Use <code>tc netem</code> to add 50 ms latency to the Redis connection. Verify your application timeouts and fallbacks work correctly.</li>
+        <li><strong>Expire all keys simultaneously:</strong> Set all TTLs to 1 second and watch what happens. This simulates the worst-case thundering herd.</li>
+      </ul>
+
+      <h3>Benchmarking Methodology</h3>
+      <ul>
+        <li><strong>Warm the cache first:</strong> Never benchmark against a cold cache unless you are specifically testing cold-start behavior. Run a warm-up phase of 5-10 minutes before collecting measurements.</li>
+        <li><strong>Use realistic data sizes:</strong> Benchmarking with 10-byte values tells you nothing about production performance with 2 KB JSON documents.</li>
+        <li><strong>Measure tail latency:</strong> p99 and p99.9 matter more than average. A GC pause or network hiccup can cause a 100x latency spike that the average hides.</li>
+        <li><strong>Account for connection overhead:</strong> Use persistent connections (connection pooling) in your benchmark, just like you would in production.</li>
+        <li><strong>Test with the right tool:</strong> <code>redis-benchmark</code> is useful for raw Redis throughput, but for end-to-end application benchmarking, use k6 or wrk hitting your actual API endpoints.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you design a cache invalidation strategy for a social media feed?</summary>
+        <div class="answer">
+          <p>
+            A social media feed aggregates posts from hundreds of followed accounts. The naive approach &mdash; invalidating the entire cached feed on every new post &mdash; would cause constant cache misses since someone you follow posts every few seconds.
+          </p>
+          <p>
+            <strong>Approach:</strong> Use a <em>write-behind fan-out</em> model. When a user publishes a post, push the post ID into each follower's cached feed list (stored as a Redis sorted set keyed by timestamp). This is an append, not an invalidation. The cached feed stays warm.
+          </p>
+          <p>
+            For celebrity accounts with millions of followers, use a hybrid approach: don't fan-out at write time. Instead, when a reader requests their feed, merge their pre-assembled feed (from normal followed accounts) with a fresh query for celebrity posts. This is the "fan-out on read" optimization that Twitter famously uses.
+          </p>
+          <p>
+            Set a TTL of 5-15 minutes on the cached feed. Use <code>stale-while-revalidate</code> logic: serve the stale feed immediately while recomputing in the background.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle deletions? (Tombstones in the feed list.) What about feed ranking changes? (Re-rank on read with a short TTL on the ranking cache.) How do you handle a user unfollowing someone? (Remove that user's posts from the cached feed lazily on next read.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the thundering herd problem and how to prevent it.</summary>
+        <div class="answer">
+          <p>
+            The thundering herd occurs when a popular cache key expires and many servers simultaneously detect the miss. All of them query the database for the same data, creating a load spike that can overwhelm the backend.
+          </p>
+          <p>
+            <strong>Prevention strategies:</strong>
+          </p>
+          <ul>
+            <li><strong>Locking / leases:</strong> The first server to detect a miss acquires a distributed lock (or lease) and is the only one allowed to fetch from the database. Other servers either wait and retry, or serve a slightly stale value.</li>
+            <li><strong>Staggered TTLs:</strong> Add random jitter to each TTL. Instead of all copies expiring at T=300s, they expire between T=270s and T=330s, spreading the load.</li>
+            <li><strong>Probabilistic early recomputation:</strong> Each request has a small probability of refreshing the cache before the TTL expires. The probability increases as the TTL approaches expiry. This ensures the cache is almost always fresh without a hard cliff.</li>
+            <li><strong>Background refresh:</strong> A dedicated worker proactively refreshes hot keys before they expire, so application servers never see a miss.</li>
+          </ul>
+          <p class="follow-up"><strong>Follow-ups:</strong> How would you implement the lease in a distributed system? (Use Redis SETNX with a short TTL.) What happens if the lease holder crashes? (The lease TTL expires and another server can acquire it.) How does this interact with circuit breakers? (If the DB is down, the lease holder should fail fast and serve stale data.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>When would you choose write-through vs. write-behind caching?</summary>
+        <div class="answer">
+          <p>
+            <strong>Write-through:</strong> Every write goes to both the cache and the database synchronously. The write is only considered successful when both are complete. Use this when data consistency between cache and database is critical, and you can tolerate higher write latency.
+          </p>
+          <p>
+            <strong>Write-behind (write-back):</strong> Writes go to the cache immediately, and the cache asynchronously flushes to the database in batches. Use this when write performance is critical (e.g., a gaming leaderboard, analytics counters) and you can tolerate the risk of data loss if the cache crashes before flushing.
+          </p>
+          <p>
+            <strong>Decision factors:</strong>
+          </p>
+          <ul>
+            <li>Can you lose the last few seconds of writes? If no, use write-through. If yes, write-behind gives 10-100x better write throughput.</li>
+            <li>Is your write rate high enough that the database can't keep up in real-time? Write-behind lets you batch and coalesce writes (e.g., 100 increments to the same counter become a single +100 write).</li>
+            <li>Do reads need to see writes immediately? Write-through guarantees this. Write-behind guarantees it for cache reads but not for direct database reads.</li>
+          </ul>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle write-behind with multiple cache nodes? (Use a write-ahead log per node.) What happens during failover? (The WAL must be replicated or the unflushed writes are lost.) Can you combine write-through with cache-aside? (Yes &mdash; write-through for writes, cache-aside for reads, is a common hybrid.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you handle cache warming for a new data center or after a full cache flush?</summary>
+        <div class="answer">
+          <p>
+            A cold cache means 100% of traffic hits the database. If the database cannot handle the full un-cached load (which is typical at scale), you need a warming strategy.
+          </p>
+          <p>
+            <strong>Approaches:</strong>
+          </p>
+          <ul>
+            <li><strong>Pre-loading:</strong> Before routing traffic, run a batch job that loads the top N most-accessed keys from the database into the cache. You need access logs or analytics to know which keys are hot.</li>
+            <li><strong>Gradual traffic shifting:</strong> Route only 5% of traffic to the new data center initially. The cache warms organically under low load. Gradually increase to 25%, 50%, 100% over hours.</li>
+            <li><strong>Cache replication:</strong> If you have an existing warm cache, replicate its contents to the new cache before cutover. Redis supports replication natively. Memcached does not, but you can build a migration tool.</li>
+            <li><strong>Request coalescing:</strong> During warm-up, use request coalescing (singleflight pattern) so that duplicate cache misses for the same key result in only one database query.</li>
+          </ul>
+          <p class="follow-up"><strong>Follow-ups:</strong> How long does warming take? (Depends on working set size and DB throughput. For 1M keys at 10K writes/sec to Redis, ~100 seconds.) How do you prioritize which keys to warm first? (By access frequency from logs. Hot keys first.) What if you don't have access logs? (Start with a small traffic slice and let organic warming happen.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a caching strategy for a product catalog with 10 million items.</summary>
+        <div class="answer">
+          <p>
+            Start with the access pattern: product catalogs follow a heavy Zipfian distribution. A few thousand popular products (bestsellers, trending, homepage features) account for the vast majority of views.
+          </p>
+          <p>
+            <strong>Architecture:</strong> Use a multi-tier cache. L1: in-process cache (Caffeine/Guava) on each app server holding the top 500 products, TTL = 30 seconds, ~1 MB. L2: Redis cluster holding the top 100K products, TTL = 10 minutes, ~200 MB. L3: CDN for product detail pages with <code>Cache-Control: max-age=60, stale-while-revalidate=300</code>.
+          </p>
+          <p>
+            <strong>Invalidation:</strong> When a product is updated (price change, inventory update), publish an invalidation event to a Kafka topic. Each app server subscribes and evicts the key from its L1 cache. A separate consumer invalidates the Redis key. For CDN, use the provider's purge API for critical changes (price drops) and rely on TTL for non-critical changes (description edits).
+          </p>
+          <p>
+            <strong>Sizing:</strong> 10M products &times; 2 KB = 20 GB total. Caching the top 1% (100K products) covers 90%+ of reads and costs ~400 MB in Redis (with overhead). ROI is excellent.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle flash sales where a cold product suddenly becomes hot? (Detect traffic spikes and pre-warm. Use request coalescing for the initial burst.) How do you handle personalized pricing? (Cache the base product data; compute personalized pricing on top. Don't cache personalized responses in shared caches.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>What are the tradeoffs between Redis and Memcached for caching?</summary>
+        <div class="answer">
+          <p>
+            <strong>Memcached</strong> is simpler: it is a pure key-value store with a multi-threaded architecture. It excels at simple caching workloads with many concurrent connections. It has no persistence, no replication, and no data structures beyond strings. Its memory allocator (slab allocator) is highly efficient and predictable.
+          </p>
+          <p>
+            <strong>Redis</strong> is richer: it supports data structures (lists, sets, sorted sets, hashes, streams), persistence (RDB/AOF), replication, Lua scripting, pub/sub, and clustering. It is single-threaded (per shard) for command processing, which simplifies consistency but limits per-node throughput on CPU-bound workloads.
+          </p>
+          <p>
+            <strong>Choose Memcached when:</strong> You need simple key-value caching at high concurrency, your values are small (&lt; 1 MB), you don't need persistence or data structures, and you want multi-threaded performance on a single node.
+          </p>
+          <p>
+            <strong>Choose Redis when:</strong> You need data structures (sorted sets for leaderboards, lists for queues), persistence for cache durability across restarts, pub/sub for invalidation, or built-in clustering. Most teams choose Redis because its richer feature set justifies the small performance overhead.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How does Redis 7.0's multi-threaded I/O change this? (It handles network I/O on multiple threads but still processes commands single-threaded. Improves throughput by 2-3x for network-bound workloads.) What about DragonflyDB? (A modern Redis-compatible store with multi-threaded command processing. Claims 10-25x throughput improvement.)</p>
+        </div>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li>Caching trades memory and consistency for latency and throughput. The tradeoff is almost always worth it for read-heavy workloads.</li>
+        <li>Cache-aside is the most common pattern: the application checks the cache, falls back to the database on a miss, and fills the cache for next time.</li>
+        <li>Your cache only needs to hold the <strong>working set</strong>, not all your data. For Zipfian workloads, caching the top 1% of keys can capture 80%+ of reads.</li>
+        <li>The thundering herd is the most dangerous failure mode. Prevent it with lease-based locking, staggered TTLs, and request coalescing.</li>
+        <li>Always add jitter to TTLs. A fixed TTL across all keys causes synchronized expiry storms.</li>
+        <li>Monitor hit rate as your primary health metric. If it drops below 85%, investigate immediately.</li>
+        <li>Modern eviction policies (W-TinyLFU, ARC) significantly outperform classic LRU, especially on workloads with scan pollution.</li>
+        <li>Cache invalidation is one of the two hard problems in computer science. When in doubt, use short TTLs rather than complex invalidation logic.</li>
+        <li>Plan for cold starts. Have a warming strategy before you need one.</li>
+        <li>The cost of caching is almost always lower than the cost of scaling your database to handle un-cached load.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <p>Continue exploring related system design topics:</p>
+      <ul>
+        <li><a href="consistent-hashing.html">Consistent Hashing</a> &mdash; How data is distributed across cache nodes in a cluster. Essential for understanding Redis Cluster and Memcached sharding.</li>
+        <li><a href="database-replication.html">Database Replication</a> &mdash; Understanding replication lag is critical for avoiding stale cache fills after writes.</li>
+        <li><a href="cdn.html">Content Delivery Networks (CDN)</a> &mdash; CDNs are caches at the edge. Learn how they interact with your application-level cache.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> &mdash; Often implemented with Redis. Learn why rate-limited responses should never be cached.</li>
+        <li><a href="database-sharding.html">Database Sharding</a> &mdash; Per-shard caches can have very different hit rates. Understand the interaction between sharding and caching strategies.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="database-sharding.html" class="prev">Database Sharding</a>
+      <a href="load-balancing.html" class="next">Load Balancing</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+  <script src="../js/sequence-diagram.js"></script>
+
+  <script>
+    // ===== Cache Hit / Miss Animation =====
+    (function () {
+      const canvas = document.getElementById('cache-canvas');
+      const container = document.getElementById('cache-animation-container');
+
+      // Animation state
+      const CYCLE_DURATION = 5; // seconds per scenario
+      const TOTAL_CYCLE = CYCLE_DURATION * 2; // hit + miss
+
+      function drawCacheAnimation(ctx, time, w, h) {
+        // Layout positions
+        const clientX = 80;
+        const cacheX = w / 2;
+        const dbX = w - 80;
+        const centerY = h / 2;
+
+        // Determine which scenario we're showing
+        const cycleTime = time % TOTAL_CYCLE;
+        const isHitScenario = cycleTime < CYCLE_DURATION;
+        const scenarioTime = isHitScenario ? cycleTime : cycleTime - CYCLE_DURATION;
+        const progress = scenarioTime / CYCLE_DURATION;
+
+        // Draw static elements
+        // Connection lines
+        drawDashedLine(ctx, clientX + 25, centerY, cacheX - 35, centerY, { color: '#cbd5e1' });
+        drawDashedLine(ctx, cacheX + 35, centerY, dbX - 30, centerY, { color: '#cbd5e1' });
+
+        // Draw components
+        drawClient(ctx, clientX, centerY, { label: 'Client' });
+        drawCache(ctx, cacheX, centerY, { label: 'Cache', width: 70, height: 44 });
+        drawDatabase(ctx, dbX, centerY, { label: 'Database' });
+
+        // Scenario label
+        if (isHitScenario) {
+          drawStatusBadge(ctx, w / 2, 30, 'CACHE HIT', 'success');
+        } else {
+          drawStatusBadge(ctx, w / 2, 30, 'CACHE MISS', 'warning');
+        }
+
+        // Animate the dots
+        if (isHitScenario) {
+          drawCacheHit(ctx, progress, clientX, cacheX, centerY);
+        } else {
+          drawCacheMiss(ctx, progress, clientX, cacheX, dbX, centerY);
+        }
+
+        // Latency labels
+        if (isHitScenario) {
+          drawLabel(ctx, w / 2, h - 30, 'Latency: ~1-2 ms (from cache)', {
+            color: '#16a34a',
+            fontSize: 13,
+            bold: true,
+          });
+        } else {
+          drawLabel(ctx, w / 2, h - 30, 'Latency: ~50-200 ms (from database)', {
+            color: '#d97706',
+            fontSize: 13,
+            bold: true,
+          });
+        }
+      }
+
+      function drawCacheHit(ctx, progress, clientX, cacheX, centerY) {
+        const dotStartX = clientX + 25;
+        const dotEndX = cacheX - 35;
+
+        if (progress < 0.3) {
+          // Request: client -> cache
+          const p = ease.inOut(progress / 0.3);
+          drawMovingDot(ctx, dotStartX, centerY, dotEndX, centerY, p, {
+            color: '#16a34a',
+            radius: 6,
+          });
+          drawLabel(ctx, (dotStartX + dotEndX) / 2, centerY - 30, 'GET user:123', {
+            color: '#16a34a',
+            fontSize: 11,
+            bold: true,
+          });
+        } else if (progress < 0.5) {
+          // Found in cache - flash
+          const flashP = (progress - 0.3) / 0.2;
+          const alpha = 0.3 + 0.7 * Math.sin(flashP * Math.PI);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          drawBox(ctx, cacheX - 35, centerY - 22, 70, 44, {
+            color: '#16a34a',
+            fill: '#dcfce7',
+            radius: 6,
+          });
+          ctx.restore();
+          drawLabel(ctx, cacheX, centerY - 35, 'HIT!', {
+            color: '#16a34a',
+            fontSize: 12,
+            bold: true,
+          });
+        } else if (progress < 0.8) {
+          // Response: cache -> client
+          const p = ease.inOut((progress - 0.5) / 0.3);
+          drawMovingDot(ctx, dotEndX, centerY, dotStartX, centerY, p, {
+            color: '#16a34a',
+            radius: 6,
+          });
+          drawLabel(ctx, (dotStartX + dotEndX) / 2, centerY - 30, '{user data}', {
+            color: '#16a34a',
+            fontSize: 11,
+            bold: true,
+          });
+        }
+        // 0.8 - 1.0: pause
+      }
+
+      function drawCacheMiss(ctx, progress, clientX, cacheX, dbX, centerY) {
+        const clientEdge = clientX + 25;
+        const cacheLeft = cacheX - 35;
+        const cacheRight = cacheX + 35;
+        const dbEdge = dbX - 30;
+
+        if (progress < 0.15) {
+          // Request: client -> cache
+          const p = ease.inOut(progress / 0.15);
+          drawMovingDot(ctx, clientEdge, centerY, cacheLeft, centerY, p, {
+            color: '#d97706',
+            radius: 6,
+          });
+          drawLabel(ctx, (clientEdge + cacheLeft) / 2, centerY - 30, 'GET user:456', {
+            color: '#d97706',
+            fontSize: 11,
+            bold: true,
+          });
+        } else if (progress < 0.25) {
+          // Miss indicator
+          const flashP = (progress - 0.15) / 0.1;
+          const alpha = 0.3 + 0.7 * Math.sin(flashP * Math.PI);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          drawBox(ctx, cacheX - 35, centerY - 22, 70, 44, {
+            color: '#dc2626',
+            fill: '#fef2f2',
+            radius: 6,
+          });
+          ctx.restore();
+          drawLabel(ctx, cacheX, centerY - 35, 'MISS', {
+            color: '#dc2626',
+            fontSize: 12,
+            bold: true,
+          });
+        } else if (progress < 0.4) {
+          // Cache -> DB query
+          const p = ease.inOut((progress - 0.25) / 0.15);
+          drawMovingDot(ctx, cacheRight, centerY, dbEdge, centerY, p, {
+            color: '#d97706',
+            radius: 6,
+          });
+          drawLabel(ctx, (cacheRight + dbEdge) / 2, centerY - 30, 'SELECT ...', {
+            color: '#d97706',
+            fontSize: 11,
+            bold: true,
+          });
+        } else if (progress < 0.55) {
+          // DB -> cache (fill)
+          const p = ease.inOut((progress - 0.4) / 0.15);
+          drawMovingDot(ctx, dbEdge, centerY, cacheRight, centerY, p, {
+            color: '#2563eb',
+            radius: 6,
+          });
+          drawLabel(ctx, (cacheRight + dbEdge) / 2, centerY - 30, '{data}', {
+            color: '#2563eb',
+            fontSize: 11,
+            bold: true,
+          });
+        } else if (progress < 0.65) {
+          // Fill cache - flash
+          const flashP = (progress - 0.55) / 0.1;
+          const alpha = 0.3 + 0.7 * Math.sin(flashP * Math.PI);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          drawBox(ctx, cacheX - 35, centerY - 22, 70, 44, {
+            color: '#2563eb',
+            fill: '#dbeafe',
+            radius: 6,
+          });
+          ctx.restore();
+          drawLabel(ctx, cacheX, centerY - 35, 'FILL CACHE', {
+            color: '#2563eb',
+            fontSize: 11,
+            bold: true,
+          });
+        } else if (progress < 0.85) {
+          // Cache -> client (response)
+          const p = ease.inOut((progress - 0.65) / 0.2);
+          drawMovingDot(ctx, cacheLeft, centerY, clientEdge, centerY, p, {
+            color: '#d97706',
+            radius: 6,
+          });
+          drawLabel(ctx, (clientEdge + cacheLeft) / 2, centerY - 30, '{user data}', {
+            color: '#d97706',
+            fontSize: 11,
+            bold: true,
+          });
+        }
+        // 0.85 - 1.0: pause
+      }
+
+      const animation = createAnimation(canvas, drawCacheAnimation, { height: 280 });
+      setupControls(container, animation);
+    })();
+
+    // ===== LRU Cache Step-by-Step Animation =====
+    (function () {
+      const canvas = document.getElementById('lru-canvas');
+      const container = document.getElementById('lru-animation-container');
+      if (!canvas || !container) return;
+
+      // Operations matching the table in the LRU section:
+      // put(A,10), put(B,20), put(C,30), get(A)->hit, put(D,40)->evict B,
+      // get(B)->miss, get(C)->hit, put(E,50)->evict A, get(D)->hit, put(C,99)->update
+      const operations = [
+        { op: 'put', key: 'A', val: 10, list: ['A'],         result: null,    evicted: null, note: 'Insert A' },
+        { op: 'put', key: 'B', val: 20, list: ['B','A'],     result: null,    evicted: null, note: 'Insert B' },
+        { op: 'put', key: 'C', val: 30, list: ['C','B','A'], result: null,    evicted: null, note: 'Cache full (3/3)' },
+        { op: 'get', key: 'A', val: null, list: ['A','C','B'], result: 'HIT 10', evicted: null, note: 'Move A to head' },
+        { op: 'put', key: 'D', val: 40, list: ['D','A','C'], result: null,    evicted: 'B',  note: 'Evict B (tail)' },
+        { op: 'get', key: 'B', val: null, list: ['D','A','C'], result: 'MISS', evicted: null, note: 'B was evicted' },
+        { op: 'get', key: 'C', val: null, list: ['C','D','A'], result: 'HIT 30', evicted: null, note: 'Move C to head' },
+        { op: 'put', key: 'E', val: 50, list: ['E','C','D'], result: null,    evicted: 'A',  note: 'Evict A (tail)' },
+        { op: 'get', key: 'D', val: null, list: ['D','E','C'], result: 'HIT 40', evicted: null, note: 'Move D to head' },
+        { op: 'put', key: 'C', val: 99, list: ['C','D','E'], result: null,    evicted: null, note: 'Update C, move to head' },
+      ];
+
+      const TOTAL_STEPS = operations.length;
+      const STEP_TIME = 2; // seconds per step
+
+      function drawLRUAnimation(ctx, time, w, h) {
+        const stepIdx = Math.min(Math.floor(time / STEP_TIME), TOTAL_STEPS - 1);
+        const stepProgress = (time / STEP_TIME) - stepIdx;
+        const op = operations[Math.max(0, stepIdx)];
+
+        const pad = 20;
+        const boxW = 60;
+        const boxH = 40;
+        const gap = 8;
+        const listY = h / 2 - 10;
+
+        // Title: current operation
+        const opStr = op.op === 'get' ? `get("${op.key}")` : `put("${op.key}", ${op.val})`;
+        drawLabel(ctx, w / 2, 15, `Step ${stepIdx + 1}: ${opStr}`, {
+          color: '#1e293b', fontSize: 15, bold: true
+        });
+
+        // Draw the linked list: head -> ... -> tail
+        drawLabel(ctx, pad, listY - 25, 'HEAD (MRU)', {
+          color: '#16a34a', fontSize: 10, bold: true, align: 'left'
+        });
+
+        const list = op.list;
+        const listStartX = pad;
+
+        for (let i = 0; i < list.length; i++) {
+          const x = listStartX + i * (boxW + gap + 20);
+          const isNew = (op.key === list[i] && stepProgress < 0.7);
+          const fillColor = isNew ? '#dbeafe' : '#f8fafc';
+          const borderColor = isNew ? '#2563eb' : '#94a3b8';
+
+          drawBox(ctx, x, listY, boxW, boxH, {
+            color: borderColor, fill: fillColor, text: list[i],
+            fontSize: 16, radius: 6
+          });
+
+          // Draw arrow to next node
+          if (i < list.length - 1) {
+            const arrowFromX = x + boxW;
+            const arrowToX = x + boxW + gap + 20;
+            drawArrow(ctx, arrowFromX + 2, listY + boxH / 2, arrowToX - 2, listY + boxH / 2, {
+              color: '#94a3b8', headSize: 6, width: 1.5
+            });
+          }
+        }
+
+        const lastX = listStartX + (list.length - 1) * (boxW + gap + 20);
+        drawLabel(ctx, lastX + boxW, listY - 25, 'TAIL (LRU)', {
+          color: '#dc2626', fontSize: 10, bold: true, align: 'right'
+        });
+
+        // Result badge
+        if (op.result) {
+          const isHit = op.result.startsWith('HIT');
+          const badgeColor = isHit ? '#16a34a' : '#dc2626';
+          const badgeFill = isHit ? '#dcfce7' : '#fef2f2';
+          const badgeW = 80;
+          const badgeH = 28;
+          const badgeX = w / 2 - badgeW / 2;
+          const badgeY = listY + boxH + 20;
+          drawBox(ctx, badgeX, badgeY, badgeW, badgeH, {
+            color: badgeColor, fill: badgeFill, text: op.result,
+            fontSize: 12, radius: 14
+          });
+        }
+
+        // Eviction notice
+        if (op.evicted) {
+          const evictY = listY + boxH + 20;
+          drawLabel(ctx, w - pad, evictY + 5, `Evicted: ${op.evicted}`, {
+            color: '#dc2626', fontSize: 12, bold: true, align: 'right'
+          });
+        }
+
+        // Note
+        drawLabel(ctx, w / 2, h - 25, op.note, {
+          color: '#64748b', fontSize: 12, bold: false
+        });
+
+        // Hash map visualization
+        const hmY = 45;
+        drawLabel(ctx, w - pad, hmY, 'Hash Map', {
+          color: '#64748b', fontSize: 10, bold: true, align: 'right'
+        });
+        const hmEntries = list.map((k, i) => `${k} → node${i}`).join('  ');
+        drawLabel(ctx, w - pad, hmY + 15, hmEntries, {
+          color: '#94a3b8', fontSize: 9, align: 'right'
+        });
+      }
+
+      const lruAnim = createAnimation(canvas, drawLRUAnimation, {
+        height: 220,
+        numSteps: TOTAL_STEPS,
+        totalDuration: TOTAL_STEPS * STEP_TIME,
+      });
+      setupControls(container, lruAnim);
+    })();
+  </script>
+
+</body>
+</html>

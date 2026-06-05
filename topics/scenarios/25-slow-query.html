@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Debugging a Slow Database Query at 3 AM — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Debugging a Slow Database Query at 3 AM</h1>
+      <p class="hero-subtitle">Your monitoring system pages you. A 200ms query now takes 5 seconds. Search pages are timing out, conversion is dropping, and the connection pool is filling up. Walk through the systematic diagnosis and fix.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>It is 3:07 AM. Your phone buzzes with a PagerDuty alert: <strong>"Product search p99 latency &gt; 3s for 5 minutes."</strong> You open the dashboard. The product search page &mdash; the most critical page on your e-commerce site &mdash; is timing out for roughly 40% of users. Conversion rate has dropped from 3.2% to 0.4%. Revenue is bleeding.</p>
+
+      <p class="full-width">The root cause is a single database query that powers the search page. Normally it completes in 200ms. Right now it is taking 5 seconds.</p>
+
+      <div>
+        <h3>The Query</h3>
+        <pre class="line-numbers"><code class="language-sql">SELECT p.id, p.name, p.price, c.name AS category
+FROM products p
+JOIN categories c ON p.category_id = c.id
+WHERE p.name ILIKE '%wireless%'
+  AND p.price BETWEEN 10 AND 500
+  AND p.is_active = true
+ORDER BY p.relevance_score DESC
+LIMIT 20;</code></pre>
+        <p>The query uses <code>ILIKE</code>, which is PostgreSQL's case-insensitive pattern matching operator. The <code>%wireless%</code> pattern has a <strong>leading wildcard</strong>, meaning it searches for "wireless" anywhere in the product name. This detail turns out to be critical.</p>
+      </div>
+
+      <div>
+        <h3>The Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Products table rows</td><td>50,000,000 (50M)</td></tr>
+              <tr><td>Categories table rows</td><td>5,000</td></tr>
+              <tr><td>Search QPS (queries per second)</td><td>2,000</td></tr>
+              <tr><td>Normal query latency</td><td>200ms</td></tr>
+              <tr><td>Current query latency</td><td>5,000ms (5 seconds)</td></tr>
+              <tr><td>Connection pool size</td><td>150 connections</td></tr>
+              <tr><td>App server thread pool</td><td>200 threads</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe-math">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>Before diagnosing the query itself, let's understand the blast radius of a 5-second query at 2,000 QPS.</p>
+
+      <div>
+        <h3>Connection Pool Exhaustion</h3>
+        <p>Each query holds a database connection for its duration. Under normal conditions:</p>
+        <pre class="line-numbers"><code class="language-text">Concurrent connections needed = QPS x latency
+Normal:  2,000 req/sec x 0.2s = 400 concurrent connections
+Current: 2,000 req/sec x 5.0s = 10,000 concurrent connections</code></pre>
+
+        <p>Your connection pool has <strong>150 connections</strong>. Under normal load, you need 400 concurrent connections &mdash; already tight, likely spread across multiple app servers (e.g., 10 servers with 15 connections each = 150 total). But at 5-second latency, you need 10,000 concurrent connections. The pool is exhausted by a factor of <strong>67x</strong>.</p>
+
+        <p>What happens when the pool is exhausted:</p>
+        <ol>
+          <li>New requests queue up waiting for a free connection.</li>
+          <li>The queue grows at a rate of 2,000 requests/sec minus the drain rate.</li>
+          <li>Drain rate = 150 connections / 5s = 30 queries/sec (instead of the needed 2,000).</li>
+          <li>Queue growth = 2,000 - 30 = <strong>1,970 requests/sec</strong> accumulating.</li>
+          <li>After 10 seconds, 19,700 requests are queued. Most will hit the application-level timeout (typically 10-30s) and return errors.</li>
+        </ol>
+      </div>
+
+      <div>
+        <h3>Thread Pool Exhaustion</h3>
+        <p>Each queued request holds a thread (in thread-per-request models). With 200 threads per app server and 10 app servers = 2,000 threads total. At 5s/query, throughput = 2,000 / 5 = 400 req/sec. But you're receiving 2,000 req/sec. After the thread pool fills, new requests are immediately rejected with <code>503 Service Unavailable</code>.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>The Cascading Effect</h3>
+
+        <svg viewBox="0 0 800 340" style="width:100%;max-width:800px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="cas-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+          </defs>
+
+          <!-- Timeline axis -->
+          <line x1="60" y1="30" x2="760" y2="30" stroke="#94a3b8" stroke-width="2"/>
+
+          <!-- Time ticks -->
+          <line x1="80" y1="24" x2="80" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="80" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=0</text>
+
+          <line x1="210" y1="24" x2="210" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="210" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=5s</text>
+
+          <line x1="340" y1="24" x2="340" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="340" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=10s</text>
+
+          <line x1="470" y1="24" x2="470" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="470" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=30s</text>
+
+          <line x1="600" y1="24" x2="600" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="600" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=60s</text>
+
+          <line x1="730" y1="24" x2="730" y2="36" stroke="#64748b" stroke-width="2"/>
+          <text x="730" y="18" text-anchor="middle" fill="#334155" font-weight="600" font-size="11">T=2min</text>
+
+          <!-- Event boxes -->
+          <rect x="60" y="48" width="130" height="48" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="125" y="66" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="11">Query latency</text>
+          <text x="125" y="82" text-anchor="middle" fill="#2563eb" font-size="11">jumps to 5s</text>
+
+          <rect x="190" y="48" width="130" height="48" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+          <text x="255" y="66" text-anchor="middle" fill="#92400e" font-weight="600" font-size="11">Connection pool full</text>
+          <text x="255" y="82" text-anchor="middle" fill="#92400e" font-size="11">Requests queue up</text>
+
+          <rect x="320" y="48" width="130" height="48" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="385" y="66" text-anchor="middle" fill="#b91c1c" font-weight="600" font-size="11">Thread pools full</text>
+          <text x="385" y="82" text-anchor="middle" fill="#b91c1c" font-size="11">503 errors begin</text>
+
+          <rect x="450" y="48" width="130" height="48" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="515" y="66" text-anchor="middle" fill="#b91c1c" font-weight="600" font-size="11">Health checks fail</text>
+          <text x="515" y="82" text-anchor="middle" fill="#b91c1c" font-size="11">LB cascades traffic</text>
+
+          <rect x="580" y="48" width="130" height="48" rx="8" fill="#fecaca" stroke="#dc2626" stroke-width="2"/>
+          <text x="645" y="66" text-anchor="middle" fill="#991b1b" font-weight="700" font-size="11">SITE-WIDE OUTAGE</text>
+          <text x="645" y="82" text-anchor="middle" fill="#991b1b" font-size="11">All servers down</text>
+
+          <rect x="710" y="48" width="60" height="48" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="740" y="66" text-anchor="middle" fill="#334155" font-weight="600" font-size="10">Page</text>
+          <text x="740" y="82" text-anchor="middle" fill="#334155" font-size="10">on-call</text>
+
+          <!-- Cascade arrows -->
+          <line x1="190" y1="72" x2="195" y2="72" stroke="#ef4444" stroke-width="1.5" marker-end="url(#cas-arrow)"/>
+          <line x1="320" y1="72" x2="325" y2="72" stroke="#ef4444" stroke-width="1.5" marker-end="url(#cas-arrow)"/>
+          <line x1="450" y1="72" x2="455" y2="72" stroke="#ef4444" stroke-width="1.5" marker-end="url(#cas-arrow)"/>
+          <line x1="580" y1="72" x2="585" y2="72" stroke="#ef4444" stroke-width="1.5" marker-end="url(#cas-arrow)"/>
+          <line x1="710" y1="72" x2="715" y2="72" stroke="#ef4444" stroke-width="1.5" marker-end="url(#cas-arrow)"/>
+
+          <!-- Metrics graph area below -->
+          <text x="60" y="130" fill="#334155" font-weight="600" font-size="12">Connections in use</text>
+          <rect x="60" y="138" width="700" height="60" rx="4" fill="#f8fafc" stroke="#e2e8f0"/>
+          <!-- Connection bar chart rising -->
+          <rect x="80" y="168" width="50" height="24" rx="2" fill="#2563eb" opacity="0.3"/>
+          <text x="105" y="182" text-anchor="middle" fill="#2563eb" font-size="9">40</text>
+          <rect x="210" y="148" width="50" height="44" rx="2" fill="#d97706" opacity="0.5"/>
+          <text x="235" y="182" text-anchor="middle" fill="#92400e" font-size="9" font-weight="600">150</text>
+          <rect x="340" y="148" width="50" height="44" rx="2" fill="#ef4444" opacity="0.5"/>
+          <text x="365" y="182" text-anchor="middle" fill="#b91c1c" font-size="9" font-weight="600">150</text>
+          <rect x="470" y="148" width="50" height="44" rx="2" fill="#ef4444" opacity="0.7"/>
+          <text x="495" y="182" text-anchor="middle" fill="#b91c1c" font-size="9" font-weight="600">150</text>
+          <rect x="600" y="148" width="50" height="44" rx="2" fill="#ef4444" opacity="0.9"/>
+          <text x="625" y="182" text-anchor="middle" fill="#991b1b" font-size="9" font-weight="700">150</text>
+          <!-- Pool limit line -->
+          <line x1="60" y1="150" x2="760" y2="150" stroke="#ef4444" stroke-dasharray="4,3" stroke-width="1"/>
+          <text x="762" y="154" fill="#ef4444" font-size="9">limit=150</text>
+
+          <!-- Error rate graph -->
+          <text x="60" y="220" fill="#334155" font-weight="600" font-size="12">Error rate (%)</text>
+          <rect x="60" y="228" width="700" height="60" rx="4" fill="#f8fafc" stroke="#e2e8f0"/>
+          <rect x="80" y="278" width="50" height="4" rx="2" fill="#16a34a" opacity="0.5"/>
+          <text x="105" y="274" text-anchor="middle" fill="#16a34a" font-size="9">0%</text>
+          <rect x="210" y="268" width="50" height="14" rx="2" fill="#d97706" opacity="0.5"/>
+          <text x="235" y="264" text-anchor="middle" fill="#92400e" font-size="9">15%</text>
+          <rect x="340" y="258" width="50" height="24" rx="2" fill="#ef4444" opacity="0.5"/>
+          <text x="365" y="254" text-anchor="middle" fill="#b91c1c" font-size="9">40%</text>
+          <rect x="470" y="248" width="50" height="34" rx="2" fill="#ef4444" opacity="0.7"/>
+          <text x="495" y="244" text-anchor="middle" fill="#b91c1c" font-size="9">70%</text>
+          <rect x="600" y="234" width="50" height="48" rx="2" fill="#ef4444" opacity="0.9"/>
+          <text x="625" y="232" text-anchor="middle" fill="#991b1b" font-size="9" font-weight="700">100%</text>
+
+          <!-- Annotation -->
+          <text x="400" y="320" text-anchor="middle" fill="#64748b" font-size="12" font-style="italic">A single slow query causes a complete site outage in under 2 minutes</text>
+        </svg>
+      </div>
+
+      <p class="full-width">A single slow query has turned into a complete site outage in under 2 minutes. This is why query performance monitoring matters.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive State / Diagnosis Step 1                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="diagnosis-step1">
+    <div class="container">
+      <h2>Step 1: Check the Query Plan</h2>
+      <p>The first thing to do with any slow query is run <code>EXPLAIN ANALYZE</code>. This tells you exactly what the database is doing.</p>
+
+      <div>
+        <h3>The EXPLAIN ANALYZE Command</h3>
+        <pre class="line-numbers"><code class="language-sql">EXPLAIN ANALYZE
+SELECT p.id, p.name, p.price, c.name AS category
+FROM products p
+JOIN categories c ON p.category_id = c.id
+WHERE p.name ILIKE '%wireless%'
+  AND p.price BETWEEN 10 AND 500
+  AND p.is_active = true
+ORDER BY p.relevance_score DESC
+LIMIT 20;</code></pre>
+      </div>
+
+      <div>
+        <h3>The Output (simplified)</h3>
+        <pre class="line-numbers"><code class="language-text">Limit  (cost=2847239.52..2847239.57 rows=20)
+  (actual time=4892.331..4892.412 rows=20 loops=1)
+  -> Sort  (cost=2847239.52..2848489.52 rows=500000)
+       Sort Key: p.relevance_score DESC
+       Sort Method: top-N heapsort  Memory: 29kB
+       -> Nested Loop  (cost=0.00..2835739.52 rows=500000)
+            -> Seq Scan on products p  (cost=0.00..2834489.52 rows=500000)
+                 Filter: ((name ILIKE '%wireless%') AND (price >= 10)
+                          AND (price <= 500) AND (is_active = true))
+                 Rows Removed by Filter: 49500000
+            -> Index Scan on categories c  (cost=0.28..0.30 rows=1)
+                 Index Cond: (id = p.category_id)
+Planning Time: 0.245 ms
+Execution Time: 4892.631 ms</code></pre>
+      </div>
+
+      <div>
+        <h3>Reading the Query Plan</h3>
+        <p>The critical line is:</p>
+        <pre class="line-numbers"><code class="language-text">Seq Scan on products p  (cost=0.00..2834489.52 rows=500000)
+  Filter: ((name ILIKE '%wireless%') AND ...)
+  Rows Removed by Filter: 49,500,000</code></pre>
+
+        <p><strong>Seq Scan</strong> means a <strong>sequential scan</strong> &mdash; the database is reading every single row in the products table, all 50 million of them, one by one. It reads each row, checks if the name contains "wireless" (case-insensitive), checks the price range, checks is_active, and discards 49.5 million rows that don't match. Only 500,000 rows survive the filter.</p>
+
+        <p>This is like searching for a specific book in a library by walking down every aisle and reading the title of every single book, instead of using the card catalog. With 50 million "books," it takes a while.</p>
+      </div>
+
+      <div>
+        <h3>Why Not an Index Scan?</h3>
+        <p>A B-tree index (the default index type in PostgreSQL) works like a sorted phone book. If you search for names starting with "Smith," the index takes you directly to the "S" section. But if you search for names <em>containing</em> "smith" anywhere, the sorted phone book doesn't help &mdash; "Blacksmith" is in the "B" section, "Goldsmith" is in "G," "Smithfield" is in "S." You'd have to read the entire phone book.</p>
+
+        <p>That's the leading wildcard problem. <code>ILIKE '%wireless%'</code> has a <code>%</code> before "wireless," meaning the match can start at any position in the string. A B-tree index is useless here, and the query planner correctly ignores it.</p>
+      </div>
+
+      <div class="full-width">
+        <h4>Index Usability by Pattern Type</h4>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Pattern</th><th>B-tree Index Usable?</th><th>Reason</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>LIKE 'wireless%'</code></td><td>Yes</td><td>Prefix search &mdash; index can seek to "wireless" and scan forward</td></tr>
+              <tr><td><code>LIKE '%wireless'</code></td><td>No</td><td>Suffix search &mdash; could appear anywhere</td></tr>
+              <tr><td><code>LIKE '%wireless%'</code></td><td>No</td><td>Substring search &mdash; could appear anywhere</td></tr>
+              <tr><td><code>ILIKE '%wireless%'</code></td><td>No</td><td>Case-insensitive substring &mdash; worst case</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <svg viewBox="0 0 780 260" style="width:100%;max-width:780px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="qp-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+            <marker id="qp-arrow-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+          </defs>
+
+          <text x="390" y="20" text-anchor="middle" fill="#334155" font-weight="700" font-size="14">Query Plan: Sequential Scan (no usable index)</text>
+
+          <!-- Seq Scan box -->
+          <rect x="20" y="40" width="220" height="80" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="2"/>
+          <text x="130" y="62" text-anchor="middle" fill="#b91c1c" font-weight="700" font-size="13">Seq Scan on products</text>
+          <text x="130" y="80" text-anchor="middle" fill="#b91c1c" font-size="11">Reads ALL 50M rows</text>
+          <text x="130" y="96" text-anchor="middle" fill="#b91c1c" font-size="11">Discards 49.5M (99%)</text>
+          <text x="130" y="112" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">4,892 ms</text>
+
+          <!-- Arrow -->
+          <line x1="240" y1="80" x2="290" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#qp-arrow)"/>
+          <text x="265" y="72" text-anchor="middle" fill="#64748b" font-size="10">500K rows</text>
+
+          <!-- Filter box -->
+          <rect x="298" y="50" width="180" height="60" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+          <text x="388" y="72" text-anchor="middle" fill="#92400e" font-weight="600" font-size="12">Filter + Sort</text>
+          <text x="388" y="90" text-anchor="middle" fill="#92400e" font-size="11">price, is_active, ORDER BY</text>
+
+          <!-- Arrow -->
+          <line x1="478" y1="80" x2="528" y2="80" stroke="#64748b" stroke-width="1.5" marker-end="url(#qp-arrow)"/>
+          <text x="503" y="72" text-anchor="middle" fill="#64748b" font-size="10">500K rows</text>
+
+          <!-- Nested Loop Join -->
+          <rect x="536" y="50" width="220" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="646" y="72" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="12">Nested Loop JOIN</text>
+          <text x="646" y="90" text-anchor="middle" fill="#2563eb" font-size="11">categories (index scan, fast)</text>
+
+          <!-- Result -->
+          <line x1="646" y1="110" x2="646" y2="140" stroke="#16a34a" stroke-width="1.5" marker-end="url(#qp-arrow)"/>
+          <rect x="576" y="148" width="140" height="36" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="646" y="172" text-anchor="middle" fill="#166534" font-weight="600" font-size="12">LIMIT 20 rows</text>
+
+          <!-- Bottleneck annotation -->
+          <line x1="130" y1="120" x2="130" y2="200" stroke="#ef4444" stroke-dasharray="4,3" stroke-width="1"/>
+          <rect x="30" y="200" width="200" height="44" rx="6" fill="#fff" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="130" y="218" text-anchor="middle" fill="#b91c1c" font-weight="600" font-size="11">BOTTLENECK</text>
+          <text x="130" y="234" text-anchor="middle" fill="#b91c1c" font-size="10">99.7% of time spent here</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Changed?                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-changed">
+    <div class="container">
+      <h2>Step 2: But This Query Was Fast Before</h2>
+      <p>If the query always did a sequential scan on 50M rows, it would always have been slow. Something changed. Here are the most common culprits:</p>
+
+      <div>
+        <h3>Hypothesis A: The Table Grew Significantly</h3>
+        <p>Perhaps the table was 10M rows three months ago, and the sequential scan took ~1 second (still slow, but below the timeout). After the holiday season, the catalog grew to 50M rows. The scan time grew proportionally: 5x more rows = 5x slower.</p>
+        <pre class="line-numbers"><code class="language-sql">-- Check table size over time (if you track it)
+SELECT relname, n_live_tup, last_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'products';</code></pre>
+      </div>
+
+      <div>
+        <h3>Hypothesis B: Statistics Are Stale</h3>
+        <p>PostgreSQL's query planner uses <strong>statistics</strong> (histograms of column value distributions) to estimate how many rows each filter will match. These statistics are collected by the <code>ANALYZE</code> command. If <code>ANALYZE</code> hasn't run in a while, the planner might have wrong estimates.</p>
+
+        <p>For example, the planner might estimate that <code>ILIKE '%wireless%'</code> matches 100 rows (because the statistics are from when the table had fewer rows with "wireless" in the name). With that estimate, a sequential scan looks cheap. In reality, it matches 500,000 rows &mdash; but the planner doesn't know that.</p>
+
+        <p>Stale statistics can also cause the planner to choose a bad <strong>join order</strong> or a bad index. Check when statistics were last collected:</p>
+        <pre class="line-numbers"><code class="language-sql">-- When was ANALYZE last run?
+SELECT schemaname, relname, last_analyze, last_autoanalyze,
+       n_live_tup, n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname = 'products';
+
+-- If last_analyze is NULL or weeks old, run it:
+ANALYZE products;</code></pre>
+      </div>
+
+      <div>
+        <h3>Hypothesis C: A Critical Index Was Dropped</h3>
+        <p>Someone ran a migration that dropped an index. Maybe there was a trigram index that supported the <code>ILIKE</code> query, and it was accidentally removed during a schema change. Check the current indexes:</p>
+        <pre class="line-numbers"><code class="language-sql">-- List all indexes on the products table
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'products';</code></pre>
+      </div>
+
+      <div>
+        <h3>Hypothesis D: Lock Contention</h3>
+        <p>A long-running batch job (e.g., a nightly import that updates all product prices) might be holding a lock that blocks the search query. The query itself isn't slow &mdash; it's waiting for a lock.</p>
+        <pre class="line-numbers"><code class="language-sql">-- Check for blocked queries
+SELECT blocked_locks.pid AS blocked_pid,
+       blocked_activity.query AS blocked_query,
+       blocking_locks.pid AS blocking_pid,
+       blocking_activity.query AS blocking_query
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity
+  ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks
+  ON blocking_locks.locktype = blocked_locks.locktype
+  AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+  AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+  AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_catalog.pg_stat_activity blocking_activity
+  ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;</code></pre>
+      </div>
+
+      <div>
+        <h3>Hypothesis E: Connection Pool Exhaustion (Feedback Loop)</h3>
+        <p>This is a vicious cycle. The query is a bit slow (say 1s instead of 200ms due to table growth). This causes connections to be held longer. The pool fills up. New queries wait for a connection. By the time they get one, the database is under heavier load (more concurrent queries), making each query even slower. The cycle accelerates until everything times out.</p>
+
+        <pre class="line-numbers"><code class="language-sql">-- Check active connections and their state
+SELECT state, count(*), avg(now() - state_change) AS avg_duration
+FROM pg_stat_activity
+WHERE datname = 'mydb'
+GROUP BY state;
+
+-- Look for long-running queries
+SELECT pid, now() - query_start AS duration, query
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND now() - query_start > interval '5 seconds'
+ORDER BY duration DESC;</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Fix: Trigram Index                                        -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration1">
+    <div class="container">
+      <h2>Iteration 1: The Trigram Index</h2>
+      <p>The core problem is that B-tree indexes can't handle <code>ILIKE '%wireless%'</code>. We need a different kind of index.</p>
+
+      <div>
+        <h3>What Is a Trigram?</h3>
+        <p>A trigram is a sequence of three consecutive characters. PostgreSQL's <code>pg_trgm</code> extension breaks strings into trigrams and indexes them.</p>
+        <pre class="line-numbers"><code class="language-text">The word "wireless" breaks into these trigrams:
+  "  w", " wi", "wir", "ire", "rel", "ele", "les", "ess", "ss "
+
+The word "Sony Wireless Headphones" breaks into:
+  "  s", " so", "son", "ony", "ny ", "y w", " wi", "wir", "ire",
+  "rel", "ele", "les", "ess", "ss ", "s h", " he", "hea", "ead",
+  "adp", "dph", "pho", "hon", "one", "nes", "es "</code></pre>
+
+        <p>A trigram index stores a mapping from each trigram to the set of rows that contain it. When you search for <code>ILIKE '%wireless%'</code>, PostgreSQL:</p>
+        <ol>
+          <li>Breaks "wireless" into trigrams: "wir", "ire", "rel", "ele", "les", "ess"</li>
+          <li>Looks up each trigram in the index to find which rows contain it</li>
+          <li>Intersects the results &mdash; only rows containing ALL trigrams are candidates</li>
+          <li>Does a final recheck on the candidates to confirm the full pattern matches</li>
+        </ol>
+
+        <p>This is dramatically faster than a sequential scan because most rows don't contain any of these trigrams, and the index eliminates them without reading the actual row data.</p>
+      </div>
+
+      <div>
+        <h3>Creating the Index</h3>
+        <pre class="line-numbers"><code class="language-sql">-- Enable the extension (one-time, requires superuser)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Create the trigram index
+CREATE INDEX CONCURRENTLY idx_products_name_trgm
+ON products USING gin (name gin_trgm_ops);</code></pre>
+
+        <p>Key details:</p>
+        <ul>
+          <li><strong><code>CONCURRENTLY</code></strong>: Build the index without locking the table. This is essential for a 50M-row table in production &mdash; without it, the table would be locked for writes during the entire index build (potentially hours).</li>
+          <li><strong><code>USING gin</code></strong>: GIN (Generalized Inverted Index) is the index type designed for "contains" queries. It maps each trigram to the list of rows containing it.</li>
+          <li><strong><code>gin_trgm_ops</code></strong>: The operator class that tells PostgreSQL to break the column into trigrams for indexing.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>How Long Does Index Creation Take?</h3>
+        <pre class="line-numbers"><code class="language-text">50M rows, average name length ~50 characters:
+  ~15 trigrams per name (after deduplication)
+  50M x 15 = 750M trigram entries in the index
+
+Build time estimate: 30-90 minutes for CONCURRENTLY on 50M rows
+  (depends on disk speed, RAM, CPU)
+
+Index size: approximately 2-4 GB</code></pre>
+
+        <p>This is too slow for a 3 AM emergency. The index should be created proactively, but right now we need a faster fix.</p>
+      </div>
+
+      <div>
+        <h3>After the Trigram Index Is Built</h3>
+        <p>Run <code>EXPLAIN ANALYZE</code> again:</p>
+        <pre class="line-numbers"><code class="language-text">Limit  (cost=1520.42..1520.47 rows=20)
+  (actual time=45.892..45.974 rows=20 loops=1)
+  -> Sort  (cost=1520.42..2770.42 rows=500000)
+       -> Nested Loop  (cost=384.28..1234.56 rows=500000)
+            -> Bitmap Heap Scan on products p  (cost=384.00..1200.00 rows=500000)
+                 Recheck Cond: (name ILIKE '%wireless%')
+                 Filter: ((price >= 10) AND (price <= 500) AND is_active)
+                 -> Bitmap Index Scan on idx_products_name_trgm
+                      Index Cond: (name ILIKE '%wireless%')
+            -> Index Scan on categories c  (cost=0.28..0.30 rows=1)
+Execution Time: 46.152 ms</code></pre>
+
+        <p>Query time dropped from <strong>4,892ms to 46ms</strong> &mdash; a 100x improvement. The database now uses the trigram index to find the ~500K matching products directly, instead of scanning all 50M.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Composite Index                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration2">
+    <div class="container">
+      <h2>Iteration 2: Composite and Partial Indexes</h2>
+      <p>The trigram index solves the <code>ILIKE</code> problem, but we're still filtering 500K rows for price range and is_active, then sorting by relevance_score. We can optimize further.</p>
+
+      <div>
+        <h3>Partial Index for Active Products</h3>
+        <p>Since 85% of searches only look at active products, create an index that only includes active rows:</p>
+        <pre class="line-numbers"><code class="language-sql">-- Partial index: only indexes rows where is_active = true
+CREATE INDEX CONCURRENTLY idx_products_price_active
+ON products (price, relevance_score DESC)
+WHERE is_active = true;</code></pre>
+
+        <p>This index is smaller (only active products, perhaps 40M of 50M rows) and covers both the price filter and the sort order.</p>
+      </div>
+
+      <div>
+        <h3>Covering Index Strategy</h3>
+        <p>If we include all needed columns in the index, PostgreSQL can answer the query entirely from the index without touching the table data (an "index-only scan"):</p>
+        <pre class="line-numbers"><code class="language-sql">-- Covering index with INCLUDE (PostgreSQL 11+)
+CREATE INDEX CONCURRENTLY idx_products_search_covering
+ON products USING gin (name gin_trgm_ops)
+INCLUDE (price, is_active, relevance_score, category_id);</code></pre>
+
+        <p>Note: GIN indexes with INCLUDE are supported in PostgreSQL 14+. For earlier versions, you'd need a different approach.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>How Many Rows Does Each Filter Eliminate?</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Filter</th><th>Matching Rows</th><th>% of 50M</th><th>Selectivity</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>name ILIKE '%wireless%'</code></td><td>500,000</td><td>1%</td><td>Very selective</td></tr>
+              <tr><td><code>price BETWEEN 10 AND 500</code></td><td>40,000,000</td><td>80%</td><td>Not selective</td></tr>
+              <tr><td><code>is_active = true</code></td><td>40,000,000</td><td>80%</td><td>Not selective</td></tr>
+              <tr><td>All three combined</td><td>~320,000</td><td>0.64%</td><td>Very selective</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The <code>ILIKE</code> filter is by far the most selective &mdash; it eliminates 99% of rows. The optimizer should apply it first. If statistics are accurate, it will. If statistics are stale (hypothesis B from earlier), it might choose a worse plan. Always ensure <code>ANALYZE</code> has been run.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Immediate Emergency Response                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="emergency-response">
+    <div class="container">
+      <h2>Iteration 3: The Emergency Response (Right Now at 3 AM)</h2>
+      <p>Creating a trigram index on 50M rows takes 30-90 minutes. Users are experiencing outages right now. Here's the immediate triage, in order:</p>
+
+      <div>
+        <h3>Step 1: Reduce the Bleeding (0-2 minutes)</h3>
+        <pre class="line-numbers"><code class="language-text">Action: Enable circuit breaker or serve degraded results
+  - If you have a circuit breaker: trip it for the search endpoint
+  - Serve cached search results (even if stale)
+  - Or: return a "Search is temporarily unavailable" message
+  - This stops the thread pool exhaustion cascade immediately</code></pre>
+      </div>
+
+      <div>
+        <h3>Step 2: Kill Long-Running Queries (2-5 minutes)</h3>
+        <pre class="line-numbers"><code class="language-sql">-- Find and kill queries running longer than 10 seconds
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND query ILIKE '%products%wireless%'
+  AND now() - query_start > interval '10 seconds';</code></pre>
+        <p>This frees up database connections immediately. But new queries will still be slow.</p>
+      </div>
+
+      <div>
+        <h3>Step 3: Run ANALYZE (5-10 minutes)</h3>
+        <pre class="line-numbers"><code class="language-sql">-- Update statistics for the products table
+ANALYZE products;</code></pre>
+        <p>This takes 1-5 minutes on a 50M-row table. If the problem was stale statistics causing a bad query plan, this fixes it immediately.</p>
+      </div>
+
+      <div>
+        <h3>Step 4: Check for Lock Contention (Parallel with Step 3)</h3>
+        <pre class="line-numbers"><code class="language-sql">-- If a batch job is blocking, consider killing it
+SELECT pid, query, now() - xact_start AS transaction_duration
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND now() - xact_start > interval '30 minutes'
+ORDER BY transaction_duration DESC;</code></pre>
+      </div>
+
+      <div>
+        <h3>Step 5: Start the Index Build (10+ minutes)</h3>
+        <pre class="line-numbers"><code class="language-sql">CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX CONCURRENTLY idx_products_name_trgm
+ON products USING gin (name gin_trgm_ops);</code></pre>
+        <p>This runs in the background without locking the table. Once complete (30-90 min), the query will be fast.</p>
+      </div>
+
+      <div>
+        <h3>Step 6: Gradually Re-enable Traffic</h3>
+        <pre class="line-numbers"><code class="language-text">After Steps 2-3, if the query is faster (check with EXPLAIN ANALYZE):
+  - Partially re-enable search (10% of traffic)
+  - Monitor latency
+  - If stable, increase to 25%, 50%, 100%
+
+If query is still slow (waiting for index build):
+  - Keep serving degraded results
+  - Add a cache layer: cache search results for 5 minutes
+  - At 2,000 QPS, most searches are for common terms
+  - Even a 60-second cache TTL reduces DB load by 98%+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Connection Pool Recovery                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="pool-recovery">
+    <div class="container">
+      <h2>Iteration 4: Connection Pool Recovery</h2>
+      <p>Even after fixing the query, recovery isn't instant. The connection pool has queued hundreds or thousands of requests. These all fire at once when connections become available, creating a <strong>thundering herd</strong> on the database.</p>
+
+      <div>
+        <h3>The Pool Drainage Problem</h3>
+        <pre class="line-numbers"><code class="language-text">State when query is fixed:
+  - 150 connections busy with slow queries (some still running)
+  - 5,000+ requests queued waiting for a connection
+  - Each queued request has been waiting 5-30 seconds
+
+When the slow queries finish:
+  - 150 connections free up simultaneously
+  - 150 queued requests immediately get connections
+  - They all hit the DB at once
+  - If the DB can handle it, great
+  - If not, latency spikes again (mini-cascade)</code></pre>
+      </div>
+
+      <div>
+        <h3>Controlled Recovery</h3>
+        <ol>
+          <li><strong>Drain the queue first:</strong> Don't immediately release all queued requests. Many have been waiting longer than the client timeout (30s). These will get a DB result but have no client to send it to &mdash; wasted work.</li>
+          <li><strong>Drop aged-out requests:</strong> If a request has been queued for longer than the client timeout, drop it. There's no point executing it.</li>
+          <li><strong>Ramp up gradually:</strong> Start with 10% of the connection pool active, measure latency, increase.</li>
+        </ol>
+
+        <pre class="line-numbers"><code class="language-python"># Pseudo-code: connection pool with queue aging
+class SmartConnectionPool:
+    def get_connection(self, timeout=30):
+        queued_at = time.now()
+        conn = self.pool.acquire(timeout=timeout)
+
+        # How long did we wait?
+        wait_time = time.now() - queued_at
+
+        # If we waited longer than the client timeout,
+        # the client has already given up. Release the connection.
+        if wait_time > CLIENT_TIMEOUT:
+            self.pool.release(conn)
+            raise TimeoutError("Request aged out in queue")
+
+        return conn</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design / Prevention                                     -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design: Preventing the Next 3 AM Page</h2>
+      <p>The immediate crisis is resolved. Here's the architecture to prevent it from happening again.</p>
+
+      <div>
+        <h3>1. Query Performance Monitoring</h3>
+        <pre class="line-numbers"><code class="language-sql">-- Enable pg_stat_statements to track query performance
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Find the slowest queries by total time
+SELECT query,
+       calls,
+       mean_exec_time,
+       max_exec_time,
+       stddev_exec_time,
+       rows
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 20;</code></pre>
+      </div>
+
+      <div>
+        <h3>2. Proactive Index Management</h3>
+        <pre class="line-numbers"><code class="language-sql">-- Detect missing indexes: find sequential scans on large tables
+SELECT relname, seq_scan, seq_tup_read,
+       idx_scan, idx_tup_fetch,
+       n_live_tup,
+       round(seq_tup_read::numeric / GREATEST(seq_scan, 1)) AS avg_rows_per_seq_scan
+FROM pg_stat_user_tables
+WHERE seq_scan > 0
+  AND n_live_tup > 100000
+ORDER BY seq_tup_read DESC;</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Alert Thresholds</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Warning Threshold</th><th>Critical Threshold</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Query p99 latency</td><td>&gt; 500ms (2.5x normal)</td><td>&gt; 2s (10x normal)</td></tr>
+              <tr><td>Sequential scans on large tables</td><td>&gt; 10/min</td><td>&gt; 100/min</td></tr>
+              <tr><td>Connection pool utilization</td><td>&gt; 70%</td><td>&gt; 90%</td></tr>
+              <tr><td>Dead tuples / live tuples ratio</td><td>&gt; 10%</td><td>&gt; 20%</td></tr>
+              <tr><td>Time since last ANALYZE</td><td>&gt; 24 hours</td><td>&gt; 72 hours</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>3. Automatic Statistics Maintenance</h3>
+        <pre class="line-numbers"><code class="language-text">-- In postgresql.conf, tune autovacuum for large tables:
+autovacuum_analyze_scale_factor = 0.02  -- analyze after 2% of rows change
+                                        -- (default is 10%, too lazy for 50M rows)
+                                        -- 2% of 50M = 1M row changes triggers ANALYZE
+
+autovacuum_analyze_threshold = 50000    -- minimum changes before analyze</code></pre>
+      </div>
+
+      <div>
+        <h3>4. Search Architecture for Scale</h3>
+        <p>For a 50M-product search, the long-term solution is a dedicated search engine. Elasticsearch advantages for text search: inverted index built specifically for text search, distributed across multiple nodes, supports fuzzy matching, synonyms, and relevance scoring, handles <code>ILIKE '%wireless%'</code> natively and efficiently, and can serve 50K+ search queries/sec from a small cluster.</p>
+        <p>Trade-offs: data duplication (products in both Postgres and ES), synchronization complexity (what if ES is out of date?), and additional infrastructure to manage.</p>
+      </div>
+
+      <div>
+        <h3>5. Caching Layer for Common Searches</h3>
+        <pre class="line-numbers"><code class="language-text">Top 1,000 search terms account for ~80% of searches (Zipf's law)
+
+Cache strategy:
+  Key:   search:{normalized_query_hash}
+  Value: serialized result set (20 product objects)
+  TTL:   5 minutes (products don't change that fast)
+
+  Cache hit rate estimate: 80%+ for common terms
+  DB load reduction: 80% * 2,000 QPS = 1,600 QPS saved
+  Remaining DB load: 400 QPS (easily handled)</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Architecture Diagram</h3>
+
+        <svg viewBox="0 0 780 440" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arch-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+            <marker id="arch-arrow-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arch-arrow-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- QPS label -->
+          <text x="390" y="22" text-anchor="middle" fill="#334155" font-weight="700" font-size="14">2,000 QPS</text>
+
+          <!-- Load Balancer -->
+          <rect x="300" y="36" width="180" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="390" y="61" text-anchor="middle" fill="#334155" font-weight="600">Load Balancer</text>
+
+          <!-- Arrow LB -> App Servers -->
+          <line x1="390" y1="76" x2="390" y2="104" stroke="#64748b" stroke-width="1.5" marker-end="url(#arch-arrow)"/>
+
+          <!-- App Servers -->
+          <rect x="280" y="112" width="220" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="390" y="137" text-anchor="middle" fill="#2563eb" font-weight="600">App Servers (x10)</text>
+
+          <!-- Fork: Cache check -->
+          <line x1="330" y1="152" x2="330" y2="174" stroke="#64748b" stroke-width="1.5"/>
+          <line x1="450" y1="152" x2="450" y2="174" stroke="#64748b" stroke-width="1.5"/>
+
+          <!-- Cache Hit? diamond -->
+          <polygon points="390,180 430,200 390,220 350,200" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+          <text x="390" y="204" text-anchor="middle" fill="#92400e" font-weight="600" font-size="11">Cache?</text>
+
+          <!-- Left: Cache Hit path -->
+          <line x1="350" y1="200" x2="240" y2="200" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arch-arrow-green)"/>
+          <text x="295" y="193" text-anchor="middle" fill="#16a34a" font-weight="600" font-size="11">HIT (80%)</text>
+
+          <!-- Redis Cache -->
+          <rect x="100" y="180" width="140" height="40" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="170" y="205" text-anchor="middle" fill="#166534" font-weight="600">Redis Cache</text>
+
+          <!-- Return from Redis -->
+          <line x1="170" y1="220" x2="170" y2="258" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arch-arrow-green)"/>
+          <rect x="110" y="266" width="120" height="32" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="170" y="287" text-anchor="middle" fill="#166534" font-weight="600" font-size="12">Return result</text>
+
+          <!-- Right: Cache Miss path -->
+          <line x1="430" y1="200" x2="540" y2="200" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arch-arrow-blue)"/>
+          <text x="485" y="193" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="11">MISS (20%)</text>
+
+          <!-- Elasticsearch -->
+          <rect x="540" y="180" width="180" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="630" y="205" text-anchor="middle" fill="#2563eb" font-weight="600">Elasticsearch</text>
+          <text x="630" y="237" text-anchor="middle" fill="#64748b" font-size="11">search queries</text>
+
+          <!-- Arrow ES -> Return -->
+          <line x1="630" y1="220" x2="630" y2="258" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arch-arrow-blue)"/>
+          <rect x="570" y="266" width="120" height="32" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="630" y="287" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="12">Return result</text>
+
+          <!-- PostgreSQL below, for writes/orders -->
+          <line x1="390" y1="220" x2="390" y2="344" stroke="#64748b" stroke-width="1.5" marker-end="url(#arch-arrow)"/>
+          <text x="390" y="332" text-anchor="middle" fill="#64748b" font-size="11">writes, orders, non-search</text>
+
+          <rect x="300" y="352" width="180" height="50" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+          <text x="390" y="375" text-anchor="middle" fill="#1e40af" font-weight="700">PostgreSQL</text>
+          <text x="390" y="393" text-anchor="middle" fill="#1e40af" font-size="11">source of truth</text>
+
+          <!-- Sync arrow: PG -> ES -->
+          <line x1="480" y1="370" x2="630" y2="224" stroke="#94a3b8" stroke-width="1" stroke-dasharray="5,3" marker-end="url(#arch-arrow)"/>
+          <text x="568" y="306" text-anchor="middle" fill="#94a3b8" font-size="10" transform="rotate(-30,568,306)">sync / CDC</text>
+
+          <!-- Annotation -->
+          <text x="390" y="430" text-anchor="middle" fill="#64748b" font-size="12" font-style="italic">Redis absorbs 80% of traffic; Elasticsearch handles text search; PostgreSQL stays the source of truth</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <div class="card full-width" style="padding: 2rem;">
+        <ol style="line-height: 2;">
+          <li><strong>EXPLAIN ANALYZE is your first tool.</strong> Always check the query plan before guessing. The difference between a sequential scan and an index scan can be 100x.</li>
+          <li><strong>Leading wildcards kill B-tree indexes.</strong> <code>LIKE '%foo%'</code> cannot use a standard B-tree index. Use trigram indexes (pg_trgm) for substring search, or move to a dedicated search engine.</li>
+          <li><strong>Slow queries cascade.</strong> A 25x latency increase (200ms to 5s) causes connection pool exhaustion, thread pool exhaustion, and then a complete outage. The blast radius of one slow query is the entire application.</li>
+          <li><strong>Connection pool math matters.</strong> Concurrent connections = QPS x latency. If latency increases 25x, you need 25x more connections. If you don't have them, requests queue and timeout.</li>
+          <li><strong>Keep statistics fresh.</strong> Stale statistics cause the query planner to make bad decisions. Tune autovacuum_analyze_scale_factor for large tables.</li>
+          <li><strong>Have a degraded mode ready.</strong> When the database is in trouble, serve cached or degraded results rather than letting everything fail. A search page that shows "popular products" is better than a 503 error.</li>
+          <li><strong>Monitor query latency percentiles, not averages.</strong> The average might be 200ms while the p99 is 3 seconds. Alert on p99 before it reaches the timeout threshold.</li>
+          <li><strong>For text search at scale, use a search engine.</strong> PostgreSQL is a great database, but Elasticsearch/OpenSearch is purpose-built for text search. At 50M+ rows with complex text queries, the right tool matters.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../observability.html" class="card topic-card">
+          <h3>Observability</h3>
+          <p>Monitoring query latency, setting up alerts, and the metrics that would have caught this before 3 AM.</p>
+        </a>
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>How a caching layer in front of the database prevents slow queries from reaching users.</p>
+        </a>
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>Read replicas, replication lag, and routing read-heavy queries to replicas.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

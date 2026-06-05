@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caches: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad  { color: var(--color-danger);  font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+        <li><a href="../caching.html">Caching</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- 1. Hero -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Caches: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">"Cache" means at least four different things: a remote KV in front of a database, an in-process LRU inside the app, an HTTP cache in a reverse proxy, and a CDN cache at the edge. Picking the wrong layer is the most common cache mistake.</p>
+      <p class="hero-meta">Redis (cache mode) &bull; Memcached &bull; Caffeine &bull; Varnish &bull; Nginx proxy_cache &bull; CDN-as-cache</p>
+    </div>
+  </section>
+
+  <!-- 2. Decision flowchart -->
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <p>Pick the layer first, then the product. Most "cache" decisions are really "which layer."</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 1240 680" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs>
+            <marker id="arrC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+            </marker>
+          </defs>
+
+          <rect x="470" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="620" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">What are you caching?</text>
+          <text x="620" y="62" text-anchor="middle" fill="white" font-size="12" opacity="0.9">Start at the layer</text>
+
+          <!-- HTTP responses? -->
+          <rect x="20" y="140" width="280" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="160" y="166" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">HTTP responses for many users?</text>
+          <text x="160" y="184" text-anchor="middle" fill="#64748b" font-size="11">images, pages, GET API responses</text>
+          <line x1="470" y1="76" x2="240" y2="138" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="20" y="240" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="85" y="270" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">CDN (edge)</text>
+          <line x1="100" y1="200" x2="85" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+          <text x="35" y="225" fill="#16a34a" font-size="11" font-weight="700">global users</text>
+
+          <rect x="170" y="240" width="140" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="240" y="265" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Varnish /</text>
+          <text x="240" y="280" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Nginx cache</text>
+          <line x1="200" y1="200" x2="225" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+          <text x="220" y="225" fill="#dc2626" font-size="11" font-weight="700">regional</text>
+
+          <!-- DB query results? -->
+          <rect x="340" y="140" width="280" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="480" y="166" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">DB query results / KV by ID?</text>
+          <text x="480" y="184" text-anchor="middle" fill="#64748b" font-size="11">cache-aside in front of DB</text>
+          <line x1="560" y1="76" x2="500" y2="138" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="320" y="240" width="280" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="460" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Need data structures or persistence?</text>
+          <text x="460" y="284" text-anchor="middle" fill="#64748b" font-size="11">ZSET, HSET, AOF</text>
+          <line x1="480" y1="200" x2="460" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="320" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="385" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Redis</text>
+          <line x1="395" y1="300" x2="385" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+          <text x="335" y="325" fill="#16a34a" font-size="11" font-weight="700">YES</text>
+
+          <rect x="470" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="535" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Memcached</text>
+          <line x1="525" y1="300" x2="535" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+          <text x="555" y="325" fill="#dc2626" font-size="11" font-weight="700">NO &mdash; max QPS</text>
+
+          <!-- In-process? -->
+          <rect x="660" y="140" width="280" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="800" y="166" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Same JVM / process, hot data?</text>
+          <text x="800" y="184" text-anchor="middle" fill="#64748b" font-size="11">no network hop allowed</text>
+          <line x1="660" y1="76" x2="780" y2="138" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="660" y="240" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="725" y="270" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Caffeine (JVM)</text>
+          <line x1="730" y1="200" x2="725" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="810" y="240" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="875" y="270" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">stdlib LRU</text>
+          <line x1="850" y1="200" x2="875" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <!-- Computed result / memoization? -->
+          <rect x="980" y="140" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="1100" y="166" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Computed result, expensive,</text>
+          <text x="1100" y="184" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">fan-out across pods?</text>
+          <line x1="770" y1="76" x2="1080" y2="138" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <rect x="980" y="240" width="240" height="60" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1100" y="262" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Redis (single-flight)</text>
+          <text x="1100" y="280" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">+ in-proc Caffeine front</text>
+          <line x1="1100" y1="200" x2="1100" y2="238" stroke="#334155" stroke-width="1.5" marker-end="url(#arrC)"/>
+
+          <!-- Layered note -->
+          <rect x="280" y="450" width="660" height="100" rx="12" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="610" y="475" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Real systems layer caches.</text>
+          <text x="610" y="497" text-anchor="middle" fill="#334155" font-size="13">CDN at edge &rarr; Varnish/Nginx in DC &rarr; Redis (cache-aside) &rarr; in-proc LRU &rarr; DB.</text>
+          <text x="610" y="515" text-anchor="middle" fill="#334155" font-size="13">Each layer has shorter TTL going inward, larger keyspace going outward.</text>
+          <text x="610" y="535" text-anchor="middle" fill="#64748b" font-size="11">First miss = next layer; populate on miss; invalidate on write.</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Feature matrix -->
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+
+      <div class="table-responsive comp-table">
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>Redis</th><th>Memcached</th><th>Caffeine (JVM)</th><th>Varnish</th><th>Nginx proxy_cache</th><th>CDN (CloudFront/Cloudflare/Fastly)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Layer</td><td>Remote KV</td><td>Remote KV</td><td>In-process</td><td>Reverse proxy (HTTP)</td><td>Reverse proxy (HTTP)</td><td>Edge (HTTP)</td></tr>
+            <tr><td>Data model</td><td>String / list / hash / set / ZSET / stream</td><td>String only</td><td>Object reference</td><td>HTTP response</td><td>HTTP response</td><td>HTTP response</td></tr>
+            <tr><td>Underlying mechanism</td><td>Single-thread event loop + hash table + skiplist</td><td>Multi-thread + slab + LRU</td><td>W-TinyLFU + Caffeine policy</td><td>Workspace + storage backends</td><td>File-based cache zone</td><td>POPs + tiered cache</td></tr>
+            <tr><td>Eviction policy</td><td>noeviction / allkeys-lru / allkeys-lfu / volatile-* / random</td><td>LRU only</td><td>W-TinyLFU (admission + eviction)</td><td>LRU; configurable</td><td>LRU on cache zone size</td><td>LRU; varies by vendor</td></tr>
+            <tr><td>Persistence</td><td>RDB snapshot + AOF (fsync configurable)</td><td>None</td><td>None (process-bound)</td><td>None (in-mem) or file</td><td>Filesystem</td><td>Edge ephemeral; tiered cache shared</td></tr>
+            <tr><td>Replication / cluster</td><td>Cluster (16k slots), Sentinel, replicas</td><td>None native (client hashing)</td><td>None (per process)</td><td>Director / hashing</td><td>None</td><td>Anycast + tiered</td></tr>
+            <tr><td>Consistency model</td><td>Single-shard linear; cross-shard eventual</td><td>Per-key on one server</td><td>Per-process (no coherence)</td><td>Per-PoP</td><td>Per-instance</td><td>Per-PoP; purge propagation eventual</td></tr>
+            <tr><td>Read latency P99</td><td>&lt; 1 ms (LAN)</td><td>&lt; 1 ms (LAN)</td><td>~10 ns</td><td>&lt; 1 ms</td><td>&lt; 1 ms</td><td>1&ndash;30 ms (PoP-local)</td></tr>
+            <tr><td>Throughput</td><td>~100k ops/sec/core</td><td>~200k ops/sec/core</td><td>10s of M ops/sec</td><td>~100k req/sec</td><td>~50k req/sec/worker</td><td>Unbounded (sharded by URL)</td></tr>
+            <tr><td>Memory model</td><td>One value, full size</td><td>Slab classes (some waste)</td><td>JVM heap or off-heap</td><td>RAM or file</td><td>Filesystem</td><td>Per-PoP, edge SSD</td></tr>
+            <tr><td>Invalidation primitives</td><td>DEL, key TTL, keyspace events, pub/sub</td><td>delete, TTL</td><td>invalidate, expireAfterWrite</td><td>BAN, PURGE; xkey tags</td><td>proxy_cache_purge (Plus)</td><td>Vendor purge API; surrogate keys</td></tr>
+            <tr><td>Stampede protection</td><td>App-side (Redlock single-flight) or Redis 7 client-side caching</td><td>App-side</td><td>refreshAfterWrite (built-in single-flight)</td><td>request coalescing native</td><td>proxy_cache_lock</td><td>Origin shielding + coalescing</td></tr>
+            <tr><td>Scope</td><td>Global to app cluster</td><td>Global to app cluster</td><td>Per-pod</td><td>Per-PoP / per-DC</td><td>Per-instance</td><td>Per-PoP, ~global</td></tr>
+            <tr><td>Cost driver</td><td>RAM &times; replicas</td><td>RAM</td><td>None (heap)</td><td>Instance hours</td><td>Instance hours + disk</td><td>Egress + requests</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Workload patterns -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Cache-aside in front of DB</td><td>Redis</td><td>Memcached</td><td>Redis if you'll grow into ZSETs/Streams; Memcached for pure GET/SET max QPS</td></tr>
+            <tr><td>Static asset cache (images, JS, CSS)</td><td>CDN</td><td>Varnish + CDN</td><td>CDN always; Varnish in front of origin if origin is slow</td></tr>
+            <tr><td>API GET response cache (cacheable)</td><td>CDN with Cache-Control</td><td>Varnish</td><td>CDN if global; Varnish if regional and per-PoP cardinality is low</td></tr>
+            <tr><td>Per-request memoization in a service</td><td>Caffeine</td><td>stdlib LRU</td><td>Caffeine for hit rate; stdlib if dependency-light</td></tr>
+            <tr><td>Cross-pod hot config / feature flags</td><td>Redis pub/sub for invalidation + Caffeine local</td><td>Watcher in etcd / Consul</td><td>Redis if you already have it; etcd/Consul for stronger consistency</td></tr>
+            <tr><td>Session store (read-heavy)</td><td>Redis (HSET + TTL)</td><td>Memcached</td><td>Redis for replication + persistence; Memcached if sessions truly stateless and recoverable</td></tr>
+            <tr><td>Negative cache (404s, "no result")</td><td>Redis with short TTL</td><td>CDN with negative TTL</td><td>Match the layer where the lookup happens</td></tr>
+            <tr><td>Hot computed result (e.g., recommendation)</td><td>Redis + single-flight</td><td>Caffeine local + Redis backing</td><td>Two layers: Caffeine front, Redis back to share across pods</td></tr>
+            <tr><td>Edge personalization (logged-in user pages)</td><td>CDN with cache key on user-tier or VARY: Cookie</td><td>Origin Redis + bypass CDN</td><td>VARY explodes cache cardinality; consider edge functions</td></tr>
+            <tr><td>Database query result cache</td><td>Redis with hash key = query+args</td><td>App-side Caffeine</td><td>Redis if shared; Caffeine if per-pod is fine</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape (the staff+ probe matrix)</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Access pattern</th><th>Redis</th><th>Memcached</th><th>Caffeine</th><th>Varnish</th><th>CDN</th></tr></thead>
+          <tbody>
+            <tr><td>Read-heavy uniform</td><td><span class="pat-good">&#10003;&#10003;</span> replicas + cluster</td><td><span class="pat-good">&#10003;&#10003;</span> client hashing</td><td><span class="pat-good">&#10003;&#10003;</span> per-pod local</td><td><span class="pat-good">&#10003;</span> hashed director</td><td><span class="pat-good">&#10003;&#10003;</span> edge fan-out</td></tr>
+            <tr><td>Write-heavy (writes to cache directly)</td><td><span class="pat-warn">&#9888;</span> single-thread per shard</td><td><span class="pat-good">&#10003;</span> multi-thread</td><td><span class="pat-good">&#10003;</span> very fast</td><td><span class="pat-bad">&#10005;</span> not a write cache</td><td><span class="pat-bad">&#10005;</span> not a write cache</td></tr>
+            <tr><td>Power-law / hot key</td><td><span class="pat-bad">&#10005;</span> single-thread shard pegs</td><td><span class="pat-warn">&#9888;</span> hot server pegs</td><td><span class="pat-good">&#10003;&#10003;</span> per-pod absorbs</td><td><span class="pat-good">&#10003;</span> CPU bound, scale wide</td><td><span class="pat-good">&#10003;&#10003;</span> tiered cache + shielding</td></tr>
+            <tr><td>Stampede on TTL expiry</td><td><span class="pat-warn">&#9888;</span> needs single-flight</td><td><span class="pat-warn">&#9888;</span> app-side</td><td><span class="pat-good">&#10003;&#10003;</span> refreshAfterWrite</td><td><span class="pat-good">&#10003;</span> coalescing native</td><td><span class="pat-good">&#10003;</span> origin shielding</td></tr>
+            <tr><td>Bursty / spiky</td><td><span class="pat-good">&#10003;</span> in-mem absorbs</td><td><span class="pat-good">&#10003;</span> in-mem absorbs</td><td><span class="pat-good">&#10003;&#10003;</span> heap-bound</td><td><span class="pat-good">&#10003;</span> RAM cache</td><td><span class="pat-good">&#10003;&#10003;</span> elastic edge</td></tr>
+            <tr><td>Long-tail (low hit rate)</td><td><span class="pat-bad">&#10005;</span> RAM = $</td><td><span class="pat-bad">&#10005;</span> RAM = $</td><td><span class="pat-bad">&#10005;</span> JVM heap pressure</td><td><span class="pat-warn">&#9888;</span> file backend helps</td><td><span class="pat-warn">&#9888;</span> tiered cache helps</td></tr>
+            <tr><td>Large items (&gt; 1 MB)</td><td><span class="pat-bad">&#10005;</span> blocks event loop</td><td><span class="pat-warn">&#9888;</span> slab class waste</td><td><span class="pat-good">&#10003;</span> heap allows</td><td><span class="pat-good">&#10003;&#10003;</span> made for HTTP bodies</td><td><span class="pat-good">&#10003;&#10003;</span> made for HTTP bodies</td></tr>
+            <tr><td>Cache invalidation across regions</td><td><span class="pat-warn">&#9888;</span> active-active or pub/sub</td><td><span class="pat-bad">&#10005;</span> none native</td><td><span class="pat-warn">&#9888;</span> needs coordination</td><td><span class="pat-warn">&#9888;</span> BAN / shovel</td><td><span class="pat-good">&#10003;</span> purge API</td></tr>
+            <tr><td>Consistency w/ source-of-truth</td><td><span class="pat-warn">&#9888;</span> TTL + invalidation</td><td><span class="pat-warn">&#9888;</span> TTL + invalidation</td><td><span class="pat-warn">&#9888;</span> per-pod TTL</td><td><span class="pat-warn">&#9888;</span> Cache-Control / surrogate</td><td><span class="pat-warn">&#9888;</span> surrogate keys best</td></tr>
+            <tr><td>Memoization / single-flight needed</td><td><span class="pat-warn">&#9888;</span> Lua single-flight</td><td><span class="pat-warn">&#9888;</span> app-side</td><td><span class="pat-good">&#10003;&#10003;</span> built-in</td><td><span class="pat-good">&#10003;</span> coalescing</td><td><span class="pat-good">&#10003;</span> shielding</td></tr>
+            <tr><td>Personalized responses</td><td><span class="pat-good">&#10003;</span> per-user key</td><td><span class="pat-good">&#10003;</span> per-user key</td><td><span class="pat-warn">&#9888;</span> per-pod sees subset</td><td><span class="pat-warn">&#9888;</span> VARY explodes</td><td><span class="pat-bad">&#10005;</span> needs edge fn</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend">
+        <span class="pat-good">&#10003;&#10003;</span> excellent fit
+        <span class="pat-good">&#10003;</span> handles natively
+        <span class="pat-warn">&#9888;</span> works with effort
+        <span class="pat-bad">&#10005;</span> wrong layer
+      </p>
+    </div>
+  </section>
+
+  <!-- 5. Scaling cliffs -->
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Redis (single shard)</td><td>~100k ops/sec/core; one slow command</td><td>KEYS / SMEMBERS huge / Lua loop blocks event loop &rarr; entire shard stalls</td><td>Avoid blocking commands; cluster; use SCAN</td></tr>
+            <tr><td>Redis Cluster</td><td>Cross-slot multi-key ops</td><td>MSET across slots fails; need hashtags</td><td><code>{user:123}</code> hashtags to colocate</td></tr>
+            <tr><td>Memcached</td><td>Slab fragmentation + hot server</td><td>Memory wasted in wrong slab classes; one server with hot keys saturates</td><td>slab_reassign; consistent hashing client; replicate hot keys</td></tr>
+            <tr><td>Caffeine</td><td>JVM heap pressure</td><td>Large entries trigger GC; full GC on stop-the-world</td><td>Tune size; off-heap (e.g. Cache2k)</td></tr>
+            <tr><td>Varnish</td><td>Storage backend full / restarts</td><td>RAM-only loses cache on restart; file backend has fragmentation</td><td>Massive Storage Engine (MSE) Plus; tier with CDN</td></tr>
+            <tr><td>Nginx proxy_cache</td><td>Cache zone disk full or zone size limit</td><td>LRU evicts hot items first if zone size too small</td><td>Larger zone; tier behind a CDN</td></tr>
+            <tr><td>CDN edge</td><td>Cache cardinality (URL space) explosion</td><td>Hit rate falls if VARY or query strings unbounded</td><td>Normalize cache keys; surrogate keys; tiered cache + shielding</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Migration -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <p>Cache migrations are easier than DB migrations &mdash; cache is recoverable from source. The pain is hit-rate during cutover.</p>
+      <ul>
+        <li><strong>Memcached &rarr; Redis</strong> &mdash; switch the client library; let warm fill from DB. Optional: dump/restore (less common). Watch for slab semantics: Memcached's per-key size limit is 1 MB, Redis is more generous but hot keys are still dangerous.</li>
+        <li><strong>Redis (single) &rarr; Redis Cluster</strong> &mdash; introduce hashtags before the migration; live-migrate slots; clients must support cluster mode.</li>
+        <li><strong>Caffeine &rarr; Redis</strong> &mdash; usually the trigger is "we need cross-pod consistency." Add Redis as the canonical cache; Caffeine becomes L1 in front of Redis.</li>
+        <li><strong>App-cache &rarr; Varnish</strong> &mdash; move HTTP cacheability into Cache-Control headers; let Varnish sit in front of origin. Test with curl + Age/X-Cache headers.</li>
+        <li><strong>No CDN &rarr; CDN</strong> &mdash; the win is huge but VARY:Cookie kills hit rate. Normalize before turning on.</li>
+        <li><strong>CDN A &rarr; CDN B</strong> &mdash; DNS cutover after warming both; surrogate keys / purge APIs differ.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7. Cost shape -->
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Redis (managed)</td><td>RAM &times; replicas &times; cluster shards</td><td>RF=2 doubles bill; cluster mode multiplies; cross-AZ replication network</td></tr>
+            <tr><td>Memcached (managed)</td><td>RAM only</td><td>Cheaper than Redis at the same RAM; single-AZ usually</td></tr>
+            <tr><td>Caffeine</td><td>None (heap)</td><td>JVM heap costs come back as RAM-sized instances</td></tr>
+            <tr><td>Varnish</td><td>Instance hours</td><td>OSS Varnish loses cache on restart; commercial MSE costs</td></tr>
+            <tr><td>Nginx proxy_cache</td><td>Disk + instance</td><td>Disk IOPS becomes the cap at large cache zones</td></tr>
+            <tr><td>CDN</td><td>Egress GB + requests</td><td>Egress dominates; cache-miss percentage drives origin egress (often the real bill)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. Hybrid -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns ("layers stack")</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>L1 in-process + L2 Redis (the classic)</h3>
+          <p>Caffeine in each pod for sub-microsecond hits on hottest keys; Redis as L2 for cross-pod sharing. L1 TTL short (seconds); L2 TTL longer (minutes). On L1 miss, single-flight to Redis; on L2 miss, single-flight to DB.</p>
+        </div>
+        <div>
+          <h3>CDN + Varnish + Redis + DB (4-layer web)</h3>
+          <p>Edge CDN for assets &amp; cacheable GETs; Varnish in DC for personalized-but-cacheable; Redis cache-aside for DB rows; DB as source of truth. Each layer protects the next.</p>
+        </div>
+        <div>
+          <h3>Redis as both cache and pub/sub for invalidation</h3>
+          <p>One Redis cluster: keys for the cache, pub/sub channel for "invalidate user:123". Each pod listens, drops Caffeine entries on signal. Solves "stale L1 after another pod's write."</p>
+        </div>
+        <div>
+          <h3>CDN with surrogate keys / cache tags</h3>
+          <p>Each response tagged with surrogate keys (e.g., <code>user-123,product-456</code>). On write, app calls CDN purge by tag; one API call invalidates many URLs. Fastly &amp; Cloudflare native; CloudFront via Lambda@Edge.</p>
+        </div>
+        <div>
+          <h3>Negative cache with short TTL</h3>
+          <p>404s and "not found" results cached for ~1 min. Without this, missing keys hammer the DB during scrapes. Layer it where the misses originate.</p>
+        </div>
+        <div>
+          <h3>Read-through cache library</h3>
+          <p>Caffeine's <code>LoadingCache</code>, Spring Cache, Go's groupcache &mdash; the cache itself fetches on miss. Encapsulates single-flight + populate. Avoids duplicate cache-aside logic.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9. Anti-patterns -->
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"We used Redis as the source of truth"</h3>
+          <p>Eviction silently deletes data. AOF=everysec loses up to 1s of writes on crash. Cluster slot migrations have edge cases. <strong>Lesson:</strong> if you can't lose it, durable store first; cache on top.</p>
+        </div>
+        <div>
+          <h3>"We didn't TTL anything"</h3>
+          <p>Cache fills, evicts unpredictably, hot vs cold blur. Always TTL. Use jittered TTLs to spread expiry.</p>
+        </div>
+        <div>
+          <h3>"All keys expire at the same time"</h3>
+          <p>Stampede &mdash; thousands of misses concurrent. Add jitter (<code>TTL = base + random(0, base*0.2)</code>).</p>
+        </div>
+        <div>
+          <h3>"We cached without single-flight"</h3>
+          <p>10,000 requests for the same missing key &rarr; 10,000 DB queries. Use Redis SETNX, Caffeine refreshAfterWrite, or app-level mutex.</p>
+        </div>
+        <div>
+          <h3>"VARY: Cookie at the CDN"</h3>
+          <p>Each user gets their own cache entry &rarr; CDN hit rate &asymp; 0. Either don't cache personalized pages or use edge functions to compute.</p>
+        </div>
+        <div>
+          <h3>"Cache stampede on deploy"</h3>
+          <p>New deploy invalidates Caffeine on every pod restart; concurrent fills hammer Redis or DB. Use rolling restarts; pre-warm cache; honor <code>Cache-Control: stale-while-revalidate</code>.</p>
+        </div>
+        <div>
+          <h3>"Hot key &gt; one node"</h3>
+          <p>One key hitter pegs the shard; entire cluster looks fine but P99 explodes. Replicate the key (write to multiple suffixes), or front it with in-process cache.</p>
+        </div>
+        <div>
+          <h3>"Negative cache forever"</h3>
+          <p>404 cached for 1 hour means the new resource is invisible for 1 hour after it's created. Negative TTL &lt; positive TTL.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. Decision rules -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>Pick the layer first, then the product.</strong> CDN &rarr; reverse proxy &rarr; remote KV &rarr; in-process. The same logic chooses different products at each layer.</li>
+          <li><strong>"Cache" defaults to Redis cache-aside in front of DB.</strong> Memcached only when "max QPS, pure ephemeral" is mandatory.</li>
+          <li><strong>Always say cache-aside vs write-through vs write-behind on purpose.</strong> Defaults: cache-aside for reads; write-through if cache-miss is unacceptable; write-behind only with durability story.</li>
+          <li><strong>TTL everything; jitter the TTL.</strong></li>
+          <li><strong>Single-flight on miss; Caffeine has it built-in, Redis needs Lua/SETNX.</strong></li>
+          <li><strong>Hot key &gt; one node = replicate the key or front with in-process L1.</strong></li>
+          <li><strong>Personalized HTTP responses &rarr; don't put them in the CDN; put a Redis tier behind it.</strong></li>
+          <li><strong>Invalidation: prefer event-driven (pub/sub or CDN purge) over short TTL.</strong></li>
+          <li><strong>Negative cache shorter than positive cache.</strong></li>
+          <li><strong>If cache is required for correctness, you have a bug.</strong> Cache is an optimization &mdash; the system must work when cache is empty.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../caching.html">Caching (concept)</a></li>
+        <li><a href="../scenarios/07-caching-strategies.html">Scenario: Caching strategies</a></li>
+        <li><a href="../scenarios/27-thundering-herd.html">Scenario: Thundering herd</a></li>
+        <li><a href="../scenarios/21-distributed-cache.html#hot-key-iteration">Scenario: Distributed cache (hot-key iteration)</a></li>
+        <li><a href="comparison-datastores.html">Datastores comparison</a></li>
+        <li><a href="../technologies.html">All Technologies</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

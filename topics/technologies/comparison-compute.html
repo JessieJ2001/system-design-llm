@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Compute &amp; Orchestration: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad { color: var(--color-danger); font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Compute &amp; Orchestration: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">VM, container, container-as-a-service, serverless function, serverless container &mdash; five distinct shapes. Cold starts, statefulness, max execution time, and cost shape are wildly different. Pick by traffic shape, not by technology fashion.</p>
+      <p class="hero-meta">Kubernetes (EKS / GKE / AKS) &bull; Nomad &bull; ECS / Fargate &bull; Cloud Run &bull; GKE Autopilot &bull; Lambda &bull; Cloud Functions &bull; Container Apps</p>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <div class="full-width">
+        <svg viewBox="0 0 1240 540" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs><marker id="arCo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker></defs>
+
+          <rect x="470" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="620" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">What runs your code?</text>
+
+          <rect x="470" y="120" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="620" y="146" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Traffic shape?</text>
+          <text x="620" y="164" text-anchor="middle" fill="#64748b" font-size="11">always-on / spiky / event-driven</text>
+          <line x1="620" y1="76" x2="620" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="20" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="160" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Always-on, &gt; 10 services</text>
+          <text x="160" y="284" text-anchor="middle" fill="#64748b" font-size="11">stateful, complex topology</text>
+          <line x1="500" y1="170" x2="280" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="20" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="160" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Kubernetes (EKS / GKE / AKS)</text>
+          <line x1="160" y1="300" x2="160" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="320" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="460" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Always-on, simple containers</text>
+          <text x="460" y="284" text-anchor="middle" fill="#64748b" font-size="11">no k8s expertise needed</text>
+          <line x1="600" y1="180" x2="500" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="320" y="340" width="280" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="460" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">ECS Fargate / GKE Autopilot</text>
+          <line x1="460" y1="300" x2="460" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="620" y="240" width="280" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="760" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Spiky / scale-to-zero containers</text>
+          <text x="760" y="284" text-anchor="middle" fill="#64748b" font-size="11">HTTP service, sometimes idle</text>
+          <line x1="700" y1="180" x2="730" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="620" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="685" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Cloud Run</text>
+          <line x1="685" y1="300" x2="685" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="770" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="835" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">App Runner /</text>
+          <text x="835" y="382" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Container Apps</text>
+          <line x1="800" y1="300" x2="835" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="930" y="240" width="290" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="1075" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Event-driven, &lt; 15 min, stateless</text>
+          <text x="1075" y="284" text-anchor="middle" fill="#64748b" font-size="11">S3 trigger, Pub/Sub, cron</text>
+          <line x1="770" y1="180" x2="1000" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="930" y="340" width="140" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1000" y="370" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Lambda</text>
+          <line x1="1000" y1="300" x2="1000" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="1080" y="340" width="140" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1150" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Cloud Functions</text>
+          <text x="1150" y="382" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">/ Functions</text>
+          <line x1="1130" y1="300" x2="1150" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arCo)"/>
+
+          <rect x="100" y="430" width="1000" height="80" rx="12" fill="#fef9c3" stroke="#ca8a04"/>
+          <text x="600" y="458" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Default progression: VM &rarr; ECS Fargate / Cloud Run &rarr; k8s only when complexity demands.</text>
+          <text x="600" y="478" text-anchor="middle" fill="#334155" font-size="12">Lambda for glue / event handlers / cron. K8s for &gt; 10 services with custom controllers / stateful sets.</text>
+          <text x="600" y="498" text-anchor="middle" fill="#64748b" font-size="11">Going from Cloud Run to k8s is mostly painless; going from k8s to Cloud Run is easy if app is 12-factor.</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Dimension</th><th>Kubernetes</th><th>Nomad</th><th>ECS Fargate</th><th>Cloud Run</th><th>GKE Autopilot</th><th>Lambda</th><th>Cloud Functions</th><th>Container Apps</th></tr></thead>
+          <tbody>
+            <tr><td>Unit</td><td>Pod (1+ containers)</td><td>Task</td><td>Task (1+ containers)</td><td>Container</td><td>Pod</td><td>Function (or container)</td><td>Function (or container)</td><td>Container</td></tr>
+            <tr><td>Scaling shape</td><td>HPA / KEDA / VPA</td><td>Autoscaler</td><td>Service auto-scaling</td><td>0&rarr;N concurrency-based</td><td>HPA</td><td>0&rarr;N event-based</td><td>0&rarr;N event-based</td><td>0&rarr;N HTTP-based + KEDA</td></tr>
+            <tr><td>Cold-start</td><td>Slow (image pull) but pre-warmed</td><td>Same</td><td>Slow (Fargate startup)</td><td>~1&ndash;3s typical</td><td>Slow on first pod</td><td>~50ms&ndash;5s (lang-dependent)</td><td>Similar to Lambda</td><td>~1&ndash;3s</td></tr>
+            <tr><td>Max execution</td><td>Unlimited (long-running)</td><td>Unlimited</td><td>Unlimited</td><td>60 min (HTTP); jobs longer</td><td>Unlimited</td><td>15 min</td><td>9 min (1st gen) / 60 min (2nd gen)</td><td>Unlimited (HTTP) / 1 hr job</td></tr>
+            <tr><td>Stateful</td><td>StatefulSets, PVs</td><td>Yes (volumes)</td><td>EFS volumes</td><td>No (stateless)</td><td>Yes</td><td>No (filesystem ephemeral)</td><td>No</td><td>No (mostly)</td></tr>
+            <tr><td>Networking</td><td>CNI / Service / Ingress</td><td>Native + Connect</td><td>VPC + ENI per task</td><td>VPC connector + private services</td><td>Same as GKE</td><td>VPC + ENI</td><td>VPC connector</td><td>Env (VNet integration)</td></tr>
+            <tr><td>Service mesh / discovery</td><td>Native + Istio/Linkerd</td><td>Consul Connect</td><td>Cloud Map / App Mesh (deprecating)</td><td>Cloud Run revisions / direct VPC</td><td>Same as GKE</td><td>Cloud Map (limited)</td><td>(none native)</td><td>Container Apps Env</td></tr>
+            <tr><td>GPU / accelerator</td><td>Yes (device plugin)</td><td>Yes</td><td>Yes (Fargate-GPU limited)</td><td>Yes (limited)</td><td>Yes</td><td>No (Lambda has limited inference)</td><td>No</td><td>Limited</td></tr>
+            <tr><td>Cron / scheduled</td><td>CronJob</td><td>Periodic jobs</td><td>EventBridge Scheduler &rarr; ECS</td><td>Cloud Scheduler &rarr; CR</td><td>CronJob</td><td>EventBridge Scheduler</td><td>Cloud Scheduler</td><td>(via triggers)</td></tr>
+            <tr><td>Multi-tenancy</td><td>Namespaces + RBAC + NetworkPolicy</td><td>Namespaces</td><td>VPC / IAM</td><td>Project-level + IAM</td><td>Same</td><td>Per-function IAM</td><td>Same</td><td>Per-app</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>4&ndash;5 self-host, 3 managed</td><td>2&ndash;3</td><td>2</td><td>1</td><td>2</td><td>1</td><td>1</td><td>1</td></tr>
+            <tr><td>Cost driver</td><td>Node-hours + control plane</td><td>Node-hours</td><td>vCPU+RAM-seconds</td><td>vCPU+RAM-seconds + req</td><td>Pod-resources-seconds</td><td>GB-seconds + invocations</td><td>Same</td><td>vCPU/mem-seconds + req</td></tr>
+            <tr><td>Pricing surprise</td><td>You pay nodes even if idle</td><td>Same</td><td>Min granularity</td><td>0 cost when idle (mostly)</td><td>Pod-only billing</td><td>0 idle; spike on burst</td><td>0 idle</td><td>0 idle option</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Always-on web service, 1 cloud, no k8s expertise</td><td>ECS Fargate / Cloud Run / Container Apps</td><td>k8s</td><td>Pick the simpler one until you outgrow it</td></tr>
+            <tr><td>Microservices &gt; ~10 services, complex topology</td><td>Kubernetes</td><td>Nomad</td><td>k8s if hiring market matters; Nomad if simpler is OK</td></tr>
+            <tr><td>Multi-cloud / on-prem hybrid</td><td>Kubernetes</td><td>Nomad</td><td>Anywhere k8s runs (which is everywhere)</td></tr>
+            <tr><td>Bursty / scale-to-zero HTTP</td><td>Cloud Run</td><td>Container Apps / App Runner</td><td>Cloud Run is most mature; pick by cloud</td></tr>
+            <tr><td>Event-driven (S3 / Pub/Sub trigger)</td><td>Lambda / Cloud Functions</td><td>Cloud Run jobs</td><td>Functions if &lt; 15 min; CR jobs for longer</td></tr>
+            <tr><td>Cron / scheduled task</td><td>Lambda + EventBridge / Cloud Scheduler &rarr; CR</td><td>k8s CronJob</td><td>Serverless if existing k8s would be overkill</td></tr>
+            <tr><td>Long-running batch</td><td>k8s Jobs, Batch, Fargate</td><td>Nomad</td><td>Match where the data lives</td></tr>
+            <tr><td>Stateful workload (DB, queue)</td><td>Managed service first; otherwise k8s StatefulSet</td><td>VM</td><td>Don't run a stateful workload in serverless</td></tr>
+            <tr><td>GPU inference</td><td>k8s + GPU node pool</td><td>SageMaker / Vertex / Azure ML</td><td>Managed if simple; k8s if you serve at scale</td></tr>
+            <tr><td>Glue / connector / one-off</td><td>Lambda</td><td>Cloud Functions</td><td>Whichever cloud the data lives in</td></tr>
+            <tr><td>Long polling / WebSocket</td><td>k8s / Cloud Run (with min-instances)</td><td>ECS Fargate</td><td>Lambda has 15-min limit + cold starts</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Pattern</th><th>Kubernetes</th><th>ECS Fargate</th><th>Cloud Run</th><th>Lambda</th></tr></thead>
+          <tbody>
+            <tr><td>Steady high QPS</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> $$ at scale</td></tr>
+            <tr><td>Spiky / bursty</td><td><span class="pat-warn">&#9888;</span> HPA lag</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td></tr>
+            <tr><td>Idle for hours</td><td><span class="pat-bad">&#10005;</span> pay nodes</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-good">&#10003;&#10003;</span> scale-to-zero</td><td><span class="pat-good">&#10003;&#10003;</span></td></tr>
+            <tr><td>Long-lived connection (WS)</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> 60 min</td><td><span class="pat-bad">&#10005;</span> 15 min</td></tr>
+            <tr><td>Cold-start sensitive</td><td><span class="pat-good">&#10003;</span> always warm</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> ~1&ndash;3s</td><td><span class="pat-warn">&#9888;</span> langs vary</td></tr>
+            <tr><td>Stateful (local FS)</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span> EFS</td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-bad">&#10005;</span></td></tr>
+            <tr><td>GPU</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-warn">&#9888;</span> limited</td><td><span class="pat-warn">&#9888;</span> limited</td><td><span class="pat-bad">&#10005;</span></td></tr>
+            <tr><td>Massive parallel ingestion</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td></tr>
+            <tr><td>Predictable cost</td><td><span class="pat-good">&#10003;&#10003;</span> nodes</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> req-based</td><td><span class="pat-warn">&#9888;</span> req-based</td></tr>
+            <tr><td>Multi-cloud portability</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-bad">&#10005;</span></td><td><span class="pat-bad">&#10005;</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend"><span class="pat-good">&#10003;&#10003;</span> excellent <span class="pat-good">&#10003;</span> handles <span class="pat-warn">&#9888;</span> with effort <span class="pat-bad">&#10005;</span> wrong tool</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Kubernetes</td><td>5,000+ nodes / 150k+ pods</td><td>etcd / API server saturate; controller backlog</td><td>Sharded clusters; reduce object churn</td></tr>
+            <tr><td>HPA</td><td>Scale-up lag</td><td>Pod startup &gt; spike duration; under-provisioned</td><td>Custom metric scaling; pre-warm via min replicas</td></tr>
+            <tr><td>ECS / Fargate</td><td>Account vCPU quota</td><td>Spike denied at quota</td><td>Quota raise; multi-region</td></tr>
+            <tr><td>Cloud Run</td><td>Concurrency per instance &times; max instances</td><td>Throttled; some 429s</td><td>Increase max-instances; tune concurrency target</td></tr>
+            <tr><td>Lambda</td><td>Concurrent execution quota (default 1k)</td><td>Throttling on burst</td><td>Reserved + provisioned concurrency; quota raise</td></tr>
+            <tr><td>Lambda (cold start)</td><td>Java / .NET on burst</td><td>P99 latency spikes 1&ndash;5s</td><td>Provisioned concurrency; switch to Go / Node</td></tr>
+            <tr><td>Spot / preemptible</td><td>Interruption rate</td><td>Workers churn; checkpoints lost</td><td>Mix on-demand + spot; checkpoint frequently</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <ul>
+        <li><strong>VMs &rarr; containers:</strong> dockerize each app; deploy on ECS Fargate / Cloud Run first (lowest ops); migrate to k8s only if needed.</li>
+        <li><strong>ECS Fargate &rarr; k8s:</strong> typical when team grows / multi-cloud needed. Translate task defs to Deployment manifests; redo IAM via IRSA.</li>
+        <li><strong>k8s &rarr; Cloud Run:</strong> for stateless 12-factor services; cuts ops cost dramatically. Watch for stateful sets, custom controllers, sidecars (Cloud Run has limited sidecar support).</li>
+        <li><strong>Lambda &rarr; container:</strong> when 15-min limit hits, cold-start is unacceptable, or you outgrow function model. Lambda containers were a stepping stone; Cloud Run / Fargate is the real destination.</li>
+        <li><strong>Self-host k8s &rarr; managed (EKS / GKE / AKS):</strong> almost always worth it; takes managing the control plane off your plate.</li>
+        <li><strong>k8s &rarr; GKE Autopilot:</strong> if pods don't need node-level customization. Removes node management entirely.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>k8s self-host (EC2/GCE)</td><td>Node-hours + ELB + EBS</td><td>You pay nodes 24/7 even idle; bin-packing is your friend</td></tr>
+            <tr><td>EKS / GKE / AKS</td><td>Node-hours + control-plane fee</td><td>$0.10/hr control plane = $73/mo per cluster</td></tr>
+            <tr><td>GKE Autopilot</td><td>Pod resource-seconds</td><td>Higher per-resource than nodes; great if utilization low</td></tr>
+            <tr><td>ECS Fargate</td><td>vCPU+RAM-seconds</td><td>~30% more than EC2 self-managed; less ops cost offsets</td></tr>
+            <tr><td>Cloud Run</td><td>vCPU+RAM-seconds + req</td><td>Free tier generous; idle = $0; concurrency target affects cost</td></tr>
+            <tr><td>Lambda</td><td>GB-seconds + invocations</td><td>Sustained 100% load is &gt;5&times; ECS; bursty loads cheaper</td></tr>
+            <tr><td>Spot / preemptible</td><td>Discounted nodes</td><td>50&ndash;90% savings on batch / stateless; interruption pain</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>k8s + Cloud Run side by side</h3>
+          <p>k8s for the steady microservice fleet; Cloud Run for spiky/idle services and webhooks. Same team, different scaling shapes.</p>
+        </div>
+        <div>
+          <h3>Lambda glue + Fargate workers</h3>
+          <p>Lambda for event triggers (S3, SQS, EventBridge); Fargate / Cloud Run for long-running workers. Lambda hands work over the line.</p>
+        </div>
+        <div>
+          <h3>Spot for batch + on-demand for serving</h3>
+          <p>Mixed node groups in k8s. Batch jobs on spot for 70% savings; serving stays on-demand for SLOs.</p>
+        </div>
+        <div>
+          <h3>Stateful in managed services + stateless in serverless</h3>
+          <p>DBs, queues, caches in managed services. App = stateless on Cloud Run / Fargate. Match each part of the system to the right shape.</p>
+        </div>
+        <div>
+          <h3>k8s as deploy target + serverless as event surface</h3>
+          <p>Knative / KEDA bring scale-to-zero and event-driven scaling to k8s. Get serverless ergonomics without leaving k8s.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"k8s for our 5-service startup"</h3>
+          <p>Cluster ops eats engineer time; team would have shipped faster on Cloud Run / Fargate.</p>
+        </div>
+        <div>
+          <h3>"Lambda for a busy 24/7 API"</h3>
+          <p>5&ndash;10&times; the cost of Fargate/Cloud Run at sustained high QPS. And cold starts hurt.</p>
+        </div>
+        <div>
+          <h3>"Stateful workload in serverless"</h3>
+          <p>Filesystem ephemeral; no sticky sessions. Use managed DB / queue, not Lambda local FS.</p>
+        </div>
+        <div>
+          <h3>"k8s nodes always at 30% utilization"</h3>
+          <p>Pay for 70% idle. Bin-pack with VPA / pod packing; consider Autopilot.</p>
+        </div>
+        <div>
+          <h3>"Lambda for &gt; 15-min jobs"</h3>
+          <p>Hits the wall. Use Cloud Run jobs / Fargate / k8s Jobs.</p>
+        </div>
+        <div>
+          <h3>"Forgot reserved concurrency"</h3>
+          <p>Lambda burst exceeds account limit; whole account 429s. Reserve concurrency for important functions.</p>
+        </div>
+        <div>
+          <h3>"App Mesh in production"</h3>
+          <p>AWS App Mesh end-of-life announced. Use Istio/Linkerd directly on EKS.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>Default progression: VM &rarr; ECS Fargate / Cloud Run &rarr; k8s only when complexity demands.</strong></li>
+          <li><strong>Lambda / Cloud Functions for event glue, cron, &lt; 15 min stateless.</strong></li>
+          <li><strong>Cloud Run / App Runner / Container Apps for spiky HTTP.</strong></li>
+          <li><strong>k8s for &gt;~10 services, complex topology, multi-cloud.</strong></li>
+          <li><strong>Stateful = managed service first; k8s StatefulSet only if forced.</strong></li>
+          <li><strong>Always say which scaling metric (CPU / RPS / queue depth) drives autoscaler.</strong></li>
+          <li><strong>For HPA, scale-up lag is the main risk; pre-warm with min replicas for spike-prone services.</strong></li>
+          <li><strong>Spot / preemptible for batch + checkpointed work; never for serving alone.</strong></li>
+          <li><strong>Cold-start: Go / Node &lt; Java / .NET. For latency-critical Lambdas, use provisioned concurrency.</strong></li>
+          <li><strong>Always state "managed control plane" when naming k8s in a cloud answer.</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../technologies.html">All Technologies</a></li>
+        <li><a href="comparison-edge.html">Edge comparison</a></li>
+        <li><a href="comparison-workflow.html">Workflow comparison</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

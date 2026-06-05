@@ -1,0 +1,1466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebSockets — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Nav ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="design-principles.html">Principles</a></li>
+        <li><a href="api-gateway.html">API Gateway</a></li>
+        <li><a href="websockets.html" style="color: var(--color-primary); font-weight: 600;">WebSockets</a></li>
+        <li><a href="service-discovery.html">Service Discovery</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero ===== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>WebSockets</h1>
+      <p class="hero-subtitle">Full-duplex, persistent connections that enable real-time bidirectional communication between clients and servers over a single TCP connection.</p>
+      <span class="hero-meta">30 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>A WebSocket is a communication protocol that provides a <strong>full-duplex, persistent connection</strong> between a client (typically a browser) and a server over a single TCP socket. Unlike the traditional HTTP request-response model where the client must initiate every exchange, a WebSocket connection allows both sides to send data at any time, independently and simultaneously. Once the connection is established, it stays open until either side explicitly closes it or the network drops.</p>
+      <p>The connection begins life as a normal HTTP request. The client sends an <strong>HTTP Upgrade handshake</strong>&mdash;a regular GET request with special headers (<code>Upgrade: websocket</code>, <code>Connection: Upgrade</code>, and a <code>Sec-WebSocket-Key</code>). If the server supports WebSockets, it responds with HTTP 101 Switching Protocols, and from that moment the connection is no longer HTTP. It becomes a lightweight, framed, bidirectional binary protocol running over the same TCP connection. This handshake is critical because it lets WebSocket traffic pass through existing HTTP infrastructure&mdash;proxies, load balancers, firewalls&mdash;that understand HTTP.</p>
+
+      <h3>Sec-WebSocket-Key Validation: Preventing HTTP/WebSocket Confusion</h3>
+      <p>The handshake includes a cryptographic validation step to ensure both sides genuinely intend to speak WebSocket. Without this, a malicious page could trick a browser into sending a crafted HTTP request to a WebSocket endpoint (or vice versa), potentially poisoning HTTP caches or confusing intermediary proxies. Here is the exact computation defined by RFC 6455:</p>
+      <p><strong>Step 1:</strong> The client generates a random 16-byte nonce and base64-encodes it. For example:</p>
+      <pre class="line-numbers"><code class="language-python">Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==</code></pre>
+      <p><strong>Step 2:</strong> The server takes this key and appends a fixed "magic string" defined in the RFC:</p>
+      <pre class="line-numbers"><code class="language-python"># The magic GUID is hardcoded in RFC 6455 - never changes
+magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+concatenated = "dGhlIHNhbXBsZSBub25jZQ==" + magic
+# Result: "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"</code></pre>
+      <p><strong>Step 3:</strong> The server computes the SHA-1 hash of the concatenated string, then base64-encodes the 20-byte hash digest:</p>
+      <pre class="line-numbers"><code class="language-python">import hashlib, base64
+
+key = "dGhlIHNhbXBsZSBub25jZQ=="
+magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# SHA-1 hash of the concatenated string
+sha1_hash = hashlib.sha1((key + magic).encode()).digest()
+# sha1_hash = b'\xb3\x7a\x4f\x2c\xc0\x62\x4f\x16\x90\xf6\x46\x06\xcf\x38\x59\x45\xb2\xbe\xc4\xea'
+
+accept_value = base64.b64encode(sha1_hash).decode()
+# accept_value = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="</code></pre>
+      <p><strong>Step 4:</strong> The server returns this value in the response header:</p>
+      <pre class="line-numbers"><code class="language-python">Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</code></pre>
+      <p>The client verifies that the <code>Sec-WebSocket-Accept</code> value matches what it expects (it performs the same computation locally). If the values do not match, the client closes the connection immediately.</p>
+      <p><strong>Why this matters:</strong> The magic GUID ensures that only a real WebSocket server (one that knows the RFC 6455 protocol) can produce the correct <code>Sec-WebSocket-Accept</code> header. A regular HTTP server or caching proxy would not know to perform this computation and would either reject the request or return a wrong value. This prevents <strong>cache poisoning attacks</strong> where an attacker tricks a proxy into caching a WebSocket upgrade response as if it were a normal HTTP response, which could later be served to other users. The nonce (random key) ensures each handshake is unique, preventing replay attacks.</p>
+      <p>Why not just use HTTP? Consider the alternatives. <strong>Short polling</strong> means the client sends a request every N seconds asking "anything new?"&mdash;wasteful when there is nothing new, and sluggish when there is. <strong>Long polling</strong> improves on this by having the server hold the request open until it has something to send&mdash;but each response still requires a new connection, and you only get server-to-client messages (the client must send another request to talk back). <strong>Server-Sent Events (SSE)</strong> give you a persistent server-to-client stream, but it is unidirectional&mdash;the client cannot push data back over the same channel. WebSockets are the only option that gives you true, low-latency, bidirectional communication over a single persistent connection.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>WebSocket Connection Lifecycle (Animated)</h2>
+      <div class="animation-container">
+        <canvas id="ws-animation"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">A client initiates an HTTP Upgrade handshake. Once upgraded, a persistent connection (thick line) is established and messages flow bidirectionally. Blue dots flow client-to-server; teal dots flow server-to-client, simultaneously.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>1. HTTP Upgrade Handshake</h3>
+      <p>The client sends a standard HTTP GET with upgrade headers. The server validates the request and responds with <code>101 Switching Protocols</code>. The <code>Sec-WebSocket-Key</code> and <code>Sec-WebSocket-Accept</code> headers prevent accidental upgrades and cross-protocol attacks. After this handshake, the TCP connection is repurposed for WebSocket frames.</p>
+      <pre class="line-numbers"><code class="language-python"># Client request headers
+# GET /chat HTTP/1.1
+# Host: server.example.com
+# Upgrade: websocket
+# Connection: Upgrade
+# Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+# Sec-WebSocket-Version: 13
+
+# Server response
+# HTTP/1.1 101 Switching Protocols
+# Upgrade: websocket
+# Connection: Upgrade
+# Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</code></pre>
+
+      <h3>2. Frame Format</h3>
+      <p>Once connected, data is sent in <strong>frames</strong>. Each frame has a small header (2-14 bytes) containing: a FIN bit (is this the last fragment?), an opcode (text=0x1, binary=0x2, close=0x8, ping=0x9, pong=0xA), a masking bit (client-to-server frames must be masked), and the payload length. The framing overhead is minimal&mdash;as low as 2 bytes for a small message, versus ~800 bytes for an equivalent HTTP request with headers.</p>
+
+      <h4>Byte-by-Byte Frame Breakdown</h4>
+      <p>Let us trace how the text message <code>"Hello"</code> (5 ASCII bytes) is encoded in a WebSocket frame sent from a client to a server. Since it is client-to-server, it <strong>must</strong> be masked (RFC 6455, Section 5.1).</p>
+
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Byte Position</th><th>Binary</th><th>Hex</th><th>Field</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Byte 0</td><td><code>1 000 0001</code></td><td><code>0x81</code></td><td>FIN + RSV1-3 + Opcode</td><td>FIN=1 (final fragment), RSV=000, Opcode=0x1 (text frame)</td></tr>
+            <tr><td>Byte 1</td><td><code>1 0000101</code></td><td><code>0x85</code></td><td>MASK + Payload length</td><td>MASK=1 (masked), Length=5 bytes</td></tr>
+            <tr><td>Bytes 2-5</td><td colspan="2"><code>0x37 0xFA 0x21 0x3D</code></td><td>Masking key</td><td>4 random bytes chosen by the client</td></tr>
+            <tr><td>Bytes 6-10</td><td colspan="2"><code>0x7F 0x9F 0x4D 0x51 0x58</code></td><td>Masked payload</td><td>"Hello" XOR'd with the masking key</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Total frame size: 11 bytes</strong> for a 5-byte message. Compare this to an HTTP POST with headers, which would be ~800+ bytes for the same payload.</p>
+
+      <h4>The XOR Masking Step-by-Step</h4>
+      <p>Masking transforms each byte of the payload by XOR-ing it with the corresponding byte of the 4-byte masking key, cycling through the key:</p>
+      <pre class="line-numbers"><code class="language-python"># Masking key (4 random bytes chosen by client)
+mask_key = [0x37, 0xFA, 0x21, 0x3D]
+
+# Original payload: "Hello"
+payload = [0x48, 0x65, 0x6C, 0x6C, 0x6F]  # H=0x48, e=0x65, l=0x6C, l=0x6C, o=0x6F
+
+# Masking formula: masked[i] = payload[i] XOR mask_key[i % 4]
+masked = []
+for i in range(len(payload)):
+    masked_byte = payload[i] ^ mask_key[i % 4]
+    masked.append(masked_byte)
+
+# Step-by-step:
+# i=0: 'H' 0x48 XOR 0x37 = 0x7F   (mask_key[0])
+# i=1: 'e' 0x65 XOR 0xFA = 0x9F   (mask_key[1])
+# i=2: 'l' 0x6C XOR 0x21 = 0x4D   (mask_key[2])
+# i=3: 'l' 0x6C XOR 0x3D = 0x51   (mask_key[3])
+# i=4: 'o' 0x6F XOR 0x37 = 0x58   (mask_key[0], cycles back)
+
+# Masked payload: [0x7F, 0x9F, 0x4D, 0x51, 0x58]
+# To unmask, apply the SAME XOR again: 0x7F XOR 0x37 = 0x48 = 'H'</code></pre>
+
+      <p><strong>Why must client-to-server frames be masked?</strong> This is not for encryption (the masking key is sent in the clear). The purpose is to prevent <strong>cache poisoning attacks</strong>. Without masking, an attacker could craft a malicious web page that opens a WebSocket connection through a transparent HTTP proxy. The proxy does not understand WebSocket frames and interprets the raw bytes as an HTTP request/response. By carefully constructing the payload, the attacker could inject a fake HTTP response into the proxy's cache, which would then be served to other users. Masking with a random key makes it impossible for the attacker to predict the byte sequence on the wire, preventing this class of attacks. Server-to-client frames are <strong>not</strong> masked because the server is trusted and does not run attacker-controlled code.</p>
+
+      <h4>Payload Length Encoding</h4>
+      <p>The length field uses a variable-length encoding to keep small frames compact:</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Payload Size</th><th>Length Field (7 bits of byte 1)</th><th>Extended Length</th><th>Total Header Overhead</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>0&ndash;125 bytes</td><td>Actual length (0&ndash;125)</td><td>None</td><td>2 bytes (+ 4 if masked)</td></tr>
+            <tr><td>126&ndash;65,535 bytes</td><td>126 (marker)</td><td>Next 2 bytes = uint16 length</td><td>4 bytes (+ 4 if masked)</td></tr>
+            <tr><td>65,536+ bytes</td><td>127 (marker)</td><td>Next 8 bytes = uint64 length</td><td>10 bytes (+ 4 if masked)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>For our "Hello" example (5 bytes), the length fits in the 7-bit field directly, so no extended length bytes are needed. A 1KB message would use the 2-byte extended encoding. A 100KB message would also use the 2-byte extended encoding. Only messages larger than 64KB need the 8-byte extended encoding.</p>
+
+      <h3>3. Ping/Pong Heartbeats</h3>
+      <p>WebSocket defines control frames for keepalive. The server (or client) sends a <strong>Ping</strong> frame; the other side must respond with a <strong>Pong</strong> frame carrying the same payload. This serves two purposes: it detects dead connections (if no pong comes back within a timeout, close the socket) and it keeps the connection alive through intermediaries like proxies and NATs that may close idle connections.</p>
+
+      <h4>Ping/Pong Timeline: Detecting a Dead Connection</h4>
+      <p>Consider a server configured with <code>ping_interval = 25s</code> and <code>ping_timeout = 5s</code>. Here is a concrete timeline showing a healthy connection that eventually goes dead:</p>
+
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Time</th><th>Event</th><th>Direction</th><th>Connection Status</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>T=0.00s</td><td>WebSocket connection established</td><td>&mdash;</td><td>Open</td></tr>
+            <tr><td>T=25.00s</td><td>Server sends <strong>Ping</strong> frame (payload: <code>0x01</code>)</td><td>Server &rarr; Client</td><td>Open, waiting for pong</td></tr>
+            <tr><td>T=25.01s</td><td>Client replies with <strong>Pong</strong> frame (payload: <code>0x01</code>)</td><td>Client &rarr; Server</td><td>Open, healthy</td></tr>
+            <tr><td>T=50.00s</td><td>Server sends <strong>Ping</strong> frame (payload: <code>0x02</code>)</td><td>Server &rarr; Client</td><td>Open, waiting for pong</td></tr>
+            <tr><td>T=50.01s</td><td>Client replies with <strong>Pong</strong> frame (payload: <code>0x02</code>)</td><td>Client &rarr; Server</td><td>Open, healthy</td></tr>
+            <tr><td>T=60.00s</td><td><em>Client's network drops (phone enters tunnel)</em></td><td>&mdash;</td><td>Open (server does not know yet)</td></tr>
+            <tr><td>T=75.00s</td><td>Server sends <strong>Ping</strong> frame (payload: <code>0x03</code>)</td><td>Server &rarr; (void)</td><td>Open, waiting for pong</td></tr>
+            <tr><td>T=80.00s</td><td>5 seconds elapsed, <strong>no Pong received</strong></td><td>&mdash;</td><td><strong>Server closes connection</strong> (dead)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Without ping/pong, the server would never know the client disappeared. The TCP connection would remain in memory indefinitely as a "zombie connection," leaking memory. The server only discovers the client is gone when it tries to write data and the OS eventually reports a TCP error&mdash;which can take minutes or even hours depending on TCP keepalive settings.</p>
+
+      <h4>Why 25 Seconds? Proxy Idle Timeouts</h4>
+      <p>Most intermediaries (reverse proxies, load balancers, NAT gateways, corporate firewalls) have an <strong>idle connection timeout</strong>&mdash;they close connections where no data has flowed for a certain period. Common defaults:</p>
+      <ul>
+        <li><strong>Nginx:</strong> <code>proxy_read_timeout</code> defaults to <strong>60 seconds</strong></li>
+        <li><strong>AWS ALB:</strong> idle timeout defaults to <strong>60 seconds</strong></li>
+        <li><strong>HAProxy:</strong> <code>timeout tunnel</code> defaults to <strong>no timeout</strong> (but often configured to 60-300s)</li>
+        <li><strong>NAT gateways:</strong> typically <strong>30-300 seconds</strong> depending on the device</li>
+        <li><strong>Corporate firewalls:</strong> can be as low as <strong>30 seconds</strong></li>
+      </ul>
+      <p>The ping interval must be <strong>shorter than the smallest idle timeout in the entire network path</strong>. Since the smallest common timeout is 30 seconds (NAT/firewall), a 25-second ping interval provides a safety margin. Each ping/pong exchange resets the idle timer on every intermediary in the path, keeping the connection alive even when no application data is flowing.</p>
+
+      <h3>4. Close Handshake</h3>
+      <p>Either side can initiate a graceful close by sending a <strong>Close</strong> frame with a status code (e.g., 1000 for normal closure, 1001 for going away). The other side responds with its own Close frame, and then both sides close the TCP connection. This two-way close prevents data loss from in-flight messages.</p>
+
+      <h3>Comparison: Polling vs. Long-Polling vs. SSE vs. WebSocket</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Property</th>
+            <th>Short Polling</th>
+            <th>Long Polling</th>
+            <th>SSE</th>
+            <th>WebSocket</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Direction</strong></td>
+            <td>Client &rarr; Server</td>
+            <td>Client &rarr; Server</td>
+            <td>Server &rarr; Client</td>
+            <td>Bidirectional</td>
+          </tr>
+          <tr>
+            <td><strong>Latency</strong></td>
+            <td>High (poll interval)</td>
+            <td>Medium (reconnect delay)</td>
+            <td>Low</td>
+            <td>Lowest</td>
+          </tr>
+          <tr>
+            <td><strong>Overhead per message</strong></td>
+            <td>High (full HTTP headers)</td>
+            <td>High</td>
+            <td>Low (small SSE framing)</td>
+            <td>Lowest (2-14 byte frame)</td>
+          </tr>
+          <tr>
+            <td><strong>Connection reuse</strong></td>
+            <td>No (new req each time)</td>
+            <td>Partial</td>
+            <td>Yes (persistent)</td>
+            <td>Yes (persistent)</td>
+          </tr>
+          <tr>
+            <td><strong>Browser support</strong></td>
+            <td>Universal</td>
+            <td>Universal</td>
+            <td>All modern (no IE)</td>
+            <td>All modern</td>
+          </tr>
+          <tr>
+            <td><strong>Proxy/firewall friendly</strong></td>
+            <td>Yes</td>
+            <td>Mostly</td>
+            <td>Yes (just HTTP)</td>
+            <td>Sometimes blocked</td>
+          </tr>
+          <tr>
+            <td><strong>Best for</strong></td>
+            <td>Simple dashboards</td>
+            <td>Notifications</td>
+            <td>Live feeds, logs</td>
+            <td>Chat, gaming, collaboration</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use WebSockets When</h4>
+          <ul>
+            <li><strong>Real-time chat:</strong> Messages must be delivered instantly in both directions. WebSocket latency is measured in single-digit milliseconds.</li>
+            <li><strong>Live multiplayer gaming:</strong> Game state updates need to flow continuously between server and multiple clients at high frequency (30-60 updates/sec).</li>
+            <li><strong>Live dashboards and monitoring:</strong> Metrics, alerts, and status updates should push to the UI the moment they change, not on a poll cycle.</li>
+            <li><strong>Collaborative editing:</strong> Google Docs-style editing requires every keystroke or operation to propagate to all participants in real time.</li>
+            <li><strong>Financial tickers:</strong> Stock prices, order book updates, and trade notifications demand sub-millisecond delivery of high-frequency data.</li>
+            <li><strong>Presence and typing indicators:</strong> Showing "user is typing..." or online/offline status requires lightweight, frequent, bidirectional signals.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use WebSockets When</h4>
+          <ul>
+            <li><strong>Simple request-response:</strong> If your app is CRUD with occasional reads, HTTP is simpler, better cached, and more widely supported. Don't add complexity you don't need.</li>
+            <li><strong>Infrequent updates:</strong> If data changes every 30 seconds or less, SSE or even short polling is simpler and avoids the operational overhead of persistent connections. SSE also auto-reconnects.</li>
+            <li><strong>Fire-and-forget writes:</strong> If the client just sends data and does not need a response (telemetry, analytics events), plain HTTP POST is fine. No need for a persistent connection.</li>
+            <li><strong>Server-only push:</strong> If data only flows server-to-client (news feed, live scores), SSE is lighter weight, uses standard HTTP, and works through CDNs and proxies without special configuration.</li>
+            <li><strong>Corporate or restricted networks:</strong> Some firewalls and proxies block WebSocket upgrades. If you cannot control the network environment, SSE or long-polling with fallback is safer.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>Choose WebSocket over SSE when:</h3>
+      <p>You need the client to push data back to the server over the same connection (chat, gaming), you need binary data support (SSE is text-only), or you need the absolute lowest possible latency. Choose SSE over WebSocket when data flow is only server-to-client, you want automatic reconnection built into the browser API, or you need to work through HTTP infrastructure that does not support WebSocket upgrade.</p>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic: Raw WebSocket API</h3>
+      <p>The browser's native <code>WebSocket</code> API is straightforward: <code>new WebSocket('wss://...')</code> gives you <code>onopen</code>, <code>onmessage</code>, <code>onclose</code>, and <code>onerror</code> callbacks. The server-side equivalent exists in every language (Python's <code>websockets</code>, Go's <code>gorilla/websocket</code>, Node's <code>ws</code>). Raw WebSocket is simple but leaves you to implement reconnection logic, heartbeats, message serialization, room/channel abstraction, and fallback for environments that block upgrades.</p>
+
+      <h3>Socket.IO (Fallbacks + Rooms)</h3>
+      <p>Socket.IO wraps WebSocket with automatic fallback to HTTP long-polling, built-in reconnection with exponential backoff, room/namespace abstractions for fan-out, and binary support. It is the most popular real-time library (2M+ weekly npm downloads) and works in environments where raw WebSocket fails. The tradeoff: it uses a custom protocol on top of WebSocket, so Socket.IO clients cannot talk to plain WebSocket servers and vice versa.</p>
+
+      <h3>WebSocket over HTTP/2</h3>
+      <p>RFC 8441 (2018) enables WebSocket connections to be tunneled over HTTP/2 streams. This means multiple WebSocket connections can share a single TCP connection (multiplexing), reducing the connection overhead and playing nicely with HTTP/2 infrastructure. Browser support is growing but not universal.</p>
+
+      <h3>WebTransport (QUIC-Based)</h3>
+      <p>WebTransport is the newest contender, built on HTTP/3 and QUIC. It provides bidirectional streams (like WebSocket), unidirectional streams, and unreliable datagrams (like UDP)&mdash;all multiplexed over a single QUIC connection. QUIC eliminates head-of-line blocking and handles connection migration (switching between WiFi and cellular without reconnecting). WebTransport is ideal for gaming and video streaming where occasional packet loss is acceptable. It is still emerging (Chrome supports it, Firefox is implementing it).</p>
+
+      <h3>gRPC Streaming</h3>
+      <p>gRPC supports server streaming, client streaming, and bidirectional streaming over HTTP/2. For service-to-service communication, gRPC streaming offers strong typing via Protocol Buffers, built-in flow control, and deadline propagation. It is not suitable for browser-to-server communication without a proxy (gRPC-Web), but for backend microservices, it is often a better choice than raw WebSocket.</p>
+
+      <h3>Phoenix Channels / LiveView Pattern</h3>
+      <p>Elixir's Phoenix framework pioneered a pattern where WebSocket connections are managed by lightweight BEAM processes, each using only ~2KB of memory. Phoenix Channels provides presence tracking, topic-based pub/sub, and graceful reconnection out of the box. LiveView takes this further by managing UI state entirely on the server and pushing DOM diffs over WebSocket, eliminating the need for a JavaScript SPA. This pattern has inspired similar approaches: Laravel LiveWire, Rails Hotwire/Turbo Streams, and Django Channels.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Persistent connections are maintainable:</strong> The model assumes the network supports long-lived TCP connections. This breaks on mobile networks where connections are frequently dropped during cell tower handoffs, and on networks with aggressive NAT timeout (often 30-60 seconds). You must implement reconnection with exponential backoff.</li>
+          <li><strong>Clients can handle full-duplex:</strong> We assume both sides can send and receive simultaneously. In practice, browser clients handle this natively, but embedded devices or constrained environments may not support WebSocket at all.</li>
+          <li><strong>Intermediaries support WebSocket upgrade:</strong> Proxies, load balancers, CDNs, and firewalls must understand and pass through the HTTP 101 Upgrade handshake. This assumption breaks frequently: corporate HTTP proxies often strip Upgrade headers, older nginx configurations require explicit <code>proxy_set_header Upgrade</code> directives, and many CDNs (CloudFront until recently) do not support WebSocket.</li>
+          <li><strong>Memory scales linearly with connections:</strong> The sizing model assumes each connection has a roughly constant memory footprint. This breaks if connections carry vastly different state sizes (e.g., one connection subscribed to 1 room vs. 10,000 rooms) or if message buffering during backpressure causes memory spikes.</li>
+          <li><strong>Message ordering is guaranteed per connection:</strong> TCP guarantees in-order delivery within a single connection. However, this guarantee disappears across reconnections (client disconnects and reconnects, possibly to a different server). You need sequence numbers or vector clocks for cross-reconnect ordering.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>Memory Per Connection</h3>
+      <p>Each WebSocket connection consumes memory for: the TCP socket buffer (~8-16KB read + write), the application-level connection state (session data, subscribed rooms, pending messages), and any framework overhead. A minimal connection uses ~10KB; a typical production connection (with buffers and state) uses ~30-50KB.</p>
+
+      <h3>Connections Per Server</h3>
+      <p>The upper bound is set by file descriptors (each connection = 1 fd; Linux default is 1024, production servers set this to 1M+) and available RAM. At 30KB per connection, a server with 64GB of RAM dedicated to WebSocket state can theoretically hold ~2M connections.</p>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+
+      <div class="callout callout-info">
+        <h4>Example 1: Real-Time Chat App</h4>
+        <p><strong>SLO:</strong> p99 message delivery &lt; 100ms, 1M concurrent connections.</p>
+        <p><strong>Memory sizing:</strong> Each chat connection carries user metadata, room subscriptions (avg 5 rooms), and a 4KB outbound buffer = ~40KB per connection. 1M &times; 40KB = <strong>40GB RAM</strong> for connection state alone. Allow 20GB headroom for OS, GC, and application code &rarr; 64GB instances (r6g.2xlarge).</p>
+        <p><strong>Server count:</strong> To keep p99 delivery under 100ms, each server should handle no more than 200K connections (reduces tail latency from per-server fan-out). 1M &divide; 200K = <strong>5 servers minimum</strong>, deploy 7 for redundancy (survive 2 failures without SLO breach).</p>
+        <p><strong>Message rate:</strong> At 0.1 msg/sec sent per user, fan-out to avg 20 recipients per room message: effective outbound rate per server = 200K &times; 0.1 &times; 20 = 400K msg/sec. At 200B avg message, bandwidth = 80MB/s = 640 Mbps &mdash; well within 10 Gbps NIC. CPU at 1&mu;s per message = 0.4 cores. <strong>This workload is memory-bound.</strong></p>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Example 2: Live Sports Scores</h4>
+        <p><strong>SLO:</strong> p95 update latency &lt; 500ms, 5M concurrent viewers.</p>
+        <p><strong>Fan-out architecture:</strong> Score updates are publisher-driven (servers push to all viewers of a match). A single match may have 2M viewers. Broadcasting 2M messages sequentially at 10&mu;s each = 20 seconds &mdash; far exceeds the 500ms SLO. Solution: <strong>two-tier fan-out</strong>. Origin servers publish to N edge relay servers via pub/sub; each edge server fans out to its local connections.</p>
+        <p><strong>Edge server sizing:</strong> Each viewer connection is read-only, minimal state = ~15KB per connection. At 100K connections per edge server: 100K &times; 15KB = <strong>1.5GB RAM</strong>. 5M &divide; 100K = <strong>50 edge servers</strong>. Score updates are small (100B) and infrequent (every few seconds per match), so CPU and bandwidth are negligible.</p>
+        <p><strong>Latency budget:</strong> Origin &rarr; pub/sub (10ms) + pub/sub &rarr; edge server (20ms) + edge fan-out to 100K clients (100K &times; 5&mu;s = 500ms if serial). To hit p95 &lt; 500ms: use async I/O with write batching (epoll/kqueue), reducing fan-out to ~50ms for 100K connections. Total: <strong>~80ms p95</strong>, well within SLO.</p>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Example 3: Collaborative Document Editing</h4>
+        <p><strong>SLO:</strong> p99 &lt; 50ms for cursor/keystroke sync, 100K concurrent documents (avg 5 collaborators each = 500K connections).</p>
+        <p><strong>Connection routing:</strong> All collaborators on the same document must connect to the <strong>same server</strong> (or share state via CRDT/OT with sub-50ms sync). Use consistent hashing on document ID to route connections. Each server handles ~2,000 documents &times; 5 users = 10K connections.</p>
+        <p><strong>Server sizing:</strong> Each connection carries CRDT state for the active document (~200KB for a large doc) + cursor positions for all collaborators. Memory per connection: ~250KB. Per server: 10K &times; 250KB = <strong>2.5GB RAM</strong>. 100K documents &divide; 2K docs/server = <strong>50 servers</strong>.</p>
+        <p><strong>Latency budget:</strong> Keystroke &rarr; server (network RTT, ~10ms same region) + OT/CRDT transform (1-5ms) + broadcast to 4 other collaborators (negligible). Total p99: <strong>~20ms</strong> within-region. Cross-region collaboration requires regional relay or CRDT with eventual convergence &lt; 50ms via dedicated inter-region links.</p>
+        <p><strong>CPU is the constraint:</strong> OT transforms at high keystroke rates (10 keystrokes/sec &times; 5 users &times; 2K docs = 100K transforms/sec per server). At 50&mu;s per transform = 5 CPU cores per server. Use c6g.2xlarge (8 vCPU) instances.</p>
+      </div>
+
+      <div class="callout callout-info">
+        <h4>Example 4: Financial Trading Dashboard</h4>
+        <p><strong>SLO:</strong> p99 &lt; 10ms tick delivery, 50K concurrent traders.</p>
+        <p><strong>Dedicated connection pool:</strong> At this latency target, no pub/sub backplane &mdash; each server directly receives the market data feed. Traders subscribe to specific symbols (avg 50 symbols each). Use a <strong>topic-partitioned architecture</strong>: partition symbols across N servers, each trader connects to the servers that own their symbols (multi-connection client).</p>
+        <p><strong>Server sizing:</strong> 10K symbols &divide; 5 partitions = 2K symbols per server. Each server handles ~20K trader connections (some traders overlap across partitions). Memory per connection: 20KB state + 8KB buffer = 28KB. Per server: 20K &times; 28KB = <strong>560MB RAM</strong>. Memory is not the bottleneck.</p>
+        <p><strong>CPU is the bottleneck:</strong> Market data arrives at 500K ticks/sec total, 100K ticks/sec per server. Each tick fans out to avg 200 subscribed traders on that server. Outbound: 100K &times; 200 = 20M messages/sec. At 0.5&mu;s per message write = 10 CPU cores. Use <strong>c6g.4xlarge (16 vCPU)</strong> with kernel bypass (io_uring or DPDK) to hit p99 &lt; 10ms.</p>
+        <p><strong>Bandwidth:</strong> 20M msg/sec &times; 100B per tick = 2GB/sec = 16 Gbps per server. Requires 25 Gbps NIC &mdash; use network-optimized instances.</p>
+      </div>
+
+      <!-- Interactive Canvas: Concurrent Connections vs Memory & Latency vs Fan-out -->
+      <h3>Interactive Sizing Visualisation</h3>
+      <p>Hover over data points to see detailed sizing breakdowns. The left chart shows how memory usage scales with concurrent connections for different per-connection footprints. The right chart shows how message delivery latency grows with fan-out factor at different processing speeds.</p>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 24px; margin: 24px 0;">
+        <div style="flex: 1; min-width: 340px;">
+          <canvas id="ws-sizing-connections-memory" width="520" height="370" style="width: 100%; max-width: 520px; border: 1px solid var(--color-border, #d0d7de); border-radius: 8px; cursor: crosshair;"></canvas>
+        </div>
+        <div style="flex: 1; min-width: 340px;">
+          <canvas id="ws-sizing-latency-fanout" width="520" height="370" style="width: 100%; max-width: 520px; border: 1px solid var(--color-border, #d0d7de); border-radius: 8px; cursor: crosshair;"></canvas>
+        </div>
+      </div>
+      <div id="ws-sizing-tooltip" style="position: fixed; display: none; background: #1a1a2e; color: #e0e0e0; padding: 10px 14px; border-radius: 6px; font-size: 13px; font-family: 'JetBrains Mono', monospace; pointer-events: none; z-index: 1000; box-shadow: 0 4px 16px rgba(0,0,0,0.3); max-width: 300px; line-height: 1.5;"></div>
+
+      <script>
+      (function() {
+        const tooltip = document.getElementById('ws-sizing-tooltip');
+
+        // === Chart 1: Connections vs Memory ===
+        const c1 = document.getElementById('ws-sizing-connections-memory');
+        const ctx1 = c1.getContext('2d');
+        const W1 = c1.width, H1 = c1.height;
+        const pad1 = { top: 50, right: 30, bottom: 60, left: 70 };
+        const plotW1 = W1 - pad1.left - pad1.right;
+        const plotH1 = H1 - pad1.top - pad1.bottom;
+
+        // Data: connections in thousands, memory profiles in KB per conn
+        const connSteps = [10, 50, 100, 200, 500, 1000, 2000];
+        const profiles = [
+          { label: '15 KB (read-only viewer)', kb: 15, color: '#22c55e' },
+          { label: '40 KB (chat app)', kb: 40, color: '#3b82f6' },
+          { label: '100 KB (gaming)', kb: 100, color: '#f59e0b' },
+          { label: '250 KB (collab editing)', kb: 250, color: '#ef4444' }
+        ];
+        const maxConn = 2000; // in thousands
+        const maxMemGB = 500;
+
+        function xPos1(connK) { return pad1.left + (connK / maxConn) * plotW1; }
+        function yPos1(memGB) { return pad1.top + plotH1 - (memGB / maxMemGB) * plotH1; }
+
+        function drawChart1() {
+          ctx1.clearRect(0, 0, W1, H1);
+          // Background
+          ctx1.fillStyle = '#f8fafc';
+          ctx1.fillRect(0, 0, W1, H1);
+
+          // Title
+          ctx1.fillStyle = '#1e293b';
+          ctx1.font = 'bold 14px JetBrains Mono, monospace';
+          ctx1.textAlign = 'center';
+          ctx1.fillText('Concurrent Connections vs Memory Usage', W1 / 2, 24);
+
+          // Grid
+          ctx1.strokeStyle = '#e2e8f0';
+          ctx1.lineWidth = 1;
+          for (let g = 0; g <= 500; g += 100) {
+            const y = yPos1(g);
+            ctx1.beginPath(); ctx1.moveTo(pad1.left, y); ctx1.lineTo(W1 - pad1.right, y); ctx1.stroke();
+            ctx1.fillStyle = '#64748b'; ctx1.font = '11px JetBrains Mono, monospace'; ctx1.textAlign = 'right';
+            ctx1.fillText(g + ' GB', pad1.left - 8, y + 4);
+          }
+          for (let i = 0; i < connSteps.length; i++) {
+            const x = xPos1(connSteps[i]);
+            ctx1.beginPath(); ctx1.moveTo(x, pad1.top); ctx1.lineTo(x, H1 - pad1.bottom); ctx1.stroke();
+            ctx1.fillStyle = '#64748b'; ctx1.font = '11px JetBrains Mono, monospace'; ctx1.textAlign = 'center';
+            ctx1.fillText(connSteps[i] + 'K', x, H1 - pad1.bottom + 18);
+          }
+
+          // Axis labels
+          ctx1.fillStyle = '#475569'; ctx1.font = '12px JetBrains Mono, monospace'; ctx1.textAlign = 'center';
+          ctx1.fillText('Concurrent Connections', W1 / 2, H1 - 8);
+          ctx1.save(); ctx1.translate(16, pad1.top + plotH1 / 2); ctx1.rotate(-Math.PI / 2);
+          ctx1.fillText('Memory (GB)', 0, 0); ctx1.restore();
+
+          // Lines and points
+          profiles.forEach(function(p) {
+            ctx1.strokeStyle = p.color; ctx1.lineWidth = 2.5;
+            ctx1.beginPath();
+            connSteps.forEach(function(ck, i) {
+              var memGB = (ck * 1000 * p.kb) / (1024 * 1024);
+              var x = xPos1(ck), y = yPos1(memGB);
+              if (i === 0) ctx1.moveTo(x, y); else ctx1.lineTo(x, y);
+            });
+            ctx1.stroke();
+            // Points
+            connSteps.forEach(function(ck) {
+              var memGB = (ck * 1000 * p.kb) / (1024 * 1024);
+              var x = xPos1(ck), y = yPos1(memGB);
+              ctx1.beginPath(); ctx1.arc(x, y, 4, 0, Math.PI * 2);
+              ctx1.fillStyle = p.color; ctx1.fill();
+              ctx1.strokeStyle = '#fff'; ctx1.lineWidth = 1.5; ctx1.stroke();
+            });
+          });
+
+          // Legend
+          var ly = pad1.top + 8;
+          profiles.forEach(function(p, i) {
+            var lx = pad1.left + 10;
+            ctx1.fillStyle = p.color;
+            ctx1.fillRect(lx, ly + i * 18, 12, 12);
+            ctx1.fillStyle = '#334155'; ctx1.font = '10px JetBrains Mono, monospace'; ctx1.textAlign = 'left';
+            ctx1.fillText(p.label, lx + 16, ly + i * 18 + 10);
+          });
+        }
+        drawChart1();
+
+        c1.addEventListener('mousemove', function(e) {
+          var rect = c1.getBoundingClientRect();
+          var scaleX = W1 / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H1 / rect.height);
+          var best = null, bestDist = 30;
+          profiles.forEach(function(p) {
+            connSteps.forEach(function(ck) {
+              var memGB = (ck * 1000 * p.kb) / (1024 * 1024);
+              var x = xPos1(ck), y = yPos1(memGB);
+              var d = Math.sqrt((mx - x) * (mx - x) + (my - y) * (my - y));
+              if (d < bestDist) { bestDist = d; best = { ck: ck, memGB: memGB, profile: p }; }
+            });
+          });
+          if (best) {
+            var servers64 = Math.ceil(best.memGB / 50); // 50GB usable per 64GB instance
+            tooltip.innerHTML = '<strong>' + best.profile.label + '</strong><br>' +
+              'Connections: ' + best.ck.toLocaleString() + 'K<br>' +
+              'Memory: ' + best.memGB.toFixed(1) + ' GB<br>' +
+              'Servers (64GB): ' + servers64 + '<br>' +
+              'Per-conn: ' + best.profile.kb + ' KB';
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 16) + 'px';
+            tooltip.style.top = (e.clientY - 10) + 'px';
+          } else {
+            tooltip.style.display = 'none';
+          }
+        });
+        c1.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+
+        // === Chart 2: Fan-out Factor vs Delivery Latency ===
+        const c2 = document.getElementById('ws-sizing-latency-fanout');
+        const ctx2 = c2.getContext('2d');
+        const W2 = c2.width, H2 = c2.height;
+        const pad2 = { top: 50, right: 30, bottom: 60, left: 70 };
+        const plotW2 = W2 - pad2.left - pad2.right;
+        const plotH2 = H2 - pad2.top - pad2.bottom;
+
+        const fanoutSteps = [1, 10, 100, 1000, 10000, 100000, 1000000];
+        const speeds = [
+          { label: '0.5 \u00B5s/msg (kernel bypass)', us: 0.5, color: '#22c55e' },
+          { label: '5 \u00B5s/msg (epoll async)', us: 5, color: '#3b82f6' },
+          { label: '20 \u00B5s/msg (threaded)', us: 20, color: '#f59e0b' },
+          { label: '100 \u00B5s/msg (naive loop)', us: 100, color: '#ef4444' }
+        ];
+        const maxLog = 6; // 10^6
+        const maxLatencyMs = 1000; // log scale up to 1000ms
+
+        function xPos2(fanout) {
+          var logVal = Math.log10(Math.max(fanout, 1));
+          return pad2.left + (logVal / maxLog) * plotW2;
+        }
+        function yPos2(ms) {
+          if (ms <= 0) ms = 0.001;
+          var logMs = Math.log10(ms);
+          var minLog = -3; // 0.001 ms
+          var maxLogY = 3; // 1000 ms
+          return pad2.top + plotH2 - ((logMs - minLog) / (maxLogY - minLog)) * plotH2;
+        }
+
+        function drawChart2() {
+          ctx2.clearRect(0, 0, W2, H2);
+          ctx2.fillStyle = '#f8fafc';
+          ctx2.fillRect(0, 0, W2, H2);
+
+          // Title
+          ctx2.fillStyle = '#1e293b'; ctx2.font = 'bold 14px JetBrains Mono, monospace'; ctx2.textAlign = 'center';
+          ctx2.fillText('Fan-out Factor vs Delivery Latency', W2 / 2, 24);
+
+          // Y-axis grid (log scale)
+          var yTicks = [0.001, 0.01, 0.1, 1, 10, 100, 1000];
+          var yLabels = ['1\u00B5s', '10\u00B5s', '0.1ms', '1ms', '10ms', '100ms', '1s'];
+          ctx2.strokeStyle = '#e2e8f0'; ctx2.lineWidth = 1;
+          yTicks.forEach(function(t, i) {
+            var y = yPos2(t);
+            ctx2.beginPath(); ctx2.moveTo(pad2.left, y); ctx2.lineTo(W2 - pad2.right, y); ctx2.stroke();
+            ctx2.fillStyle = '#64748b'; ctx2.font = '11px JetBrains Mono, monospace'; ctx2.textAlign = 'right';
+            ctx2.fillText(yLabels[i], pad2.left - 8, y + 4);
+          });
+
+          // SLO reference lines
+          var sloLines = [
+            { ms: 10, label: 'Trading SLO (10ms)', color: '#ef4444' },
+            { ms: 50, label: 'Collab SLO (50ms)', color: '#f59e0b' },
+            { ms: 100, label: 'Chat SLO (100ms)', color: '#3b82f6' },
+            { ms: 500, label: 'Sports SLO (500ms)', color: '#22c55e' }
+          ];
+          sloLines.forEach(function(slo) {
+            var y = yPos2(slo.ms);
+            ctx2.setLineDash([6, 4]); ctx2.strokeStyle = slo.color; ctx2.lineWidth = 1; ctx2.globalAlpha = 0.5;
+            ctx2.beginPath(); ctx2.moveTo(pad2.left, y); ctx2.lineTo(W2 - pad2.right, y); ctx2.stroke();
+            ctx2.setLineDash([]); ctx2.globalAlpha = 1;
+            ctx2.fillStyle = slo.color; ctx2.font = '9px JetBrains Mono, monospace'; ctx2.textAlign = 'right';
+            ctx2.fillText(slo.label, W2 - pad2.right - 4, y - 4);
+          });
+
+          // X-axis grid
+          fanoutSteps.forEach(function(f) {
+            var x = xPos2(f);
+            ctx2.strokeStyle = '#e2e8f0'; ctx2.lineWidth = 1;
+            ctx2.beginPath(); ctx2.moveTo(x, pad2.top); ctx2.lineTo(x, H2 - pad2.bottom); ctx2.stroke();
+            ctx2.fillStyle = '#64748b'; ctx2.font = '11px JetBrains Mono, monospace'; ctx2.textAlign = 'center';
+            var label = f >= 1000000 ? '1M' : f >= 1000 ? (f/1000) + 'K' : '' + f;
+            ctx2.fillText(label, x, H2 - pad2.bottom + 18);
+          });
+
+          // Axis labels
+          ctx2.fillStyle = '#475569'; ctx2.font = '12px JetBrains Mono, monospace'; ctx2.textAlign = 'center';
+          ctx2.fillText('Fan-out Factor (recipients per message)', W2 / 2, H2 - 8);
+          ctx2.save(); ctx2.translate(16, pad2.top + plotH2 / 2); ctx2.rotate(-Math.PI / 2);
+          ctx2.fillText('Delivery Latency (log)', 0, 0); ctx2.restore();
+
+          // Lines and points
+          speeds.forEach(function(s) {
+            ctx2.strokeStyle = s.color; ctx2.lineWidth = 2.5;
+            ctx2.beginPath();
+            fanoutSteps.forEach(function(f, i) {
+              var latencyMs = (f * s.us) / 1000;
+              var x = xPos2(f), y = yPos2(latencyMs);
+              y = Math.max(pad2.top, Math.min(H2 - pad2.bottom, y));
+              if (i === 0) ctx2.moveTo(x, y); else ctx2.lineTo(x, y);
+            });
+            ctx2.stroke();
+            fanoutSteps.forEach(function(f) {
+              var latencyMs = (f * s.us) / 1000;
+              var x = xPos2(f), y = yPos2(latencyMs);
+              y = Math.max(pad2.top, Math.min(H2 - pad2.bottom, y));
+              ctx2.beginPath(); ctx2.arc(x, y, 4, 0, Math.PI * 2);
+              ctx2.fillStyle = s.color; ctx2.fill();
+              ctx2.strokeStyle = '#fff'; ctx2.lineWidth = 1.5; ctx2.stroke();
+            });
+          });
+
+          // Legend
+          var ly2 = pad2.top + 8;
+          speeds.forEach(function(s, i) {
+            var lx = pad2.left + 10;
+            ctx2.fillStyle = s.color;
+            ctx2.fillRect(lx, ly2 + i * 18, 12, 12);
+            ctx2.fillStyle = '#334155'; ctx2.font = '10px JetBrains Mono, monospace'; ctx2.textAlign = 'left';
+            ctx2.fillText(s.label, lx + 16, ly2 + i * 18 + 10);
+          });
+        }
+        drawChart2();
+
+        c2.addEventListener('mousemove', function(e) {
+          var rect = c2.getBoundingClientRect();
+          var scaleX = W2 / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H2 / rect.height);
+          var best = null, bestDist = 30;
+          speeds.forEach(function(s) {
+            fanoutSteps.forEach(function(f) {
+              var latencyMs = (f * s.us) / 1000;
+              var x = xPos2(f), y = yPos2(latencyMs);
+              y = Math.max(pad2.top, Math.min(H2 - pad2.bottom, y));
+              var d = Math.sqrt((mx - x) * (mx - x) + (my - y) * (my - y));
+              if (d < bestDist) { bestDist = d; best = { f: f, latencyMs: latencyMs, speed: s }; }
+            });
+          });
+          if (best) {
+            var latStr = best.latencyMs >= 1 ? best.latencyMs.toFixed(1) + ' ms' : (best.latencyMs * 1000).toFixed(1) + ' \u00B5s';
+            var fLabel = best.f >= 1000000 ? '1M' : best.f >= 1000 ? (best.f/1000) + 'K' : '' + best.f;
+            var breaches = [];
+            sloLines.forEach(function(slo) {
+              if (best.latencyMs > slo.ms) breaches.push(slo.label.split('(')[0].trim());
+            });
+            tooltip.innerHTML = '<strong>' + best.speed.label + '</strong><br>' +
+              'Fan-out: ' + fLabel + ' recipients<br>' +
+              'Latency: ' + latStr +
+              (breaches.length ? '<br><span style="color:#ef4444">Exceeds: ' + breaches.join(', ') + '</span>' : '<br><span style="color:#22c55e">Within all SLOs</span>');
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 16) + 'px';
+            tooltip.style.top = (e.clientY - 10) + 'px';
+          } else {
+            tooltip.style.display = 'none';
+          }
+        });
+        c2.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+      })();
+      </script>
+
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Traditional WebSocket sizing starts with "how many connections can a server hold?" SLO-driven capacity planning inverts this: <strong>start with the latency and reliability targets, then derive the infrastructure.</strong></p>
+
+      <h4>Step 1: Define the SLO Budget</h4>
+      <p>Break the end-to-end SLO into per-hop budgets. For a p99 &lt; 100ms message delivery SLO in a chat app:</p>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Hop</th><th>Budget</th><th>What Drives It</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Client &rarr; Server (network)</td><td>30ms</td><td>Regional deployment, CDN/edge termination</td></tr>
+          <tr><td>Server processing</td><td>5ms</td><td>CPU speed, event loop efficiency</td></tr>
+          <tr><td>Pub/sub backplane</td><td>15ms</td><td>Redis/NATS latency, partition count</td></tr>
+          <tr><td>Receiving server fan-out</td><td>20ms</td><td>Connections per server, async I/O model</td></tr>
+          <tr><td>Server &rarr; Client (network)</td><td>30ms</td><td>Regional deployment</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Step 2: Size Per-Server Load from the Fan-out Budget</h4>
+      <p>If you have 20ms for fan-out and each message write takes 5&mu;s (epoll-based async I/O), a single thread can write to 20ms &divide; 5&mu;s = <strong>4,000 connections</strong> within budget. With 4 I/O threads, that is 16K connections in a single room. If your largest room has 50K users, you need at least 4 servers sharing that room's fan-out &mdash; which means pub/sub-based distribution to multiple servers.</p>
+
+      <h4>Step 3: Add Headroom for Failure Scenarios</h4>
+      <p>If you run N servers at 80% capacity (your SLO holds at this load), losing one server redistributes its connections to N-1 servers. The new per-server load is N/(N-1) &times; 80%. For N=5: each surviving server takes 100% load &mdash; right at the edge. For N=7: each takes 93% &mdash; still within SLO. <strong>Rule of thumb: provision at least N+2 servers where N is the minimum for SLO compliance.</strong></p>
+
+      <h4>Step 4: Validate with Load Testing</h4>
+      <p>Synthetic sizing models assume uniform connection behaviour. In production, connections are non-uniform (power-law room sizes, bursty message patterns, variable message sizes). Always validate your model with a load test that replays production traffic patterns, and measure p99 latency at 80%, 90%, and 100% of target connection count. Your sizing model is only as good as its worst-case validation.</p>
+
+      <h3>Key Tradeoff: Connection Count vs. Message Rate</h3>
+      <p>A system with millions of mostly-idle connections (presence, notifications) is <strong>memory-bound</strong>. A system with thousands of high-frequency connections (gaming, trading) is <strong>CPU-bound</strong>. Design your infrastructure accordingly: use large-memory instances for the first case, high-CPU instances for the second. The SLO examples above illustrate this spectrum: the sports scores system is memory-bound (5M idle viewers), while the trading dashboard is CPU-bound (50K connections but 20M outbound msg/sec per server).</p>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0&ndash;1K users</span>
+          <h4>Single Server, In-Memory State</h4>
+          <p>All WebSocket connections terminate on one server. Room membership and message routing are stored in a <code>Map&lt;roomId, Set&lt;connection&gt;&gt;</code> in memory. Broadcasting to a room is a simple loop. No external dependencies. This handles thousands of connections trivially.</p>
+          <p><strong>Signal to evolve:</strong> You need more than one server for redundancy or the single server cannot handle the load.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K&ndash;100K users</span>
+          <h4>Sticky Sessions with Load Balancer</h4>
+          <p>Add a load balancer (HAProxy, Nginx, ALB) that routes WebSocket connections. Use sticky sessions (cookie or IP hash) so a client always connects to the same backend. Each server still manages its own connections in memory. Problem: broadcasting to a room only reaches users connected to that specific server.</p>
+          <p><strong>Signal to evolve:</strong> Users in the same room are on different servers and cannot see each other's messages.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K&ndash;10M users</span>
+          <h4>Pub/Sub Backplane</h4>
+          <p>Add a pub/sub system (Redis Pub/Sub, NATS, Kafka) as a backplane. When server A receives a message for a room, it publishes to the backplane. All servers subscribe and forward to their local connections in that room. This is the Socket.IO + Redis adapter pattern. Redis Pub/Sub handles ~1M msg/sec on a single node.</p>
+          <p><strong>Signal to evolve:</strong> Redis Pub/Sub becomes a bottleneck (it is single-threaded), or you need cross-region support.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Dedicated WebSocket Service + Edge Termination</h4>
+          <p>Extract WebSocket handling into a dedicated, horizontally scalable service. Use sharded pub/sub (Kafka partitions, Redis Cluster pub/sub) for the backplane. Terminate WebSocket connections at the edge (Cloudflare, Fastly) to reduce latency. Use consistent hashing to route rooms to specific backend shards, reducing cross-server fan-out. Slack, Discord, and Figma all run dedicated WebSocket tiers at this scale.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Reconnection Storm (Thundering Herd)</h3>
+      <p><strong>What happened:</strong> A WebSocket server crashes or is restarted during a deploy. All 500K connected clients detect the connection loss simultaneously and attempt to reconnect at the same time.</p>
+      <p><strong>Root cause:</strong> Clients use a fixed or small reconnection delay. 500K connections hit the server (or load balancer) in a 1-2 second window.</p>
+      <p><strong>Blast radius:</strong> The server or load balancer is overwhelmed by the connection spike, causing cascading failures. New connections timeout and retry, amplifying the storm.</p>
+      <p><strong>Detection:</strong> Spike in TCP SYN packets, load balancer connection rate metrics, HTTP 503 errors on upgrade requests.</p>
+      <p><strong>Mitigation:</strong> Implement <strong>jittered exponential backoff</strong> on the client. The first retry should be random within [0, 1s], then [0, 2s], [0, 4s], etc. This spreads reconnections over time. Server-side: use rolling deploys so only a fraction of connections are disrupted at once.</p>
+      <p><strong>Prevention:</strong> Always deploy with rolling updates. Client libraries must include jitter. Provision headroom for 2x the normal connection rate during deploys.</p>
+
+      <h3>2. Memory Leak from Unclosed Connections</h3>
+      <p><strong>What happened:</strong> A production Node.js WebSocket server's memory usage grew steadily over days, eventually triggering OOM kills every 48 hours.</p>
+      <p><strong>Root cause:</strong> When a client disconnected uncleanly (network drop, browser crash), the server-side connection object was not properly cleaned up. Event listeners, room subscriptions, and message buffers accumulated. The application relied on the <code>close</code> event which never fires for TCP half-open connections without ping/pong.</p>
+      <p><strong>Blast radius:</strong> Server becomes unresponsive as memory pressure increases, affecting all connected users on that server.</p>
+      <p><strong>Detection:</strong> Monitor RSS memory growth over time. Track connection count vs. expected active users&mdash;a divergence indicates leaked connections.</p>
+      <p><strong>Mitigation:</strong> Enable <strong>server-side ping/pong</strong> with a timeout (e.g., ping every 30s, close if no pong within 10s). Use <code>WeakRef</code> or explicit cleanup in disconnect handlers. Set <code>tcp_keepalive</code> at the OS level as a backstop.</p>
+
+      <h3>3. Proxy Timeout Killing Idle Connections</h3>
+      <p><strong>What happened:</strong> Users reported frequent disconnections every 60 seconds despite no network issues. The WebSocket server logs showed no close frames received.</p>
+      <p><strong>Root cause:</strong> An upstream nginx proxy had <code>proxy_read_timeout 60s</code> configured. Idle WebSocket connections (no data flowing) were silently closed by the proxy after 60 seconds. No close frame was sent to either side&mdash;TCP RST was used.</p>
+      <p><strong>Detection:</strong> Pattern of disconnections at exactly the timeout interval. Missing close frames in server logs.</p>
+      <p><strong>Mitigation:</strong> Set <code>proxy_read_timeout</code> to a high value (3600s or more) for WebSocket endpoints. Implement application-level ping/pong at an interval shorter than the smallest proxy timeout in the path (e.g., ping every 25s for a 60s timeout). Document all proxy/LB timeout values in the chain.</p>
+
+      <h3>4. Backpressure: Slow Consumer Overwhelming the Server</h3>
+      <p><strong>What happened:</strong> A client on a slow 2G mobile network (effective throughput: ~50KB/s) was subscribed to a high-volume room producing 100KB/s of messages. The server's memory usage grew unboundedly until OOM kill.</p>
+      <p><strong>Root cause:</strong> The server was sending messages faster than the client could receive them. Here is the mechanical breakdown of what happens:</p>
+
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Time</th><th>Event</th><th>TCP Send Buffer</th><th>App Buffer</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>T=0.0s</td><td>Connection established, server starts sending 100KB/s</td><td>0 KB / 64 KB</td><td>0 KB</td><td>Normal operation</td></tr>
+            <tr><td>T=0.5s</td><td>Server has sent 50KB, client has consumed 25KB</td><td>25 KB / 64 KB</td><td>0 KB</td><td>TCP buffer absorbing the difference</td></tr>
+            <tr><td>T=1.3s</td><td>TCP send buffer is full (64KB). <code>write()</code> would block.</td><td><strong>64 KB / 64 KB</strong></td><td>0 KB</td><td>OS stops accepting writes from app</td></tr>
+            <tr><td>T=1.3s+</td><td>Async WebSocket library starts queuing messages in application memory</td><td>64 KB / 64 KB</td><td>Growing...</td><td>App buffer accumulates at ~50KB/s</td></tr>
+            <tr><td>T=60s</td><td>~3MB queued in application buffer for this single connection</td><td>64 KB / 64 KB</td><td>~3 MB</td><td>Memory growing</td></tr>
+            <tr><td>T=600s</td><td>~30MB queued for one slow client. Multiply by 100 slow clients...</td><td>64 KB / 64 KB</td><td>~30 MB</td><td><strong>3GB total, OOM risk</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Detection:</strong> Monitor per-connection outbound buffer size. Alert when any connection's buffer exceeds a threshold (e.g., 1MB). Track the <code>bufferedAmount</code> property on the WebSocket object (browser-side) or the equivalent write-buffer metric server-side.</p>
+      <p><strong>Mitigation strategies:</strong></p>
+      <ul>
+        <li><strong>Disconnect slow consumers:</strong> Set a maximum outbound buffer per connection (e.g., 4MB). If the buffer exceeds this, close the connection with a close code indicating the reason. The client can reconnect and catch up via message history.</li>
+        <li><strong>Drop messages for slow consumers:</strong> For non-critical data (e.g., cursor positions, presence updates), drop the oldest queued messages when the buffer is full. Keep only the most recent state.</li>
+        <li><strong>Check if the send buffer is draining before writing:</strong></li>
+      </ul>
+      <pre class="line-numbers"><code class="language-python">import asyncio
+import websockets
+
+MAX_BUFFER = 4 * 1024 * 1024  # 4 MB
+
+async def safe_send(ws, message):
+    """Send a message, but disconnect if the client is too slow."""
+    # Check how much data is queued but not yet sent
+    if ws.transport and ws.transport.get_write_buffer_size() > MAX_BUFFER:
+        # Client cannot keep up — disconnect it
+        await ws.close(4001, "Slow consumer: buffer limit exceeded")
+        return False
+
+    try:
+        await ws.send(message)
+        return True
+    except websockets.ConnectionClosed:
+        return False
+
+async def broadcast_to_room(room_id, message, rooms):
+    """Broadcast to all room members, disconnecting slow consumers."""
+    peers = list(rooms.get(room_id, set()))
+    results = await asyncio.gather(
+        *[safe_send(peer, message) for peer in peers],
+        return_exceptions=True
+    )
+    # Remove disconnected peers
+    for peer, ok in zip(peers, results):
+        if ok is False or isinstance(ok, Exception):
+            rooms[room_id].discard(peer)</code></pre>
+      <p><strong>Prevention:</strong> Always set <code>backpressure_limit</code> in your WebSocket server configuration. Never allow unbounded per-connection buffers. In production, the most common approach is to disconnect slow consumers and let them reconnect, rather than trying to queue indefinitely.</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Metric</th><th>Why It Matters</th><th>Alert Threshold</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ws_connections_active</code></td><td>Total open connections. Indicates capacity usage and detects connection leaks.</td><td>Alert if &gt;80% of max fd limit; page if &gt;90%.</td></tr>
+          <tr><td><code>ws_messages_per_sec</code></td><td>Inbound + outbound message rate. Indicates throughput and detects traffic spikes.</td><td>Alert if sustained &gt;2x normal baseline.</td></tr>
+          <tr><td><code>ws_connection_duration_p50</code></td><td>Median connection lifetime. Short durations indicate reconnection churn.</td><td>Alert if p50 drops below 5 minutes (expect hours for healthy chat connections).</td></tr>
+          <tr><td><code>ws_reconnect_rate</code></td><td>Reconnections per second. Spikes indicate server instability or network issues.</td><td>Alert if &gt;5x normal rate (potential reconnection storm).</td></tr>
+          <tr><td><code>ws_message_send_latency_p99</code></td><td>Time to deliver a message to a connected client. Detects backpressure issues.</td><td>Alert if p99 &gt;100ms; page if &gt;500ms.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Critical Configuration</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Config</th><th>What It Does</th><th>Recommended Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ping_interval</code></td><td>How often the server sends WebSocket ping frames to detect dead connections.</td><td>25-30 seconds. Must be less than the smallest proxy timeout in the chain.</td></tr>
+          <tr><td><code>ping_timeout</code></td><td>How long to wait for a pong response before considering the connection dead.</td><td>5-10 seconds.</td></tr>
+          <tr><td><code>max_message_size</code></td><td>Maximum size of a single WebSocket message. Prevents memory abuse.</td><td>64KB-1MB depending on use case. Chat: 64KB. File sync: 1MB.</td></tr>
+          <tr><td><code>connection_timeout</code></td><td>Maximum time for the upgrade handshake to complete.</td><td>10 seconds. Prevents slowloris-style attacks on upgrade.</td></tr>
+          <tr><td><code>backpressure_limit</code></td><td>Maximum outbound buffer per connection before dropping or disconnecting.</td><td>1-16MB. Disconnect slow consumers that cannot keep up.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Users report disconnections?</strong></p>
+        <p>&rarr; Check <code>ws_reconnect_rate</code>. If spiking, check for deploys or proxy restarts.</p>
+        <p>&rarr; Check connection duration distribution. If clustered at a fixed interval (60s, 120s), a proxy timeout is killing idle connections. Increase <code>proxy_read_timeout</code> and verify ping interval.</p>
+        <p>&rarr; If durations are random and short, check server memory (OOM kills) and CPU (event loop lag on Node.js, GC pauses on JVM).</p>
+        <br>
+        <p><strong>Messages are delayed?</strong></p>
+        <p>&rarr; Check <code>ws_message_send_latency_p99</code>. If high, check outbound buffer size per connection (slow consumers).</p>
+        <p>&rarr; Check pub/sub backplane latency (Redis Pub/Sub lag, Kafka consumer lag). If high, the fan-out system is the bottleneck.</p>
+        <p>&rarr; Check event loop lag or thread pool saturation on the WebSocket server.</p>
+        <br>
+        <p><strong>Memory growing steadily?</strong></p>
+        <p>&rarr; Compare <code>ws_connections_active</code> to expected user count. If connections &gt;&gt; users, you have a connection leak (missing close handlers).</p>
+        <p>&rarr; Check for undelivered message buffers accumulating on slow connections. Enforce backpressure limits.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>WebSockets + Load Balancing</h3>
+      <p>WebSocket connections are long-lived and stateful, which conflicts with how most load balancers work. An L7 load balancer only makes a routing decision at connection time&mdash;it cannot rebalance an existing connection. If you add a new server, existing connections do not migrate to it. You need either <strong>sticky sessions</strong> (route by client ID or IP hash) or <strong>connection-aware routing</strong> (the load balancer knows which server handles which user). Without this, a client that reconnects may land on a different server and lose its room subscriptions. AWS ALB supports WebSocket natively; Nginx requires explicit <code>Upgrade</code> header forwarding.</p>
+
+      <h3>WebSockets + Message Queues (Pub/Sub Backplane)</h3>
+      <p>When you scale beyond one server, you need a way to broadcast a message to all servers that have clients in a given room. Redis Pub/Sub is the classic choice: cheap, fast, fire-and-forget. But Redis Pub/Sub has no persistence&mdash;if a server is temporarily disconnected from Redis, it misses messages permanently. For durability, use Kafka or NATS JetStream as the backplane, but accept higher latency. The pitfall: using a durable queue for real-time fan-out adds latency and complexity that you may not need. Match the backplane's guarantees to your application's needs.</p>
+
+      <h4>Step-by-Step Trace: Cross-Server Message Delivery via Redis Pub/Sub</h4>
+      <p>Consider this scenario: User Alice is connected to <strong>Server A</strong> and sends a message to room <code>"general"</code>. Users Bob and Carol are in the same room but connected to <strong>Server B</strong>. Here is exactly what happens:</p>
+
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Step</th><th>Action</th><th>Where</th><th>Latency</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>Alice sends WebSocket message: <code>{"type":"message","room":"general","text":"Hi!"}</code></td><td>Alice &rarr; Server A</td><td>~10ms (network RTT)</td></tr>
+            <tr><td>2</td><td>Server A receives the message, validates it, and checks local connections in room "general". Server A finds 12 local members and delivers to them immediately.</td><td>Server A (local)</td><td>~0.1ms</td></tr>
+            <tr><td>3</td><td>Server A publishes the message to Redis channel <code>room:general</code> via <code>PUBLISH room:general '{"from":"alice","text":"Hi!"}'</code></td><td>Server A &rarr; Redis</td><td>~1ms</td></tr>
+            <tr><td>4</td><td>Redis delivers the published message to all subscribers of <code>room:general</code>. Server B (and any other servers with members in that room) receives the message via its subscription.</td><td>Redis &rarr; Server B</td><td>~1ms</td></tr>
+            <tr><td>5</td><td>Server B looks up its local connections in room "general", finds Bob and Carol, and sends the WebSocket message to both.</td><td>Server B (local)</td><td>~0.05ms</td></tr>
+            <tr><td>6</td><td>Bob and Carol receive the message in their browsers.</td><td>Server B &rarr; Bob, Carol</td><td>~10ms (network RTT)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Total end-to-end latency:</strong> ~22ms (Alice's network RTT + Redis round-trip + Bob/Carol's network RTT). The pub/sub backplane adds only ~2ms to the delivery path.</p>
+
+      <h4>Scale Numbers: How Much Load Does the Backplane Handle?</h4>
+      <p>Consider a chat application with the following parameters:</p>
+      <ul>
+        <li><strong>10,000 rooms</strong> (channels/conversations)</li>
+        <li><strong>50 members average</strong> per room (500K total connections across all rooms)</li>
+        <li><strong>1 message/second average</strong> per room</li>
+        <li><strong>5 WebSocket servers</strong>, each handling 100K connections</li>
+      </ul>
+      <p>The backplane sees:</p>
+      <ul>
+        <li><strong>10,000 PUBLISH commands/sec</strong> into Redis (1 per room per second)</li>
+        <li><strong>~50,000 message deliveries/sec</strong> from Redis to servers (each PUBLISH fans out to all subscribing servers; with 5 servers, each room has members on ~5 servers, so each PUBLISH produces ~5 deliveries, giving 10K &times; 5 = 50K)</li>
+        <li><strong>500,000 WebSocket writes/sec</strong> across all servers (each message fans out to 50 room members)</li>
+      </ul>
+      <p>A single Redis instance comfortably handles ~1M pub/sub messages/sec, so 50K deliveries/sec uses only 5% of Redis capacity. The bottleneck at this scale is the WebSocket servers' fan-out (500K writes/sec across 5 servers = 100K writes/sec per server), not the Redis backplane.</p>
+
+      <h3>Message Ordering Across Reconnections</h3>
+      <p>TCP guarantees in-order delivery within a single connection, but when a connection drops and the client reconnects (possibly to a different server), that ordering guarantee vanishes. Messages sent during the disconnect window are lost, and the new server has no knowledge of what the old server already delivered. Here is a step-by-step trace of the problem and the solution:</p>
+
+      <h4>The Problem: Lost Messages During Reconnection</h4>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr><th>Step</th><th>Event</th><th>Client State</th><th>Server State</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>Client connected to <strong>Server A</strong>. Server A delivers messages with sequence numbers: <code>msg#1</code>, <code>msg#2</code>, <code>msg#3</code>.</td><td>Last received: <code>seq=3</code></td><td>Server A: last sent to this client = <code>seq=3</code></td></tr>
+            <tr><td>2</td><td>Room receives <code>msg#4</code> and <code>msg#5</code>. Server A delivers both to the client.</td><td>Last received: <code>seq=5</code></td><td>Server A: last sent = <code>seq=5</code></td></tr>
+            <tr><td>3</td><td><strong>Connection drops.</strong> Network failure or Server A crashes.</td><td>Last received: <code>seq=5</code> (stored locally)</td><td>Server A is gone. Messages <code>msg#6</code>, <code>msg#7</code> arrive in the room.</td></tr>
+            <tr><td>4</td><td>Client reconnects to <strong>Server B</strong> (load balancer routes to a different server). Server B has no record of what this client has already received.</td><td>Sends: <code>"last_ack_seq": 5</code></td><td>Server B receives reconnection with <code>seq=5</code></td></tr>
+            <tr><td>5</td><td>Server B queries the <strong>message store</strong> (Redis Streams / Kafka / database) for all messages in the room with <code>seq &gt; 5</code>.</td><td>Waiting for replay...</td><td>Server B finds <code>msg#6</code>, <code>msg#7</code></td></tr>
+            <tr><td>6</td><td>Server B <strong>replays</strong> <code>msg#6</code> and <code>msg#7</code> to the client, then resumes live delivery.</td><td>Last received: <code>seq=7</code>, caught up</td><td>Server B: live delivery from <code>seq=8</code> onward</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Implementation Requirements</h4>
+      <ul>
+        <li><strong>Sequence numbers:</strong> Every message in a room gets a monotonically increasing sequence number. The client tracks the highest sequence number it has received.</li>
+        <li><strong>Durable message store:</strong> Messages must be persisted to a store that survives server crashes. Redis Streams (with <code>XADD</code> / <code>XRANGE</code>), Kafka (with consumer offsets), or a database table keyed by <code>(room_id, seq)</code> all work.</li>
+        <li><strong>Reconnection protocol:</strong> On reconnection, the client sends its <code>last_ack_seq</code>. The server queries the message store for <code>seq &gt; last_ack_seq</code> and replays them before switching to live delivery.</li>
+        <li><strong>Retention window:</strong> You do not need to store messages forever. A retention window of 5-15 minutes covers most reconnection scenarios. Clients that reconnect after the retention window can fall back to fetching history via HTTP API.</li>
+      </ul>
+      <pre class="line-numbers"><code class="language-python">import redis.asyncio as redis
+
+r = redis.Redis()
+
+async def on_reconnect(ws, room_id, last_ack_seq):
+    """Replay missed messages after a reconnection."""
+    # Fetch all messages in the room after the client's last-seen sequence
+    # Redis Streams: XRANGE room:general <last_ack_seq>+1 +
+    missed = await r.xrange(
+        f"room:{room_id}",
+        min=f"{last_ack_seq + 1}",  # exclusive of last ack
+        max="+",                     # up to the latest
+    )
+
+    # Replay each missed message
+    for msg_id, fields in missed:
+        await ws.send(fields[b"payload"].decode())
+
+    # Now subscribe to live messages from the backplane
+    # (client is caught up, resume normal delivery)</code></pre>
+
+      <h3>WebSockets + Authentication</h3>
+      <p>WebSocket does not have a built-in authentication mechanism. You must validate the user's identity during the <strong>HTTP upgrade handshake</strong>&mdash;check a JWT or session cookie in the initial GET request headers. Once the connection is upgraded, there are no more HTTP headers. Do not rely on per-message authentication (it is too expensive). However, tokens expire: if a connection lives for hours, the token used at upgrade time may have expired. Solutions: (1) periodically re-validate tokens server-side, (2) require the client to send a re-auth message before the token expires, (3) set a maximum connection duration and force reconnection.</p>
+
+      <h3>WebSockets + CDN</h3>
+      <p>Most CDNs are designed for HTTP request-response caching and do not handle WebSocket well. Cloudflare and Fastly now support WebSocket proxying, but they cannot cache WebSocket traffic (it is dynamic by nature). Using a CDN for WebSocket adds another hop of latency and another intermediary that can timeout or fail. The main benefit is <strong>edge termination</strong>&mdash;terminating the TLS and WebSocket connection at a PoP close to the user, then maintaining a persistent backend connection to your origin. This reduces latency for the initial handshake but adds complexity.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cost Analysis</h4>
+        <p><strong>Dominant cost driver: Memory.</strong> WebSocket servers are memory-bound for high-connection, low-message-rate workloads (chat, presence). For high-message-rate workloads (gaming, trading), CPU and bandwidth dominate.</p>
+
+        <h4>Approximate Cloud Costs (AWS)</h4>
+        <ul>
+          <li><strong>10K connections:</strong> A single t3.medium (4GB RAM) is sufficient. ~$30/month.</li>
+          <li><strong>100K connections:</strong> r6g.large (16GB). ~$75/month. Add a Redis t3.small for pub/sub backplane: ~$15/month. Total: ~$90/month.</li>
+          <li><strong>1M connections:</strong> 2-3x r6g.2xlarge (64GB each) behind an ALB. ~$300/month per instance + ~$200/month for ALB + Redis: ~$1,100/month.</li>
+          <li><strong>10M connections:</strong> 20-30 r6g.2xlarge instances with Redis Cluster or Kafka for backplane. ~$6,000-$10,000/month for compute, ~$1,000/month for backplane. Total: ~$10,000/month.</li>
+        </ul>
+
+        <h4>Bandwidth</h4>
+        <p>At 1M connections with 1 msg/sec average (200 bytes): ~200MB/sec = ~500TB/month. AWS data transfer: ~$0.09/GB for first 10TB, decreasing after that. Roughly ~$5,000-$10,000/month in bandwidth alone at scale. <strong>Compression (permessage-deflate) reduces this by 60-80% for text payloads.</strong></p>
+
+        <h4>Cost of NOT Using WebSockets</h4>
+        <p>Polling a REST API every second for 1M users = 1M HTTP requests/sec. Each request has ~1KB of header overhead = 1GB/sec of unnecessary overhead. This costs 10-20x more in compute and bandwidth than WebSocket for the same real-time experience.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Slack &mdash; Real-Time Messaging</h3>
+      <p>Slack uses WebSockets for all real-time message delivery, presence updates, and typing indicators. Each Slack workspace maintains persistent WebSocket connections for all online users. Slack's architecture uses a dedicated WebSocket gateway tier that terminates millions of connections, with a Redis-based pub/sub backplane for cross-server message routing. When a user sends a message, it goes via HTTP POST to the API, is stored in the database, and then fanned out via the WebSocket gateway to all channel members. Slack reports handling millions of concurrent WebSocket connections with sub-100ms message delivery latency.</p>
+
+      <h3>Figma &mdash; Collaborative Design Editing</h3>
+      <p>Figma uses WebSockets to synchronize design state across multiple editors in real time. Every cursor movement, shape drag, and property change is transmitted as an operational transform (OT) over WebSocket. Figma's multiplayer system runs on a custom Rust-based WebSocket server that manages document state and conflict resolution. The server maintains per-document state in memory and broadcasts operational transforms to all connected editors. This architecture enables Figma's signature feature: seeing other designers' cursors and edits in real time, with latency typically under 50ms.</p>
+
+      <h3>Binance &mdash; Live Trading Data</h3>
+      <p>Binance uses WebSockets extensively for streaming live market data: order book updates, trade executions, and price tickers. Their WebSocket API serves millions of concurrent connections, each subscribing to specific trading pair streams. Binance uses a high-performance C++ WebSocket server to minimize per-message latency (critical for algorithmic trading). The system handles peak throughput of millions of messages per second during high-volatility market events. Binance offers both raw streams (individual updates) and combined streams (multiplexed over a single connection) to optimize for different client needs.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example: Room-Based WebSocket Fan-Out</h2>
+      <p>A minimal WebSocket server in Python using <code>websockets</code> that supports room-based messaging. Clients join a room and all messages are broadcast to room members.</p>
+
+      <pre class="line-numbers"><code class="language-python">import asyncio
+import json
+import websockets
+
+# room_id -> set of connected websockets
+rooms: dict[str, set] = {}
+
+async def handler(ws):
+    room_id = None
+    try:
+        async for raw in ws:
+            msg = json.loads(raw)
+
+            if msg["type"] == "join":
+                room_id = msg["room"]
+                rooms.setdefault(room_id, set()).add(ws)
+                await ws.send(json.dumps({"type": "joined", "room": room_id}))
+
+            elif msg["type"] == "message" and room_id:
+                payload = json.dumps({
+                    "type": "message",
+                    "room": room_id,
+                    "from": msg.get("from", "anon"),
+                    "text": msg["text"],
+                })
+                # Fan-out to all room members except sender
+                peers = [
+                    peer.send(payload)
+                    for peer in rooms.get(room_id, set())
+                    if peer != ws
+                ]
+                await asyncio.gather(*peers, return_exceptions=True)
+    finally:
+        if room_id and room_id in rooms:
+            rooms[room_id].discard(ws)
+            if not rooms[room_id]:
+                del rooms[room_id]
+
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", 8765):
+        print("WebSocket server running on ws://0.0.0.0:8765")
+        await asyncio.Future()  # run forever
+
+asyncio.run(main())</code></pre>
+
+      <p>The equivalent client in Python:</p>
+
+      <pre class="line-numbers"><code class="language-python">import asyncio, json, websockets
+
+async def client():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        # Join a room
+        await ws.send(json.dumps({"type": "join", "room": "general"}))
+
+        # Listen for messages
+        async def listen():
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg["type"] == "message":
+                    print(f"[{msg['room']}] {msg['from']}: {msg['text']}")
+
+        # Send a message
+        async def send_message(text):
+            await ws.send(json.dumps({"type": "message", "from": "alice", "text": text}))
+
+        listener = asyncio.create_task(listen())
+        await send_message("Hello everyone!")
+        await listener
+
+asyncio.run(client())</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Load Testing</h3>
+      <p>Use <strong>websocket-bench</strong> or <strong>Artillery</strong> (with the WebSocket engine) to simulate thousands of concurrent connections. Artillery lets you define scenarios: connect, join a room, send N messages, wait, disconnect. Key metrics to measure: connection establishment rate (connections/sec), message round-trip latency (p50, p95, p99), maximum stable concurrent connections, and server memory/CPU under load.</p>
+      <pre class="line-numbers"><code class="language-python"># Artillery scenario (config.yml)
+# phases: ramp to 10K connections over 5 minutes
+# Each virtual user: connect, join room, send 10 messages, wait 60s
+# config:
+#   target: "ws://your-server:8765"
+#   phases:
+#     - duration: 300
+#       arrivalRate: 33  # ~10K total connections
+# scenarios:
+#   - engine: ws
+#     flow:
+#       - send: '{"type":"join","room":"loadtest"}'
+#       - loop:
+#           - send: '{"type":"message","from":"bot","text":"hello"}'
+#           - think: 1
+#         count: 10
+#       - think: 60</code></pre>
+
+      <h3>Chaos Testing</h3>
+      <ul>
+        <li><strong>Kill a WebSocket server mid-operation:</strong> Verify that clients reconnect with jitter, re-join rooms, and resume receiving messages. Use <code>toxiproxy</code> to simulate network partitions between the WebSocket server and the pub/sub backplane.</li>
+        <li><strong>Inject latency on the pub/sub backplane:</strong> Add 500ms latency to Redis with toxiproxy. Verify that messages still arrive (with delay) and that the system does not buffer unboundedly.</li>
+        <li><strong>Simulate slow consumers:</strong> Create a test client that reads messages slowly (or not at all). Verify that the server detects backpressure and disconnects the slow client rather than running out of memory.</li>
+        <li><strong>DNS failover:</strong> If using edge termination, simulate a PoP failure and verify that clients re-resolve DNS and connect to a different PoP.</li>
+      </ul>
+
+      <h3>Benchmarking Methodology</h3>
+      <p>When benchmarking WebSocket performance, sweep these variables: connection count (1K, 10K, 100K), message size (64B, 1KB, 64KB), message rate per connection (1/sec, 10/sec, 100/sec), and fan-out ratio (1:1, 1:100, 1:10K). Common mistakes: (1) benchmarking with a single client process that becomes the bottleneck, (2) not measuring tail latency (p99.9), (3) not running long enough to expose memory leaks (run for at least 30 minutes), (4) using <code>localhost</code> which hides network latency.</p>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>Design a real-time chat system for 10M concurrent users.</summary>
+        <div class="answer">
+          <p>Start by separating concerns: an HTTP API layer for CRUD operations (create channel, fetch history) and a dedicated <strong>WebSocket gateway tier</strong> for real-time message delivery. Users connect via WebSocket to the gateway, which maintains an in-memory mapping of <code>userId &rarr; connection</code> and <code>channelId &rarr; set of userIds</code>.</p>
+          <p>At 10M connections (~30KB each), you need ~300GB of RAM. Spread this across 10-15 large-memory instances (r6g.4xlarge, 128GB each), each handling 700K-1M connections. Use consistent hashing on userId to route connections, so a given user always connects to the same gateway (simplifies presence tracking). An ALB with WebSocket support handles the initial routing.</p>
+          <p>For cross-server fan-out, use a <strong>sharded pub/sub backplane</strong>. Kafka with channel-based partitioning works well: partition by channelId so all messages for a channel go to the same partition, preserving order. Each gateway server consumes from all partitions and delivers to its local connections. For 1:1 messaging, route directly via the user's gateway (look up in a shared registry like Redis).</p>
+          <p>Message persistence: write to a Cassandra or DynamoDB table keyed by <code>(channelId, timestamp)</code>. This is decoupled from real-time delivery&mdash;the API layer writes to the database and publishes to Kafka; the gateway tier consumes from Kafka and pushes to WebSocket.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle message ordering across reconnections? How do you implement read receipts at this scale? What happens when a gateway server crashes&mdash;how do users recover their room subscriptions?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>WebSocket vs. SSE &mdash; when to use which?</summary>
+        <div class="answer">
+          <p>Use <strong>SSE</strong> when data flows only server-to-client: live scores, stock tickers (read-only), log tailing, notification feeds. SSE is built on standard HTTP, works through all proxies and CDNs without configuration, auto-reconnects with <code>Last-Event-ID</code> for resumption, and supports event types natively. It is simpler to deploy and debug because it is just HTTP with <code>Content-Type: text/event-stream</code>.</p>
+          <p>Use <strong>WebSocket</strong> when you need bidirectional communication (chat, collaborative editing, gaming), binary data support (audio/video streaming, file transfer), or the absolute lowest latency (WebSocket frame overhead is 2-14 bytes vs. SSE's text-based framing). WebSocket also supports multiplexing protocols on top (e.g., custom subprotocols like WAMP or STOMP).</p>
+          <p>The deciding factor is usually: <strong>does the client need to push data back to the server over the same connection?</strong> If yes, WebSocket. If no, SSE is almost always simpler and sufficient. A common mistake is choosing WebSocket for a server-push use case and then spending days configuring proxies and load balancers to support the upgrade handshake, when SSE would have worked out of the box.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Can you use SSE with HTTP/2 to get multiplexing? What about HTTP/2 server push vs. SSE? How does browser connection limit (6 per domain) affect SSE?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How to scale WebSocket connections horizontally?</summary>
+        <div class="answer">
+          <p>The core challenge is that WebSocket connections are <strong>stateful and server-affine</strong>. A message sent to "room X" must reach all members of room X, but those members are spread across multiple servers. Horizontal scaling requires solving two problems: (1) routing connections to servers, and (2) cross-server message delivery.</p>
+          <p><strong>Connection routing:</strong> Use a load balancer that supports WebSocket (AWS ALB, HAProxy, Envoy). For simple cases, use sticky sessions (hash client ID to a server). For more control, use consistent hashing on a routing key (userId or roomId) so related connections land on the same server, reducing cross-server traffic.</p>
+          <p><strong>Cross-server fan-out:</strong> Add a pub/sub backplane. Options in order of complexity: (1) Redis Pub/Sub&mdash;simplest, no persistence, ~1M msg/sec single node. (2) NATS&mdash;higher throughput, built for this use case, with JetStream for persistence. (3) Kafka&mdash;durable, ordered, partitioned, but higher latency (~5-10ms). The pattern: when server A receives a message for room X, it publishes to topic <code>room:X</code> on the backplane. All servers that have members of room X subscribe and deliver locally.</p>
+          <p><strong>Optimization:</strong> Maintain a <code>room &rarr; set of servers</code> mapping (in Redis or a shared registry). Only publish to the backplane if the room spans multiple servers. For rooms where all members happen to be on the same server, deliver locally without touching the backplane. This optimization matters at scale&mdash;most rooms are small and often local to one server.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle a server crash without losing message state? How do you rebalance connections when adding a new server? What is the latency overhead of the pub/sub backplane?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How to handle authentication with WebSockets?</summary>
+        <div class="answer">
+          <p>WebSocket authentication happens in three layers. <strong>Layer 1 (Upgrade handshake):</strong> Validate the user during the HTTP upgrade request. The browser sends cookies automatically with the upgrade request, so you can validate a session cookie or JWT in a query parameter (<code>wss://host/ws?token=...</code>). Reject unauthorized upgrades with HTTP 401 before the connection is established. This is the most important layer&mdash;it prevents unauthenticated connections from consuming server resources.</p>
+          <p><strong>Layer 2 (Connection lifetime):</strong> Tokens expire, but connections can live for hours. Implement a periodic re-validation: the server checks the token's expiry and sends a "re-auth required" message before it expires. The client sends a fresh token over the WebSocket. If the client fails to re-authenticate within a grace period, the server closes the connection with a 4001 (custom close code).</p>
+          <p><strong>Layer 3 (Per-message authorization):</strong> Even with an authenticated connection, you may need to authorize specific actions (e.g., "can this user send to this channel?"). Do this check when the user joins a room (authorize once, not per-message) and maintain an in-memory ACL. Re-check if permissions change (listen for permission-change events from your auth system).</p>
+          <p><strong>Common mistake:</strong> Putting the JWT in a query parameter means it appears in server logs, proxy logs, and the browser history. Use a short-lived, single-use token for the upgrade, then exchange it for a session on the server side. Never put long-lived secrets in URLs.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you revoke a user's access in real time (e.g., they are banned from a channel while connected)? How do you handle token refresh across reconnections?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a live collaborative document editor.</summary>
+        <div class="answer">
+          <p>The architecture has three main components: a <strong>WebSocket server</strong> for real-time operation delivery, a <strong>conflict resolution engine</strong>, and a <strong>persistence layer</strong> for document state.</p>
+          <p><strong>Conflict resolution:</strong> Use either <strong>Operational Transformation (OT)</strong> (as in Google Docs) or <strong>CRDTs</strong> (as in Figma and Yjs). OT requires a central server to transform concurrent operations against each other; CRDTs can resolve conflicts without a central authority. OT is simpler to implement for text editing but requires careful server-side logic. CRDTs (e.g., Yjs, Automerge) are more complex but enable peer-to-peer collaboration and offline editing.</p>
+          <p><strong>Data flow:</strong> User types a character &rarr; local editor generates an operation (insert "a" at position 5) &rarr; operation is applied locally immediately (optimistic) &rarr; operation is sent via WebSocket to the server &rarr; server transforms the operation against any concurrent operations &rarr; server broadcasts the transformed operation to all other editors via WebSocket &rarr; each client applies the transformed operation to its local state.</p>
+          <p><strong>Persistence:</strong> Store the document as a log of operations (event sourcing). Periodically snapshot the document state for fast loading. New users joining a document receive the latest snapshot plus any subsequent operations. Use a separate storage system (S3 for snapshots, DynamoDB for operation logs) rather than trying to store everything in the WebSocket server's memory.</p>
+          <p><strong>Scaling:</strong> Partition by document&mdash;all editors of a single document connect to the same server (or server group). Use consistent hashing on documentId for routing. Most documents have fewer than 10 concurrent editors, so a single server can handle thousands of documents. For very popular documents, the server becomes CPU-bound on OT/CRDT computation.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle cursor positions and selections? How do you deal with a user who goes offline and comes back with a large set of changes? How do you show presence (who is viewing which part of the document)?</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>What happens when a WebSocket server crashes?</summary>
+        <div class="answer">
+          <p>When a WebSocket server crashes, every client connected to it loses their connection simultaneously. Here is the sequence and how to handle each phase:</p>
+          <p><strong>Detection (0-5 seconds):</strong> Clients detect the connection loss via the <code>onclose</code> or <code>onerror</code> event. The load balancer's health check detects the server is down (typically within 10-30 seconds, depending on configuration). During this window, the load balancer may still route new connections to the dead server&mdash;configure health checks with short intervals (5s) and low thresholds (2 failures).</p>
+          <p><strong>Reconnection (5-60 seconds):</strong> Clients reconnect with <strong>jittered exponential backoff</strong> to avoid a thundering herd. They connect to a different server (the load balancer routes them to surviving servers). The new server does not know the client's previous state&mdash;room subscriptions, undelivered messages, cursor position. The client must re-send its subscriptions (re-join rooms) after reconnecting.</p>
+          <p><strong>State recovery:</strong> Messages sent while the client was disconnected are lost unless you have a <strong>message replay mechanism</strong>. Solutions: (1) Each message has a sequence number. On reconnect, the client sends its last-seen sequence number, and the server replays missed messages from a durable store (Redis Streams, Kafka). (2) Use CRDT-based state synchronization&mdash;the client sends its state vector, the server computes the delta. (3) For simpler systems, just accept that messages during the disconnect window are lost and rely on the client fetching history via HTTP.</p>
+          <p><strong>Prevention:</strong> Use rolling deploys (drain connections before shutting down). Implement graceful shutdown: the server sends a Close frame with code 1001 (Going Away) to all connections, giving clients time to reconnect proactively. Store critical state (room memberships) externally (Redis) rather than only in server memory, so a new server can reconstruct it on reconnection.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you drain connections during a deploy without dropping messages? How do you test this recovery path? What is the impact on presence tracking (users briefly appear offline)?</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>WebSockets provide full-duplex, persistent connections</strong> with minimal per-message overhead (2-14 bytes). Use them when you need real-time, bidirectional communication.</li>
+        <li><strong>The HTTP upgrade handshake</strong> is how WebSocket connections begin. Every proxy, load balancer, and firewall in the path must understand and pass it through.</li>
+        <li><strong>SSE is simpler when data flows one way.</strong> Do not reach for WebSocket when SSE or even polling will suffice. The operational complexity of persistent connections is real.</li>
+        <li><strong>Memory is the dominant cost driver</strong> for high-connection workloads. Budget ~30KB per connection. At 1M connections, that is 30GB of RAM.</li>
+        <li><strong>Scaling requires a pub/sub backplane</strong> (Redis Pub/Sub, NATS, Kafka) for cross-server fan-out. Without it, users on different servers cannot communicate in the same room.</li>
+        <li><strong>Reconnection storms are the #1 operational risk.</strong> Always use jittered exponential backoff in clients. Use rolling deploys and graceful shutdown on the server.</li>
+        <li><strong>Ping/pong heartbeats are not optional.</strong> They detect dead connections, prevent memory leaks from zombie connections, and keep connections alive through proxy timeouts.</li>
+        <li><strong>Authenticate during the upgrade handshake</strong>, not per-message. But plan for token expiry over long-lived connections.</li>
+        <li><strong>Modern alternatives</strong> like WebTransport (QUIC-based) and gRPC streaming are worth considering for specific use cases, but WebSocket remains the most widely supported real-time protocol.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="load-balancing.html">Load Balancing</a> &mdash; How to route WebSocket connections with sticky sessions, health checks, and connection-aware balancing.</li>
+        <li><a href="message-queues.html">Message Queues</a> &mdash; Pub/sub backplanes (Redis, Kafka, NATS) that enable cross-server WebSocket fan-out at scale.</li>
+        <li><a href="proxies.html">Proxies</a> &mdash; How reverse proxies handle (or break) WebSocket connections, and the configuration required to support upgrades.</li>
+        <li><a href="networking-fundamentals.html">Networking Fundamentals</a> &mdash; TCP, TLS, and the underlying transport that WebSocket connections rely on.</li>
+        <li><a href="api-gateway.html">API Gateway</a> &mdash; How API gateways handle WebSocket routing alongside REST endpoints.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> &mdash; Throttling WebSocket message rates to prevent abuse and protect backend services.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <div class="page-nav">
+      <a href="api-gateway.html" class="prev">API Gateway</a>
+      <a href="service-discovery.html" class="next">Service Discovery</a>
+    </div>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; A free, open resource for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== WebSocket Animation =====
+    (function () {
+      const canvas = document.getElementById('ws-animation');
+      if (!canvas) return;
+
+      // Animation phases
+      const HANDSHAKE_DURATION = 3;   // seconds for upgrade handshake
+      const MESSAGE_CYCLE = 2;        // seconds per message cycle
+      const TOTAL_LOOP = 12;          // total loop duration
+
+      // Positions
+      function getPositions(w, h) {
+        return {
+          clientX: 100,
+          clientY: h / 2,
+          serverX: w - 100,
+          serverY: h / 2,
+          midX: w / 2,
+          midY: h / 2,
+        };
+      }
+
+      function drawFrame(ctx, time, w, h) {
+        const pos = getPositions(w, h);
+        const loopTime = time % TOTAL_LOOP;
+
+        // Draw client
+        drawClient(ctx, pos.clientX, pos.clientY, { label: 'Client' });
+
+        // Draw server
+        drawServer(ctx, pos.serverX, pos.serverY, {
+          label: 'Server',
+          width: 70,
+          height: 48,
+        });
+
+        // Phase 1: HTTP Upgrade Handshake (0 - HANDSHAKE_DURATION)
+        if (loopTime < HANDSHAKE_DURATION) {
+          const phase = loopTime / HANDSHAKE_DURATION;
+
+          // Dashed line (not yet upgraded)
+          drawDashedLine(ctx, pos.clientX + 30, pos.clientY, pos.serverX - 45, pos.serverY, {
+            color: '#94a3b8',
+            width: 1,
+            dash: [8, 6],
+          });
+
+          // Phase label
+          drawLabel(ctx, pos.midX, 30, 'HTTP Upgrade Handshake', {
+            fontSize: 14,
+            bold: true,
+            color: '#d97706',
+          });
+
+          if (phase < 0.45) {
+            // Client sends upgrade request
+            const p = ease.inOut(phase / 0.45);
+            drawMovingDot(ctx, pos.clientX + 30, pos.clientY - 8, pos.serverX - 45, pos.serverY - 8, p, {
+              color: '#2563eb',
+              radius: 6,
+            });
+            drawLabel(ctx, pos.midX, pos.midY - 40, 'GET /ws HTTP/1.1', {
+              fontSize: 11,
+              color: '#2563eb',
+              bold: true,
+            });
+            drawLabel(ctx, pos.midX, pos.midY - 25, 'Upgrade: websocket', {
+              fontSize: 10,
+              color: '#64748b',
+            });
+          } else if (phase < 0.9) {
+            // Server responds with 101
+            const p = ease.inOut((phase - 0.45) / 0.45);
+            drawMovingDot(ctx, pos.serverX - 45, pos.serverY + 8, pos.clientX + 30, pos.clientY + 8, p, {
+              color: '#0891b2',
+              radius: 6,
+            });
+            drawLabel(ctx, pos.midX, pos.midY - 40, 'HTTP/1.1 101 Switching Protocols', {
+              fontSize: 11,
+              color: '#0891b2',
+              bold: true,
+            });
+            drawLabel(ctx, pos.midX, pos.midY - 25, 'Upgrade: websocket', {
+              fontSize: 10,
+              color: '#64748b',
+            });
+          } else {
+            // Connection established flash
+            drawStatusBadge(ctx, pos.midX, pos.midY - 30, 'UPGRADED', 'success');
+          }
+        }
+        // Phase 2: Bidirectional message flow
+        else {
+          const msgTime = loopTime - HANDSHAKE_DURATION;
+
+          // Thick persistent connection line
+          ctx.save();
+          ctx.strokeStyle = '#16a34a';
+          ctx.lineWidth = 4;
+          ctx.globalAlpha = 0.4;
+          ctx.beginPath();
+          ctx.moveTo(pos.clientX + 30, pos.clientY);
+          ctx.lineTo(pos.serverX - 45, pos.serverY);
+          ctx.stroke();
+          ctx.restore();
+
+          // Label
+          drawLabel(ctx, pos.midX, 30, 'Persistent WebSocket Connection', {
+            fontSize: 14,
+            bold: true,
+            color: '#16a34a',
+          });
+
+          drawStatusBadge(ctx, pos.midX, 55, 'FULL-DUPLEX', 'success');
+
+          // Client-to-server messages (blue dots, upper path)
+          const c2sOffsets = [0, 2.5, 5, 7.5];
+          for (const offset of c2sOffsets) {
+            const localT = (msgTime - offset);
+            if (localT >= 0 && localT < MESSAGE_CYCLE) {
+              const p = ease.linear(localT / MESSAGE_CYCLE);
+              drawMovingDot(
+                ctx,
+                pos.clientX + 30, pos.clientY - 12,
+                pos.serverX - 45, pos.serverY - 12,
+                p,
+                { color: '#2563eb', radius: 5 }
+              );
+            }
+          }
+
+          // Server-to-client messages (teal dots, lower path)
+          const s2cOffsets = [0.8, 1.8, 3.3, 4.5, 6.0, 7.0];
+          for (const offset of s2cOffsets) {
+            const localT = (msgTime - offset);
+            if (localT >= 0 && localT < MESSAGE_CYCLE) {
+              const p = ease.linear(localT / MESSAGE_CYCLE);
+              drawMovingDot(
+                ctx,
+                pos.serverX - 45, pos.serverY + 12,
+                pos.clientX + 30, pos.clientY + 12,
+                p,
+                { color: '#0891b2', radius: 5 }
+              );
+            }
+          }
+
+          // Legend
+          ctx.save();
+          ctx.fillStyle = '#2563eb';
+          ctx.beginPath();
+          ctx.arc(pos.midX - 80, h - 25, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          drawLabel(ctx, pos.midX - 65, h - 30, 'Client → Server', {
+            fontSize: 10,
+            color: '#64748b',
+            align: 'left',
+          });
+
+          ctx.save();
+          ctx.fillStyle = '#0891b2';
+          ctx.beginPath();
+          ctx.arc(pos.midX + 30, h - 25, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          drawLabel(ctx, pos.midX + 45, h - 30, 'Server → Client', {
+            fontSize: 10,
+            color: '#64748b',
+            align: 'left',
+          });
+        }
+      }
+
+      const anim = createAnimation(canvas, drawFrame, { height: 300 });
+      setupControls(canvas.closest('.animation-container'), anim);
+    })();
+  </script>
+
+</body>
+</html>

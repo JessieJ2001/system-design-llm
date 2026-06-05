@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Redis vs Memcached &mdash; Single-Threaded vs Multi-Threaded, and Why</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .code-box { background:#f8fafc; color:#0f172a; border:1px solid #cbd5e1; border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.82rem; line-height:1.5;
+      white-space:pre-wrap; overflow-x:auto; }
+    .code-box .kw { color:#1d4ed8; font-weight:700; }
+    .code-box .cm { color:#64748b; font-style:italic; }
+    .code-box .lt { color:#b45309; }
+    .code-box .fn { color:#15803d; font-weight:700; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .why-box  { background:#f5f3ff; border-left:6px solid #7c3aed; border-radius:8px; padding:.7rem 1rem; margin:.9rem 0; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    .pro h4  { color:#15803d; }
+    .con h4  { color:#b91c1c; }
+    .pro { border-left:4px solid #16a34a !important; }
+    .con { border-left:4px solid #dc2626 !important; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+    .pick   { color:#15803d; font-weight:700; }
+    .reject { color:#b91c1c; font-weight:700; }
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:700;
+      padding:.05rem .35rem; border-radius:4px; margin-left:.25rem; vertical-align:baseline; }
+    .tag-r { color:#b91c1c; background:#fee2e2; border:1px solid #fca5a5; }
+    .tag-m { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .steps { counter-reset: step; list-style:none; padding-left:0; }
+    .steps > li { position:relative; padding:.35rem 0 .35rem 2.2rem; margin:.2rem 0; border-bottom:1px dashed #e2e8f0; }
+    .steps > li::before { counter-increment: step; content: counter(step); position:absolute; left:0; top:.35rem;
+      width:1.5rem; height:1.5rem; background:#7c3aed; color:#fff; border-radius:50%; text-align:center; font-weight:700; font-size:.82rem; line-height:1.5rem; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">&larr; Scenario page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html">kv_store.html</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#tldr">The one-line answer</a></li>
+          <li><a class="sidebar-section-link" href="#spine">Naive&rarr;problem&rarr;fix spine</a></li>
+          <li><a class="sidebar-section-link" href="#mechanism">1. The threading models</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#diagram">&nbsp;&nbsp;Side-by-side diagram</a></li>
+          <li><a class="sidebar-section-link" href="#fast">2. Why 1 thread is FAST</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#throughput">&nbsp;&nbsp;Same-resources throughput</a></li>
+          <li><a class="sidebar-section-link" href="#coherence">3. The cache-coherence &ldquo;why&rdquo;</a></li>
+          <li><a class="sidebar-section-link" href="#proscons">4. Pros &amp; cons, both sides</a></li>
+          <li><a class="sidebar-section-link" href="#deeper">5. The deeper tradeoff</a></li>
+          <li><a class="sidebar-section-link" href="#pick">6. When to pick which</a></li>
+          <li><a class="sidebar-section-link" href="#interview">7. In a system-design interview</a></li>
+          <li><a class="sidebar-section-link" href="#here">8. In this codebase</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Cross-links</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html#iter1b">Scenario &mdash; broker-job (Redis Streams)</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html#protocol">kv_store &mdash; gossip bus</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Redis vs Memcached &mdash; single-threaded vs multi-threaded, and <em>why</em></h1>
+      <p class="hero-subtitle">Both are in-memory key&ndash;value (KV) stores; the headline difference is the <strong>concurrency model</strong>. Redis runs its command-execution loop on <strong>one</strong> thread; Memcached spreads work across <strong>N</strong> worker threads. This page shows what each choice buys, what it costs, and the causal chain that links the threading model to each store&rsquo;s feature set &mdash; the &ldquo;why,&rdquo; not just the &ldquo;what.&rdquo;</p>
+      <p class="hero-meta">Reference / design-choice page &middot; cross-links the <a href="distributed_kv_cache.html#iter1b">broker-job</a> (which uses Redis Streams) &middot; ~12 min</p>
+    </div>
+  </section>
+
+  <!-- ================= TL;DR ================= -->
+  <section class="section">
+    <div class="container">
+      <h2 id="tldr">The one-line answer</h2>
+      <p><strong>TL;DR.</strong> Redis is single-threaded <em>on purpose</em>: serializing all data access onto one core makes every command atomic for free and removes locks, contention, and cross-core cache traffic &mdash; so per-op latency is tiny and predictable. It still serves millions of ops/sec because the bottleneck was never CPU: the work is in-memory (no disk wait) and I/O is multiplexed (one thread watches thousands of sockets via <code>epoll</code>). Memcached is multi-threaded <em>on purpose</em>: it keeps values opaque and operations trivial, so its lock critical-sections stay short enough that many cores can share the hash table &mdash; letting one process saturate a fat machine without sharding. <strong>The threading model and the feature set are the same decision viewed from two ends.</strong></p>
+
+      <div class="note-box"><strong>The myth this page kills:</strong> &ldquo;single-threaded&rdquo; sounds like &ldquo;slow.&rdquo; It is the opposite. Single-threaded execution is <em>why</em> Redis is fast and predictable &mdash; the thread never waits on a lock, never gets descheduled mid-critical-section, and keeps the hot data structures pinned in one core&rsquo;s L1/L2 cache. The cost is a single-core <em>ceiling per process</em>, not a per-op slowdown.</p></div>
+
+      <!-- ================= SPINE ================= -->
+      <h2 id="spine">Naive &rarr; problem &rarr; fix &mdash; the spine</h2>
+      <table class="sheet">
+        <thead><tr><th>Naive belief</th><th>The problem with it</th><th>What&rsquo;s actually true</th></tr></thead>
+        <tbody>
+          <tr><td>&ldquo;One thread = can only do one thing = slow.&rdquo;</td><td>Conflates <em>CPU execution</em> with <em>waiting on I/O</em>. For a KV store the CPU is idle most of the time &mdash; it&rsquo;s waiting on the network.</td><td>One thread + non-blocking I/O (<code>epoll</code>) drives thousands of connections; the single thread is busy only for the microseconds each tiny command takes. <a href="#fast">&sect;2</a></td></tr>
+          <tr><td>&ldquo;More threads always = more throughput.&rdquo;</td><td>Threads sharing a hash table / LRU / allocator contend on locks and bounce cache lines between cores &mdash; coherence traffic that <em>caps</em> scaling.</td><td>Memcached scales well only because its ops are trivial and lock hold-times tiny. Make ops rich and the locks would dominate. <a href="#coherence">&sect;3</a></td></tr>
+          <tr><td>&ldquo;Redis needs locks for <code>INCR</code> / transactions.&rdquo;</td><td>Locks would re-introduce the very contention single-threading removes.</td><td>Serial execution gives atomicity <em>for free</em> &mdash; a command runs to completion before the next starts, no lock anywhere. <a href="#proscons">&sect;4</a></td></tr>
+          <tr><td>&ldquo;Just pick the multi-threaded one, it uses the whole machine.&rdquo;</td><td>Ignores the feature axis: rich atomic data structures vs opaque blobs.</td><td>The threading choice <em>dictates</em> the feature set. Choose on what you need to <em>store and operate on</em>, then accept the scaling model. <a href="#deeper">&sect;5</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= MECHANISM ================= -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="mechanism">1. The two threading models, precisely</h2>
+      <p><strong>The distinction is narrow and exact.</strong> It is <em>not</em> &ldquo;Redis can&rsquo;t use threads&rdquo; &mdash; modern Redis (v6+) offloads network read/write and some background jobs to helper threads. The invariant is about <strong>data access</strong>:</p>
+      <div class="two-col">
+        <div><h4>Redis &mdash; serialized command loop <span class="tag tag-r">1 core for data</span></h4>
+          <ul>
+            <li>One <strong>event-loop thread</strong> pulls ready commands off an <code>epoll</code>/<code>kqueue</code> queue and executes them <em>one at a time, to completion</em>.</li>
+            <li>All reads and writes of the actual data structures (strings, hashes, sorted sets, streams) happen on <strong>this one thread</strong>.</li>
+            <li>v6+ may use extra threads to <em>parse/copy bytes off sockets</em>, but the command itself still runs on the single data thread &mdash; so the atomicity guarantee holds.</li>
+          </ul>
+        </div>
+        <div><h4>Memcached &mdash; N symmetric workers <span class="tag tag-m">all cores for data</span></h4>
+          <ul>
+            <li><strong>Several worker threads</strong>, typically one per core, each run their own event loop and accept connections.</li>
+            <li>Every worker reads and writes the <em>same shared</em> hash table, LRU lists, and slab allocator.</li>
+            <li>To stay correct they take <strong>fine-grained locks</strong> (per-bucket item locks, LRU-lock, slab-lock) around each access &mdash; held only for the microseconds of a trivial get/set.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 id="diagram">Side-by-side: where the data lives and who touches it</h3>
+      <svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels comparing data access. Left panel, Redis: thousands of client connections funnel through one epoll event loop running on a single CPU core; that one core owns the data structures, which stay resident in its L1 and L2 cache with no cross-core traffic; every command runs serially and is therefore atomic. Right panel, Memcached: clients are spread across four worker threads on four CPU cores; all four cores reach into one shared region holding the hash table, LRU lists, and slab allocator; each access takes a fine-grained lock, and because multiple cores touch the same cache lines there is cache-coherence traffic bouncing those lines between cores.">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#dc2626"/></marker>
+        </defs>
+        <!-- titles -->
+        <text x="300" y="34" text-anchor="middle" font-size="20" font-weight="700" fill="#0f172a">Redis &mdash; single data thread</text>
+        <text x="900" y="34" text-anchor="middle" font-size="20" font-weight="700" fill="#0f172a">Memcached &mdash; N worker threads</text>
+        <line x1="600" y1="60" x2="600" y2="540" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="6 6"/>
+
+        <!-- ===== LEFT: REDIS ===== -->
+        <!-- clients -->
+        <rect x="40" y="80" width="150" height="120" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
+        <text x="115" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">thousands of</text>
+        <text x="115" y="123" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">client sockets</text>
+        <text x="115" y="150" text-anchor="middle" font-size="11" fill="#475569">conn 1 &hellip; conn N</text>
+        <text x="115" y="172" text-anchor="middle" font-size="11" fill="#475569">non-blocking</text>
+        <!-- epoll -->
+        <rect x="240" y="95" width="130" height="90" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+        <text x="305" y="135" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">epoll / kqueue</text>
+        <text x="305" y="156" text-anchor="middle" font-size="11" fill="#475569">I/O multiplex</text>
+        <line x1="190" y1="140" x2="240" y2="140" stroke="#475569" stroke-width="2" marker-end="url(#ar)"/>
+        <!-- single core -->
+        <rect x="200" y="250" width="200" height="120" rx="10" fill="#16a34a" opacity="0.12" stroke="#16a34a" stroke-width="2"/>
+        <text x="300" y="278" text-anchor="middle" font-size="14" font-weight="700" fill="#15803d">CPU core 0</text>
+        <text x="300" y="300" text-anchor="middle" font-size="12" fill="#166534">event-loop thread</text>
+        <text x="300" y="322" text-anchor="middle" font-size="12" fill="#166534">runs cmds serially</text>
+        <text x="300" y="350" text-anchor="middle" font-size="11" font-weight="700" fill="#15803d">&rArr; atomic, no lock</text>
+        <line x1="305" y1="185" x2="300" y2="250" stroke="#475569" stroke-width="2" marker-end="url(#ar)"/>
+        <!-- idle cores -->
+        <rect x="40" y="250" width="130" height="50" rx="8" fill="#f1f5f9" stroke="#cbd5e1"/>
+        <text x="105" y="272" text-anchor="middle" font-size="11" fill="#94a3b8">cores 1..63</text>
+        <text x="105" y="290" text-anchor="middle" font-size="11" fill="#94a3b8">idle for data ops</text>
+        <!-- data in L1/L2 -->
+        <rect x="200" y="420" width="200" height="100" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="300" y="448" text-anchor="middle" font-size="13" font-weight="700" fill="#15803d">data structures</text>
+        <text x="300" y="468" text-anchor="middle" font-size="11" fill="#166534">hash / zset / stream</text>
+        <text x="300" y="492" text-anchor="middle" font-size="11" font-weight="700" fill="#15803d">pinned in core-0 L1/L2</text>
+        <text x="300" y="510" text-anchor="middle" font-size="11" fill="#166534">no coherence traffic</text>
+        <line x1="300" y1="370" x2="300" y2="420" stroke="#16a34a" stroke-width="2" marker-end="url(#ar)"/>
+
+        <!-- ===== RIGHT: MEMCACHED ===== -->
+        <rect x="640" y="80" width="150" height="120" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
+        <text x="715" y="113" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">client sockets</text>
+        <text x="715" y="138" text-anchor="middle" font-size="11" fill="#475569">spread across</text>
+        <text x="715" y="156" text-anchor="middle" font-size="11" fill="#475569">workers</text>
+        <!-- 4 cores -->
+        <g>
+          <rect x="630" y="250" width="80" height="80" rx="8" fill="#1d4ed8" opacity="0.12" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="670" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">core 0</text>
+          <text x="670" y="305" text-anchor="middle" font-size="10" fill="#475569">worker</text>
+          <rect x="720" y="250" width="80" height="80" rx="8" fill="#1d4ed8" opacity="0.12" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="760" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">core 1</text>
+          <text x="760" y="305" text-anchor="middle" font-size="10" fill="#475569">worker</text>
+          <rect x="810" y="250" width="80" height="80" rx="8" fill="#1d4ed8" opacity="0.12" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="850" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">core 2</text>
+          <text x="850" y="305" text-anchor="middle" font-size="10" fill="#475569">worker</text>
+          <rect x="900" y="250" width="80" height="80" rx="8" fill="#1d4ed8" opacity="0.12" stroke="#1d4ed8" stroke-width="2"/>
+          <text x="940" y="285" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">core 3</text>
+          <text x="940" y="305" text-anchor="middle" font-size="10" fill="#475569">worker</text>
+        </g>
+        <line x1="715" y1="200" x2="760" y2="250" stroke="#475569" stroke-width="2" marker-end="url(#ar)"/>
+        <line x1="715" y1="200" x2="850" y2="250" stroke="#475569" stroke-width="2" marker-end="url(#ar)"/>
+        <!-- shared region -->
+        <rect x="700" y="420" width="280" height="110" rx="10" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="840" y="448" text-anchor="middle" font-size="13" font-weight="700" fill="#b91c1c">ONE shared region</text>
+        <text x="840" y="470" text-anchor="middle" font-size="11" fill="#7f1d1d">hash table &middot; LRU lists &middot; slab alloc</text>
+        <text x="840" y="492" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">fine-grained locks per access</text>
+        <text x="840" y="512" text-anchor="middle" font-size="11" fill="#7f1d1d">same cache lines, many cores</text>
+        <!-- all 4 cores point in, red coherence -->
+        <line x1="670" y1="330" x2="780" y2="420" stroke="#dc2626" stroke-width="2" marker-end="url(#arr)"/>
+        <line x1="760" y1="330" x2="820" y2="420" stroke="#dc2626" stroke-width="2" marker-end="url(#arr)"/>
+        <line x1="850" y1="330" x2="860" y2="420" stroke="#dc2626" stroke-width="2" marker-end="url(#arr)"/>
+        <line x1="940" y1="330" x2="900" y2="420" stroke="#dc2626" stroke-width="2" marker-end="url(#arr)"/>
+        <text x="1010" y="475" text-anchor="middle" font-size="11" font-weight="700" fill="#dc2626" transform="rotate(90 1010 475)">cache-line bouncing</text>
+      </svg>
+      <ul style="columns:2; -webkit-columns:2; column-gap:2rem; font-size:.88rem; margin-top:.4rem;">
+        <li><strong>Redis (left):</strong> many sockets &rarr; one <code>epoll</code> loop &rarr; <em>one</em> core executes every command serially; the data lives in that core&rsquo;s cache untouched by anyone else &mdash; solid arrows, no red.</li>
+        <li><strong>Memcached (right):</strong> sockets spread across 4 worker cores; <em>all four</em> reach into one shared region (red arrows) and take locks &mdash; the same cache lines bounce between cores (coherence traffic).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================= WHY FAST ================= -->
+  <section class="section">
+    <div class="container">
+      <h2 id="fast">2. Why one thread still serves millions of ops/sec</h2>
+      <p><strong>The bottleneck for a KV store was never raw CPU.</strong> A <code>GET</code> touches a few cache lines and returns &mdash; nanoseconds of compute. The time goes to waiting on the network and (for disk stores) the disk. Redis removes both waits, so one core&rsquo;s worth of compute is plenty:</p>
+      <ol class="steps">
+        <li><strong>I/O is multiplexed.</strong> <code>epoll</code>/<code>kqueue</code>/<code>select</code> let one thread watch thousands of sockets and wake only for the ones with data ready &mdash; it never blocks on any single connection, so &ldquo;one thread&rdquo; is not &ldquo;one client at a time.&rdquo;</li>
+        <li><strong>Everything is in memory.</strong> No disk seek on the hot path &rarr; no millisecond stalls to hide, so there&rsquo;s little idle time that a second data thread could usefully fill.</li>
+        <li><strong>Commands are intentionally small and atomic.</strong> Each command does a tiny, bounded amount of work, so the serial queue drains fast &mdash; head-of-line blocking is rare <em>because</em> ops are designed to be O(1)/O(log&nbsp;N).</li>
+        <li><strong>The kernel and NIC do the heavy lifting.</strong> Packet handling, interrupt coalescing, and TCP live below the application thread.</li>
+        <li><strong>Modern Redis offloads <em>I/O</em>, not data.</strong> v6+ threaded I/O parses and writes socket bytes on helper threads, leaving the single data thread to do only command execution &mdash; keeping atomicity while relieving the network-syscall cost.</li>
+      </ol>
+      <div class="warn-box"><strong>Where the single thread <em>does</em> bite: head-of-line blocking.</strong> Because commands run serially, one expensive command &mdash; <code>KEYS *</code>, a big <code>SORT</code>, an O(N) op over a huge collection, a heavy Lua script &mdash; stalls <em>every</em> other client until it finishes. The fix is operational, not architectural: avoid O(N) commands on large keys, use <code>SCAN</code> over <code>KEYS</code>, and keep Lua short.</div>
+
+      <h3 id="throughput" style="margin-top:1.2rem;">2.1 &nbsp;Same resources &mdash; can Memcached out-throughput Redis?</h3>
+      <p><strong>Short answer: only when you compare <em>one process to one process</em>.</strong> The honest answer hinges on the <em>deployment unit</em> you hold equal, not on the engine &mdash; because &ldquo;same resources&rdquo; does not force you to run a single Redis process.</p>
+      <table class="sheet">
+        <thead><tr><th>What you hold equal</th><th>Winner for simple get/set</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><strong>One multi-core box, <em>one process each</em></strong></td><td class="c"><strong>Memcached</strong> (several&times;)</td><td>One Redis process executes commands on a single core and leaves the rest idle for data ops; one Memcached process spreads work across all cores and scales close to linearly with core count.</td></tr>
+          <tr><td><strong>One box, but you may fill the cores</strong></td><td class="c">&asymp; <strong>Comparable</strong></td><td>Run N Redis shards (Redis Cluster), one per core, consistent-hashing the keyspace &rarr; aggregate Redis throughput catches up. Memcached may keep a modest edge (no cross-shard hop, slightly lower per-op overhead), but it&rsquo;s close and benchmark-dependent.</td></tr>
+        </tbody>
+      </table>
+      <p><strong>And four things flip even the one-process comparison:</strong></p>
+      <ul>
+        <li><strong>Pipelining &rarr; Redis.</strong> Batching many commands per round-trip lifts Redis&rsquo;s <em>per-core</em> throughput, often past a non-pipelined multi-threaded Memcached &mdash; the network round-trip, not the core, was the limit.</li>
+        <li><strong>Hot keys / write-heavy &rarr; Redis (per shard).</strong> Memcached&rsquo;s shared structures suffer lock contention + cache-line bouncing under a hot key; Redis&rsquo;s serial loop is immune to contention (still capped at one core/shard).</li>
+        <li><strong>Large values &rarr; tie.</strong> Both go network/memory-bound; the threading difference washes out.</li>
+        <li><strong>Rich ops &rarr; not a throughput question.</strong> Memcached can&rsquo;t do <code>ZADD</code> / <code>INCR</code>-on-a-structure at all, so the comparison only ever holds for the trivial get/set subset.</li>
+      </ul>
+      <div class="note-box"><strong>Net.</strong> Memcached out-throughputs Redis only in the narrow case of <em>one process vs one process</em> on multi-core hardware for opaque get/set. Shard Redis to fill the same cores and they&rsquo;re comparable; turn on pipelining or use any non-trivial operation and it tilts back to Redis. The single-thread &ldquo;limit&rdquo; is a <em>per-process</em> ceiling you engineer around with sharding &mdash; not a per-op tax.</div>
+    </div>
+  </section>
+
+  <!-- ================= COHERENCE ================= -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="coherence">3. The cache-coherence &ldquo;why&rdquo; &mdash; the hardware reason single-threaded is <em>predictable</em></h2>
+      <p><strong>This is the part most comparisons miss.</strong> The difference isn&rsquo;t only locks &mdash; it&rsquo;s what the CPU&rsquo;s cache-coherence protocol (MESI) has to do when multiple cores touch the <em>same</em> memory.</p>
+      <div class="two-col">
+        <div class="pro"><h4>Redis &mdash; zero coherence traffic for its data</h4>
+          <ul>
+            <li>All data access stays on <strong>one core</strong>, so the hot structures live in that core&rsquo;s L1/L2 and <em>never</em> get invalidated by another core.</li>
+            <li>No core ever has to ask another to surrender a cache line &mdash; no MESI invalidations, no <em>false sharing</em>.</li>
+            <li><strong>Consequence:</strong> per-op latency is tiny <em>and</em> low-variance &mdash; a big reason Redis&rsquo;s single-thread performance is so predictable.</li>
+          </ul>
+        </div>
+        <div class="con"><h4>Memcached &mdash; coherence traffic caps scaling</h4>
+          <ul>
+            <li>Several cores hammer shared structures &mdash; hash-table buckets, LRU-list heads, global counters &mdash; that often sit on the <em>same cache lines</em>.</li>
+            <li>Each write by one core invalidates the line in the others&rsquo; caches, forcing a cross-core transfer &mdash; <strong>cache-line bouncing</strong>.</li>
+            <li><strong>Consequence:</strong> beyond some core count the coherence traffic, not the lock logic itself, limits how well one process scales &mdash; especially under hot-key or write-heavy load.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="note-box"><strong>False sharing, defined (first use):</strong> two unrelated variables that happen to land on the same 64-byte cache line. Even though no two cores touch the <em>same</em> variable, writing either one invalidates the whole line in every other core&rsquo;s cache &mdash; so the cores fight over a line for no logical reason. Memcached mitigates this with padding and per-core/per-bucket structures; Redis sidesteps it entirely by never sharing.</div>
+    </div>
+  </section>
+
+  <!-- ================= PROS CONS ================= -->
+  <section class="section">
+    <div class="container">
+      <h2 id="proscons">4. Pros and cons, both sides</h2>
+      <h3>Redis &mdash; single-threaded</h3>
+      <div class="two-col">
+        <div class="pro"><h4>Pros</h4>
+          <ul>
+            <li><strong>Free atomicity.</strong> Every command runs to completion before the next starts, so <code>INCR</code>, <code>LPUSH</code>, <code>MULTI</code>/<code>EXEC</code> transactions, and Lua scripts are atomic with <em>zero</em> locking &mdash; no race conditions on shared structures, by construction.</li>
+            <li><strong>No synchronization cost.</strong> No locks, no mutex contention, no thread context-switching for data access &mdash; simpler code and predictable per-op latency.</li>
+            <li><strong>Cache-friendly.</strong> One core keeps the hot structures in its L1/L2; no cross-core coherence traffic, no false sharing.</li>
+          </ul>
+        </div>
+        <div class="con"><h4>Cons</h4>
+          <ul>
+            <li><strong>One-core ceiling per process.</strong> Command execution can&rsquo;t use multiple cores, so a 64-core box running one Redis process leaves ~63 cores idle for data ops (v6+ threads only the network I/O, not data access).</li>
+            <li><strong>Head-of-line blocking.</strong> One slow command (<code>KEYS *</code>, big <code>SORT</code>, O(N) on a huge collection, heavy Lua) stalls every other client until it finishes.</li>
+            <li><strong>Multi-core needs sharding.</strong> To use a big machine you run several Redis processes and split the keyspace (Redis Cluster), adding cross-shard complexity.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 style="margin-top:1.2rem;">Memcached &mdash; multi-threaded</h3>
+      <div class="two-col">
+        <div class="pro"><h4>Pros</h4>
+          <ul>
+            <li><strong>Full machine utilization.</strong> One process saturates all cores, so it scales <em>vertically</em> on a fat machine without sharding.</li>
+            <li><strong>Higher per-process throughput</strong> for simple get/set on multi-core hardware.</li>
+            <li><strong>Better request isolation.</strong> A slow request on one thread doesn&rsquo;t fully block the others &mdash; no global head-of-line stall.</li>
+          </ul>
+        </div>
+        <div class="con"><h4>Cons</h4>
+          <ul>
+            <li><strong>Locking required.</strong> The shared hash table, LRU lists, and slab allocator need synchronization (fine-grained item/bucket locks), adding complexity and contention under hot-key or write-heavy load.</li>
+            <li><strong>Cache-line bouncing.</strong> Shared structures touched by multiple cores generate coherence traffic that caps scaling.</li>
+            <li><strong>Thin feature set.</strong> Keeping lock hold-times short forces values to stay opaque and ops trivial &mdash; no rich server-side data structures (see <a href="#deeper">&sect;5</a>).</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DEEPER ================= -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="deeper">5. The deeper tradeoff &mdash; the threading model <em>causes</em> the feature set</h2>
+      <p><strong>The two choices aren&rsquo;t independent.</strong> Each store&rsquo;s concurrency model and its feature set are locked together by one constraint: <em>how long is a critical section allowed to be?</em></p>
+      <div class="why-box">
+        <p style="margin:.1rem 0 .4rem"><strong>Redis chose single-threaded <em>so that</em> it could offer rich atomic operations.</strong></p>
+        <ul style="margin:.2rem 0">
+          <li>A serial loop makes <em>any</em> command atomic regardless of how many steps it takes &mdash; so Redis can ship sorted sets, streams, <code>HINCRBY</code>, set intersections, and Lua, all atomic, all for free.</li>
+          <li>Doing those multi-step ops in a multi-threaded store would mean holding a lock across the whole operation &mdash; long critical sections that would crush the concurrency benefit.</li>
+        </ul>
+      </div>
+      <div class="why-box" style="border-left-color:#1d4ed8;background:#eff6ff;">
+        <p style="margin:.1rem 0 .4rem"><strong>Memcached chose multi-threaded <em>and therefore</em> kept values opaque and ops trivial.</strong></p>
+        <ul style="margin:.2rem 0">
+          <li>Many cores can share a structure only if each lock is held for a microsecond &mdash; which is true exactly when the op is a flat get/set on an opaque blob.</li>
+          <li>Adding rich server-side operations would lengthen lock hold-times and reintroduce the contention multi-threading was meant to avoid &mdash; so Memcached deliberately doesn&rsquo;t have them.</li>
+        </ul>
+      </div>
+      <p><strong>Read it as one decision, two ends:</strong> &ldquo;I want rich atomic data structures&rdquo; &rArr; serialize on one thread &rArr; accept a per-process core ceiling. &ldquo;I want to saturate every core with one process&rdquo; &rArr; keep critical sections tiny &rArr; accept opaque values and trivial ops.</p>
+    </div>
+  </section>
+
+  <!-- ================= PICK ================= -->
+  <section class="section">
+    <div class="container">
+      <h2 id="pick">6. When to pick which</h2>
+      <table class="sheet">
+        <thead><tr><th>Axis</th><th>Redis <span class="tag tag-r">single-threaded</span></th><th>Memcached <span class="tag tag-m">multi-threaded</span></th></tr></thead>
+        <tbody>
+          <tr><td>Data model</td><td>Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog</td><td>Opaque value blobs only</td></tr>
+          <tr><td>Server-side ops</td><td>Rich + atomic (<code>INCR</code>, <code>ZADD</code>, set ops, Lua, transactions)</td><td>get / set / add / incr / decr &mdash; trivial</td></tr>
+          <tr><td>Scaling a fat box</td><td>Run N processes + shard (Redis Cluster)</td><td>One process uses all cores; no sharding</td></tr>
+          <tr><td>Per-op latency profile</td><td>Tiny + very low variance (no locks/coherence)</td><td>Tiny; variance rises under contention</td></tr>
+          <tr><td>Durability / persistence</td><td>RDB snapshots + AOF log; replication; can be a system of record</td><td>None &mdash; pure cache, data is volatile</td></tr>
+          <tr><td>Extra features</td><td>Pub/Sub, Streams, TTL, eviction policies, modules</td><td>LRU eviction + TTL; that&rsquo;s it</td></tr>
+          <tr><td><strong>Pick it when</strong></td><td>You need data structures, atomic ops, persistence, pub/sub, or messaging &mdash; not just a cache</td><td>You need a dead-simple, multi-core LRU cache for opaque blobs and nothing more</td></tr>
+        </tbody>
+      </table>
+      <div class="note-box"><strong>Rule of thumb.</strong> If your need is literally &ldquo;memoize opaque blobs by key, evict by LRU, saturate one big box&rdquo; &mdash; Memcached is a clean fit. The moment you want a counter, a leaderboard, a queue, a TTL set, pub/sub, or persistence, you want Redis &mdash; and the single thread is a feature, not a tax.</div>
+    </div>
+  </section>
+
+  <!-- ================= INTERVIEW ================= -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="interview">7. In a system-design interview &mdash; what to actually say</h2>
+      <p><strong>TL;DR for the room.</strong> The interviewer almost never wants a feature checklist &mdash; they want to hear you <em>reason from the workload to the choice</em>. Default to <strong>Redis</strong>: it does everything Memcached does <em>plus</em> data structures, persistence, and pub/sub, so it&rsquo;s the safe pick unless you can name a specific reason for Memcached. Then justify in one breath: &ldquo;Redis, because I need X (counter / sorted set / TTL / pub/sub / durability), and the single-thread ceiling doesn&rsquo;t bind because my per-shard QPS is Y.&rdquo;</p>
+
+      <h3>The 10-second decision rule</h3>
+      <ol class="steps">
+        <li><strong>Do you need anything beyond get/set on opaque blobs?</strong> &mdash; a counter, leaderboard, queue, set, TTL index, pub/sub, rate-limiter, or persistence? &rArr; <span class="pick">Redis.</span> This is ~90% of interview cases.</li>
+        <li><strong>Is it purely a multi-core LRU cache for opaque blobs, throughput-maximal on one fat box, no persistence?</strong> &rArr; <span class="pick">Memcached</span> is the cleaner, lower-overhead answer &mdash; and naming it shows you know Redis isn&rsquo;t the only hammer.</li>
+        <li><strong>Either way, say <em>why the loser loses</em>.</strong> &ldquo;Not Memcached &mdash; I need atomic <code>INCR</code> for the rate-limiter.&rdquo; / &ldquo;Not Redis &mdash; I just need a dumb sharded blob cache and Memcached&rsquo;s multi-threading saturates the box without me running N processes.&rdquo;</li>
+      </ol>
+
+      <h3>Canonical interview prompts &rarr; the answer</h3>
+      <table class="sheet">
+        <thead><tr><th>If the question is&hellip;</th><th>Reach for</th><th>The one-line justification to say out loud</th></tr></thead>
+        <tbody>
+          <tr><td>Rate limiter / API quota</td><td class="c">Redis</td><td>Atomic <code>INCR</code> + <code>EXPIRE</code> (or a Lua token-bucket) &mdash; the counter must be race-free without app-side locks.</td></tr>
+          <tr><td>Leaderboard / top-K ranking</td><td class="c">Redis</td><td>Sorted set: <code>ZADD</code> / <code>ZREVRANGE</code> is O(log&nbsp;N) server-side &mdash; Memcached would force read-modify-write round-trips.</td></tr>
+          <tr><td>Session store / read-through cache of opaque values</td><td class="c">Either; default Redis</td><td>Both work; pick Redis for TTL+persistence+failover, Memcached only if it&rsquo;s pure volatile cache and ops simplicity matters.</td></tr>
+          <tr><td>Pub/Sub, job queue, or event fan-out</td><td class="c">Redis</td><td>Pub/Sub + Streams with consumer groups &mdash; Memcached has no messaging primitive at all.</td></tr>
+          <tr><td>Massive, simple, multi-core object cache (e.g. a CDN-edge blob cache)</td><td class="c">Memcached</td><td>One process saturates every core; no rich ops needed, so its tiny lock hold-times scale cleanly &mdash; less to run than a sharded Redis.</td></tr>
+          <tr><td>&ldquo;Cache, but it can also be the source of truth&rdquo;</td><td class="c">Redis</td><td>RDB snapshots + AOF give durability and replication; Memcached data is volatile by design.</td></tr>
+          <tr><td>Distributed lock</td><td class="c">Redis</td><td><code>SET key val NX PX</code> (single-instance) or Redlock (multi) &mdash; Memcached&rsquo;s <code>add</code> works but lacks the safety primitives.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="note-box"><strong>The follow-up that earns the senior signal:</strong> when you say &ldquo;Redis,&rdquo; pre-empt the obvious objection. Volunteer <em>&ldquo;and to scale past one core I shard with Redis Cluster &mdash; consistent-hash the keyspace across N primaries, each single-threaded; I avoid O(N) commands like <code>KEYS *</code> so no shard head-of-line-blocks.&rdquo;</em> That single sentence shows you understand the cost (one-core ceiling), the fix (sharding), <em>and</em> the operational footgun (head-of-line blocking) &mdash; not just the feature list.</div>
+
+      <div class="warn-box"><strong>Traps to avoid saying:</strong>
+        <ul style="margin:.3rem 0">
+          <li><span class="reject">&ldquo;Redis is slower because it&rsquo;s single-threaded.&rdquo;</span> &mdash; Wrong direction; it&rsquo;s fast <em>because</em> it&rsquo;s single-threaded (<a href="#fast">&sect;2</a>). Per-<em>process</em> ceiling, not per-op slowdown.</li>
+          <li><span class="reject">&ldquo;Memcached is just old Redis.&rdquo;</span> &mdash; They&rsquo;re different design points, not versions of each other.</li>
+          <li><span class="reject">&ldquo;I&rsquo;ll use Redis for everything.&rdquo;</span> with no reason &mdash; defensible as a default, but say the <em>workload</em> reason; a flat &ldquo;Redis always&rdquo; reads as cargo-culting.</li>
+          <li><span class="reject">Reaching for Memcached to look clever</span> when you actually need a counter or TTL or pub/sub &mdash; that&rsquo;s choosing the weaker tool to seem contrarian.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= HERE ================= -->
+  <section class="section">
+    <div class="container">
+      <h2 id="here">8. Why this scenario&rsquo;s broker uses Redis (not Memcached)</h2>
+      <p>The <a href="distributed_kv_cache.html#iter1b"><code>broker-job</code></a> in this scenario runs <strong>Redis Streams</strong> as the cluster gossip bus &mdash; it fans ring-version, per-task wait-time, and the membership-filter delta out to every Router (<a href="kv_store.html#protocol">kv_store &sect;6</a>). That choice falls straight out of this comparison:</p>
+      <ul>
+        <li><strong>Streams is a data structure, not a blob.</strong> The consumer-group fan-out (&ldquo;every Router consumes the same delta exactly once&rdquo;) is a first-class atomic Redis op &mdash; precisely the rich-operation class that single-threaded execution makes free. Memcached has no such primitive.</li>
+        <li><strong>The workload is tiny + bursty, not core-bound.</strong> ~100&nbsp;K low-rate gossip msg/s at ~93&nbsp;MB/s aggregate (<a href="distributed_kv_cache.html#iter1b">scenario &sect;Iter&nbsp;1b</a>) is trivial for one in-memory thread &mdash; the single-core ceiling is irrelevant here, so Redis pays none of its main cost.</li>
+        <li><strong>Atomic, predictable latency matters for control-plane gossip.</strong> The zero-coherence, low-variance profile from <a href="#coherence">&sect;3</a> is exactly what you want on the path that keeps every Router&rsquo;s ring view consistent.</li>
+      </ul>
+      <p>So the broker is a textbook case of the <a href="#deeper">&sect;5</a> logic: the need is &ldquo;rich atomic fan-out op on a small message stream,&rdquo; which selects Redis, and the single-thread ceiling never binds because the traffic is light.</p>
+    </div>
+  </section>
+
+  <script src="../../../js/sidebar.js"></script>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

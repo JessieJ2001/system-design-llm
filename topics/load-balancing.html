@@ -1,0 +1,1334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Load Balancing — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Nav ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="design-principles.html">Principles</a></li>
+        <li><a href="caching.html">Caching</a></li>
+        <li><a href="load-balancing.html" style="color: var(--color-primary); font-weight: 600;">Load Balancing</a></li>
+        <li><a href="message-queues.html">Message Queues</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero ===== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Load Balancing</h1>
+      <p class="hero-subtitle">Distributing incoming network traffic across multiple servers to ensure no single machine becomes a bottleneck.</p>
+      <span class="hero-meta">25 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>A load balancer sits between clients and a pool of backend servers, forwarding each incoming request to one of the available servers. Its purpose is straightforward: spread the work so that no single server is overwhelmed while others sit idle. The result is higher throughput, lower latency, and better resilience&mdash;if one server crashes, the load balancer stops sending traffic to it and the remaining servers absorb the load.</p>
+      <p>Load balancers operate at two primary layers of the network stack. An <strong>L4 (transport-layer) load balancer</strong> routes traffic based on IP addresses and TCP/UDP port numbers without inspecting the payload. It is fast and efficient&mdash;think HAProxy in TCP mode or AWS Network Load Balancer. An <strong>L7 (application-layer) load balancer</strong> understands HTTP, can inspect headers, cookies, and URL paths, and can make routing decisions based on content&mdash;think Nginx, Envoy, or AWS Application Load Balancer. L7 gives you flexibility (route <code>/api</code> to one pool and <code>/static</code> to another) at the cost of higher per-request overhead.</p>
+      <p>Why does it matter? Without a load balancer, scaling beyond a single server means relying on DNS round-robin, which has no health awareness and caches stale records for minutes. A proper load balancer gives you health checking, connection draining, and the ability to do zero-downtime deploys&mdash;capabilities that are table stakes for any production system serving real users.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How Load Balancing Works (Animated)</h2>
+      <div class="animation-container">
+        <canvas id="lb-animation"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">Requests arrive from clients on the left, pass through the load balancer (diamond), and are distributed to backend servers using round-robin. Watch how each successive request goes to a different server.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How It Works</h2>
+      <p>A load-balanced request follows these steps from client to server and back:</p>
+      <ol>
+        <li><strong>DNS Resolution.</strong> The client resolves the service hostname (e.g., <code>api.example.com</code>) to the load balancer's IP address. This IP is either a virtual IP (VIP) owned by the LB or an Anycast IP that routes to the nearest LB instance.</li>
+        <li><strong>Client Connects.</strong> The client opens a TCP connection (or sends a UDP packet) to the load balancer's IP and port. For L7, a TLS handshake may occur here&mdash;the LB terminates TLS, meaning it holds the certificate and decrypts traffic.</li>
+        <li><strong>LB Selects a Backend.</strong> The load balancer consults its algorithm (round-robin, least-connections, consistent hashing, etc.) and the current health status of backends to pick a target server.</li>
+        <li><strong>LB Forwards the Request.</strong> For L4, the LB rewrites packet headers (destination IP/port) and forwards at the TCP level. For L7, the LB establishes a separate TCP connection to the chosen backend and proxies the HTTP request, often adding headers like <code>X-Forwarded-For</code>.</li>
+        <li><strong>Backend Processes and Responds.</strong> The backend server handles the request and sends its response back to the load balancer.</li>
+        <li><strong>LB Returns the Response.</strong> The LB forwards the response back to the client over the original connection. The client has no idea which backend actually served the request.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use When</h4>
+          <ul>
+            <li><strong>Horizontal scaling:</strong> You need more throughput than a single server can provide. Adding servers behind a load balancer is the standard horizontal scaling pattern.</li>
+            <li><strong>High availability:</strong> You cannot tolerate a single point of failure. With multiple backends, one can go down without affecting users.</li>
+            <li><strong>Zero-downtime deploys:</strong> Rolling deployments require draining connections from old servers while routing new traffic to updated ones. A load balancer makes this possible.</li>
+            <li><strong>A/B testing and canary releases:</strong> L7 load balancers can route a percentage of traffic to a new version, enabling gradual rollouts.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use When</h4>
+          <ul>
+            <li><strong>Single-server applications:</strong> If your app comfortably runs on one machine and you don't need redundancy, a load balancer adds unnecessary complexity and a new failure mode.</li>
+            <li><strong>The bottleneck is the database, not compute:</strong> If your servers are underutilized but your database is saturated, adding more app servers behind a load balancer won't help. Fix the data layer first (caching, read replicas, sharding).</li>
+            <li><strong>Sub-millisecond latency budgets:</strong> Every hop adds latency. L4 adds ~0.1ms; L7 can add 1-5ms. For ultra-low-latency systems (HFT, real-time control), direct connections may be necessary.</li>
+            <li><strong>Peer-to-peer architectures:</strong> Systems where nodes communicate directly (gossip protocols, mesh networks) don't route through a central balancer.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic Algorithms</h3>
+      <p><strong>Round-Robin:</strong> Requests are distributed to servers in cyclic order: 1, 2, 3, 1, 2, 3... Simple, zero state, but ignores server load and request cost. A heavy query and a health check get equal treatment.</p>
+
+      <h4>Round-Robin: Concrete Walkthrough</h4>
+      <p>Suppose we have 3 servers (A, B, C) and 10 incoming requests. The load balancer maintains a single counter and cycles through the server list:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Request #</th><th>Counter (mod 3)</th><th>Assigned Server</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>0</td><td>A</td></tr>
+          <tr><td>2</td><td>1</td><td>B</td></tr>
+          <tr><td>3</td><td>2</td><td>C</td></tr>
+          <tr><td>4</td><td>0</td><td>A</td></tr>
+          <tr><td>5</td><td>1</td><td>B</td></tr>
+          <tr><td>6</td><td>2</td><td>C</td></tr>
+          <tr><td>7</td><td>0</td><td>A</td></tr>
+          <tr><td>8</td><td>1</td><td>B</td></tr>
+          <tr><td>9</td><td>2</td><td>C</td></tr>
+          <tr><td>10</td><td>0</td><td>A</td></tr>
+        </tbody>
+      </table></div>
+      <p>Final tally: A = 4, B = 3, C = 3. Almost perfectly even. The downside is obvious: if request #1 is a 10-second database report and request #2 is a 5ms health check, both get equal treatment. Server A could be drowning while B and C are idle.</p>
+
+      <p><strong>Weighted Round-Robin:</strong> Each server gets a weight proportional to its capacity. A server with weight 3 receives three times more requests than one with weight 1. Useful when servers have different hardware specs, but weights are static and don't adapt to runtime load.</p>
+
+      <h4>Weighted Round-Robin: Smooth Distribution (Nginx-Style)</h4>
+      <p>A naive implementation of weighted round-robin would send all of Server A's requests in a burst (AAAAABBBCC), causing uneven load spikes. Nginx solves this with a <strong>smooth weighted round-robin</strong> algorithm that interleaves servers proportionally. Here is how it works:</p>
+      <p>Each server has three values:</p>
+      <ul>
+        <li><code>effective_weight</code> &mdash; the configured weight (stays constant)</li>
+        <li><code>current_weight</code> &mdash; a running counter that changes each round (starts at 0)</li>
+        <li><code>total_weight</code> &mdash; the sum of all effective weights</li>
+      </ul>
+      <p><strong>Each round:</strong> (1) Add <code>effective_weight</code> to each server's <code>current_weight</code>. (2) Pick the server with the highest <code>current_weight</code>. (3) Subtract <code>total_weight</code> from the chosen server's <code>current_weight</code>.</p>
+      <p>Let's trace this with servers A (weight=5), B (weight=3), C (weight=2). Total weight = 10.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Round</th><th>After Adding Weights<br>(A, B, C)</th><th>Selected<br>(highest)</th><th>After Subtracting Total<br>(A, B, C)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>(5, 3, 2)</td><td><strong>A</strong></td><td>(&minus;5, 3, 2)</td></tr>
+          <tr><td>2</td><td>(0, 6, 4)</td><td><strong>B</strong></td><td>(0, &minus;4, 4)</td></tr>
+          <tr><td>3</td><td>(5, &minus;1, 6)</td><td><strong>C</strong></td><td>(5, &minus;1, &minus;4)</td></tr>
+          <tr><td>4</td><td>(10, 2, &minus;2)</td><td><strong>A</strong></td><td>(0, 2, &minus;2)</td></tr>
+          <tr><td>5</td><td>(5, 5, 0)</td><td><strong>A</strong> (tie: pick first)</td><td>(&minus;5, 5, 0)</td></tr>
+          <tr><td>6</td><td>(0, 8, 2)</td><td><strong>B</strong></td><td>(0, &minus;2, 2)</td></tr>
+          <tr><td>7</td><td>(5, 1, 4)</td><td><strong>A</strong></td><td>(&minus;5, 1, 4)</td></tr>
+          <tr><td>8</td><td>(0, 4, 6)</td><td><strong>C</strong></td><td>(0, 4, &minus;4)</td></tr>
+          <tr><td>9</td><td>(5, 7, &minus;2)</td><td><strong>B</strong></td><td>(5, &minus;3, &minus;2)</td></tr>
+          <tr><td>10</td><td>(10, 0, 0)</td><td><strong>A</strong></td><td>(0, 0, 0)</td></tr>
+        </tbody>
+      </table></div>
+      <p>The selection sequence is: <strong>A, B, C, A, A, B, A, C, B, A</strong>. Count: A = 5, B = 3, C = 2 &mdash; exactly matching the weights. But notice how the requests are <em>interleaved</em> rather than batched. You never see three A's in a row. This is why Nginx's approach is called "smooth" &mdash; it spreads each server's share evenly across the timeline.</p>
+      <pre class="line-numbers"><code class="language-python">class SmoothWeightedRR:
+    def __init__(self, servers_with_weights):
+        """servers_with_weights: list of (name, weight) tuples."""
+        self.servers = []
+        for name, weight in servers_with_weights:
+            self.servers.append({
+                'name': name,
+                'effective_weight': weight,
+                'current_weight': 0,
+            })
+        self.total_weight = sum(s['effective_weight'] for s in self.servers)
+
+    def next_server(self):
+        # Step 1: Add effective_weight to each server's current_weight
+        for s in self.servers:
+            s['current_weight'] += s['effective_weight']
+
+        # Step 2: Pick the server with the highest current_weight
+        best = max(self.servers, key=lambda s: s['current_weight'])
+
+        # Step 3: Subtract total_weight from chosen server
+        best['current_weight'] -= self.total_weight
+
+        return best['name']
+
+# Demo
+lb = SmoothWeightedRR([('A', 5), ('B', 3), ('C', 2)])
+sequence = [lb.next_server() for _ in range(10)]
+print(sequence)
+# Output: ['A', 'B', 'C', 'A', 'A', 'B', 'A', 'C', 'B', 'A']</code></pre>
+
+      <p><strong>Least Connections:</strong> Route each new request to the server with the fewest active connections. Better than round-robin for requests with variable processing times. However, it requires the LB to track per-server connection counts in real time, and it can oscillate (the "herd" effect where many requests pile onto a just-freed server).</p>
+
+      <h4>Least Connections: Step-by-Step Timeline</h4>
+      <p>Unlike round-robin, least connections requires the load balancer to maintain a running count of active connections per server. This count goes up when a request is assigned and goes down when the request completes. Let's trace 3 servers handling 6 requests with varying durations:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Event</th><th>Server A<br>conns</th><th>Server B<br>conns</th><th>Server C<br>conns</th><th>Decision</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>t=0</td><td>Request R1 arrives</td><td>0</td><td>0</td><td>0</td><td>All tied at 0. Pick A (first). A &rarr; 1</td></tr>
+          <tr><td>t=1</td><td>Request R2 arrives</td><td>1</td><td>0</td><td>0</td><td>B and C tied at 0. Pick B. B &rarr; 1</td></tr>
+          <tr><td>t=2</td><td>Request R3 arrives</td><td>1</td><td>1</td><td>0</td><td>C has fewest (0). Pick C. C &rarr; 1</td></tr>
+          <tr><td>t=3</td><td>R2 completes (B)</td><td>1</td><td>0</td><td>1</td><td>&mdash;</td></tr>
+          <tr><td>t=3</td><td>Request R4 arrives</td><td>1</td><td>0</td><td>1</td><td>B has fewest (0). Pick B. B &rarr; 1</td></tr>
+          <tr><td>t=4</td><td>R1 completes (A)</td><td>0</td><td>1</td><td>1</td><td>&mdash;</td></tr>
+          <tr><td>t=5</td><td>Request R5 arrives</td><td>0</td><td>1</td><td>1</td><td>A has fewest (0). Pick A. A &rarr; 1</td></tr>
+          <tr><td>t=5</td><td>R3 completes (C)</td><td>1</td><td>1</td><td>0</td><td>&mdash;</td></tr>
+          <tr><td>t=6</td><td>Request R6 arrives</td><td>1</td><td>1</td><td>0</td><td>C has fewest (0). Pick C. C &rarr; 1</td></tr>
+        </tbody>
+      </table></div>
+      <p>Notice how the algorithm naturally adapts: when R2 finished quickly on Server B (at t=3), the next request (R4) was immediately routed to B because it had the lowest count. If R1 had been a slow query, it would not receive new requests until it caught up. This is the key advantage over round-robin &mdash; least connections inherently reacts to variable request durations.</p>
+      <p><strong>The herd problem:</strong> If many requests complete simultaneously on one server, that server's count drops to 0, and a burst of new requests all pile onto it. This is the "thundering herd" variant for least connections. Mitigations include adding randomized tie-breaking (when counts are equal, pick randomly instead of always picking the first) and combining with P2C (pick two random servers, then choose the one with fewer connections).</p>
+
+      <h3>Modern Approaches</h3>
+      <p><strong>Power of Two Random Choices (P2C):</strong> Instead of checking all servers, pick two at random and send the request to the one with fewer connections. This simple change is transformative: Mitzenmacher proved that the maximum load drops from <code>O(log n / log log n)</code> with one random choice to <code>O(log log n)</code> with two. That's the difference between 5x imbalance and 2x imbalance at 1000 servers. P2C is used by Envoy, gRPC, and Nginx Plus. It requires minimal state (just two random lookups) and scales effortlessly.</p>
+
+      <h4>Power of Two Choices: The Balls-into-Bins Analogy</h4>
+      <p>Imagine you have N bins (servers) and N balls (requests), and you're dropping them in one at a time. The question is: how full does the most-loaded bin get?</p>
+      <ul>
+        <li><strong>1 random choice:</strong> Each ball goes into a uniformly random bin. The most-loaded bin ends up with <code>O(log n / log log n)</code> balls. For n = 1,000, this means the heaviest bin has roughly 5&ndash;7 balls when the average is 1. Some bins are nearly empty while one is severely overloaded.</li>
+        <li><strong>2 random choices:</strong> Each ball inspects two random bins and goes into the one with fewer balls. The most-loaded bin now has only <code>O(log log n)</code> balls. For n = 1,000, the heaviest bin has roughly 2&ndash;3 balls. The overload nearly vanishes.</li>
+      </ul>
+      <p>The insight is that the second choice creates a feedback mechanism: heavily loaded bins are more likely to be sampled (there are more of them), and when they are, they <em>lose</em> the comparison. This pushes load away from hot spots automatically.</p>
+
+      <h4>Concrete Example: 4 Servers, 8 Requests</h4>
+      <p>Let's compare one random choice vs. P2C with 4 servers (S1&ndash;S4) and 8 requests. We'll use a fixed random sequence for reproducibility.</p>
+      <p><strong>One random choice</strong> (each request picks one random server):</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Request</th><th>Random Pick</th><th>S1 load</th><th>S2 load</th><th>S3 load</th><th>S4 load</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>R1</td><td>S2</td><td>0</td><td>1</td><td>0</td><td>0</td></tr>
+          <tr><td>R2</td><td>S1</td><td>1</td><td>1</td><td>0</td><td>0</td></tr>
+          <tr><td>R3</td><td>S2</td><td>1</td><td>2</td><td>0</td><td>0</td></tr>
+          <tr><td>R4</td><td>S1</td><td>2</td><td>2</td><td>0</td><td>0</td></tr>
+          <tr><td>R5</td><td>S3</td><td>2</td><td>2</td><td>1</td><td>0</td></tr>
+          <tr><td>R6</td><td>S2</td><td>2</td><td>3</td><td>1</td><td>0</td></tr>
+          <tr><td>R7</td><td>S1</td><td>3</td><td>3</td><td>1</td><td>0</td></tr>
+          <tr><td>R8</td><td>S4</td><td>3</td><td>3</td><td>1</td><td>1</td></tr>
+        </tbody>
+      </table></div>
+      <p>Result: loads are (3, 3, 1, 1). Max load = <strong>3</strong>, average = 2. The max is 1.5x the average.</p>
+      <p><strong>Power of Two Choices</strong> (each request picks two random servers, goes to the less loaded one):</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Request</th><th>Two Picks</th><th>Loads at Pick Time</th><th>Choice</th><th>S1</th><th>S2</th><th>S3</th><th>S4</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>R1</td><td>S2, S4</td><td>0 vs 0</td><td>S2 (tie)</td><td>0</td><td>1</td><td>0</td><td>0</td></tr>
+          <tr><td>R2</td><td>S1, S2</td><td>0 vs 1</td><td>S1</td><td>1</td><td>1</td><td>0</td><td>0</td></tr>
+          <tr><td>R3</td><td>S2, S3</td><td>1 vs 0</td><td>S3</td><td>1</td><td>1</td><td>1</td><td>0</td></tr>
+          <tr><td>R4</td><td>S1, S4</td><td>1 vs 0</td><td>S4</td><td>1</td><td>1</td><td>1</td><td>1</td></tr>
+          <tr><td>R5</td><td>S3, S1</td><td>1 vs 1</td><td>S3 (tie)</td><td>1</td><td>1</td><td>2</td><td>1</td></tr>
+          <tr><td>R6</td><td>S2, S4</td><td>1 vs 1</td><td>S2 (tie)</td><td>1</td><td>2</td><td>2</td><td>1</td></tr>
+          <tr><td>R7</td><td>S1, S3</td><td>1 vs 2</td><td>S1</td><td>2</td><td>2</td><td>2</td><td>1</td></tr>
+          <tr><td>R8</td><td>S4, S2</td><td>1 vs 2</td><td>S4</td><td>2</td><td>2</td><td>2</td><td>2</td></tr>
+        </tbody>
+      </table></div>
+      <p>Result: loads are (2, 2, 2, 2). Max load = <strong>2</strong>, average = 2. <em>Perfectly balanced.</em> The max is exactly the average. Compare to the random approach where the max was 50% above average. At larger scales (thousands of servers), this difference becomes even more dramatic.</p>
+      <p><strong>Why not three choices?</strong> Azar et al. proved that going from 1 to 2 choices gives an exponential improvement, but going from 2 to 3 gives diminishing returns. The max load with <em>d</em> choices is <code>O(log log n / log d)</code>, so three choices only shaves a constant factor. Two choices captures nearly all the benefit while keeping the implementation trivially simple.</p>
+
+      <p><strong>Maglev Hashing (Google, 2016):</strong> Google's software load balancer uses a custom consistent hashing scheme that maps connections to backends via a lookup table. The table is constructed so that each backend gets an equal share, disruption from backend changes is minimal (only ~1% of connections remap), and lookup is O(1). Maglev handles 10M+ packets per second per machine. It's used for Google's front-end serving infrastructure.</p>
+
+      <p><strong>Join-Idle-Queue (JIQ):</strong> Idle servers proactively advertise their availability to a dispatcher. When a request arrives, the dispatcher picks from the idle queue instantly&mdash;no need to probe or sample. JIQ achieves near-perfect load balance with zero queueing delay, but requires servers to push state to the dispatcher, which adds implementation complexity.</p>
+
+      <h4>Join-Idle-Queue: How It Works Step by Step</h4>
+      <p>JIQ inverts the traditional model. Instead of the dispatcher probing servers to find one that's available, <strong>servers tell the dispatcher when they're idle</strong>. This eliminates the querying overhead entirely.</p>
+      <p>The full flow:</p>
+      <ol>
+        <li><strong>Server finishes a request</strong> and has no more work in its local queue.</li>
+        <li><strong>Server sends an "I'm idle" message</strong> to the dispatcher (load balancer).</li>
+        <li><strong>Dispatcher adds the server</strong> to an idle queue (a simple FIFO queue of servers with no work).</li>
+        <li><strong>New request arrives</strong> at the dispatcher.</li>
+        <li><strong>If the idle queue is non-empty:</strong> pop a server off the queue and send the request directly. This server starts processing immediately with zero queueing delay.</li>
+        <li><strong>If the idle queue is empty:</strong> all servers are busy. Fall back to a secondary algorithm (typically P2C) to pick the least loaded server. The request will queue on that server.</li>
+      </ol>
+
+      <h4>JIQ Timeline Example</h4>
+      <p>3 servers (A, B, C), 6 requests. Each request takes 2 time units to process.</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Event</th><th>Idle Queue</th><th>Server A</th><th>Server B</th><th>Server C</th><th>Decision</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>t=0</td><td>System starts</td><td>[A, B, C]</td><td>idle</td><td>idle</td><td>idle</td><td>All servers register as idle</td></tr>
+          <tr><td>t=1</td><td>R1 arrives</td><td>[B, C]</td><td>R1</td><td>idle</td><td>idle</td><td>Pop A from idle queue. Send R1 to A.</td></tr>
+          <tr><td>t=1</td><td>R2 arrives</td><td>[C]</td><td>R1</td><td>R2</td><td>idle</td><td>Pop B from idle queue. Send R2 to B.</td></tr>
+          <tr><td>t=2</td><td>R3 arrives</td><td>[]</td><td>R1</td><td>R2</td><td>R3</td><td>Pop C from idle queue. Send R3 to C.</td></tr>
+          <tr><td>t=2</td><td>R4 arrives</td><td>[] (empty)</td><td>R1</td><td>R2</td><td>R3</td><td>Idle queue empty! Fallback to P2C. Pick A (sampled A,C; tied; pick A). R4 queues on A.</td></tr>
+          <tr><td>t=3</td><td>R1 finishes on A</td><td>[]</td><td>R4 (starts)</td><td>R2</td><td>R3</td><td>A has R4 queued, so starts it immediately. Does NOT re-register as idle.</td></tr>
+          <tr><td>t=3</td><td>R2 finishes on B</td><td>[B]</td><td>R4</td><td>idle</td><td>R3</td><td>B has no queued work. Sends "I'm idle" to dispatcher.</td></tr>
+          <tr><td>t=3</td><td>R5 arrives</td><td>[]</td><td>R4</td><td>R5</td><td>R3</td><td>Pop B from idle queue. Send R5 to B. Zero queueing delay.</td></tr>
+          <tr><td>t=4</td><td>R3 finishes on C</td><td>[C]</td><td>R4</td><td>R5</td><td>idle</td><td>C registers as idle.</td></tr>
+          <tr><td>t=4</td><td>R6 arrives</td><td>[]</td><td>R4</td><td>R5</td><td>R6</td><td>Pop C from idle queue. Send R6 to C.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Key observation:</strong> Out of 6 requests, 5 experienced <em>zero queueing delay</em> &mdash; they were sent directly to an idle server. Only R4 had to queue, because all servers were busy at that moment. Compare this to P2C, where even with two random choices, requests might go to a server with an existing queue. JIQ achieves near-optimal dispatching because it has <em>perfect knowledge</em> of which servers are ready for work.</p>
+      <p><strong>Tradeoff vs. P2C:</strong> JIQ requires servers to send "I'm idle" notifications to the dispatcher, which adds a message per request completion. In a system handling millions of requests per second, this is significant overhead. P2C requires no server-to-dispatcher communication at all &mdash; just two random picks and two load lookups. JIQ shines when processing times are long (seconds, not milliseconds), because the notification overhead is amortized over the request duration.</p>
+
+      <p><strong>Consistent Hashing with Bounded Loads:</strong> A 2017 paper from Google combines consistent hashing (for session affinity) with a load cap. Each server has a maximum load of <code>(1 + epsilon) * average_load</code>. If a server is at its cap, the request "overflows" to the next server on the hash ring. This prevents hot spots while preserving the benefits of consistent hashing. Used in HAProxy and Vimeo's load balancers.</p>
+
+      <h4>Consistent Hashing with Bounded Loads: Full Walkthrough</h4>
+      <p><strong>The problem it solves:</strong> Standard consistent hashing maps each key to a fixed server on the hash ring. This gives you session affinity (the same key always goes to the same server), but it has no protection against hot spots. If one key generates 100x more traffic than others, its server drowns while others are idle.</p>
+      <p><strong>The idea:</strong> Add a load cap. Each server can handle at most <code>(1 + &epsilon;) &times; (total_keys / num_servers)</code> keys. When a server reaches its cap, additional keys "overflow" to the next server clockwise on the ring. The parameter &epsilon; controls the tradeoff: smaller &epsilon; means tighter balance but more keys displaced from their "natural" server; larger &epsilon; means more affinity but allows more imbalance.</p>
+
+      <h4>Worked Example: 4 Servers, 12 Keys, &epsilon; = 0.25</h4>
+      <p>Setup: 4 servers (S1&ndash;S4) placed on a hash ring. 12 keys to assign. Average load = 12 / 4 = 3 keys per server. Load cap = (1 + 0.25) &times; 3 = <strong>3.75</strong>, so each server can hold at most <strong>3 keys</strong> (since keys are integers, we floor the cap; some implementations round up to 4).</p>
+      <p>Suppose the hash ring assigns keys to "natural" servers like this (based on which server is nearest clockwise):</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Server</th><th>Natural Keys</th><th>Count</th><th>Over Cap?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>S1</td><td>K1, K2, K3, K4, K5</td><td>5</td><td>Yes (cap = 3.75)</td></tr>
+          <tr><td>S2</td><td>K6, K7</td><td>2</td><td>No</td></tr>
+          <tr><td>S3</td><td>K8, K9, K10, K11</td><td>4</td><td>Yes (cap = 3.75)</td></tr>
+          <tr><td>S4</td><td>K12</td><td>1</td><td>No</td></tr>
+        </tbody>
+      </table></div>
+      <p>Now apply the bounded loads algorithm. Process each key in hash-ring order. When a key's natural server is at its cap, overflow to the next server clockwise:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Key</th><th>Natural Server</th><th>Server Load at Arrival</th><th>At Cap?</th><th>Assigned To</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>K1</td><td>S1</td><td>S1: 0</td><td>No</td><td>S1</td></tr>
+          <tr><td>K2</td><td>S1</td><td>S1: 1</td><td>No</td><td>S1</td></tr>
+          <tr><td>K3</td><td>S1</td><td>S1: 2</td><td>No</td><td>S1</td></tr>
+          <tr><td>K4</td><td>S1</td><td>S1: 3</td><td><strong>Yes (3 &ge; 3.75? No, but next would reach 4)</strong></td><td>S1 (still under cap at 3)</td></tr>
+          <tr><td>K5</td><td>S1</td><td>S1: 3.75 (at cap with 4 keys if we round up)</td><td><strong>Yes</strong></td><td>Overflow &rarr; S2 (next clockwise)</td></tr>
+          <tr><td>K6</td><td>S2</td><td>S2: 1 (has K5)</td><td>No</td><td>S2</td></tr>
+          <tr><td>K7</td><td>S2</td><td>S2: 2</td><td>No</td><td>S2</td></tr>
+          <tr><td>K8</td><td>S3</td><td>S3: 0</td><td>No</td><td>S3</td></tr>
+          <tr><td>K9</td><td>S3</td><td>S3: 1</td><td>No</td><td>S3</td></tr>
+          <tr><td>K10</td><td>S3</td><td>S3: 2</td><td>No</td><td>S3</td></tr>
+          <tr><td>K11</td><td>S3</td><td>S3: 3</td><td><strong>Yes</strong></td><td>Overflow &rarr; S4 (next clockwise)</td></tr>
+          <tr><td>K12</td><td>S4</td><td>S4: 1 (has K11)</td><td>No</td><td>S4</td></tr>
+        </tbody>
+      </table></div>
+      <p>Final assignment: S1 = 4, S2 = 3, S3 = 3, S4 = 2. Without bounded loads, S1 had 5 and S4 had 1 &mdash; a 5:1 imbalance. With bounded loads (&epsilon; = 0.25), the worst imbalance is 4:2 = 2:1. Lowering &epsilon; would tighten this further, but would displace more keys from their natural servers (reducing session affinity).</p>
+      <p><strong>Key benefit:</strong> Most keys still go to their "natural" server (10 out of 12 in this example), preserving cache locality and session affinity. Only the overflow keys (K5 and K11) get displaced. When a server is added or removed, the algorithm re-balances by overflowing keys from overloaded servers, but the bounded guarantee ensures no server ever gets more than (1 + &epsilon;) times the average.</p>
+
+      <h3>L4 vs L7 Load Balancing: In Depth</h3>
+      <p>To understand the difference between L4 and L7 load balancing, you need to understand what the load balancer can "see" at each layer. The OSI model defines how data is encapsulated: application data is wrapped in an HTTP message, which is wrapped in a TCP segment, which is wrapped in an IP packet. A lower-layer load balancer can only inspect outer layers &mdash; it cannot see inside the payload.</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>OSI Layer</th><th>Name</th><th>Protocol Examples</th><th>Info Available to LB</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>3</td><td>Network</td><td>IP</td><td>Source/destination IP address</td></tr>
+          <tr><td>4</td><td>Transport</td><td>TCP, UDP</td><td>Source/destination port, connection state (SYN, ACK, FIN), sequence numbers</td></tr>
+          <tr><td>7</td><td>Application</td><td>HTTP, gRPC, WebSocket, SMTP</td><td>HTTP method, URL path, headers, cookies, request body, gRPC service/method</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4>What L4 Sees vs. What L7 Sees</h4>
+      <p>When a client sends <code>GET /api/users HTTP/1.1</code> with a cookie <code>session_id=abc123</code>, here's what each layer sees:</p>
+      <ul>
+        <li><strong>L4 (Transport) LB</strong> sees: source IP <code>203.0.113.50</code>, destination port <code>443</code>, TCP SYN flag. It does <em>not</em> see the URL path, the HTTP method, or the cookie. The HTTP request is encrypted inside the TLS payload, which is inside the TCP segment's data field. L4 treats this as opaque bytes.</li>
+        <li><strong>L7 (Application) LB</strong> sees everything: the method (<code>GET</code>), the path (<code>/api/users</code>), all headers (<code>Host</code>, <code>Cookie</code>, <code>Authorization</code>), and even the request body. To get this visibility, the L7 LB must <em>terminate</em> the TCP connection and (if using TLS) <em>decrypt</em> the traffic. It then establishes a <em>new</em> TCP connection to the chosen backend and re-transmits the request.</li>
+      </ul>
+
+      <h4>When to Use Each</h4>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Use Case</th><th>L4</th><th>L7</th><th>Why</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Raw throughput (millions of packets/sec)</td><td>Yes</td><td>No</td><td>L4 is 10&ndash;100x faster because it doesn't parse application data</td></tr>
+          <tr><td>Non-HTTP protocols (database, game server, custom TCP)</td><td>Yes</td><td>No</td><td>L7 only understands HTTP/gRPC. For raw TCP/UDP, use L4.</td></tr>
+          <tr><td>TLS passthrough (end-to-end encryption)</td><td>Yes</td><td>No</td><td>L4 forwards encrypted bytes without decrypting. L7 must terminate TLS.</td></tr>
+          <tr><td>Path-based routing (<code>/api</code> vs <code>/static</code>)</td><td>No</td><td>Yes</td><td>L4 can't see the URL path.</td></tr>
+          <tr><td>Header injection (<code>X-Forwarded-For</code>, <code>X-Request-ID</code>)</td><td>No</td><td>Yes</td><td>L4 can't modify HTTP headers (it doesn't know they exist).</td></tr>
+          <tr><td>Cookie-based session affinity</td><td>No</td><td>Yes</td><td>L4 can't read cookies.</td></tr>
+          <tr><td>A/B testing, canary routing</td><td>No</td><td>Yes</td><td>Requires inspecting headers or cookies to decide which backend version to use.</td></tr>
+          <tr><td>SSL/TLS termination (offload crypto from backends)</td><td>No</td><td>Yes</td><td>L4 passes through TLS; L7 terminates it and sends plain HTTP to backends.</td></tr>
+          <tr><td>WebSocket upgrade handling</td><td>Partial</td><td>Yes</td><td>L4 can forward the TCP connection, but L7 can inspect the HTTP Upgrade header and route WebSocket connections to specialized backends.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>In practice, use both:</strong> Most production systems run a two-tier architecture. An L4 LB (AWS NLB, Maglev, IPVS) sits at the edge and distributes raw TCP connections across a pool of L7 LBs (Nginx, Envoy, HAProxy in HTTP mode). The L4 tier handles connection distribution, DDoS absorption, and Anycast routing. The L7 tier handles intelligent routing, TLS termination, header manipulation, and rate limiting. This is exactly how Google (Maglev &rarr; GFE), AWS (NLB &rarr; ALB), and GitHub (GLB Director &rarr; HAProxy) architect their stacks.</p>
+
+      <h3>Health Checking: Active vs. Passive</h3>
+      <p>Health checking determines whether a backend server is alive and able to serve requests. There are two fundamentally different approaches, and most production systems use both simultaneously.</p>
+
+      <h4>Active vs. Passive: Comparison</h4>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Aspect</th><th>Active Health Check</th><th>Passive Health Check</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>How it works</strong></td><td>LB periodically sends probe requests to each backend (e.g., <code>GET /health</code> every 10s)</td><td>LB observes real traffic responses. If a backend returns too many 5xx errors or timeouts, it's marked unhealthy.</td></tr>
+          <tr><td><strong>Detection speed</strong></td><td>Depends on interval &times; threshold. With interval=10s and threshold=3 failures, detection takes 30s.</td><td>Near-instant: after observing N consecutive failures in real traffic, the server is ejected.</td></tr>
+          <tr><td><strong>False positives</strong></td><td>Low: dedicated health endpoint can check app readiness, DB connectivity, etc.</td><td>Higher: a burst of 5xx errors might be caused by bad input, not server failure.</td></tr>
+          <tr><td><strong>Overhead</strong></td><td>Small: one HTTP request per server per interval. With 100 servers and 10s interval, that's 10 requests/second.</td><td>Zero extra traffic: uses real requests that are already being processed.</td></tr>
+          <tr><td><strong>Works before traffic starts?</strong></td><td>Yes: LB can verify servers are healthy before sending any real requests.</td><td>No: needs real traffic to observe. Can't detect a server that's down before any requests arrive.</td></tr>
+          <tr><td><strong>Detects "grey failures"?</strong></td><td>Only if health check exercises the failure mode (e.g., checks DB connectivity). Simple <code>/ping</code> checks miss most grey failures.</td><td>Yes: if the server is returning errors on real requests, passive checks catch it.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h4>Concrete Health Check Configuration</h4>
+      <p>Typical production settings:</p>
+      <ul>
+        <li><strong>Interval:</strong> 10 seconds &mdash; the LB sends a probe every 10s.</li>
+        <li><strong>Unhealthy threshold:</strong> 3 consecutive failures &mdash; a server must fail 3 checks in a row before being marked unhealthy. This prevents transient blips (a single dropped packet, a momentary GC pause) from causing premature removal.</li>
+        <li><strong>Time to detect failure:</strong> 3 &times; 10s = <strong>30 seconds</strong>. During these 30 seconds, the LB is still sending real traffic to the failing server. This is why passive checks complement active checks &mdash; passive detection can be much faster.</li>
+        <li><strong>Healthy threshold:</strong> 2 consecutive successes &mdash; a server must pass 2 checks before being re-added. This prevents a flapping server (up-down-up-down) from rapidly toggling.</li>
+        <li><strong>Time to recover:</strong> 2 &times; 10s = <strong>20 seconds</strong> after the server starts passing checks again.</li>
+      </ul>
+
+      <h4>What Happens During a Rolling Deploy</h4>
+      <p>Imagine you're deploying a new version to 4 servers (S1&ndash;S4) one at a time, with interval = 10s, unhealthy threshold = 3, healthy threshold = 2:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Time</th><th>Event</th><th>Healthy Servers</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>t=0s</td><td>Deploy starts. S1 is taken out of rotation (connection draining begins).</td><td>S1*, S2, S3, S4</td><td>S1 stops accepting new connections but finishes in-flight requests.</td></tr>
+          <tr><td>t=30s</td><td>S1 drain completes. S1 shuts down. Health check fails.</td><td>S2, S3, S4</td><td>If no graceful drain: LB needs 30s (3 &times; 10s) to detect S1 is down.</td></tr>
+          <tr><td>t=45s</td><td>S1 restarts with new version. Passes first health check.</td><td>S2, S3, S4</td><td>Not yet healthy (needs 2 successes).</td></tr>
+          <tr><td>t=55s</td><td>S1 passes second health check.</td><td>S1 (new), S2, S3, S4</td><td>S1 is back in rotation. Slow-start ramps its traffic over 30s.</td></tr>
+          <tr><td>t=60s</td><td>S2 begins draining.</td><td>S1 (new), S2*, S3, S4</td><td>Process repeats for S2.</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>The critical window:</strong> Between t=30s and t=55s, only 3 of 4 servers are handling traffic. Each server carries 33% more load than normal. If this pushes any server past its capacity, latency spikes. This is exactly why SLO-driven sizing must account for rolling deploys (the "N-1" or "25% unavailable" scenario from the sizing examples above).</p>
+      <p><strong>Best practice:</strong> Use shorter intervals (5s) with lower thresholds (2) for faster detection (10s), but pair with passive health checks for instant detection of real-traffic failures. Always configure connection draining timeout to match your longest expected request duration (typically 30&ndash;60s). And always test the full deploy cycle under load before relying on it in production.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Homogeneous servers:</strong> Most balancing algorithms assume all backends have the same capacity. If servers differ in CPU, memory, or network bandwidth, you need weighted algorithms or the model breaks down&mdash;equal distribution does not mean equal utilization.</li>
+          <li><strong>Independent requests:</strong> Each request is treated as independent and can be served by any backend. This breaks down with stateful applications (WebSocket connections, in-memory sessions). Sticky sessions partially fix this but sacrifice even distribution.</li>
+          <li><strong>Health checks are accurate:</strong> The LB assumes health check responses reflect actual server health. If a server passes health checks but is degraded (e.g., high GC pressure, saturated thread pool), the LB will keep sending traffic to it. This is the "grey failure" problem.</li>
+          <li><strong>Uniform network latency:</strong> The model assumes latency between the LB and all backends is roughly the same. In multi-AZ or cross-region deployments, this assumption fails and you need topology-aware routing.</li>
+        </ul>
+        <p><strong>When assumptions break down:</strong> Grey failures cause cascading load imbalance. Heterogeneous hardware with uniform weights leads to slow servers getting overwhelmed. Cross-AZ traffic adds 0.5-2ms per hop, which accumulates on high-fan-out requests.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+      <h3>How Many Servers?</h3>
+      <p>The basic formula:</p>
+      <pre class="line-numbers"><code class="language-python">servers_needed = ceil(peak_RPS / per_server_RPS) * (1 + headroom)</code></pre>
+      <p>Where <code>headroom</code> is typically 0.3&ndash;0.5 (30&ndash;50% extra capacity) to handle traffic spikes and allow for individual server failures without overloading the remaining pool.</p>
+
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>The correct way to size a load-balanced fleet is to <strong>start from your SLO and work backward</strong> to the required backend count and LB configuration. Generic formulas like "add 40% headroom" are a starting point, but SLO-driven sizing tells you <em>exactly</em> how much capacity you need.</p>
+      <ol>
+        <li><strong>Define the SLO:</strong> "p99 latency &lt; X ms" or "availability &ge; 99.9%" or "throughput &ge; Y RPS sustained."</li>
+        <li><strong>Measure per-server capacity:</strong> Load-test a single backend to find its max RPS before the latency SLO is violated (not before it crashes &mdash; before the <em>SLO</em> breaks).</li>
+        <li><strong>Account for LB overhead:</strong> L4 adds ~0.1ms per hop; L7 adds 1&ndash;5ms. Subtract this from the backend's latency budget.</li>
+        <li><strong>Model failure scenarios:</strong> How many servers can fail simultaneously while keeping remaining servers under SLO? This gives your N+K redundancy requirement.</li>
+        <li><strong>Add spike headroom:</strong> What is your peak-to-average traffic ratio? Size so that peak traffic still meets the SLO with one server down.</li>
+        <li><strong>Validate with load testing:</strong> Run synthetic load at 1.2&times; expected peak through the actual LB to confirm the SLO holds end-to-end.</li>
+      </ol>
+
+      <h3>Worked Examples (SLO-Driven)</h3>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: E-Commerce Checkout</h4>
+        <p><strong>Target SLO:</strong> p99 latency &lt; 200ms for checkout API calls</p>
+        <p><strong>Given:</strong> Peak traffic = 30,000 RPS during flash sales. Each backend (4 vCPU, 8 GB) handles 4,000 RPS before p99 exceeds 150ms. L7 ALB adds ~5ms overhead. Must survive 2 simultaneous server failures.</p>
+        <p><strong>Step 1 &mdash; Latency budget:</strong> 200ms SLO &minus; 5ms LB overhead = 195ms backend budget. At 4,000 RPS per server, p99 is 150ms &mdash; within budget (45ms margin).</p>
+        <p><strong>Step 2 &mdash; Base server count:</strong> &lceil;30,000 / 4,000&rceil; = 8 servers minimum.</p>
+        <p><strong>Step 3 &mdash; Failure tolerance (N+2):</strong> With 2 servers down, remaining 6 would each handle 5,000 RPS. At 5,000 RPS, p99 = 220ms &mdash; exceeds our 195ms budget. Need more servers: with 10 servers, losing 2 leaves 8, each handling 3,750 RPS &mdash; p99 stays ~130ms. Safe.</p>
+        <p><strong>Step 4 &mdash; Spike headroom:</strong> Flash sale traffic can spike 1.5&times; to 45,000 RPS. With 10 servers: 4,500 RPS each &mdash; approaching the 4,000 RPS limit. With 12 servers: 3,750 RPS each even during spike, and losing 2 gives 4,500 RPS on remaining 10 &mdash; still under the budget.</p>
+        <p><strong>Result:</strong> <strong>12 backend servers</strong> behind the ALB. Monthly compute cost: 12 &times; ~$140 (c5.xlarge) = $1,680 + ~$200 ALB = <strong>$1,880/month</strong>.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: API Gateway (High Throughput)</h4>
+        <p><strong>Target SLO:</strong> Sustained throughput &ge; 200,000 RPS with p50 latency &lt; 10ms</p>
+        <p><strong>Given:</strong> API gateway layer (Envoy sidecars) fronting 50 microservices. Each gateway instance (8 vCPU) handles 25,000 RPS at p50 = 3ms. L4 NLB adds ~0.1ms. Must maintain SLO during rolling deploys (25% of instances unavailable).</p>
+        <p><strong>Step 1 &mdash; Latency budget:</strong> 10ms SLO &minus; 0.1ms NLB = 9.9ms per gateway. At 25,000 RPS, p50 = 3ms &mdash; well within budget.</p>
+        <p><strong>Step 2 &mdash; Base count:</strong> &lceil;200,000 / 25,000&rceil; = 8 gateway instances.</p>
+        <p><strong>Step 3 &mdash; Rolling deploy tolerance:</strong> During deploy, 25% are draining. With 8 instances, only 6 serve traffic: 33,333 RPS each. At that load, p50 rises to ~8ms &mdash; barely under SLO. Too risky.</p>
+        <p><strong>Step 4 &mdash; Safe count:</strong> With 12 instances, deploy drains 3, leaving 9: 22,222 RPS each, p50 = 2.5ms. Comfortable margin. Even a 1.3&times; traffic spike during deploy (260K RPS across 9 instances = 28,889 each) keeps p50 at ~5ms.</p>
+        <p><strong>Result:</strong> <strong>12 gateway instances</strong> behind NLB. At $0.085/hr (c6gn.2xlarge): 12 &times; $62/month = <strong>$744/month</strong> + ~$150 NLB = $894/month.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: Microservices Mesh (Availability)</h4>
+        <p><strong>Target SLO:</strong> 99.95% availability (max 21.9 minutes downtime/month)</p>
+        <p><strong>Given:</strong> Internal service mesh with 3 critical services chained (A &rarr; B &rarr; C). Each service has 5 instances behind an internal L7 LB. Individual server uptime = 99.9% (8.7 hours downtime/year). Health check interval = 10s, 3 failures to mark unhealthy = 30s detection time.</p>
+        <p><strong>Step 1 &mdash; Per-service availability with LB:</strong> With 5 instances at 99.9% individual uptime, probability all 5 are down = (0.001)<sup>5</sup> &approx; 0. But the real risk is capacity loss. Losing 2 of 5 servers means remaining 3 handle 1.67&times; load &mdash; may violate latency SLOs.</p>
+        <p><strong>Step 2 &mdash; Effective availability:</strong> P(2+ failures in a 1-hour window with 5 servers at 99.9%) &approx; 0.001%. But with 30s detection delay, each failure causes 30s of requests to a dead server &mdash; ~0.2% error rate per failure event. With ~2 failures/month per server, that is 10 failure events &times; 30s = 5 minutes of degraded service.</p>
+        <p><strong>Step 3 &mdash; Chain availability:</strong> Three chained services: 99.95%<sup>3</sup> = 99.85% &mdash; below our 99.95% target.</p>
+        <p><strong>Step 4 &mdash; Improve:</strong> Reduce health check detection to 10s (interval=5s, threshold=2). Add retries at LB layer (retry on 503, max 1 retry). With retries, a single server failure is masked. Increase to 6 instances per service to tolerate 2 failures without latency impact. Per-service availability becomes ~99.99%, chain = 99.97%.</p>
+        <p><strong>Result:</strong> <strong>6 instances per service &times; 3 services = 18 total instances</strong>, with fast health checks (5s interval, 2-failure threshold) and 1 automatic retry on 503.</p>
+      </div>
+
+      <div class="callout callout-assumptions">
+        <h4>&#128208; SLO-Driven Example: Video Streaming CDN Origin</h4>
+        <p><strong>Target SLO:</strong> p95 time-to-first-byte &lt; 100ms, sustained bandwidth &ge; 80 Gbps</p>
+        <p><strong>Given:</strong> CDN origin servers serving video segments. Each origin server (16 vCPU, 64 GB RAM, 10 Gbps NIC) can saturate its NIC at ~9.5 Gbps with p95 TTFB of 40ms. L4 NLB adds ~0.1ms. Peak concurrent viewers = 500,000 with average bitrate 4 Mbps.</p>
+        <p><strong>Step 1 &mdash; Bandwidth requirement:</strong> 500,000 viewers &times; 4 Mbps = 2 Tbps total, but CDN edge caches absorb 97.5%. Origin traffic = 2 Tbps &times; 2.5% = 50 Gbps steady, peaking at 80 Gbps during cache misses on new content.</p>
+        <p><strong>Step 2 &mdash; Base count:</strong> &lceil;80 Gbps / 9.5 Gbps&rceil; = 9 origin servers.</p>
+        <p><strong>Step 3 &mdash; Latency check:</strong> At 9 servers handling 80 Gbps, each runs at ~94% NIC capacity. At that load, p95 TTFB rises to ~85ms. With NLB overhead: 85.1ms &mdash; under 100ms but no margin.</p>
+        <p><strong>Step 4 &mdash; Headroom:</strong> With 12 servers, each handles 6.67 Gbps (70% NIC utilization), p95 TTFB = 45ms. Losing 2 servers leaves 10 at 8 Gbps (84% utilization), TTFB = 75ms. Still under SLO.</p>
+        <p><strong>Result:</strong> <strong>12 origin servers</strong> across 2 availability zones (6 per AZ). At $0.45/hr (m5n.4xlarge): 12 &times; $328/month = <strong>$3,936/month</strong>.</p>
+      </div>
+
+      <!-- Interactive graph: p99 latency vs backend server count -->
+      <h3>Interactive: Latency vs. Backend Count</h3>
+      <p>This graph shows how p99 latency changes as you add backend servers for a fixed traffic load. Hover to explore different server counts and see where your SLO threshold falls.</p>
+      <div class="animation-container">
+        <canvas id="lbLatencyGraph" width="700" height="350" style="cursor:crosshair"></canvas>
+        <p class="caption">p99 latency vs. number of backend servers for 30,000 RPS total load. Each server handles up to 5,000 RPS before latency degrades sharply. The red dashed line shows a 200ms SLO target. Hover to see exact values.</p>
+      </div>
+      <script>
+      (function() {
+        const canvas = document.getElementById('lbLatencyGraph');
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+
+        let hoverX = -1;
+
+        // Parameters
+        const totalRPS = 30000;
+        const maxRPSPerServer = 5000;
+        const basep99ms = 15;  // p99 at zero load
+        const sloTarget = 200; // ms
+
+        function latencyModel(serverCount) {
+          // As per-server utilization approaches 1, latency grows non-linearly (M/M/c-inspired)
+          if (serverCount < 1) return 9999;
+          const rpsPerServer = totalRPS / serverCount;
+          const rho = rpsPerServer / maxRPSPerServer;
+          if (rho >= 1) return 9999;
+          // p99 ~ base * (1 + k * rho^2 / (1 - rho))
+          return basep99ms * (1 + 3 * rho * rho / (1 - rho));
+        }
+
+        function resize() {
+          const rect = canvas.parentElement.getBoundingClientRect();
+          const w = Math.min(rect.width - 32, 700);
+          const h = 380;
+          canvas.width = w * dpr;
+          canvas.height = h * dpr;
+          canvas.style.width = w + 'px';
+          canvas.style.height = h + 'px';
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+
+        function draw() {
+          const W = parseFloat(canvas.style.width);
+          const H = parseFloat(canvas.style.height);
+          ctx.clearRect(0, 0, W, H);
+
+          const pad = { top: 40, right: 40, bottom: 60, left: 70 };
+          const gw = W - pad.left - pad.right;
+          const gh = H - pad.top - pad.bottom;
+
+          const minServers = 4;
+          const maxServers = 30;
+          const yMax = 500; // ms
+
+          // Axes
+          ctx.strokeStyle = '#e2e8f0';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(pad.left, pad.top);
+          ctx.lineTo(pad.left, pad.top + gh);
+          ctx.lineTo(pad.left + gw, pad.top + gh);
+          ctx.stroke();
+
+          // Y-axis labels (latency in ms)
+          ctx.fillStyle = '#64748b';
+          ctx.font = '12px system-ui, sans-serif';
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'middle';
+          for (let y = 0; y <= yMax; y += 100) {
+            const py = pad.top + gh - (y / yMax) * gh;
+            ctx.fillText(y + 'ms', pad.left - 8, py);
+            if (y > 0) {
+              ctx.strokeStyle = '#f1f5f9';
+              ctx.beginPath();
+              ctx.moveTo(pad.left, py);
+              ctx.lineTo(pad.left + gw, py);
+              ctx.stroke();
+            }
+          }
+          ctx.fillStyle = '#1e293b';
+          ctx.font = '600 12px system-ui, sans-serif';
+          ctx.save();
+          ctx.translate(16, pad.top + gh / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('p99 Latency (ms)', 0, 0);
+          ctx.restore();
+
+          // X-axis labels (server count)
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'top';
+          ctx.fillStyle = '#64748b';
+          ctx.font = '12px system-ui, sans-serif';
+          for (let x = minServers; x <= maxServers; x += 2) {
+            const px = pad.left + ((x - minServers) / (maxServers - minServers)) * gw;
+            ctx.fillText(x, px, pad.top + gh + 8);
+          }
+          ctx.fillStyle = '#1e293b';
+          ctx.font = '600 12px system-ui, sans-serif';
+          ctx.fillText('Number of Backend Servers', pad.left + gw / 2, pad.top + gh + 35);
+
+          // SLO target line (200ms)
+          const sloY = pad.top + gh - (sloTarget / yMax) * gh;
+          ctx.strokeStyle = '#dc2626';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([8, 5]);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, sloY);
+          ctx.lineTo(pad.left + gw, sloY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = '#dc2626';
+          ctx.font = '600 11px system-ui, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'bottom';
+          ctx.fillText('SLO Target: ' + sloTarget + 'ms', pad.left + 8, sloY - 4);
+
+          // "Safe zone" shading below SLO
+          ctx.fillStyle = 'rgba(22, 163, 74, 0.06)';
+          ctx.fillRect(pad.left, sloY, gw, pad.top + gh - sloY);
+
+          // Danger zone shading above SLO
+          ctx.fillStyle = 'rgba(220, 38, 38, 0.04)';
+          ctx.fillRect(pad.left, pad.top, gw, sloY - pad.top);
+
+          // Main latency curve (30K RPS)
+          ctx.strokeStyle = '#2563eb';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          let firstPoint = true;
+          for (let i = 0; i <= 200; i++) {
+            const servers = minServers + (i / 200) * (maxServers - minServers);
+            const lat = latencyModel(servers);
+            const clampedLat = Math.min(lat, yMax);
+            const px = pad.left + (i / 200) * gw;
+            const py = pad.top + gh - (clampedLat / yMax) * gh;
+            if (firstPoint) { ctx.moveTo(px, py); firstPoint = false; } else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+
+          // Second curve: latency with 1 server failure (30K RPS, N-1 servers)
+          ctx.strokeStyle = '#d97706';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          firstPoint = true;
+          for (let i = 0; i <= 200; i++) {
+            const servers = minServers + (i / 200) * (maxServers - minServers);
+            const effectiveServers = Math.max(servers - 1, 1);
+            const lat = latencyModel(effectiveServers);
+            const clampedLat = Math.min(lat, yMax);
+            const px = pad.left + (i / 200) * gw;
+            const py = pad.top + gh - (clampedLat / yMax) * gh;
+            if (firstPoint) { ctx.moveTo(px, py); firstPoint = false; } else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Third curve: 1.5x traffic spike
+          ctx.strokeStyle = '#7c3aed';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          firstPoint = true;
+          for (let i = 0; i <= 200; i++) {
+            const servers = minServers + (i / 200) * (maxServers - minServers);
+            const spikeRPS = totalRPS * 1.5;
+            const rpsPerServer = spikeRPS / servers;
+            const rho = rpsPerServer / maxRPSPerServer;
+            let lat;
+            if (rho >= 1) { lat = 9999; } else { lat = basep99ms * (1 + 3 * rho * rho / (1 - rho)); }
+            const clampedLat = Math.min(lat, yMax);
+            const px = pad.left + (i / 200) * gw;
+            const py = pad.top + gh - (clampedLat / yMax) * gh;
+            if (firstPoint) { ctx.moveTo(px, py); firstPoint = false; } else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Legend
+          const lx = pad.left + gw - 230;
+          const ly = pad.top + 28;
+          ctx.font = '12px system-ui, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle';
+
+          ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(lx + 24, ly); ctx.stroke();
+          ctx.fillStyle = '#1e293b'; ctx.fillText('Normal (30K RPS)', lx + 30, ly);
+
+          ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+          ctx.beginPath(); ctx.moveTo(lx, ly + 18); ctx.lineTo(lx + 24, ly + 18); ctx.stroke();
+          ctx.fillStyle = '#1e293b'; ctx.fillText('With 1 server down', lx + 30, ly + 18);
+          ctx.setLineDash([]);
+
+          ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
+          ctx.beginPath(); ctx.moveTo(lx, ly + 36); ctx.lineTo(lx + 24, ly + 36); ctx.stroke();
+          ctx.fillStyle = '#1e293b'; ctx.fillText('1.5x traffic spike', lx + 30, ly + 36);
+          ctx.setLineDash([]);
+
+          // Hover crosshair and tooltip
+          if (hoverX >= pad.left && hoverX <= pad.left + gw) {
+            const frac = (hoverX - pad.left) / gw;
+            const servers = minServers + frac * (maxServers - minServers);
+            const serverCount = Math.round(servers);
+
+            if (serverCount >= minServers && serverCount <= maxServers) {
+              // Snap to nearest integer server count
+              const snapX = pad.left + ((serverCount - minServers) / (maxServers - minServers)) * gw;
+
+              ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+              ctx.lineWidth = 1;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(snapX, pad.top);
+              ctx.lineTo(snapX, pad.top + gh);
+              ctx.stroke();
+              ctx.setLineDash([]);
+
+              const normalLat = latencyModel(serverCount);
+              const failLat = latencyModel(serverCount - 1);
+              const spikeRPS = totalRPS * 1.5;
+              const spikeRho = (spikeRPS / serverCount) / maxRPSPerServer;
+              const spikeLat = spikeRho >= 1 ? Infinity : basep99ms * (1 + 3 * spikeRho * spikeRho / (1 - spikeRho));
+              const rho = (totalRPS / serverCount) / maxRPSPerServer;
+
+              // Tooltip
+              const tooltipW = 250;
+              const tooltipH = 108;
+              let tx = snapX + 14;
+              if (tx + tooltipW > W - 10) tx = snapX - tooltipW - 14;
+              const ty = pad.top + 70;
+              ctx.fillStyle = 'rgba(255,255,255,0.96)';
+              ctx.strokeStyle = '#e2e8f0';
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.roundRect(tx, ty, tooltipW, tooltipH, 6);
+              ctx.fill();
+              ctx.stroke();
+
+              ctx.textAlign = 'left';
+              ctx.fillStyle = '#1e293b';
+              ctx.font = '600 13px system-ui, sans-serif';
+              ctx.fillText(serverCount + ' servers (\u03C1 = ' + (rho * 100).toFixed(0) + '%)', tx + 10, ty + 18);
+
+              ctx.font = '12px system-ui, sans-serif';
+              ctx.fillStyle = '#2563eb';
+              ctx.fillText('p99 normal: ' + (normalLat > 9000 ? 'UNSTABLE' : normalLat.toFixed(0) + 'ms'), tx + 10, ty + 38);
+              ctx.fillStyle = '#d97706';
+              ctx.fillText('p99 (1 down): ' + (failLat > 9000 ? 'UNSTABLE' : failLat.toFixed(0) + 'ms'), tx + 10, ty + 56);
+              ctx.fillStyle = '#7c3aed';
+              ctx.fillText('p99 (1.5x spike): ' + (spikeLat > 9000 ? 'UNSTABLE' : spikeLat.toFixed(0) + 'ms'), tx + 10, ty + 74);
+
+              const meetsSLO = normalLat <= sloTarget;
+              ctx.fillStyle = meetsSLO ? '#16a34a' : '#dc2626';
+              ctx.font = '600 12px system-ui, sans-serif';
+              ctx.fillText(meetsSLO ? '\u2713 Meets SLO' : '\u2717 Exceeds SLO', tx + 10, ty + 96);
+            }
+          }
+        }
+
+        canvas.addEventListener('mousemove', function(e) {
+          const rect = canvas.getBoundingClientRect();
+          hoverX = e.clientX - rect.left;
+          draw();
+        });
+        canvas.addEventListener('mouseleave', function() {
+          hoverX = -1;
+          draw();
+        });
+
+        resize();
+        window.addEventListener('resize', resize);
+      })();
+      </script>
+
+      <h3>Few Beefy vs. Many Small</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Factor</th><th>Few Large Servers</th><th>Many Small Servers</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Blast radius per failure</td><td>High &mdash; losing 1 of 4 is 25% capacity gone</td><td>Low &mdash; losing 1 of 20 is 5%</td></tr>
+          <tr><td>Cost efficiency</td><td>Better &mdash; less overhead per unit of compute</td><td>Worse &mdash; more OS/container overhead</td></tr>
+          <tr><td>Scaling granularity</td><td>Coarse &mdash; must add large increments</td><td>Fine &mdash; add exactly what you need</td></tr>
+          <tr><td>Connection limits</td><td>Higher per server (more RAM for connection state)</td><td>Must distribute connections carefully</td></tr>
+          <tr><td>Maintenance windows</td><td>Harder &mdash; draining a large server takes longer</td><td>Easier &mdash; drain a small server in seconds</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Rule of thumb:</strong> Start with medium-sized instances (e.g., 4-8 vCPU) and a minimum of 3 servers. Scale horizontally. Only go larger if your workload has high per-connection memory overhead (e.g., WebSocket servers holding 100K+ connections).</p>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>Single Server</h4>
+          <p>Everything on one machine. No load balancer needed. Your app, database, and static files are all on the same box. When this server goes down, your site is down. This is fine for prototypes and side projects.</p>
+          <p><strong>Signal to evolve:</strong> You need uptime guarantees, or your single server is maxing out CPU during traffic spikes.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>DNS Round-Robin / Simple LB</h4>
+          <p>Add 2-3 servers and use DNS round-robin or a simple L4 load balancer (HAProxy, AWS NLB). Health checks remove dead servers from rotation. TLS termination stays on the app servers or moves to the LB.</p>
+          <p><strong>Signal to evolve:</strong> You need path-based routing, A/B testing, or canary deployments. DNS round-robin's lack of health awareness is causing user-facing errors.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>L7 LB with Routing Rules</h4>
+          <p>Deploy Nginx or an ALB. Route <code>/api</code> to your API fleet, <code>/static</code> to CDN origin servers, <code>/ws</code> to WebSocket servers. Add rate limiting at the LB layer. Use connection draining for zero-downtime deploys. The LB itself is redundant (active-passive or active-active pair).</p>
+          <p><strong>Signal to evolve:</strong> Users in multiple regions experience high latency. A single LB region is a SPOF for global availability.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Global LB (Anycast + Geo)</h4>
+          <p>Deploy load balancers in multiple regions. Use Anycast IP addressing so clients automatically connect to the nearest LB. A global traffic manager (AWS Global Accelerator, GCP Traffic Director, Cloudflare) routes by geography and health. Each regional LB fans out to local backend pools. You now have a multi-tier LB architecture: global tier (geo routing) &rarr; regional tier (L7 routing) &rarr; per-service tier (P2C or least-connections).</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>1. Health Check Misconfiguration: All Backends Marked Unhealthy</h3>
+      <p><strong>What happened:</strong> A team deploys a new version that changes the health check endpoint from <code>/healthz</code> to <code>/health</code>, but the LB configuration still checks <code>/healthz</code>. All backends return 404. The LB marks every server as unhealthy and returns 503 to all clients.</p>
+      <p><strong>Blast radius:</strong> Complete outage. 100% of traffic gets errors.</p>
+      <p><strong>Detection:</strong> Alert on active healthy backend count dropping to zero. This should fire within one health check interval (typically 10-30 seconds).</p>
+      <p><strong>Mitigation:</strong> Most LBs have a "panic mode" or "all-unhealthy-is-healthy" fallback: if every backend fails health checks, send traffic to all of them anyway. HAProxy calls this <code>option allbackups</code>. AWS ALB does this automatically. Configure it proactively.</p>
+      <p><strong>Prevention:</strong> Include the health check endpoint path in your infrastructure-as-code alongside the application deployment. Test the health check endpoint in CI before deploying.</p>
+
+      <h3>2. Thundering Herd on Backend Recovery</h3>
+      <p><strong>What happened:</strong> A backend server restarts after a crash. Its health check passes. The LB immediately sends the full share of traffic to it. The server has cold caches, uninitialized connection pools, and un-JIT'd code. It immediately gets overwhelmed and fails again, creating a crash loop.</p>
+      <p><strong>Root cause:</strong> No warm-up period. The LB treats a just-recovered server identically to a long-running one.</p>
+      <p><strong>Mitigation:</strong> Use "slow start" mode (supported by HAProxy, Nginx, and ALB). When a server first passes health checks, the LB gradually increases its traffic share over 30-60 seconds instead of sending the full load immediately.</p>
+
+      <h3>3. Uneven Load from Consistent Hashing with Skewed Keys</h3>
+      <p><strong>What happened:</strong> A social media platform uses consistent hashing on <code>user_id</code> to route requests, ensuring each user's requests go to the same server (for in-memory session state). A celebrity with 50M followers goes live. All requests for that user hash to a single backend, which gets 100x more traffic than any other. The server saturates while others are idle.</p>
+      <p><strong>Root cause:</strong> Consistent hashing distributes keys uniformly, not load. When some keys generate dramatically more traffic than others, the assumption of uniform load per key breaks down.</p>
+      <p><strong>Mitigation:</strong> Use consistent hashing with bounded loads (cap each server at 1.25x average). Alternatively, detect hot keys and replicate them across multiple servers, using a secondary balancing algorithm for hot-key traffic.</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Metric</th><th>What It Tells You</th><th>Alert Threshold</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>active_connections</code> per backend</td><td>Current load on each server. Imbalance signals a routing problem.</td><td>Alert if max/min ratio > 3x</td></tr>
+          <tr><td><code>requests_per_second</code> per backend</td><td>Throughput distribution. Should be roughly equal (or proportional to weights).</td><td>Alert if any server gets < 50% of average RPS</td></tr>
+          <tr><td><code>error_rate</code> (5xx responses)</td><td>Backend failures. Spikes signal overload or crashes.</td><td>Alert if > 1% of responses are 5xx</td></tr>
+          <tr><td><code>latency_p99</code></td><td>Tail latency. Rising p99 often means one backend is slow (grey failure).</td><td>Alert if p99 > 2x the p50</td></tr>
+          <tr><td><code>healthy_backends</code></td><td>How many servers the LB considers alive. Drop means capacity loss.</td><td>Page if < N-1 (where N is pool size)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>High latency?</strong></p>
+        <p>&rarr; Check <code>latency_p99</code> per backend. Is one server much slower?</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>Yes:</strong> Check that server's CPU, memory, GC logs. Likely a grey failure. Drain it.</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>No (all backends slow):</strong> Check if RPS increased. Is the LB itself the bottleneck? Check LB CPU and connection count.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&rarr; LB not bottlenecked? Check downstream dependencies (database, cache, external APIs).</p>
+        <br>
+        <p><strong>5xx spike?</strong></p>
+        <p>&rarr; Check <code>healthy_backends</code>. Did servers fail health checks?</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>Yes:</strong> Check server logs. Was there a bad deploy? Rollback.</p>
+        <p>&nbsp;&nbsp;&rarr; <strong>No (all healthy but returning 5xx):</strong> Application-level error. Check app logs, recent deploys, dependency health.</p>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr><th>Config</th><th>What It Does</th><th>Recommended Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>upstream keepalive</code> (Nginx)</td><td>Maintains persistent connections to backends, avoiding TCP handshake per request.</td><td><code>keepalive 64;</code> &mdash; keeps 64 idle connections per worker. Higher for high-RPS services.</td></tr>
+          <tr><td>Health check interval / threshold</td><td>How often to check and how many failures before marking unhealthy.</td><td>Interval: 5-10s. Unhealthy threshold: 3 failures. Healthy threshold: 2 successes.</td></tr>
+          <tr><td><code>connection_draining_timeout</code></td><td>How long to wait for in-flight requests to complete when removing a server.</td><td>30-60 seconds. Match to your longest expected request duration.</td></tr>
+          <tr><td><code>slow_start</code> (HAProxy/ALB)</td><td>Gradually ramps traffic to a newly healthy backend.</td><td>30-60 seconds. Critical for backends with cold caches or JIT compilation.</td></tr>
+          <tr><td><code>max_connections</code> per backend</td><td>Caps connections to prevent overwhelming a single server.</td><td>Set to 80% of what a single server can handle in testing.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Load Balancer + Circuit Breakers</h3>
+      <p>If your services use circuit breakers (e.g., Hystrix, resilience4j) but the load balancer is unaware of their state, the LB will keep routing traffic to a backend whose circuit breaker to a downstream dependency is open. The backend will fast-fail every request, returning errors. The LB sees these as application-level errors and doesn't consider the server unhealthy (the server itself is fine; it's the dependency that's broken).</p>
+      <p><strong>Solution:</strong> Have the backend's health check reflect circuit breaker state. If a critical circuit breaker is open, the health check should return unhealthy or degraded. Alternatively, use a service mesh (Istio, Linkerd) where the sidecar proxy integrates outlier detection with routing.</p>
+
+      <h3>Load Balancer + Session Stickiness vs. Stateless Design</h3>
+      <p>Sticky sessions (routing all requests from the same user to the same backend) seem convenient but create several problems: uneven load distribution (some users generate far more traffic), inability to scale down (draining a sticky server means waiting for all its sessions to expire), and loss of sessions on server failure. The better approach is stateless backends with externalized session storage (Redis, DynamoDB). The load balancer can then use any algorithm freely.</p>
+      <p><strong>If you must use stickiness:</strong> Use cookie-based stickiness (the LB sets a cookie with the backend ID) rather than IP-based (which fails behind NATs and CDNs). Set a short TTL (5-15 minutes) so sessions naturally rebalance.</p>
+
+      <h3>Load Balancer + Autoscaling Lag</h3>
+      <p>When traffic spikes, the autoscaler launches new servers. But there's a lag: VM boot (30-60s), container start (5-15s), application warm-up (10-30s), health check passes (10-30s). During this 1-2 minute window, the existing servers must absorb the entire spike. If the spike is steep enough, servers can fail before new ones come online, causing a cascading failure.</p>
+      <p><strong>Mitigation:</strong> Over-provision by 30-50% baseline. Use predictive autoscaling (scale up before the predicted spike based on historical patterns). Pre-warm instances with synthetic traffic before adding them to the LB pool.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Cloud Cost Breakdown</h4>
+        <p><strong>AWS ALB:</strong> ~$22/month base + $8 per LCU-hour. An LCU (Load Balancer Capacity Unit) measures new connections, active connections, bandwidth, and rule evaluations. A service handling 10K RPS typically costs $150-300/month for the ALB alone.</p>
+        <p><strong>AWS NLB:</strong> ~$22/month base + $4.50 per NLCU-hour. Cheaper than ALB for pure TCP traffic since it processes at L4. A high-throughput service doing 100K connections/sec costs ~$500-800/month.</p>
+        <p><strong>Self-hosted HAProxy/Nginx:</strong> Runs on a $50-200/month VM pair (active-passive). At scale, this is dramatically cheaper than managed load balancers. The tradeoff is operational burden: you manage updates, monitoring, failover, and TLS certificate rotation yourself. This makes sense when your LB bill exceeds ~$1,000/month.</p>
+        <p><strong>Dominant cost driver:</strong> For managed LBs, it's the per-connection and per-rule charges, not bandwidth. Reducing connection count (via HTTP/2 multiplexing, connection pooling) directly reduces LB cost.</p>
+        <p><strong>Cost of NOT having a load balancer:</strong> Without one, you can't scale horizontally. Vertical scaling hits a ceiling quickly: a 96-vCPU instance costs 10x more than twelve 8-vCPU instances with equivalent total compute. You also pay in reliability&mdash;a single server failure means total downtime.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Google Maglev</h3>
+      <p>Google's Maglev is a distributed software load balancer that runs on commodity Linux servers. Each Maglev machine can handle over 10 million packets per second. It uses a custom consistent hashing algorithm (Maglev hashing) that distributes connections evenly and minimizes disruption when backends are added or removed. Maglev sits at the edge of Google's network and is the first thing every request to Google services hits. It's described in a 2016 NSDI paper and handles traffic for Search, YouTube, Gmail, and all GCP services.</p>
+
+      <h3>Netflix Zuul + Eureka</h3>
+      <p>Netflix uses Zuul as an L7 edge proxy and Eureka as a service registry. Zuul handles authentication, rate limiting, and dynamic routing. Eureka provides service discovery: backends register themselves and Zuul discovers available instances via Eureka's REST API. When a new server starts, it registers with Eureka; when it shuts down, it deregisters. Zuul periodically fetches the registry and updates its routing table. This architecture handles Netflix's entire API traffic&mdash;over 2 billion edge requests per day.</p>
+
+      <h3>GitHub's GLB (GitHub Load Balancer)</h3>
+      <p>GitHub built GLB, a custom L4 load balancer using DPDK (Data Plane Development Kit) for kernel-bypass packet processing. GLB uses Maglev-style consistent hashing to distribute TCP connections to backend servers. It replaced their previous HAProxy setup when they needed to handle more connections with lower latency. GLB is open-sourced and documented in GitHub's engineering blog. A key design choice: GLB uses a "GLB Director" tier that does consistent hashing, followed by backend HAProxy instances that do L7 routing&mdash;a two-tier architecture separating L4 and L7 concerns.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>Two load balancing implementations in Python: basic round-robin and power-of-two-choices. Notice how P2C achieves much better load distribution with minimal additional complexity.</p>
+
+      <h3>Round-Robin Load Balancer</h3>
+      <pre class="line-numbers"><code class="language-python">class RoundRobinLB:
+    def __init__(self, servers):
+        self.servers = servers
+        self.index = 0
+
+    def next_server(self):
+        server = self.servers[self.index]
+        self.index = (self.index + 1) % len(self.servers)
+        return server
+
+# Usage
+lb = RoundRobinLB(["server-1", "server-2", "server-3"])
+for _ in range(6):
+    print(lb.next_server())
+# Output: server-1, server-2, server-3, server-1, server-2, server-3</code></pre>
+
+      <h3>Power of Two Choices</h3>
+      <pre class="line-numbers"><code class="language-python">import random
+
+class P2CLB:
+    def __init__(self, servers):
+        self.servers = servers
+        self.connections = {s: 0 for s in servers}
+
+    def next_server(self):
+        # Pick two servers at random
+        a, b = random.sample(self.servers, 2)
+        # Send to the one with fewer active connections
+        choice = a if self.connections[a] <= self.connections[b] else b
+        self.connections[choice] += 1
+        return choice
+
+    def release(self, server):
+        self.connections[server] = max(0, self.connections[server] - 1)
+
+# Simulate: 10 servers, 1000 requests with variable duration
+lb = P2CLB([f"server-{i}" for i in range(10)])
+for _ in range(1000):
+    server = lb.next_server()
+    # Simulate some completing (randomly release connections)
+    if random.random() > 0.3:
+        lb.release(random.choice(lb.servers))
+
+# Check distribution — P2C keeps max load close to average
+print("Connections:", dict(lb.connections))</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Load Testing</h3>
+      <p>Use <strong>vegeta</strong> or <strong>wrk</strong> to generate realistic HTTP load. Key measurements: p50/p95/p99 latency, throughput (RPS), and error rate. Gradually increase load until you find the breaking point of your LB + backend pool.</p>
+      <pre class="line-numbers"><code class="language-python"># vegeta: send 10K RPS for 60 seconds
+# echo "GET http://your-lb:80/api/health" | vegeta attack -rate=10000 -duration=60s | vegeta report
+
+# wrk: 100 connections, 4 threads, 30 second test
+# wrk -c 100 -t 4 -d 30s http://your-lb:80/api/health</code></pre>
+      <p>While running the test, monitor per-backend metrics. Verify that load is distributed evenly (within 10-15% variance for round-robin, within 5% for P2C).</p>
+
+      <h3>Chaos Testing</h3>
+      <ul>
+        <li><strong>Kill a backend server</strong> mid-test. Verify the LB detects the failure within one health check interval and stops routing traffic to it. Verify in-flight requests are retried (for idempotent endpoints) or return clean errors.</li>
+        <li><strong>Slow down a backend</strong> using <code>toxiproxy</code> (add 2 seconds of latency). Verify the LB detects the slow server and shifts traffic away (if using least-connections or P2C). Round-robin won't react&mdash;this is one of its weaknesses.</li>
+        <li><strong>Restart all backends simultaneously.</strong> Verify panic mode activates and the LB doesn't drop all traffic. Then verify slow-start kicks in as backends recover.</li>
+      </ul>
+
+      <h3>Benchmarking Methodology</h3>
+      <p>Common mistakes to avoid:</p>
+      <ul>
+        <li><strong>Testing from the same machine as the LB.</strong> Loopback traffic doesn't exercise network stack. Use a separate client machine (or fleet).</li>
+        <li><strong>Ignoring connection reuse.</strong> Testing with new TCP connections per request (no keepalive) measures connection setup overhead, not routing performance. Test both modes.</li>
+        <li><strong>Not warming up.</strong> The first 30 seconds of a benchmark hit cold JIT, cold caches, and unfilled connection pools. Discard the warm-up period from results.</li>
+        <li><strong>Not sweeping concurrency.</strong> Run tests at 10, 100, 500, 1000, and 5000 concurrent connections. The LB may behave differently at each level (e.g., hitting file descriptor limits at high concurrency).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>How would you design a load balancer for a real-time gaming platform?</summary>
+        <div class="answer">
+          <p>Real-time games require persistent connections (WebSockets or UDP), sub-50ms latency, and session affinity (a player must stay connected to the same game server for the duration of a match). This rules out stateless round-robin.</p>
+          <p><strong>Approach:</strong> Use an L4 load balancer (NLB or Maglev-style) for the initial connection, with consistent hashing on a <code>match_id</code> or <code>session_id</code> to route players in the same game to the same server. For matchmaking, a separate service assigns players to game servers and returns the server's direct address&mdash;subsequent communication bypasses the LB entirely (direct server connection). Health checks should be aggressive (1-2 second intervals) since a stale game server causes visible lag.</p>
+          <p><strong>Key considerations:</strong> Connection draining is critical&mdash;when shutting down a server, you must wait for all active matches to complete (which could be 30+ minutes). Capacity planning must account for per-server player limits (not just RPS). Geographic routing is essential to minimize latency&mdash;players should connect to the nearest regional server.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle server crashes mid-game? (Game state checkpointing + reconnection protocol.) How do you handle global matchmaking where players from different regions play together? (Pick the server geographically closest to the centroid of all players, or use relay servers.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain the "power of two choices" and why it works so well.</summary>
+        <div class="answer">
+          <p>With one random choice, if you throw <em>n</em> balls into <em>n</em> bins, the most loaded bin has <code>O(log n / log log n)</code> balls with high probability. This is the classic "birthday problem" intuition&mdash;collisions are inevitable and some bins get disproportionately loaded.</p>
+          <p>The power of two choices says: instead of picking one random bin, pick two and place the ball in the less loaded one. This tiny change drops the maximum load to <code>O(log log n)</code>&mdash;an exponential improvement. For 1,000 servers, the max load drops from ~7x average to ~3x average. For 1,000,000 servers, from ~10x to ~4x. The result was proven by Mitzenmacher (1996) and Azar et al. (1999).</p>
+          <p><strong>Why it works:</strong> The second choice creates a feedback loop. Overloaded servers are more likely to be sampled (because there are more of them, probability-wise), and when they are, they lose the comparison. This naturally pushes traffic away from hot spots. The beautiful part is that it requires almost no state&mdash;just two random number generations and two load lookups per request.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Does choosing three or more options help further? (Yes, but with severely diminishing returns. Two choices capture almost all the benefit.) How is this implemented in practice? (Envoy uses P2C with a per-host active request count. gRPC uses P2C as its default balancing policy.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>L4 vs L7 load balancing &mdash; when to use which?</summary>
+        <div class="answer">
+          <p><strong>L4 (Transport Layer):</strong> Operates on IP addresses and TCP/UDP ports. Doesn't inspect packet contents. Extremely fast (millions of packets per second). Use L4 when: you need maximum throughput and minimum latency, you're balancing non-HTTP protocols (databases, game servers, custom TCP), or you're building the first tier of a multi-tier LB architecture.</p>
+          <p><strong>L7 (Application Layer):</strong> Understands HTTP. Can inspect headers, cookies, URL paths, and even request bodies. Can make content-based routing decisions. Use L7 when: you need path-based routing (<code>/api</code> vs <code>/web</code>), header-based routing (A/B tests via cookie), TLS termination, request/response transformation, rate limiting per endpoint, or WebSocket upgrade handling.</p>
+          <p><strong>In practice:</strong> Most production architectures use both. An L4 LB (NLB, Maglev) sits at the edge and distributes TCP connections to a pool of L7 LBs (Nginx, Envoy, ALB). The L4 tier handles raw connection distribution and DDoS absorption; the L7 tier handles intelligent routing. This is exactly how Google (Maglev → GFE), AWS (NLB → ALB), and GitHub (GLB → HAProxy) architect their stacks.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What about L3 (network layer) load balancing? (Used for Anycast/ECMP routing at the BGP level, even lower overhead than L4.) Can you do TLS termination at L4? (No, because TLS requires understanding the application layer. L4 can do TLS passthrough, where the backend terminates TLS.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How do you handle sticky sessions without sacrificing scalability?</summary>
+        <div class="answer">
+          <p>The ideal solution is to eliminate the need for sticky sessions entirely by making backends stateless. Move session state to an external store (Redis, Memcached, DynamoDB). Each request includes a session token (JWT or session ID), and any backend can look up the session from the shared store. This gives you full flexibility in load balancing and makes scaling, draining, and failover trivial.</p>
+          <p><strong>If stickiness is required</strong> (e.g., WebSocket connections, in-memory caches that are expensive to rebuild per-request): Use cookie-based affinity. The LB sets a cookie containing the backend server ID on the first response. Subsequent requests from the same client include this cookie, and the LB routes to the specified backend. If that backend is unavailable, the LB routes to another server and sets a new cookie.</p>
+          <p><strong>Consistent hashing is a middle ground:</strong> Hash the session key to a backend. This naturally provides stickiness without explicit cookies, and when a server is added/removed, only ~1/N of sessions are disrupted. Combine with bounded loads to prevent hot spots.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What happens to sticky sessions during a rolling deploy? (Sessions migrate to new instances as old ones drain. If session state is in-memory, users may need to re-authenticate.) How does this interact with autoscaling? (New servers start with zero sticky sessions; old servers may be stuck with too many. Use TTL-based session expiry to naturally rebalance.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Your load balancer is adding 50ms of latency. How do you diagnose and fix this?</summary>
+        <div class="answer">
+          <p>Start by isolating where the latency is introduced. Measure three things: (1) client-to-LB latency, (2) LB processing time, (3) LB-to-backend latency.</p>
+          <p><strong>If the LB processing time is high:</strong> The LB CPU may be saturated. Check CPU utilization. L7 LBs doing TLS termination, header parsing, and regex-based routing rules are CPU-intensive. Solutions: upgrade the LB instance, add more LB instances behind a DNS/L4 tier, offload TLS to dedicated hardware (or use TLS 1.3 with 0-RTT), simplify routing rules (a regex match per request is expensive at scale).</p>
+          <p><strong>If LB-to-backend latency is high:</strong> Check if the LB and backends are in the same availability zone. Cross-AZ traffic adds 0.5-2ms per hop. Also check if the LB is creating new TCP connections for every request instead of reusing keepalive connections (look at <code>upstream keepalive</code> settings in Nginx). Connection pooling alone can cut 5-20ms per request.</p>
+          <p><strong>If client-to-LB latency is high:</strong> This is network/geographic latency, not an LB issue. Solutions: deploy LBs in regions closer to users, use a CDN for static content, enable HTTP/2 to multiplex requests over a single connection (reducing round trips).</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Could the LB's connection queue be full? (Yes&mdash;check <code>listen</code> backlog settings and SYN queue overflow metrics.) What about GC pauses on the LB? (If using a JVM-based LB like Zuul, yes. Prefer C/Rust/Go-based LBs like Envoy, HAProxy, or Nginx for predictable latency.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a global load balancing strategy for a service with users on 6 continents.</summary>
+        <div class="answer">
+          <p>Use a three-tier architecture: (1) DNS-based geo-routing at the top, (2) regional L4 load balancers in each PoP, (3) per-service L7 load balancers within each region.</p>
+          <p><strong>Tier 1 &mdash; Global DNS:</strong> Use a managed DNS service (Route 53, Cloud DNS) with latency-based or geolocation routing. When a user in Tokyo resolves <code>api.example.com</code>, DNS returns the IP of the Tokyo PoP. For better precision, use Anycast: advertise the same IP from all PoPs and let BGP route users to the nearest one. Anycast also provides automatic failover&mdash;if a PoP goes down, BGP reroutes to the next-nearest.</p>
+          <p><strong>Tier 2 &mdash; Regional L4:</strong> Each PoP has L4 load balancers (NLB or Maglev) that distribute TCP connections across L7 LB instances. This tier handles DDoS mitigation, TCP connection management, and basic health checking.</p>
+          <p><strong>Tier 3 &mdash; Per-Service L7:</strong> Within each region, L7 LBs (Envoy, Nginx) route requests to service-specific backend pools. They handle path-based routing, authentication, rate limiting, and canary deployments. Use P2C or least-connections at this tier.</p>
+          <p><strong>Cross-region failover:</strong> If all backends in a region fail, the regional health check fails, the global DNS/Anycast removes that region, and traffic automatically routes to the next-closest region. This adds latency (e.g., Tokyo fails over to Singapore, adding ~50ms) but maintains availability.</p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle data locality? (If the database is in us-east-1, requests from Tokyo routed to the local PoP still need to make cross-Pacific database calls. Solutions: regional read replicas, edge caching, or a globally distributed database like CockroachDB/Spanner.) How do you test failover? (Regularly run "region evacuation" drills by marking a region unhealthy and verifying traffic shifts correctly.)</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li>A load balancer distributes traffic across servers to improve throughput, latency, and availability. It's one of the first infrastructure components you add when scaling beyond a single machine.</li>
+        <li><strong>L4 vs L7:</strong> L4 is faster and protocol-agnostic; L7 understands HTTP and enables content-based routing. Most production architectures use both in a multi-tier setup.</li>
+        <li><strong>Power of Two Choices (P2C)</strong> should be your default algorithm for most workloads. It dramatically reduces load imbalance with almost zero overhead compared to random or round-robin.</li>
+        <li><strong>Health checks are your lifeline.</strong> Configure them carefully, include a panic mode fallback, and use slow-start to prevent thundering herd on recovery.</li>
+        <li><strong>Stateless backends are the goal.</strong> Externalize session state to avoid sticky-session problems. If you must use stickiness, prefer cookie-based affinity with short TTLs.</li>
+        <li>The LB itself must be redundant. A single load balancer is a single point of failure. Run at least an active-passive pair, or use a managed service.</li>
+        <li><strong>Monitor per-backend metrics,</strong> not just aggregates. Aggregate p99 can look fine while one backend is on fire. Watch for imbalance in connections, RPS, and latency across your pool.</li>
+        <li>Size your pool as <code>ceil(peak_RPS / per_server_RPS) * 1.3-1.5</code>. Test your capacity assumptions under realistic load before relying on them in production.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="consistent-hashing.html">Consistent Hashing</a> &mdash; The algorithm that enables session-aware load balancing without centralized state.</li>
+        <li><a href="proxies.html">Proxies</a> &mdash; Forward and reverse proxies, and how load balancers relate to them.</li>
+        <li><a href="cdn.html">CDN</a> &mdash; Content delivery networks use global load balancing to serve content from edge locations.</li>
+        <li><a href="api-gateway.html">API Gateway</a> &mdash; How API gateways layer routing, auth, and rate limiting on top of load balancing.</li>
+        <li><a href="rate-limiting.html">Rate Limiting</a> &mdash; Protecting your backend pool from overload at the load balancer layer.</li>
+        <li><a href="circuit-breakers.html">Circuit Breakers</a> &mdash; Coordinating failure detection between load balancers and service-level circuit breakers.</li>
+        <li><a href="service-discovery.html">Service Discovery</a> &mdash; How load balancers learn which backends are available (Consul, Eureka, DNS).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <div class="page-nav">
+      <a href="caching.html" class="prev">Caching</a>
+      <a href="message-queues.html" class="next">Message Queues</a>
+    </div>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; A free, open resource for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== Load Balancing Animation =====
+    (function () {
+      const canvas = document.getElementById('lb-animation');
+      if (!canvas) return;
+
+      const CYCLE_DURATION = 3;    // seconds per request cycle
+      const NUM_SERVERS = 3;
+      const REQUEST_GAP = 1;       // seconds between requests
+
+      // State: track which requests have been dispatched
+      const requests = [];
+      let nextRequestId = 0;
+
+      function getPositions(w, h) {
+        const clientX = 70;
+        const clientY = h / 2;
+        const lbX = w * 0.38;
+        const lbY = h / 2;
+        const serverStartY = 70;
+        const serverGap = (h - 140) / (NUM_SERVERS - 1);
+        const serverX = w - 90;
+
+        const servers = [];
+        for (let i = 0; i < NUM_SERVERS; i++) {
+          servers.push({ x: serverX, y: serverStartY + i * serverGap });
+        }
+        return { clientX, clientY, lbX, lbY, servers, serverX };
+      }
+
+      function drawFrame(ctx, time, w, h) {
+        const pos = getPositions(w, h);
+
+        // Draw static elements
+        // Clients
+        drawClient(ctx, pos.clientX, pos.clientY - 60, { label: 'Client 1' });
+        drawClient(ctx, pos.clientX, pos.clientY, { label: 'Client 2' });
+        drawClient(ctx, pos.clientX, pos.clientY + 60, { label: 'Client 3' });
+
+        // Load balancer
+        drawLoadBalancer(ctx, pos.lbX, pos.lbY, { size: 50, label: 'Load Balancer' });
+
+        // Servers
+        const serverLabels = ['Server A', 'Server B', 'Server C'];
+        for (let i = 0; i < NUM_SERVERS; i++) {
+          drawServer(ctx, pos.servers[i].x, pos.servers[i].y, {
+            label: serverLabels[i],
+            width: 70,
+            height: 44
+          });
+        }
+
+        // Draw static connection lines (dashed)
+        // Client area to LB
+        drawDashedLine(ctx, pos.clientX + 30, pos.clientY, pos.lbX - 30, pos.lbY, { color: '#cbd5e1' });
+
+        // LB to each server
+        for (let i = 0; i < NUM_SERVERS; i++) {
+          drawDashedLine(ctx, pos.lbX + 30, pos.lbY, pos.servers[i].x - 40, pos.servers[i].y, { color: '#cbd5e1' });
+        }
+
+        // Spawn new requests over time
+        const totalTime = time;
+        while (nextRequestId * REQUEST_GAP < totalTime) {
+          requests.push({
+            id: nextRequestId,
+            spawnTime: nextRequestId * REQUEST_GAP,
+            targetServer: nextRequestId % NUM_SERVERS,
+            clientIndex: nextRequestId % 3
+          });
+          nextRequestId++;
+          // Keep a rolling window of requests to avoid unbounded growth
+          if (requests.length > 30) {
+            requests.shift();
+          }
+        }
+
+        // Draw each active request as a moving dot
+        const colors = ['#2563eb', '#0891b2', '#7c3aed'];
+
+        for (const req of requests) {
+          const elapsed = totalTime - req.spawnTime;
+          if (elapsed < 0 || elapsed > CYCLE_DURATION) continue;
+
+          const phase1Duration = CYCLE_DURATION * 0.45;  // client -> LB
+          const phase2Duration = CYCLE_DURATION * 0.55;  // LB -> server
+
+          const clientOffsetY = (req.clientIndex - 1) * 60;
+          const dotColor = colors[req.targetServer];
+
+          if (elapsed < phase1Duration) {
+            // Phase 1: client to LB
+            const progress = ease.inOut(elapsed / phase1Duration);
+            drawMovingDot(
+              ctx,
+              pos.clientX + 30, pos.clientY + clientOffsetY,
+              pos.lbX - 30, pos.lbY,
+              progress,
+              { color: dotColor, radius: 5 }
+            );
+          } else {
+            // Phase 2: LB to server
+            const p2elapsed = elapsed - phase1Duration;
+            const progress = ease.inOut(p2elapsed / phase2Duration);
+            const srv = pos.servers[req.targetServer];
+            drawMovingDot(
+              ctx,
+              pos.lbX + 30, pos.lbY,
+              srv.x - 40, srv.y,
+              progress,
+              { color: dotColor, radius: 5 }
+            );
+          }
+        }
+
+        // Draw round-robin label showing current target
+        const currentTarget = (Math.floor(totalTime / REQUEST_GAP)) % NUM_SERVERS;
+        drawLabel(ctx, pos.lbX, pos.lbY + 45, `Next: ${serverLabels[currentTarget]}`, {
+          fontSize: 11,
+          color: '#64748b',
+          bold: true
+        });
+
+        drawLabel(ctx, w / 2, h - 15, 'Round-Robin Distribution', {
+          fontSize: 12,
+          color: '#94a3b8'
+        });
+      }
+
+      const anim = createAnimation(canvas, drawFrame, { height: 320 });
+      setupControls(canvas.closest('.animation-container'), anim);
+
+      // Reset state when animation resets
+      const origReset = anim.reset;
+      anim.reset = function () {
+        requests.length = 0;
+        nextRequestId = 0;
+        origReset.call(anim);
+      };
+
+      // Re-bind the reset button to use our patched reset
+      const resetBtn = canvas.closest('.animation-container').querySelector('[data-action="reset"]');
+      if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+          requests.length = 0;
+          nextRequestId = 0;
+        });
+      }
+    })();
+  </script>
+
+</body>
+</html>

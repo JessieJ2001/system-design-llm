@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Search: Comparison &amp; Tradeoffs — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .comp-table table { font-size: 0.78rem; }
+    .comp-table th, .comp-table td { padding: 0.45rem 0.55rem; }
+    .comp-table td:first-child { white-space: normal; font-weight: 600; color: var(--color-text); width: 14%; }
+    .pat-good { color: var(--color-success); font-weight: 700; }
+    .pat-warn { color: var(--color-warning); font-weight: 700; }
+    .pat-bad { color: var(--color-danger); font-weight: 700; }
+    .matrix-legend { font-size: 0.85rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../technologies.html">Technologies</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Search: Comparison &amp; Tradeoffs</h1>
+      <p class="hero-subtitle">Full-text search and vector search are siblings &mdash; both rank documents by relevance to a query. The split is shifting: every full-text engine now has vectors; every vector DB now has filters. The question is how much of each you need, and whether you can do it inside your existing DB or need a dedicated engine.</p>
+      <p class="hero-meta">Elasticsearch / OpenSearch &bull; Solr &bull; Algolia &bull; Typesense / MeiliSearch &bull; Postgres tsvector &bull; pgvector &bull; Pinecone / Milvus / Weaviate / Qdrant &bull; FAISS</p>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="flowchart">
+    <div class="container">
+      <h2>2. Decision flowchart</h2>
+      <div class="full-width">
+        <svg viewBox="0 0 1240 540" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+          <defs><marker id="arSearch" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker></defs>
+
+          <rect x="470" y="20" width="300" height="56" rx="8" fill="#2563eb" stroke="#1d4ed8"/>
+          <text x="620" y="44" text-anchor="middle" fill="white" font-weight="700" font-size="15">Need ranked retrieval</text>
+          <text x="620" y="62" text-anchor="middle" fill="white" font-size="12" opacity="0.9">"search" of some kind</text>
+
+          <rect x="470" y="120" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="620" y="146" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Keyword / full-text or semantic /</text>
+          <text x="620" y="164" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">vector?</text>
+          <line x1="620" y1="76" x2="620" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <!-- Full-text branch -->
+          <rect x="20" y="240" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="170" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Data already in Postgres,</text>
+          <text x="170" y="284" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">volume modest (&lt; ~100M docs)?</text>
+          <line x1="500" y1="180" x2="280" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+          <text x="350" y="225" fill="#16a34a" font-size="12" font-weight="700">FULL-TEXT</text>
+
+          <rect x="20" y="340" width="140" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="90" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">PG tsvector</text>
+          <text x="90" y="380" text-anchor="middle" fill="#64748b" font-size="10">+ GIN index</text>
+          <line x1="100" y1="300" x2="90" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+          <text x="40" y="325" fill="#16a34a" font-size="11" font-weight="700">YES</text>
+
+          <rect x="180" y="340" width="140" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="250" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Elasticsearch</text>
+          <text x="250" y="380" text-anchor="middle" fill="#64748b" font-size="10">/ OpenSearch</text>
+          <line x1="240" y1="300" x2="250" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+          <text x="270" y="325" fill="#dc2626" font-size="11" font-weight="700">NO &mdash; volume / ops</text>
+
+          <rect x="20" y="420" width="300" height="50" rx="8" fill="#fff" stroke="#0891b2" stroke-width="2"/>
+          <text x="170" y="445" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="12">Algolia / Typesense / MeiliSearch</text>
+          <text x="170" y="462" text-anchor="middle" fill="#64748b" font-size="10">SaaS / opinionated, low ops</text>
+
+          <!-- Vector branch -->
+          <rect x="370" y="240" width="280" height="60" rx="8" fill="#fef3c7" stroke="#d97706"/>
+          <text x="510" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Vector count &amp; QPS?</text>
+          <text x="510" y="284" text-anchor="middle" fill="#64748b" font-size="11">small + low: pg; big + high: dedicated</text>
+          <line x1="600" y1="180" x2="510" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+          <text x="540" y="225" fill="#0891b2" font-size="12" font-weight="700">VECTOR</text>
+
+          <rect x="370" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="435" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">pgvector</text>
+          <text x="435" y="380" text-anchor="middle" fill="#64748b" font-size="10">&lt; 10M, low QPS</text>
+          <line x1="450" y1="300" x2="450" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <rect x="520" y="340" width="130" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="585" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Milvus / Qdrant</text>
+          <text x="585" y="380" text-anchor="middle" fill="#64748b" font-size="10">&gt; 10M / high QPS</text>
+          <line x1="570" y1="300" x2="585" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <!-- Hybrid -->
+          <rect x="700" y="240" width="300" height="60" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+          <text x="850" y="266" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Need BOTH (RAG, hybrid search)?</text>
+          <text x="850" y="284" text-anchor="middle" fill="#64748b" font-size="11">most modern apps</text>
+          <line x1="740" y1="180" x2="850" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+          <text x="800" y="220" fill="#16a34a" font-size="12" font-weight="700">HYBRID</text>
+
+          <rect x="700" y="340" width="160" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="780" y="365" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="13">Elasticsearch / OpenSearch</text>
+          <text x="780" y="380" text-anchor="middle" fill="#64748b" font-size="10">BM25 + kNN in one engine</text>
+          <line x1="780" y1="300" x2="780" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <rect x="880" y="340" width="160" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="960" y="360" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="12">Weaviate / Qdrant</text>
+          <text x="960" y="378" text-anchor="middle" fill="#64748b" font-size="10">vector-first w/ BM25</text>
+          <line x1="930" y1="300" x2="960" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <rect x="1060" y="340" width="160" height="50" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+          <text x="1140" y="360" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="12">PG: tsvector + pgvector</text>
+          <text x="1140" y="378" text-anchor="middle" fill="#64748b" font-size="10">small scale, no extra system</text>
+          <line x1="1080" y1="300" x2="1100" y2="338" stroke="#334155" stroke-width="1.5" marker-end="url(#arSearch)"/>
+
+          <rect x="200" y="490" width="800" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1"/>
+          <text x="600" y="515" text-anchor="middle" fill="#334155" font-size="12">FAISS is a library, not a service &mdash; embed it for offline / batch / GPU.</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Feature matrix -->
+  <section class="section">
+    <div class="container">
+      <h2>3. Side-by-side feature matrix</h2>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Dimension</th><th>Elasticsearch / OpenSearch</th><th>Solr</th><th>Algolia</th><th>Typesense / MeiliSearch</th><th>PG tsvector</th><th>pgvector</th><th>Milvus / Qdrant / Weaviate</th><th>Pinecone (managed)</th><th>FAISS (library)</th></tr></thead>
+          <tbody>
+            <tr><td>Type</td><td>Full-text + vector + agg</td><td>Full-text + vector</td><td>Full-text (managed)</td><td>Full-text (lightweight)</td><td>Full-text in PG</td><td>Vector in PG</td><td>Vector + filters</td><td>Vector (managed)</td><td>Vector library</td></tr>
+            <tr><td>Underlying mechanism</td><td>Lucene inverted index + segments + BM25; HNSW for vectors</td><td>Lucene (same engine)</td><td>Custom inverted index, edge replicas</td><td>Custom inverted index</td><td>GIN inverted index on tsvector</td><td>IVFFlat / HNSW indexes</td><td>HNSW (default), IVF+PQ for compression</td><td>Proprietary (HNSW-class)</td><td>HNSW / IVF / PQ / GPU</td></tr>
+            <tr><td>Ranking</td><td>BM25 + custom; kNN cosine/euclidean</td><td>BM25 + custom</td><td>Tunable: typo, geo, custom ranking</td><td>BM25 + ranking</td><td>ts_rank (basic)</td><td>Distance only (cosine / L2 / IP)</td><td>Distance + filter; some support hybrid</td><td>Distance + filter</td><td>Distance only</td></tr>
+            <tr><td>Hybrid search</td><td>Yes (RRF or weighted)</td><td>Yes (RRF)</td><td>Yes (vector beta)</td><td>Yes (Typesense)</td><td>Manual SQL combine</td><td>Manual SQL combine</td><td>Yes (built-in)</td><td>Yes (vector + metadata filter; not BM25)</td><td>n/a</td></tr>
+            <tr><td>Schema</td><td>Mapping (semi-rigid; mapping explosion risk)</td><td>schema.xml or schemaless</td><td>Records JSON, faceted attrs</td><td>JSON schema</td><td>SQL columns</td><td>SQL columns + vector type</td><td>Collection schema</td><td>Index spec</td><td>None</td></tr>
+            <tr><td>Aggregations</td><td>Rich (terms, histogram, percentiles)</td><td>Rich (facets)</td><td>Facets</td><td>Facets</td><td>SQL GROUP BY</td><td>SQL GROUP BY</td><td>Limited</td><td>Limited (metadata filter)</td><td>n/a</td></tr>
+            <tr><td>Replication</td><td>Primary-replica per shard</td><td>SolrCloud + ZK</td><td>Edge replicas</td><td>Self-managed cluster</td><td>PG replication</td><td>PG replication</td><td>Cluster (Raft for metadata)</td><td>Managed</td><td>n/a (per-process)</td></tr>
+            <tr><td>Consistency</td><td>Near-real-time (1s refresh default)</td><td>Near-real-time</td><td>Eventual edge propagation</td><td>Near-real-time</td><td>Strong (PG MVCC)</td><td>Strong</td><td>Eventual ingest; tunable consistency</td><td>Eventual</td><td>n/a</td></tr>
+            <tr><td>Throughput</td><td>~10k QPS / shard read; 50k indexes/s</td><td>Similar</td><td>Edge-cached, very high</td><td>Single-node ~10k QPS</td><td>Bound by PG (low for FT)</td><td>Bound by PG</td><td>1000s QPS / node</td><td>Managed scaling</td><td>Library-bound</td></tr>
+            <tr><td>Latency P99</td><td>10&ndash;50 ms</td><td>10&ndash;50 ms</td><td>&lt; 50 ms (edge)</td><td>10&ndash;30 ms</td><td>10&ndash;100 ms</td><td>10&ndash;100 ms</td><td>10&ndash;50 ms</td><td>20&ndash;100 ms</td><td>&lt; 1 ms in-process</td></tr>
+            <tr><td>Index size</td><td>Petabytes</td><td>Petabytes</td><td>Per-app limits</td><td>10s of GB practical</td><td>Bound by PG instance</td><td>Bound by PG</td><td>10s of B vectors</td><td>10s of B vectors</td><td>10s of M (RAM)</td></tr>
+            <tr><td>Ops complexity (1=easy, 5=hard)</td><td>4 self-host, 2 managed</td><td>4</td><td>1 (SaaS)</td><td>2</td><td>1 (already have PG)</td><td>1 (already have PG)</td><td>3</td><td>1</td><td>2 (embedded)</td></tr>
+            <tr><td>Cost driver</td><td>Heap RAM &times; nodes; storage</td><td>Same</td><td>Per-record + per-search</td><td>Instance hours</td><td>None (PG)</td><td>None (PG)</td><td>Instance + storage</td><td>Per-vector + read-write units</td><td>None (library)</td></tr>
+            <tr><td>Cloud equivalents</td><td>OpenSearch Service, Elastic Cloud</td><td>(self-host)</td><td>Algolia (only)</td><td>Typesense Cloud</td><td>RDS / Cloud SQL</td><td>RDS / AlloyDB / Aurora</td><td>Zilliz Cloud, Qdrant Cloud, Weaviate Cloud</td><td>Pinecone (only)</td><td>n/a</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Workload patterns -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>4. Workload patterns</h2>
+
+      <h3>4a. By use case</h3>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Use case</th><th>Pick</th><th>Runner-up</th><th>Tie-breaker</th></tr></thead>
+          <tbody>
+            <tr><td>Site search (small/mid commerce, blog)</td><td>Algolia</td><td>Typesense / MeiliSearch</td><td>Algolia for "just works"; Typesense if cost-sensitive</td></tr>
+            <tr><td>Site search (large catalog, custom relevance)</td><td>Elasticsearch / OpenSearch</td><td>Solr</td><td>ES for ecosystem; Solr for legacy + facets</td></tr>
+            <tr><td>Internal app search (data already in PG)</td><td>PG tsvector + GIN</td><td>Elasticsearch</td><td>tsvector if &lt; 10M docs and avoiding ops</td></tr>
+            <tr><td>Log search</td><td>OpenSearch (ELK / OSL)</td><td>Loki</td><td>OS for full-text on logs; Loki for label-based + cheaper</td></tr>
+            <tr><td>RAG over docs (LLM context)</td><td>pgvector or Qdrant</td><td>Pinecone / Weaviate</td><td>pgvector if scale fits; dedicated if &gt; 10M chunks or high QPS</td></tr>
+            <tr><td>Recommendations (similarity)</td><td>Milvus / Qdrant</td><td>FAISS (offline)</td><td>Online: dedicated; offline batch: FAISS</td></tr>
+            <tr><td>Hybrid (BM25 + vector RAG)</td><td>Elasticsearch (RRF)</td><td>Weaviate / Qdrant</td><td>ES for richer text features; vector DB for vector-first apps</td></tr>
+            <tr><td>Geospatial search</td><td>Elasticsearch / Solr</td><td>PG PostGIS</td><td>ES for combined geo + text + facet; PG if data is already there</td></tr>
+            <tr><td>Faceted ecommerce search</td><td>Algolia / Elasticsearch</td><td>Solr</td><td>Algolia for managed; ES if you customize ranking</td></tr>
+            <tr><td>Auto-complete / typo-tolerance</td><td>Algolia / Typesense / MeiliSearch</td><td>Elasticsearch + edge ngram</td><td>Specialized engines do this out of the box</td></tr>
+            <tr><td>Massive-scale ANN (billions)</td><td>Milvus</td><td>Vespa</td><td>Milvus for k8s-native; Vespa for combined search/ranking</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4b. By access-pattern shape</h3>
+      <div class="table-responsive comp-table">
+        <table>
+          <thead><tr><th>Pattern</th><th>Elasticsearch</th><th>Algolia</th><th>PG tsvector</th><th>pgvector</th><th>Milvus / Qdrant</th><th>Pinecone</th></tr></thead>
+          <tbody>
+            <tr><td>Read-heavy uniform</td><td><span class="pat-good">&#10003;&#10003;</span> replica shards</td><td><span class="pat-good">&#10003;&#10003;</span> edge cache</td><td><span class="pat-good">&#10003;</span> read replicas</td><td><span class="pat-good">&#10003;</span> read replicas</td><td><span class="pat-good">&#10003;</span> sharded</td><td><span class="pat-good">&#10003;</span> managed</td></tr>
+            <tr><td>Write-heavy / continuous indexing</td><td><span class="pat-warn">&#9888;</span> refresh + merge cost</td><td><span class="pat-good">&#10003;</span> async edge</td><td><span class="pat-warn">&#9888;</span> WAL / vacuum pressure</td><td><span class="pat-warn">&#9888;</span> HNSW build cost</td><td><span class="pat-good">&#10003;</span> tuned for ingest</td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Hot query (one term)</td><td><span class="pat-good">&#10003;</span> shard cache</td><td><span class="pat-good">&#10003;&#10003;</span> CDN</td><td><span class="pat-warn">&#9888;</span> PG buffer cache</td><td><span class="pat-warn">&#9888;</span> in PG cache</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Hot doc (one popular result)</td><td><span class="pat-good">&#10003;</span> caching at app</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+            <tr><td>Bursty / spiky</td><td><span class="pat-warn">&#9888;</span> heap pressure</td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td><td><span class="pat-warn">&#9888;</span> connection storm</td><td><span class="pat-warn">&#9888;</span></td><td><span class="pat-good">&#10003;</span> auto-scale</td><td><span class="pat-good">&#10003;&#10003;</span> elastic</td></tr>
+            <tr><td>Deep pagination</td><td><span class="pat-bad">&#10005;</span> from+size cap; use search_after</td><td><span class="pat-warn">&#9888;</span> top-N optimized</td><td><span class="pat-good">&#10003;</span> SQL OFFSET (linear)</td><td><span class="pat-bad">&#10005;</span> ANN doesn't paginate</td><td><span class="pat-bad">&#10005;</span> get top-K only</td><td><span class="pat-bad">&#10005;</span></td></tr>
+            <tr><td>Faceted aggregation</td><td><span class="pat-good">&#10003;&#10003;</span> aggs framework</td><td><span class="pat-good">&#10003;</span> facets</td><td><span class="pat-good">&#10003;</span> SQL aggregates</td><td><span class="pat-good">&#10003;</span> SQL aggregates</td><td><span class="pat-warn">&#9888;</span> limited</td><td><span class="pat-bad">&#10005;</span></td></tr>
+            <tr><td>Filter + ranked search</td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span> SQL WHERE</td><td><span class="pat-good">&#10003;&#10003;</span> filter pushdown</td><td><span class="pat-good">&#10003;</span> metadata filter</td></tr>
+            <tr><td>Hybrid (BM25 + vector)</td><td><span class="pat-good">&#10003;&#10003;</span> RRF native</td><td><span class="pat-warn">&#9888;</span> beta</td><td><span class="pat-warn">&#9888;</span> manual UNION</td><td><span class="pat-warn">&#9888;</span> manual UNION</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-warn">&#9888;</span> filter only, no BM25</td></tr>
+            <tr><td>Frequent reindex (re-embed all)</td><td><span class="pat-warn">&#9888;</span> heavy</td><td><span class="pat-warn">&#9888;</span> re-upload</td><td><span class="pat-warn">&#9888;</span> rebuild GIN</td><td><span class="pat-warn">&#9888;</span> rebuild HNSW</td><td><span class="pat-warn">&#9888;</span> rebuild collection</td><td><span class="pat-warn">&#9888;</span></td></tr>
+            <tr><td>High-cardinality filter</td><td><span class="pat-good">&#10003;</span> term query</td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;&#10003;</span></td><td><span class="pat-good">&#10003;</span></td><td><span class="pat-good">&#10003;</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="matrix-legend"><span class="pat-good">&#10003;&#10003;</span> excellent <span class="pat-good">&#10003;</span> handles <span class="pat-warn">&#9888;</span> with effort <span class="pat-bad">&#10005;</span> wrong tool</p>
+    </div>
+  </section>
+
+  <!-- 5. Scaling cliffs -->
+  <section class="section">
+    <div class="container">
+      <h2>5. Scaling cliffs</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cliff at</th><th>What breaks</th><th>The escape</th></tr></thead>
+          <tbody>
+            <tr><td>Elasticsearch</td><td>JVM heap (~32 GB cap), shard count</td><td>GC pauses; shard rebalance time grows; heap pressure on aggs</td><td>More nodes; shrink shards; ILM rollover; Frozen tier</td></tr>
+            <tr><td>Elasticsearch (mapping)</td><td>Mapping explosion (dynamic fields)</td><td>Cluster state grows; reindex required to reduce</td><td>Disable dynamic mapping; explicit schema; flatten JSON</td></tr>
+            <tr><td>Algolia</td><td>Per-record + per-search billing</td><td>Cost grows with catalog &times; query rate</td><td>Filter at app side; reduce facet count</td></tr>
+            <tr><td>PG tsvector</td><td>~10M docs, complex queries</td><td>GIN index size; lossy ranking; slow ts_rank on big sets</td><td>Move to ES; or use trigram (pg_trgm) for fuzzy</td></tr>
+            <tr><td>pgvector (IVFFlat)</td><td>~1M vectors</td><td>Recall drops; index rebuild needed on scale</td><td>HNSW index; or move to dedicated</td></tr>
+            <tr><td>pgvector (HNSW)</td><td>RAM-bound (each vector + edges in mem)</td><td>Index doesn't fit; build time grows</td><td>Sharding; or move to Milvus / Qdrant</td></tr>
+            <tr><td>Milvus / Qdrant</td><td>Single-collection scale + filter cardinality</td><td>Filter pushdown loses recall at high filter selectivity</td><td>Pre-filter then ANN; partition by filter dimension</td></tr>
+            <tr><td>Pinecone</td><td>RU/WU caps; pod resize</td><td>Throttling under burst; pod-resize is async + costly</td><td>Provision headroom; serverless tier for spiky</td></tr>
+            <tr><td>FAISS</td><td>RAM (or GPU memory)</td><td>Index doesn't fit; rebuild required to grow</td><td>IVF+PQ for compression; sharded FAISS</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. Migration -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>6. Migration paths</h2>
+      <ul>
+        <li><strong>PG tsvector &rarr; Elasticsearch:</strong> typical "we outgrew it" path. Set up ES; stream PG &rarr; ES via Debezium or app-side dual-writes; shadow-search; cut over reads.</li>
+        <li><strong>Elasticsearch &rarr; OpenSearch:</strong> wire-compatible up to ES 7.10; later versions diverge. Snapshot + restore is the path. Rewrite any X-Pack plugin code.</li>
+        <li><strong>Solr &rarr; Elasticsearch:</strong> shape is similar (Lucene under both). Reindex, rewrite query DSL.</li>
+        <li><strong>FAISS (offline) &rarr; Milvus / Qdrant (online):</strong> dump vectors + IDs, bulk-load into Milvus/Qdrant. Re-test recall.</li>
+        <li><strong>pgvector &rarr; Milvus:</strong> when scale or QPS outgrows PG. Bulk export embeddings + metadata, re-import. Shadow query both, compare recall.</li>
+        <li><strong>Pinecone &rarr; self-host (Qdrant):</strong> when cost matters. Pinecone exports limited; often re-embed from source.</li>
+        <li><strong>Algolia &rarr; Typesense:</strong> records JSON is portable; reindex via script. Watch ranking semantics differences.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7. Cost shape -->
+  <section class="section">
+    <div class="container">
+      <h2>7. Cost-shape comparison</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Product</th><th>Cost driver</th><th>What surprises people</th></tr></thead>
+          <tbody>
+            <tr><td>Elasticsearch / OpenSearch self-host</td><td>RAM-heavy nodes &times; shards</td><td>Hot tier needs RAM &gt;= 1/2 index size; storage cost is secondary</td></tr>
+            <tr><td>OpenSearch Service</td><td>Instance hours + EBS</td><td>UltraWarm and cold tiers cut cost &gt; 80% for old logs</td></tr>
+            <tr><td>Algolia</td><td>Per-record &times; per-search</td><td>Faceted queries multiply searches; type-as-you-search makes it worse</td></tr>
+            <tr><td>PG tsvector / pgvector</td><td>None (uses PG)</td><td>Index sizes can dominate PG storage; vacuum cost on update-heavy</td></tr>
+            <tr><td>Milvus / Qdrant self-host</td><td>RAM &times; vector count</td><td>HNSW index ~1.5&times; raw vectors; 10M &times; 1536-dim float32 = ~60 GB raw</td></tr>
+            <tr><td>Pinecone</td><td>Per-vector storage + RU/WU</td><td>Serverless reads cheap, writes pricey; pod-based has minimums</td></tr>
+            <tr><td>FAISS</td><td>RAM / GPU on app server</td><td>Embed in app; no separate bill but increases instance size</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. Hybrid -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>8. Hybrid patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>Postgres + Elasticsearch (CDC)</h3>
+          <p>PG is source of truth; Debezium tails WAL; ES indexes searchable fields. Searches hit ES; PG returns full record by ID. ES is rebuildable from PG.</p>
+        </div>
+        <div>
+          <h3>Vector DB + relational metadata</h3>
+          <p>Vector DB stores embeddings + lightweight metadata for filter pushdown. After top-K, hydrate full records from Postgres / DDB by ID. Keeps vector index lean.</p>
+        </div>
+        <div>
+          <h3>Hybrid retrieval (BM25 + vector + reranker)</h3>
+          <p>Two parallel retrievers: BM25 from ES, vector from Qdrant. Combine with RRF, then rerank top-N with a cross-encoder. The modern RAG stack.</p>
+        </div>
+        <div>
+          <h3>FAISS in-process for read replicas</h3>
+          <p>Build the index offline (e.g., nightly Spark job), bake it into the model server image, load into RAM at startup. Lowest latency at the cost of staleness.</p>
+        </div>
+        <div>
+          <h3>Algolia for site search + ES for log search</h3>
+          <p>Two distinct workloads, two distinct products. Don't try to unify.</p>
+        </div>
+        <div>
+          <h3>pgvector + Postgres tsvector together</h3>
+          <p>Single product, two engines. Cheap, simple, works at small scale. Migrate later if needed.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9. Anti-patterns -->
+  <section class="section">
+    <div class="container">
+      <h2>9. Anti-patterns</h2>
+      <div class="dense-columns">
+        <div>
+          <h3>"We used Elasticsearch as primary store"</h3>
+          <p>No transactions; segment merges block writes; refresh interval = stale; lossy on crash without proper translog. Always have a real DB behind it.</p>
+        </div>
+        <div>
+          <h3>"Mapping explosion"</h3>
+          <p>Dynamic field type detection generated thousands of fields; cluster state ballooned. Define explicit mappings; flatten user JSON before indexing.</p>
+        </div>
+        <div>
+          <h3>"Deep pagination with from+size"</h3>
+          <p>from+size&gt;10000 fails by default; load grows with offset. Use search_after with a tiebreaker.</p>
+        </div>
+        <div>
+          <h3>"Hybrid means UNION two queries"</h3>
+          <p>Just UNIONing BM25 + vector results gives noisy ranking. Use RRF (Reciprocal Rank Fusion) or weighted ranking; better, use ES's built-in hybrid.</p>
+        </div>
+        <div>
+          <h3>"We picked Pinecone for 10k vectors"</h3>
+          <p>Way overkill; pgvector or even FAISS-in-process is faster and cheaper.</p>
+        </div>
+        <div>
+          <h3>"We forgot the reranker"</h3>
+          <p>ANN top-K is approximate; results are close but not always best. A small cross-encoder reranker on top-50 dramatically improves quality.</p>
+        </div>
+        <div>
+          <h3>"Index built once, never updated"</h3>
+          <p>HNSW grows costly to update; many teams batch-rebuild instead. Decide upfront: online updates (smaller HNSW + IVF rebuilds) or scheduled rebuilds (FAISS).</p>
+        </div>
+        <div>
+          <h3>"We didn't filter before vector search"</h3>
+          <p>For 1B vectors with a 1% filter, ANN-then-filter loses recall (most top-K are filtered out). Use filter-then-ANN where supported.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. Decision rules -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>10. Decision rules for interviews</h2>
+      <div class="callout callout-success">
+        <ul>
+          <li><strong>Default for full-text search: Elasticsearch / OpenSearch.</strong></li>
+          <li><strong>Site search for an ecommerce or content site: Algolia.</strong></li>
+          <li><strong>Data already in Postgres + low volume: tsvector + GIN.</strong></li>
+          <li><strong>Vector search at &lt; 10M and low QPS: pgvector.</strong></li>
+          <li><strong>Vector search at &gt; 10M or high QPS: Milvus / Qdrant / Weaviate.</strong></li>
+          <li><strong>Modern RAG = hybrid retrieval (BM25 + vector) + cross-encoder reranker.</strong></li>
+          <li><strong>Search engine is never source of truth.</strong> Always rebuildable from a real DB.</li>
+          <li><strong>For deep pagination, use cursors (search_after), not offset.</strong></li>
+          <li><strong>For hot queries, cache at the app layer in front of the search engine.</strong></li>
+          <li><strong>Frozen tier / cold tier saves &gt;80% on old logs.</strong></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Related</h2>
+      <ul>
+        <li><a href="../technologies.html">All Technologies</a></li>
+        <li><a href="comparison-datastores.html">Datastores comparison</a></li>
+        <li><a href="comparison-analytics.html">Analytics comparison</a></li>
+      </ul>
+    </div>
+  </section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

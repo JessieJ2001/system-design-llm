@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Failure Modes — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Failure Modes</h1>
+      <p class="hero-subtitle">The canonical catalog of how distributed systems break — what triggers each failure, the blast radius, how you detect it, how you recover. This is the source-of-truth page; scenario "What Breaks" sections classify against this taxonomy instead of redefining failures.</p>
+      <p class="hero-meta">~12 min reference</p>
+    </div>
+  </section>
+
+  <!-- How to use -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Use This Page</h2>
+
+      <p>The C5 rubric requires every iteration to enumerate <strong>≥3 failure modes</strong> with blast radius, detection, and recovery. This page is the menu. Use it during S5:</p>
+
+      <ol>
+        <li><strong>For each iteration's new design,</strong> walk this catalog and ask: <em>which of these does the new design newly expose, leave unaddressed, or amplify?</em></li>
+        <li><strong>For each applicable mode,</strong> the page gives you the canonical blast radius / detection / recovery shape. The scenario fills in the scenario-specific numbers.</li>
+        <li><strong>Cite this page</strong> instead of redefining a mode. Scenario pages link to <code>failure-modes.html#stampede</code>, <code>#retry-storm</code>, etc.</li>
+      </ol>
+
+      <h3>Failure modes vs bottlenecks</h3>
+      <p>A bottleneck is what saturates first under <em>expected</em> load (steady-state). A failure mode is what breaks under <em>stress</em> — overload, partial outage, transient surge, deploy. Some entries appear in both pages (stampede, retry storm, backlog overflow) because the steady-state version is a bottleneck and the under-stress version is a failure. The two pages cross-reference each other on those.</p>
+
+      <h3>The three required answers per failure</h3>
+      <p>For each failure a scenario page enumerates, the C5 rubric asks for three numbers/answers, not one:</p>
+      <ul>
+        <li><strong>Blast radius.</strong> What fraction of users / what data is affected? "All requests to one shard for 5 min" vs "global write outage" are very different conversations.</li>
+        <li><strong>Detection mechanism.</strong> What signal fires, and at what threshold? "p99 latency &gt; 200 ms for 1 min" vs "error rate &gt; 1%" — be specific.</li>
+        <li><strong>Recovery action.</strong> Automatic (system self-heals) or operator (page someone)? If automatic, what's the recovery time bound? If operator, what's the runbook step 1?</li>
+      </ul>
+
+      <h3>The degradation contract</h3>
+      <p>Beyond per-failure enumeration, every Final Design states a degradation contract: <em>under overload or partial failure, what does the system serve, and what does it refuse to do?</em> Examples: "Serve stale top-K (last successful), never compute a fresh one." "Shed reads to 429 first; never silently drop writes." "Per-tenant isolation: a single tenant's failure cannot starve others."</p>
+    </div>
+  </section>
+
+  <!-- Taxonomy table -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The 16 Canonical Failure Modes</h2>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Failure mode</th><th>Trigger</th><th>Blast radius (typical)</th><th>First defense</th></tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="4"><strong>Skew / load failures</strong></td></tr>
+          <tr><td><a href="#hot-key-meltdown">Hot-key meltdown</a></td><td>Power-law key access concentrates on one node</td><td>One node degraded; readers of the hot key delayed or 429'd</td><td>Single-flight + key replication (see <a href="bottlenecks.html#hot-key">bottlenecks#hot-key</a>)</td></tr>
+          <tr><td><a href="#hot-partition-meltdown">Hot-partition meltdown</a></td><td>Partition key concentrates load on one shard</td><td>One shard's tenants/users degraded</td><td>Salt the partition key; auto-split (see <a href="bottlenecks.html#hot-partition">bottlenecks#hot-partition</a>)</td></tr>
+          <tr><td><a href="#tail-cascade">Tail-latency cascade</a></td><td>One slow component pushes p99 above timeout for all callers</td><td>Caller fleet times out; second-order failures multiply</td><td>Hedged requests; per-call deadline propagation</td></tr>
+
+          <tr><td colspan="4"><strong>Cascade failures</strong></td></tr>
+          <tr><td><a href="#stampede">Cache stampede / thundering herd</a></td><td>Synchronized cache miss → origin spike</td><td>Origin overloaded; full-system slowdown until cache repopulates</td><td>Single-flight; jittered TTL; refresh-ahead</td></tr>
+          <tr><td><a href="#retry-storm">Retry storm</a></td><td>Failure → retry → more failure → more retries</td><td>Load grows during outage; recovery delayed beyond root-cause fix</td><td>Backoff with jitter; retry budget; circuit breaker</td></tr>
+          <tr><td><a href="#cascading-timeout">Cascading timeout / death spiral</a></td><td>One slow dependency cascades through caller chain; everyone times out</td><td>Whole stack unavailable; "the entire site is down"</td><td>Per-hop deadlines; circuit breakers; bulkheads</td></tr>
+          <tr><td><a href="#poison-message">Poison message</a></td><td>One malformed event repeatedly crashes the consumer</td><td>Consumer pool wedged; backlog grows behind the poison</td><td>Dead-letter queue (DLQ) with bounded retry; idempotent processing</td></tr>
+          <tr><td><a href="#slow-dependency">Slow dependency / partial degradation</a></td><td>Downstream service slow but not down; healthchecks pass</td><td>Caller threads/connections held; resource leak; eventual exhaustion</td><td>Per-call deadlines; adaptive concurrency limits; circuit breakers</td></tr>
+
+          <tr><td colspan="4"><strong>Coordination failures</strong></td></tr>
+          <tr><td><a href="#network-partition">Network partition / split-brain</a></td><td>Network split between zones / regions; both sides think they're authoritative</td><td>Diverged writes; conflicts on heal</td><td>Quorum (R+W &gt; N); leader leases with fencing tokens; per-dataset CAP choice</td></tr>
+          <tr><td><a href="#leader-loss">Leader / lease loss</a></td><td>Leader dies, lease expires, election begins</td><td>Writes paused for election timeout (typ. 1–10 s)</td><td>Short lease + election; durable lease state in consensus store</td></tr>
+          <tr><td><a href="#lease-expiry-storm">Lease-expiry storm</a></td><td>Many leases expire simultaneously after a coordinator hiccup</td><td>Mass re-election; thundering herd on the consensus log</td><td>Stagger lease lifetimes; prioritize re-election; back off non-leaders</td></tr>
+          <tr><td><a href="#replica-divergence">Replica divergence</a></td><td>Async replication drops or reorders updates; replicas drift</td><td>Stale or inconsistent reads; correctness violation if undetected</td><td>Anti-entropy / read repair; vector clocks; periodic cross-replica audits</td></tr>
+          <tr><td><a href="#clock-skew">Clock skew / jump</a></td><td>NTP sync glitch; VM live-migration; leap second</td><td>Lease misordering; TTL early expiry; ID collisions; logs out-of-order</td><td>Logical clocks (Lamport / vector); HLC; never use wall-clock for ordering</td></tr>
+
+          <tr><td colspan="4"><strong>Resource failures</strong></td></tr>
+          <tr><td><a href="#pool-starvation">Connection / thread pool starvation</a></td><td>Slow dependency holds pool resources; new requests queue forever</td><td>Caller hung; healthcheck still passes; eventual full outage</td><td>Bounded pool with timeout; semaphore; bulkhead per dependency</td></tr>
+          <tr><td><a href="#backlog-overflow">Backlog overflow / OOM</a></td><td>Producer rate &gt; consumer rate sustained; queue fills RAM/disk</td><td>Consumer crashes; messages lost (or written messages but unprocessed)</td><td>Backpressure to producers; bounded queue with shed policy</td></tr>
+          <tr><td><a href="#resource-leak">Resource leak (FD, memory, threads)</a></td><td>Bug or unclosed resource; degradation over hours/days</td><td>Single-instance crash; auto-restart cycles; eventually fleet-wide if leak is in shared library</td><td>Bounded resource per instance; periodic recycling; observability on resource counters</td></tr>
+
+          <tr><td colspan="4"><strong>Operational failures</strong></td></tr>
+          <tr><td><a href="#bad-deploy">Bad deploy / cell-wide failure</a></td><td>Bug / config error rolled out to all instances</td><td>Global outage if deployed everywhere; single-cell outage if cell-architected</td><td>Cell-based architecture; canary deploys; automated rollback on SLO regression</td></tr>
+          <tr><td><a href="#black-hole-node">Black-hole node (alive but failing)</a></td><td>Process up, healthcheck passes, but request handling broken</td><td>Fraction of traffic routed to dead host; intermittent errors hard to diagnose</td><td>End-to-end synthetic probes; outlier ejection on real-traffic error rate</td></tr>
+          <tr><td><a href="#data-corruption">Silent data corruption</a></td><td>Bit flip, bad disk, bug writing wrong key/value, replication ordering bug</td><td>Wrong data served indefinitely; loss of trust on detection</td><td>Checksums end-to-end; periodic scrubbing; immutable audit log; never blind-trust replicas</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Per-failure detail -->
+  <section class="section">
+    <div class="container">
+      <h2>Per-Failure Detail</h2>
+      <p>Each entry: <strong>trigger</strong> (what causes it), <strong>symptom</strong> (what you observe), <strong>blast radius</strong> (who/what is affected), <strong>detection</strong> (signal + threshold), <strong>recovery</strong> (automatic vs operator), <strong>design-time prevention</strong>, <strong>scenarios</strong> exhibiting this mode.</p>
+
+      <h3 id="hot-key-meltdown">Hot-key meltdown</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Power-law key access. Celebrity user, viral post, popular product. Top-1% keys taking &gt; 50% of QPS.</li>
+        <li><strong>Symptom.</strong> One node at 100% CPU; all other nodes idle. Reads of the hot key spike in latency. Reads of cold keys on the same node are also slow (head-of-line blocking).</li>
+        <li><strong>Blast radius.</strong> All readers of any key on the hot node, until the hot key's load relents.</li>
+        <li><strong>Detection.</strong> Per-key request count via CMS sketch (continuous); per-node CPU / per-node QPS &gt; 5× cluster median for &gt; 5 min.</li>
+        <li><strong>Recovery.</strong> Auto: hot-key replication kicks in once detection fires (typ. 30–60 s lag). Operator: bump replication factor, isolate the hot key.</li>
+        <li><strong>Prevention.</strong> Single-flight on miss; key replication with salt suffix; client-side L1 cache.</li>
+        <li><strong>Cross-link.</strong> Steady-state version: <a href="bottlenecks.html#hot-key">bottlenecks#hot-key</a>. Scenarios: <a href="../scenarios/21-distributed-cache.html#hot-key-iteration">21-distributed-cache (hot-key iteration)</a>, <a href="../scenarios/41-home-timeline-fanout.html">41-home-timeline-fanout</a>.</li>
+      </ul>
+
+      <h3 id="hot-partition-meltdown">Hot-partition meltdown</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Partition key correlated with insertion time, with a popular tenant, or with a non-uniform attribute.</li>
+        <li><strong>Symptom.</strong> One shard at 100% I/O; others idle. Per-shard write latency rises; replication lag on the hot shard.</li>
+        <li><strong>Blast radius.</strong> All tenants/users whose data is on the hot shard.</li>
+        <li><strong>Detection.</strong> Per-shard QPS / bytes-in / write-latency &gt; 5× cluster median for &gt; 5 min.</li>
+        <li><strong>Recovery.</strong> Auto: range auto-split (CockroachDB, Spanner) or hash re-shuffle; typically minutes. Operator: forced split, manual re-partition.</li>
+        <li><strong>Prevention.</strong> Salt the partition key; choose a high-cardinality partition key; avoid date prefixes.</li>
+        <li><strong>Cross-link.</strong> <a href="bottlenecks.html#hot-partition">bottlenecks#hot-partition</a>; scenarios <a href="../scenarios/02-sharding-vs-replication.html">02</a>, <a href="../scenarios/18-hotspot-hashing.html">18</a>, <a href="../scenarios/44-object-store-metadata.html">44</a>.</li>
+      </ul>
+
+      <h3 id="tail-cascade">Tail-latency cascade</h3>
+      <ul>
+        <li><strong>Trigger.</strong> One downstream component's p99 spikes; the caller waits the full deadline; callers of the caller hit their deadlines too.</li>
+        <li><strong>Symptom.</strong> p99 (or even p50) for the front service climbs even though no service is fully down.</li>
+        <li><strong>Blast radius.</strong> Every user request whose call graph touches the slow component.</li>
+        <li><strong>Detection.</strong> RED metrics per service hop; flame graph showing where the time went.</li>
+        <li><strong>Recovery.</strong> Auto: hedged requests reroute to a faster replica. Operator: drain the slow node from the LB pool.</li>
+        <li><strong>Prevention.</strong> Per-hop deadlines (deadline propagation in headers); hedged requests at p95; outlier ejection.</li>
+        <li><strong>Cross-link.</strong> <a href="bottlenecks.html#tail-latency">bottlenecks#tail-latency</a>.</li>
+      </ul>
+
+      <h3 id="stampede">Cache stampede / thundering herd</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Synchronized cache miss for a hot key — TTL expires, all N readers miss in the next millisecond, all N hit the origin.</li>
+        <li><strong>Symptom.</strong> Origin QPS for one key spikes from 1/TTL to N × QPS<sub>read</sub>. Origin overloads; cache stays cold; readers retry; pile-up cascades.</li>
+        <li><strong>Blast radius.</strong> All readers of the stampeding key; any other key sharing the origin's capacity.</li>
+        <li><strong>Detection.</strong> Origin QPS spike on a single key; cache miss rate spike correlated with TTL boundaries.</li>
+        <li><strong>Recovery.</strong> Auto: single-flight allows only one miss through; subsequent misses wait or get stale-while-revalidate. Without it: operator must manually warm the cache or drop traffic.</li>
+        <li><strong>Prevention.</strong> <a href="../design-moves/single-flight.html">Single-flight on miss</a>; jittered TTL (±20%); refresh-ahead before expiry.</li>
+        <li><strong>Cross-link.</strong> <a href="bottlenecks.html#stampede">bottlenecks#stampede</a>; <a href="../scenarios/27-thundering-herd.html">27-thundering-herd</a>, <a href="../scenarios/21-distributed-cache.html">21-distributed-cache</a>.</li>
+      </ul>
+
+      <h3 id="retry-storm">Retry storm</h3>
+      <ul>
+        <li><strong>Trigger.</strong> A failure (timeout, 5xx) triggers retries from N callers; retries themselves overload, causing more failures, causing more retries.</li>
+        <li><strong>Symptom.</strong> Load <em>grows</em> during the outage instead of shrinking. Recovery time extends well beyond root-cause fix because the retry queue itself is the load.</li>
+        <li><strong>Blast radius.</strong> Whatever the failing component serves; can cascade upstream if retry amplification is high.</li>
+        <li><strong>Detection.</strong> Total request rate on the failing component &gt; original rate; retry-after-N-attempts ratio rising.</li>
+        <li><strong>Recovery.</strong> Auto: circuit breaker opens after error-rate threshold, fails fast (drains the retry queue), allows recovery, then probes. Without it: operator must shed traffic upstream.</li>
+        <li><strong>Prevention.</strong> Exponential backoff with full jitter; per-caller retry budget (max 10% of original calls); idempotency keys for safe server-side dedupe; classify errors as retryable vs not.</li>
+        <li><strong>Cross-link.</strong> <a href="bottlenecks.html#retry-storm">bottlenecks#retry-storm</a>; <a href="../scenarios/26-cascading-failure.html">26-cascading-failure</a>.</li>
+      </ul>
+
+      <h3 id="cascading-timeout">Cascading timeout / death spiral</h3>
+      <ul>
+        <li><strong>Trigger.</strong> A → B → C → D call chain. D slows down; C waits; C's threadpool fills; B's calls to C time out; B's threadpool fills; A's calls to B time out. Site down.</li>
+        <li><strong>Symptom.</strong> Errors at the front-end caller, but root cause is several hops deep. Each layer has resource exhaustion symptoms (thread pools, connection pools).</li>
+        <li><strong>Blast radius.</strong> Whole call chain unavailable, even though only the leaf was originally slow.</li>
+        <li><strong>Detection.</strong> Distributed tracing shows time spent waiting in each hop; per-service threadpool saturation alarms.</li>
+        <li><strong>Recovery.</strong> Auto: circuit breakers at each hop trip and shed load. Bulkheads keep one bad dependency from starving the rest. Operator: manually shed traffic; restart wedged services.</li>
+        <li><strong>Prevention.</strong> Per-hop deadlines (deadline propagated in headers, decremented at each hop); circuit breakers per dependency; bulkheads (separate pools per downstream); fail fast.</li>
+      </ul>
+
+      <h3 id="poison-message">Poison message</h3>
+      <ul>
+        <li><strong>Trigger.</strong> One malformed event in a stream. Consumer crashes processing it; on restart, picks up the same event and crashes again. Endless loop, no progress.</li>
+        <li><strong>Symptom.</strong> Backlog grows behind the poison message. Consumer pool wedged. From outside, looks like backlog growth (but the cause is one stuck record, not throughput).</li>
+        <li><strong>Blast radius.</strong> All downstream of this stream until the poison is removed.</li>
+        <li><strong>Detection.</strong> Same offset retried &gt; N times; consumer error rate &gt; threshold on a stationary offset.</li>
+        <li><strong>Recovery.</strong> Auto: dead-letter queue (DLQ) — after N retries, move the message to a DLQ and continue processing. Operator: inspect the DLQ, fix the data or the consumer, replay.</li>
+        <li><strong>Prevention.</strong> Bounded retry per message; DLQ as a first-class queue; idempotent consumers (so retries don't double-process).</li>
+      </ul>
+
+      <h3 id="slow-dependency">Slow dependency / partial degradation</h3>
+      <ul>
+        <li><strong>Trigger.</strong> A downstream service slows from p50 = 10 ms to p50 = 500 ms. Healthcheck still passes (it returns, just slowly).</li>
+        <li><strong>Symptom.</strong> Caller threads / connections held longer than designed. Pool exhausts; queue grows; eventual full outage. Looks like the caller is at fault, but root cause is downstream.</li>
+        <li><strong>Blast radius.</strong> Caller fleet; can cascade per <a href="#cascading-timeout">cascading timeout</a>.</li>
+        <li><strong>Detection.</strong> Per-dependency p50/p95/p99 latency monitoring; per-dependency error rate; threadpool / connection pool saturation alarms.</li>
+        <li><strong>Recovery.</strong> Auto: circuit breaker on the slow dependency; adaptive concurrency limits reduce in-flight requests; outlier ejection. Operator: drain the slow node; route around.</li>
+        <li><strong>Prevention.</strong> Per-call deadlines (not just connection timeouts); adaptive concurrency limits; bulkheads.</li>
+      </ul>
+
+      <h3 id="network-partition">Network partition / split-brain</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Network split between zones or regions. Both sides remain operational and may believe they're authoritative.</li>
+        <li><strong>Symptom.</strong> Diverged writes on each side; conflicting state on heal. Or, if quorum-based: the minority side stops accepting writes (CP behavior); reads may go stale.</li>
+        <li><strong>Blast radius.</strong> Half the cluster (in CP systems: writes blocked on the minority side). In AP systems: divergent writes, conflicts on heal.</li>
+        <li><strong>Detection.</strong> Quorum failure alarms; cross-zone heartbeat failures; replication lag monotonically growing.</li>
+        <li><strong>Recovery.</strong> Auto: quorum systems automatically continue on majority side; AP systems converge via vector clocks / CRDT / LWW. Operator: investigate root cause; sometimes manual conflict resolution.</li>
+        <li><strong>Prevention.</strong> Per-dataset CAP choice (some datasets pick CP — block writes on minority — others AP — accept divergence with merge). Quorum (R+W &gt; N). Fencing tokens to prevent two-leader scenarios.</li>
+      </ul>
+
+      <h3 id="leader-loss">Leader / lease loss</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Leader process dies; lease expires; election begins.</li>
+        <li><strong>Symptom.</strong> Writes paused for the election timeout (typ. 1–10 s for Raft). Reads may continue from followers (stale).</li>
+        <li><strong>Blast radius.</strong> All writes to that consensus group, for the duration of the election.</li>
+        <li><strong>Detection.</strong> Election counter increments; quorum loss alarm; write-error spike.</li>
+        <li><strong>Recovery.</strong> Auto: new leader elected; service resumes. Operator: only if quorum cannot be formed (need to investigate node health).</li>
+        <li><strong>Prevention.</strong> Short heartbeat / longer election timeout (tradeoff: liveness vs spurious elections). Pre-elect / hot-standby leader. Lease-based delegation so non-critical work doesn't depend on the consensus path.</li>
+      </ul>
+
+      <h3 id="lease-expiry-storm">Lease-expiry storm</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Coordinator hiccups; many leases expire simultaneously. Mass re-election attempts overload the consensus log.</li>
+        <li><strong>Symptom.</strong> Consensus log saturated; election attempts fail; cluster wedged in a re-election loop.</li>
+        <li><strong>Blast radius.</strong> Whole consensus group; in cell architecture, one cell.</li>
+        <li><strong>Detection.</strong> Election rate; consensus log queue depth.</li>
+        <li><strong>Recovery.</strong> Auto: backoff on re-election; staggered lease lifetimes spread out the next storm. Operator: temporarily increase consensus capacity.</li>
+        <li><strong>Prevention.</strong> Stagger lease lifetimes from creation (random initial offset); cap re-election rate; prioritize the consensus log over non-critical traffic.</li>
+      </ul>
+
+      <h3 id="replica-divergence">Replica divergence</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Async replication drops or reorders updates. Replicas drift over time.</li>
+        <li><strong>Symptom.</strong> Stale or inconsistent reads. May go undetected for a long time.</li>
+        <li><strong>Blast radius.</strong> Readers from the lagging replica; correctness violation if writes depend on stale reads.</li>
+        <li><strong>Detection.</strong> Replication lag metric; periodic cross-replica checksum (anti-entropy / read-repair).</li>
+        <li><strong>Recovery.</strong> Auto: read-repair on conflict; anti-entropy merges divergent state. Operator: rebuild the diverged replica from a snapshot.</li>
+        <li><strong>Prevention.</strong> Vector clocks / version numbers per record; quorum reads to detect divergence; periodic background scrubbing.</li>
+      </ul>
+
+      <h3 id="clock-skew">Clock skew / jump</h3>
+      <ul>
+        <li><strong>Trigger.</strong> NTP sync glitch; VM live-migration with paused clock; leap second; misconfigured node.</li>
+        <li><strong>Symptom.</strong> Lease misordering ("expired" leases that aren't actually expired); TTL early expiry; ID collisions; events ordered wrong in logs.</li>
+        <li><strong>Blast radius.</strong> Anything depending on wall-clock for ordering: leases, distributed locks, "expired" tokens, log ordering.</li>
+        <li><strong>Detection.</strong> NTP offset alarms; cross-node clock-difference monitoring; uniqueness violations on time-based IDs.</li>
+        <li><strong>Recovery.</strong> Auto: re-sync NTP. Operator: investigate, possibly quarantine the node, replay affected operations.</li>
+        <li><strong>Prevention.</strong> Logical clocks (Lamport, vector); HLC (hybrid logical clock) for systems that mix wall and logical time; never use wall-clock for monotonic ordering. Quarantine nodes whose clock is &gt; threshold off.</li>
+      </ul>
+
+      <h3 id="pool-starvation">Connection / thread pool starvation</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Slow dependency holds resources (connection, thread, semaphore); new requests queue forever.</li>
+        <li><strong>Symptom.</strong> Caller appears hung; healthcheck still passes. Eventually queue fills; new requests fail with timeout.</li>
+        <li><strong>Blast radius.</strong> Caller fleet; if shared pool (e.g., DB connection pool), all callers of that pool.</li>
+        <li><strong>Detection.</strong> Pool utilization &gt; 80% sustained; pool wait time rising; queue depth.</li>
+        <li><strong>Recovery.</strong> Auto: circuit breaker opens; bulkhead isolates the slow dependency; adaptive concurrency reduces in-flight. Operator: drain the slow dependency; bounce wedged caller instances.</li>
+        <li><strong>Prevention.</strong> Bounded pool with timeout (never unbounded queue); semaphore per dependency (bulkhead); separate pools for hot vs cold paths.</li>
+      </ul>
+
+      <h3 id="backlog-overflow">Backlog overflow / OOM</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Producer rate &gt; consumer rate sustained; queue fills RAM (in-memory) or disk (Kafka), eventually crashes the consumer or rejects new writes.</li>
+        <li><strong>Symptom.</strong> Latency rises with queue depth; eventually OOM crash or write rejections.</li>
+        <li><strong>Blast radius.</strong> All consumers of this stream; can cascade to producers when shedding kicks in.</li>
+        <li><strong>Detection.</strong> Queue depth monotonically growing; consumer-lag &gt; threshold.</li>
+        <li><strong>Recovery.</strong> Auto: backpressure to producers (HTTP 429 / TCP slow-down); shed by priority. Operator: scale consumer; investigate root cause.</li>
+        <li><strong>Prevention.</strong> Bounded queue with explicit shed policy (never silently buffer to OOM). Auto-scale on queue-depth signal, not CPU.</li>
+        <li><strong>Cross-link.</strong> <a href="bottlenecks.html#backlog-growth">bottlenecks#backlog-growth</a>; <a href="../scenarios/13-backpressure.html">13-backpressure</a>.</li>
+      </ul>
+
+      <h3 id="resource-leak">Resource leak (FD / memory / threads)</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Bug or unclosed resource. Slow degradation over hours/days.</li>
+        <li><strong>Symptom.</strong> Single-instance crash on hitting OS limits (FD exhaustion, OOM kill); auto-restart cycles.</li>
+        <li><strong>Blast radius.</strong> Single instance initially; can become fleet-wide if leak is in a shared library/runtime.</li>
+        <li><strong>Detection.</strong> Resource counters (open FDs, RSS, thread count) trending up between restarts. The trend, not the absolute value, is the diagnostic.</li>
+        <li><strong>Recovery.</strong> Auto: instance restart on crash. Operator: investigate, patch, redeploy.</li>
+        <li><strong>Prevention.</strong> Bounded resources per instance (FD limit, max threads, heap limit). Periodic recycling / restart for leaky processes ("the cron of last resort"). Observability on resource counters.</li>
+      </ul>
+
+      <h3 id="bad-deploy">Bad deploy / cell-wide failure</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Bug or config error rolled out to all instances simultaneously.</li>
+        <li><strong>Symptom.</strong> Global outage if deployed everywhere; one-cell outage if cell-architected.</li>
+        <li><strong>Blast radius.</strong> Whatever fraction of users the deploy reached. With cells: ≤ one cell. Without: 100%.</li>
+        <li><strong>Detection.</strong> SLO regression on the canary cell; error-rate spike post-deploy; trace anomalies.</li>
+        <li><strong>Recovery.</strong> Auto: automated rollback on SLO regression. Operator: manual rollback; investigate; root-cause; redeploy.</li>
+        <li><strong>Prevention.</strong> <strong>Cell-based architecture</strong> — bug deployed to one cell cannot affect others. Canary deploys (1% → 10% → 50% → 100% with bake time at each). Automated rollback triggered by SLO regression. Pre-prod / staging environments matching prod load.</li>
+      </ul>
+
+      <h3 id="black-hole-node">Black-hole node (alive but failing silently)</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Process up; healthcheck endpoint returns 200; but real request handling broken (corrupted state, hung internal thread, partition-isolated).</li>
+        <li><strong>Symptom.</strong> Fraction of traffic to the bad host hangs or returns wrong results. Other hosts fine. Hard to diagnose because healthcheck looks healthy.</li>
+        <li><strong>Blast radius.</strong> 1/N of traffic (where N = fleet size).</li>
+        <li><strong>Detection.</strong> End-to-end synthetic probes (real-traffic-shaped); per-host error rate / p99; outlier ejection on real-traffic SLO violations.</li>
+        <li><strong>Recovery.</strong> Auto: outlier ejection removes the host from the LB pool. Operator: bounce / replace the host; investigate root cause.</li>
+        <li><strong>Prevention.</strong> Healthchecks that exercise the real path (not just <code>GET /health</code>). Outlier ejection by error rate, not just by healthcheck. Synthetic monitoring.</li>
+      </ul>
+
+      <h3 id="data-corruption">Silent data corruption</h3>
+      <ul>
+        <li><strong>Trigger.</strong> Bit flip on disk / network; bad disk; bug writing wrong key/value; replication ordering bug.</li>
+        <li><strong>Symptom.</strong> Wrong data served indefinitely. Often discovered late (customer complaint, audit failure).</li>
+        <li><strong>Blast radius.</strong> Whatever data was corrupted; trust impact extends far beyond the immediate data.</li>
+        <li><strong>Detection.</strong> End-to-end checksums (write + read); periodic background scrubbing; cross-replica consistency audits; immutable audit log to compare against.</li>
+        <li><strong>Recovery.</strong> Auto: read-repair from a healthy replica; restore from backup. Operator: identify scope of corruption; restore range; communicate to affected users.</li>
+        <li><strong>Prevention.</strong> Checksums end-to-end (CRC, hash); ECC memory; replication with verification on read; immutable audit log to reconstruct from. Never trust replicas blindly.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Degradation contracts -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Degradation Contract Patterns</h2>
+      <p>A degradation contract states what the system serves under overload or partial failure, and what it refuses to do. The contract makes the system's behavior predictable to its callers — they can build their own recovery plans on top of a known degradation. Common patterns:</p>
+
+      <ul>
+        <li><strong>Stale-on-failure.</strong> "If we cannot compute fresh data, serve the last successful answer with a freshness header." Common for top-K, rankings, dashboards. Trade: bounded staleness for unbounded availability.</li>
+        <li><strong>Shed-reads-first.</strong> "Under overload, return 429 to a fraction of reads; never silently drop writes." Reads are usually retryable; lost writes are usually not.</li>
+        <li><strong>Per-tenant isolation.</strong> "A noisy tenant cannot starve other tenants." Implemented via per-tenant quotas, per-tenant connection pools, per-tenant rate limits.</li>
+        <li><strong>Sample-on-overload.</strong> "If we cannot ingest 100% of events, sample 10% with provenance for stat-correct down-sampling." Common for logging, telemetry, analytics. Trade: precision for availability.</li>
+        <li><strong>Read-only mode.</strong> "If write path is degraded, serve reads from cached / replicated state; return 503 on writes." Common during failover, partitions, leader elections.</li>
+        <li><strong>Best-effort partial result.</strong> "If we fan out to N and only k &lt; N return in time, return what came back marked partial." Common for fan-in reads (timelines, search, aggregations).</li>
+        <li><strong>Hard-fail-on-correctness.</strong> "If we cannot guarantee correctness (e.g., rate-limit decision under partition), refuse the request rather than allow." Use sparingly — only where a wrong answer is much worse than no answer (financial transactions, security decisions).</li>
+      </ul>
+
+      <p>Pick one (or compose two non-conflicting ones) per design. State it explicitly in S6 Final Design.</p>
+    </div>
+  </section>
+
+  <!-- Cross-references -->
+  <section class="section">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="bottlenecks.html">Bottlenecks</a> — steady-state saturation. Several entries (stampede, retry storm, backlog) appear here too as their under-stress counterparts.</li>
+        <li><a href="access-patterns.html">Access Patterns</a> — the load shapes that cause failures. Power-law access → hot-key meltdown.</li>
+        <li><a href="../cap-theorem.html">CAP Theorem</a> — the constraint that bounds responses to network partitions.</li>
+        <li><a href="../circuit-breakers.html">Circuit Breakers</a> — defense-in-depth against cascade failures.</li>
+        <li><a href="../design-moves/index.html">Design Moves</a> — the trigger→mechanism catalog. Defenses in this page link to the design-moves SoT.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

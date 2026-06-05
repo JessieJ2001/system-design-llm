@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K10 — Data Parallelism (serving-replica DP) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+    .narrow-note { background:#eef2ff; border-left:4px solid #4f46e5; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K10 &mdash; Data Parallelism <span style="font-weight:400;font-size:.55em;color:#64748b;">(serving-replica DP &mdash; and why it&rsquo;s not training DP)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable</em> throughput tier &mdash; replicate the whole engine and shard requests across replicas &mdash; when the only real design question is the router, not the sync (there is none)?</strong> This page derives why serving DP is embarrassingly parallel (unlike training DP) and why its single hard problem is stateful-KV affinity across replicas.</p>
+      <p class="hero-meta">GPU-serving SoT &bull; a K6 child (opens by citing K6&rsquo;s grid + spine) &bull; deliberately the narrowest parallelism page (that is correct, not a gap) &bull; cites <a href="K6_parallelism-overview.html">K6</a> / <a href="K2_kv-cache.html">K2</a> / <a href="gpu-fleet-autoscaling-multitenancy.html">K15</a> / <a href="K1_serving-fundamentals.html">K1</a> / <a href="fault-tolerance-multi-gpu-inference.html">K22</a> &bull; dedicated scenario: <strong>L9</strong> &bull; ~15 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the DP chain). This page is intentionally short &mdash; serving DP is structurally simple; its only real design question is the router (D39). Approve / redirect the arc, the <em>serving-DP &ne; training-DP</em> derivation, deep-dive placement (<strong>D39 cross-replica routing</strong>), and the citation plan.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Throughput / Goodput</strong> &mdash; replicating the engine N&times; scales aggregate request rate exactly linearly (no sync, no all-reduce).</li>
+          <li><strong>Cache-hit rate</strong> &mdash; D39: a cache-aware cross-replica router keeps multi-turn / reusing requests on the replica that holds their KV (else the K2-Role-2 win is lost at the DP layer).</li>
+          <li><strong>Resilience (smallest blast radius)</strong> &mdash; one replica = the smallest fault domain &rArr; DP is the resilience-friendliest axis (K22).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Replicate the whole TP&times;PP&times;EP engine N&times;, shard requests across replicas; there is <em>no</em> shared state and <em>no</em> sync, so cost is exactly linear and the sole design question is the router (D39).</p>
+      <ul>
+        <li><strong>Is:</strong> the <em>serving-DP &ne; training-DP</em> derivation; the linear cost model; DP composed <em>outside</em> TP/PP/EP; fault domain = one replica; D39 (cross-replica routing &amp; the stateful-KV affinity problem); the routing rule-11 sweep (at <em>replica</em> granularity).</li>
+        <li><strong>Is not:</strong> the cross-axis tuple (<a href="K6_parallelism-overview.html">K6</a>); the <em>intra-engine</em> KV routing &amp; the (0)&ndash;(7) spectrum&rsquo;s derivation (<a href="K2_kv-cache.html">K2</a> Role 2 owns it &mdash; K10 re-applies it at replica granularity, granularity-disambiguated); the autoscaler policy (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>); training DP/DDP/ZeRO gradient sync (training-side &mdash; explicitly the thing serving-DP is <em>not</em>). All named &amp; linked in &sect;7.</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The KV-reuse routing <em>spectrum</em> (cache-oblivious &rarr; KV-aware) is derived in <a href="K2_kv-cache.html">K2</a> Role 2; this page <strong>re-applies it at the <em>replica</em> granularity</strong> (K2 = which slot <em>within</em> a replica; K10 = which replica) and disambiguates the two scopes &mdash; it does <strong>not</strong> re-derive the spectrum. The autoscale unit is the DP degree but the autoscaler policy is <a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>&rsquo;s.</div>
+      <div class="narrow-note"><strong>Why this page is short (a scope-honest note, not a gap).</strong> Serving DP is structurally trivial &mdash; embarrassingly parallel, stateless replication + a load balancer. Its <em>only</em> non-obvious design question is the cross-replica router (D39). Padding this page to match K7&ndash;K9 would be inventing depth that doesn&rsquo;t exist.</div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The DP Spine (stated up front, before &sect;1)</h2>
+      <p>This page is a child of <a href="K6_parallelism-overview.html">K6</a> and resolves the <em>fits-but-throughput-bound</em> binding of K6&rsquo;s grid. The chain:</p>
+      <ul>
+        <li><strong>Throughput-bound</strong> (model fits one replica, aggregate rate too low) &rarr; replicate the whole engine N&times; = <strong>DP</strong>.</li>
+        <li><strong>Shard requests across replicas</strong> &mdash; no gradients, no all-reduce, no sync &rArr; cost is <em>exactly linear</em>.</li>
+        <li><strong>New problem:</strong> each replica has its <em>own independent</em> KV cache.</li>
+        <li>&rArr; a multi-turn / cache-reusing request must hit the <em>same</em> replica &mdash; <strong>affinity-vs-even-load tension at the router</strong> (D39).</li>
+        <li>&rArr; <strong>DP degree = the autoscaling unit</strong> (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>); DP alone is insufficient when the model doesn&rsquo;t fit one replica (&rarr; TP/PP first, back to K6).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>throughput-bound &amp; the model fits one replica &rarr; replicate N&times; (DP) &rarr; no sync, cost is linear &rarr; new problem: each replica&rsquo;s KV is private &rarr; reusing requests must hit the same replica (D39: affinity vs even load) &rarr; pick the cross-replica router &rarr; objective: meet the rate target at the cache-hit the router can hold</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 700" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="310" y="16" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Model fits one replica, aggregate rate too low</text>
+        <text class="s" x="620" y="58" text-anchor="middle">the binding K6 routes here &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="102"/>
+        <text class="l" x="636" y="91">replicate N&times;</text>
+
+        <rect class="bp" x="310" y="102" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="126" text-anchor="middle">DP &mdash; replicate the whole engine; shard requests</text>
+        <text class="s" x="620" y="144" text-anchor="middle">no gradients, no all-reduce, no sync &mdash; cost exactly linear &middot; §2</text>
+
+        <line x1="620" y1="158" x2="620" y2="188"/>
+        <text class="l" x="636" y="177">new problem</text>
+
+        <rect class="bd" x="310" y="188" width="620" height="56" rx="8"/>
+        <text class="t" x="620" y="212" text-anchor="middle">Each replica has its OWN independent KV cache</text>
+        <text class="s" x="620" y="230" text-anchor="middle">reusing request on the wrong replica &rarr; full recompute</text>
+
+        <line x1="620" y1="244" x2="620" y2="274"/>
+        <text class="l" x="636" y="263">the only hard question</text>
+
+        <rect class="bs" x="250" y="274" width="740" height="68" rx="8"/>
+        <text class="t" x="620" y="298" text-anchor="middle">D39 &mdash; cross-replica routing &amp; stateful-KV affinity</text>
+        <text class="s" x="620" y="316" text-anchor="middle">K2&rsquo;s (0)&ndash;(7) spectrum re-applied at REPLICA granularity</text>
+        <text class="s" x="620" y="332" text-anchor="middle">affinity hit-value vs replica load imbalance</text>
+
+        <line x1="620" y1="342" x2="620" y2="372"/>
+        <text class="l" x="636" y="361">unit</text>
+
+        <rect class="bd" x="40" y="372" width="1160" height="56" rx="8"/>
+        <text class="t" x="620" y="396" text-anchor="middle">DP degree = the autoscaling unit (K15)</text>
+        <text class="s" x="620" y="414" text-anchor="middle">DP alone insufficient if the model doesn&rsquo;t fit one replica &rarr; TP/PP first (K6)</text>
+
+        <line x1="620" y1="428" x2="620" y2="458"/>
+
+        <rect class="bc" x="310" y="458" width="620" height="64" rx="8"/>
+        <text class="t" x="620" y="482" text-anchor="middle">Objective: meet the rate target at the router&rsquo;s cache-hit</text>
+        <text class="s" x="620" y="500" text-anchor="middle">smallest fault domain &rArr; the resilience-friendliest axis (K22) &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; the model fits one replica but aggregate rate is too low (K6 routes here).</li>
+        <li><span class="b">&#9313;</span> <strong>DP = replicate</strong> &mdash; replicate the whole engine, shard requests; no sync, cost exactly linear.</li>
+        <li><span class="b">&#9314;</span> <strong>New problem: private KV</strong> &mdash; each replica&rsquo;s KV is independent; a reusing request on the wrong replica recomputes.</li>
+        <li><span class="b">&#9315;</span> <strong>D39 &mdash; the only hard question</strong> &mdash; cross-replica routing; K2&rsquo;s (0)&ndash;(7) spectrum at replica granularity; affinity vs even load.</li>
+        <li><span class="b">&#9316;</span> <strong>Unit</strong> &mdash; DP degree = the autoscale unit (K15); DP alone fails if the model doesn&rsquo;t fit one replica.</li>
+        <li><span class="b">&#9317;</span> <strong>Objective</strong> &mdash; meet the rate target at the router&rsquo;s achievable cache-hit; smallest fault domain &rArr; resilience-friendliest axis.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> the model already fits one replica but the aggregate request rate exceeds one replica&rsquo;s throughput &mdash; K6&rsquo;s <em>throughput-bound</em> binding lands here. <b>Solution (what the page builds):</b> replicate the whole engine and shard requests across replicas &mdash; the simplest, primary horizontal lever; the only non-trivial part is which replica each request goes to.<span class="meta">number: per-replica req/s vs target rate on the trace &rarr; replicas needed &mdash; cites K1 §3.x (#throughput) &middot; canonical: gpu-inference-cost-shapes.html</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where DP lives &mdash; the whole engine replicated, outside TP/PP/EP</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> DP doesn&rsquo;t cut the model at all. <b>Solution:</b> each DP replica is itself a complete TP&times;PP&times;EP group; DP is composed <em>outside</em> them (cite K6&rsquo;s grid). No tensor is split by DP &mdash; it replicates the entire forward pass.<span class="meta">no number (placement fact) &mdash; cites K6 (DP composed outside TP/PP/EP) &middot; diagram: N identical TP&times;PP groups behind one router</span></p>
+
+      <h3 id="walkthrough">The walkthrough on <code>&quot;I like cat, why?&quot;</code> &mdash; what DP does across replicas</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace: T1 <code>&quot;I like cat, why?&quot;</code> &rarr; replica A serves the whole request, building its KV. T3 (the follow-up turn) <em>must</em> return to replica A to reuse that KV; a cache-oblivious router sending it to replica B &rArr; B has none of the prior KV &rarr; full re-prefill of the whole conversation &mdash; the K2-Role-2 win silently lost at the DP layer. Show with-vs-without affinity on this trace; numbers symbolic until &sect;3.<span class="meta">numbers: symbolic until §3 D39 compares routers &middot; diagram: T1&rarr;A, T3 mis-routed to B (recompute) vs T3 affine to A (reuse)</span></p>
+
+      <h3 id="derive">Serving DP &ne; training DP (derived &mdash; the most common interview confusion)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> &ldquo;data parallelism&rdquo; evokes training&rsquo;s gradient all-reduce. <b>Solution, stated explicitly:</b> (a) <em>training DP</em> &mdash; each replica processes a different micro-batch then does an <strong>all-reduce of gradients</strong> every step &rarr; synchronised, comm-bound; (b) <em>serving DP</em> &mdash; each replica serves <em>different requests</em>, <strong>no gradients, no all-reduce, no sync</strong> &rArr; embarrassingly parallel; the only &ldquo;shared state&rdquo; is <em>none</em> (each replica&rsquo;s KV is private); (c) &rArr; cost is <em>exactly linear</em> in replicas and the <em>sole</em> design question is the <strong>router</strong>, not the sync; (d) DP is composed <em>outside</em> TP/PP/EP; fault domain = one replica (smallest &rArr; the resilience-friendliest axis, K22); DP alone is insufficient when the model doesn&rsquo;t fit one replica (&rarr; TP/PP first, K6).<span class="meta">number: linear cost ($/replica &times; replicas) vs training-DP&rsquo;s all-reduce overhead, on the trace &mdash; cites K1 (#cost), K22 (replica = smallest fault domain), K6 (composition)</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where DP sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> N independent replicas behind a router; no inter-replica fabric requirement (the structural reason DP is cheap and resilient). The router is the only shared component.<span class="meta">no new number &mdash; cites K6 (composition), K22 (replica fault domain)</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; N replicas + router</strong>the router, N TP&times;PP replicas with private KV, an arrow showing a mis-route vs an affine route. Drawn after arc approval.</div>
+
+      <h3 id="d39" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D39 &mdash; cross-replica routing &amp; the stateful-KV affinity problem</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the page&rsquo;s one real design question).</span> <b>Problem:</b> replicas have independent KV; a cache-oblivious LB (round-robin) sends turn-2 to a replica that doesn&rsquo;t hold turn-1&rsquo;s KV &rarr; full recompute &rarr; the K2-Role-2 reuse win is lost <em>at the DP layer</em>, invisibly. <b>Solution:</b> the cross-replica router is first-class &mdash; session-affinity / consistent-hash(conv-id) / KV-aware, i.e. <strong>K2&rsquo;s (0)&ndash;(7) routing spectrum re-applied at the <em>replica</em> granularity</strong> (disambiguate: K2 owns <em>within a replica</em>, K10 owns <em>which replica</em>; same spectrum, two scopes). <b>Crossover:</b> affinity hit-value (saved prefill GPU-s) vs replica load imbalance, capped by bounded-load consistent hashing.<span class="meta">number: saved prefill GPU-s from a hit vs the imbalance cost on the trace &mdash; cites K2 (Role-2 spectrum &mdash; cite, don&rsquo;t re-derive), K1 (#prefill cost) &middot; real: external L7 LB + consistent hash, SGLang router at the replica tier, Ray Serve session affinity + URLs</span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the cross-replica routing policy</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub.</span> round-robin &rarr; least-loaded &rarr; session-sticky &rarr; consistent-hash(conv-id) &rarr; KV-aware: this <em>is</em> K2&rsquo;s spectrum at replica scope &mdash; cite K2, state the granularity disambiguation, do <strong>not</strong> re-derive the spectrum here. Two-sided cliff: cache-oblivious = perfect load, ~0 cross-replica hit; strict affinity = max hit, hot-replica imbalance &mdash; bounded-load consistent hashing is the usual resolution.<span class="meta">number: hit-rate vs imbalance per policy on the trace &mdash; cites K2 (the spectrum), consistent-hashing.html &middot; real: per-policy named systems carried from K2</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> The DP degree (rate target &divide; per-replica throughput) and the cross-replica routing policy (rule-11 / D39) &mdash; each with its chosen value, reason, and the cliff on each side. There is no other K10-local knob (the scope-honest call).<span class="meta">numbers: replicas = peak req/s &divide; per-replica req/s; the routing crossover (composes with D39) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>More TP/PP instead of DP</b> &mdash; disq: adds comm/bubble for no throughput benefit once the model already fits one replica; <em>wins</em> only when the model does <em>not</em> fit one replica (&rarr; K6/K7/K8). (b) <b>A shared global KV pool across replicas</b> &mdash; disq: adds a network hop per access + a consistency/scaling problem; <em>wins</em> only when cross-replica reuse value exceeds the hop (cite K2/K5). (c) <b>Cache-oblivious round-robin</b> &mdash; disq: ~0 cross-replica hit &rarr; silently loses the Role-2 win (D39); <em>wins</em> only for no-shared-prefix identical short requests. Each: when it actually wins.<span class="meta">number: the constraint disqualifying each (single-replica fit for (a); hop cost for (b); hit-rate for (c)) &mdash; cites K6/K7/K8, K2/K5 &middot; contrast L9 (cross-replica affinity D39 is its spine)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>One replica = the smallest fault domain</b> &mdash; losing one drops only its in-flight requests (cite K22, gpu-failure-modes.html) &mdash; <em>why DP is the resilience-friendliest axis</em>; cache-oblivious routing &rarr; cache-cold thrash + lost Role-2 reuse (llm-bottlenecks.html); strict affinity without bounded load &rarr; hot-replica skew (one popular conversation/prefix saturates a replica).<span class="meta">cites llm/canonicals/gpu-failure-modes.html (replica blast radius = smallest), llm/canonicals/llm-bottlenecks.html (cache-cold thrash, hot-replica skew), K22 &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> External L7 LB + consistent-hash on conv-id, SGLang router at the replica tier, Ray Serve session affinity, vLLM multi-replica deployment behind a router (D39 evidence). Each: which routing policy it implements + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L9-cache-aware-reuse-serving.html">L9</a> (cross-replica affinity D39 is part of its spine); <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a> (a model-version canary <em>is</em> a DP split across versions); <a href="../scenarios/L4-multi-tenant-lora-platform.html">L4</a> (multi-tenant replicas); <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (DP degree is the autoscale knob). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; DP composed outside TP/PP/EP; this page opens by citing K6&rsquo;s grid + spine.</li>
+        <li><a href="K2_kv-cache.html">K2</a> &mdash; the Role-2 routing spectrum, applied at replica granularity in D39 (granularity-disambiguated &mdash; cite, don&rsquo;t re-derive).</li>
+        <li><a href="gpu-fleet-autoscaling-multitenancy.html">K15</a> &mdash; DP degree = the autoscale unit (the policy is K15&rsquo;s).</li>
+        <li><a href="K1_serving-fundamentals.html">K1</a> &mdash; the linear cost model.</li>
+        <li><a href="fault-tolerance-multi-gpu-inference.html">K22</a> &mdash; one replica = the smallest/best fault domain (why DP is resilience-friendliest).</li>
+        <li><strong>Out of scope (named, not covered):</strong> training DP / DDP / ZeRO gradient sync (training-side &mdash; explicitly the thing serving-DP is <em>not</em>); the autoscaler policy itself (K15); the <em>intra</em>-engine KV routing (K2 &mdash; K10 is strictly <em>cross</em>-replica).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

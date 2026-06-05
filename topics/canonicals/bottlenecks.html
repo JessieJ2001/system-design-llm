@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bottlenecks — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Bottlenecks</h1>
+      <p class="hero-subtitle">The canonical catalog of bottlenecks a distributed system can hit — what each looks like in numbers, which non-functional requirement (NFR) it violates, and the first techniques you reach for. This is the source-of-truth page; scenario pages diagnose against this taxonomy instead of redefining bottlenecks.</p>
+      <p class="hero-meta">~15 min reference</p>
+    </div>
+  </section>
+
+  <!-- How to use -->
+  <section class="section">
+    <div class="container">
+      <h2>How to Use This Page</h2>
+
+      <p>Staff+ system design follows one program:</p>
+      <ol>
+        <li><strong>Start from the simplest design that meets the functional requirements.</strong> One process, one DB, no cache, no shard. If functional requirements are satisfied, stop here.</li>
+        <li><strong>Walk the non-functional requirements (NFRs) from S0.</strong> For each NFR — latency, throughput, cost, availability, consistency, durability, cardinality — ask: <em>"does the current design meet this?"</em> If a number says no, that gap <strong>is</strong> the bottleneck.</li>
+        <li><strong>Match the gap to a canonical bottleneck below.</strong> The catalog gives you the first move to reach for and the cliff at which that move runs out.</li>
+        <li><strong>Apply the move; recompute the numbers; return to step 2.</strong> Iterate until every NFR is satisfied.</li>
+      </ol>
+
+      <p>This is the no-jumps rule made operational: every iteration in a scenario page traces to <em>this NFR is failing by this much</em>, and every move traces to <em>this is the canonical first lever for that bottleneck shape</em>. If you cannot name the NFR your iteration is closing, you are feature-driven, not bottleneck-driven.</p>
+
+      <p>Use this page in two ways:</p>
+      <ul>
+        <li><strong>While clarifying requirements (S0).</strong> The NFR-class column tells you which bottlenecks each NFR could surface. If your S0 names a 100 ms p99 SLO and an unbounded-cardinality stream, expect <a href="#tail-latency">tail-latency</a> and <a href="#cardinality-explosion">cardinality-explosion</a> to bite first.</li>
+        <li><strong>While iterating (S5).</strong> The signal column is the diagnostic — <em>per-shard QPS skewed &gt; 5× median for &gt; 5 min</em> classifies as <a href="#hot-partition">hot partition</a>; the entry tells you what to reach for and what number says you've run out.</li>
+      </ul>
+
+      <p>Other pages on this site cite <em>here</em>. Do not redefine bottlenecks in scenario pages — link instead.</p>
+    </div>
+  </section>
+
+  <!-- Taxonomy table -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>The 19 Canonical Bottlenecks</h2>
+      <p>Grouped by lens. The same physical symptom can appear under several lenses (e.g., a hot key is both <em>per-node memory-bandwidth saturation</em> on the hot node <em>and</em> a <em>distribution skew</em> across the cluster); pick the lens that points to the right move.</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>Bottleneck</th><th>NFR violated</th><th>Signal shape</th><th>First move</th></tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="4"><strong>Per-node resource saturation</strong></td></tr>
+          <tr><td><a href="#compute-bound">Compute-bound</a></td><td>Latency, throughput</td><td>CPU/GPU at 100%; FLOP/s near silicon peak</td><td>Vectorize, batch, cache results, scale horizontally</td></tr>
+          <tr><td><a href="#memory-bandwidth-bound">Memory-bandwidth-bound</a></td><td>Latency, throughput</td><td>Bytes-read/s near DRAM/HBM peak; CPU idle while waiting</td><td>Reduce working-set per op (quantize, prune, cache near compute)</td></tr>
+          <tr><td><a href="#memory-capacity-bound">Memory-capacity-bound</a></td><td>Latency, cost</td><td>Working set &gt; RAM; eviction churn; high page-fault rate</td><td>Tier to NVMe/disk; shrink representation; shard the dataset</td></tr>
+          <tr><td><a href="#disk-io-bound">Disk-IO-bound</a></td><td>Throughput, latency</td><td>IOPS or MB/s saturated; queue depth growing on the device</td><td>Sequential write log (LSM); batch fsync; SSD/NVMe; precompute reads</td></tr>
+          <tr><td><a href="#network-bandwidth-bound">Network-bandwidth-bound</a></td><td>Throughput, cost</td><td>NIC at line rate; cross-AZ egress dominates bill</td><td>Compress; co-locate; reduce fanout (gossip / tree)</td></tr>
+          <tr><td><a href="#network-rtt-bound">Network-RTT-bound</a></td><td>Latency</td><td>p50 ≈ k × RTT; CPU/disk idle while waiting</td><td>Pipeline / batch; move closer (cache, edge); reduce round-trips</td></tr>
+
+          <tr><td colspan="4"><strong>Concurrency &amp; coordination</strong></td></tr>
+          <tr><td><a href="#lock-contention">Lock contention</a></td><td>Throughput, latency</td><td>Per-op latency rises with concurrency; one critical section serialized</td><td>Shard the lock; lock-free / CAS; per-key partitioning</td></tr>
+          <tr><td><a href="#coordinator-bottleneck">Coordinator bottleneck</a></td><td>Throughput, availability</td><td>Single leader / sequencer at 100%; entire system pegged to its capacity</td><td>Partition the coordinator; lease-based delegation; consensus only on metadata</td></tr>
+          <tr><td><a href="#connection-saturation">Connection saturation</a></td><td>Availability, cost</td><td>Caller pods × backend pods &gt; 10⁶ connections; FD exhaustion; TLS-handshake CPU dominates</td><td>Deterministic subsetting; connection pooling; mux (HTTP/2, gRPC)</td></tr>
+
+          <tr><td colspan="4"><strong>Distribution skew</strong></td></tr>
+          <tr><td><a href="#hot-key">Hot key</a></td><td>Throughput, latency</td><td>One key at 100× median QPS; one node pegged regardless of cluster size</td><td>Single-flight on miss; client-side L1; key replication with salt suffix</td></tr>
+          <tr><td><a href="#hot-partition">Hot partition</a></td><td>Throughput, latency</td><td>Per-shard QPS or bytes skewed &gt; 5× median for &gt; 5 min</td><td>Salt the partition key; subdivide the range; auto-split</td></tr>
+          <tr><td><a href="#fanout-asymmetry">Fanout asymmetry</a></td><td>Throughput, cost</td><td>Top-percentile fan-out N orders-of-magnitude above median (celebrity)</td><td>Hybrid push/pull: fan-out-on-write for normals, fan-in-on-read for celebrities</td></tr>
+          <tr><td><a href="#tail-latency">Tail-latency amplification</a></td><td>Latency (p99)</td><td>Result needs N parallel calls; p99<sub>system</sub> ≫ p99<sub>component</sub></td><td>Hedged / speculative requests; reduce N; bound the slowest with a deadline</td></tr>
+
+          <tr><td colspan="4"><strong>Flow control</strong></td></tr>
+          <tr><td><a href="#backlog-growth">Backlog growth</a></td><td>Latency, durability, availability</td><td>Producer rate &gt; consumer rate sustained; queue depth monotonically up</td><td>Backpressure / shed by priority; scale consumer; drop or sample at ingress</td></tr>
+          <tr><td><a href="#stampede">Stampede / thundering herd</a></td><td>Availability, latency</td><td>TTL expiry → N concurrent misses → origin QPS spike of 100–1000×</td><td>Single-flight on miss; jittered TTL; refresh-ahead</td></tr>
+          <tr><td><a href="#retry-storm">Retry storm</a></td><td>Availability</td><td>Failure → retry → more failure; load grows during outage instead of shrinking</td><td>Exponential backoff with jitter; per-caller retry budget; circuit breaker</td></tr>
+
+          <tr><td colspan="4"><strong>Scale &amp; cardinality</strong></td></tr>
+          <tr><td><a href="#cardinality-explosion">Cardinality explosion</a></td><td>Cost, latency, durability</td><td>Per-key state × N grows unboundedly with input stream</td><td>Sketch (CMS / HLL / t-digest); cap N with eviction; sample at ingress</td></tr>
+          <tr><td><a href="#index-write-amp">Index bloat / write amp</a></td><td>Throughput, cost</td><td>Each write touches K indexes; write IOPS = K × insertions</td><td>Drop indexes; async index build; columnar / inverted store as a sidecar</td></tr>
+          <tr><td><a href="#cold-start">Cold start / churn cost</a></td><td>Latency, availability</td><td>Per-instance warm-up T sec × churn rate &gt; one full reload per minute</td><td>Pre-warm via shadow traffic; longer-lived instances; tiered cache to absorb warm-up</td></tr>
+
+          <tr><td colspan="4"><strong>Distance</strong></td></tr>
+          <tr><td><a href="#cross-region">Cross-region latency / consistency</a></td><td>Latency, consistency</td><td>p50 includes ≥ 1 cross-region RTT (60–200 ms); strong-consistency forces synchronous replication</td><td>Async replication with bounded staleness; per-region writes with conflict resolution; pick CP or AP per dataset</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Per-bottleneck detail -->
+  <section class="section">
+    <div class="container">
+      <h2>Per-Bottleneck Detail</h2>
+      <p>Each entry: <strong>signal</strong> (with numbers; how you diagnose it), <strong>mechanism</strong> (why it happens), <strong>first / second / last-resort moves</strong>, <strong>anti-moves</strong> (what looks reasonable but doesn't fix it), and <strong>scenarios</strong> where this is the dominant bottleneck.</p>
+
+      <h3 id="compute-bound">Compute-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> CPU or GPU at 100% utilization with FLOP/s near the silicon's peak (e.g., 312 TFLOP/s on H100 BF16 at 40% MFU = 125 TFLOP/s sustained). Adding more memory bandwidth or more disk does nothing; only more compute or less compute-per-op helps.</li>
+        <li><strong>Mechanism.</strong> The work itself is arithmetic-bound. Examples: prefill in LLM inference, dense matrix multiply, regex evaluation, hash computation in dedup, video encoding.</li>
+        <li><strong>First move.</strong> Vectorize / SIMD; batch to amortize fixed setup; cache the result if the input is reused; horizontal scale with stateless workers.</li>
+        <li><strong>Second move.</strong> Reduce work per op — quantize models (BF16 → INT8), prune, distill, approximate.</li>
+        <li><strong>Last resort.</strong> Different hardware (GPU → ASIC, CPU → GPU) or different algorithm with lower complexity class.</li>
+        <li><strong>Anti-move.</strong> Adding a cache when the cache miss <em>is</em> the compute. Adding more memory when the bottleneck is FLOPs.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/34-llm-inference-serving.html">34-llm-inference-serving</a> (prefill).</li>
+      </ul>
+
+      <h3 id="memory-bandwidth-bound">Memory-bandwidth-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> Bytes-read/s near DRAM bandwidth (≈ 100 GB/s per CPU socket) or HBM bandwidth (≈ 3.35 TB/s on H100). CPU/GPU idle while waiting for memory loads. The classic ratio: arithmetic intensity (FLOP per byte) below the hardware's roofline.</li>
+        <li><strong>Mechanism.</strong> Each operation reads a working set from memory once or more per iteration. Examples: LLM decode (autoregressive — every new token re-reads model weights), large hash-table probes, columnar scans.</li>
+        <li><strong>First move.</strong> Reduce working-set bytes per op — quantize, prune, compress in memory, or move data closer (L2/L3 cache, HBM vs HBM-far, NUMA-local).</li>
+        <li><strong>Second move.</strong> Increase arithmetic intensity — batch operations so more FLOPs share each loaded byte (e.g., decode batch &gt; 1).</li>
+        <li><strong>Last resort.</strong> Switch to higher-bandwidth memory tier (DDR → HBM); or change the algorithm to one with higher arithmetic intensity.</li>
+        <li><strong>Anti-move.</strong> Adding more cores when the bottleneck is shared memory bandwidth — they all stall on the same channel.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/34-llm-inference-serving.html">34-llm-inference-serving</a> (decode).</li>
+      </ul>
+
+      <h3 id="memory-capacity-bound">Memory-capacity-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> Working set &gt; RAM capacity. Symptoms: high page-fault rate, eviction churn, p99 spikes during background swaps, hit ratio of the eviction policy below break-even.</li>
+        <li><strong>Mechanism.</strong> The per-instance state grows faster than RAM can hold. Examples: KV cache for many concurrent LLM requests, in-memory feature store with billions of entries, deque per metric series at 200M series.</li>
+        <li><strong>First move.</strong> Tier to a slower-but-larger medium (NVMe-backed cache like CacheLib; Redis with disk overflow). Shrink the per-entry representation (compact serialization, delta encoding).</li>
+        <li><strong>Second move.</strong> Shard the state across more nodes (the sum of per-node RAM grows with the cluster).</li>
+        <li><strong>Last resort.</strong> Move to a streaming / sketched representation that bounds memory regardless of input size — see <a href="#cardinality-explosion">cardinality explosion</a>.</li>
+        <li><strong>Anti-move.</strong> Bigger eviction-policy heuristics on a working set that is fundamentally larger than RAM — no policy beats "actually have the data."</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/21-distributed-cache.html">21-distributed-cache</a> (hot-key mitigation is its Iteration 4).</li>
+      </ul>
+
+      <h3 id="disk-io-bound">Disk-IO-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> IOPS or MB/s saturated on the persistent device; iostat shows queue depth growing; sync writes block. Random IOPS for HDD ≈ 100; SATA SSD ≈ 100k; NVMe ≈ 1M. Sequential bandwidth: HDD ≈ 200 MB/s; NVMe ≈ 7 GB/s.</li>
+        <li><strong>Mechanism.</strong> Workload pattern doesn't match device strengths. Random reads on HDD; small synchronous writes on any device; un-batched fsync.</li>
+        <li><strong>First move.</strong> Convert to sequential writes (LSM with WAL); batch fsync; use NVMe for random IO; precompute reads (materialized views).</li>
+        <li><strong>Second move.</strong> Tier hot data to faster storage; cold data to object store / archive.</li>
+        <li><strong>Last resort.</strong> Asynchronous durability with separate persistence layer (Kafka in front of DB).</li>
+        <li><strong>Anti-move.</strong> Adding indexes to "speed up" reads when the bottleneck is the resulting write amplification — see <a href="#index-write-amp">index bloat</a>.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/30-logging-system.html">30-logging-system</a>.</li>
+      </ul>
+
+      <h3 id="network-bandwidth-bound">Network-bandwidth-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> NIC at line rate (10 / 25 / 100 Gbps depending on instance class). Cross-AZ or cross-region egress dominates the cloud bill ($0.01–$0.09/GB depending on path).</li>
+        <li><strong>Mechanism.</strong> Bytes-on-wire exceed link capacity, or cross-AZ traffic is priced linearly and large.</li>
+        <li><strong>First move.</strong> Compress (Zstd / LZ4); co-locate communicating tiers in the same AZ; reduce fanout (gossip vs broadcast, tree-based aggregation).</li>
+        <li><strong>Second move.</strong> Move computation to the data instead of the data to the computation (push-down filters, server-side aggregation).</li>
+        <li><strong>Last resort.</strong> Provision higher-bandwidth instances; private network paths (AWS PrivateLink, Direct Connect).</li>
+        <li><strong>Anti-move.</strong> Caching at the wrong tier — caching downstream of the bottleneck NIC doesn't help.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/10-fan-out-notification.html">10-fan-out-notification</a> (broadcast egress).</li>
+      </ul>
+
+      <h3 id="network-rtt-bound">Network-RTT-bound</h3>
+      <ul>
+        <li><strong>Signal.</strong> p50 latency dominated by k × RTT (intra-DC ≈ 0.5 ms, intra-region ≈ 1–2 ms, cross-region 60–200 ms). CPU and disk idle waiting for the network. Reducing payload size doesn't help; reducing the number of round-trips does.</li>
+        <li><strong>Mechanism.</strong> Each request needs N sequential round-trips (N-tier deep call, chatty protocol).</li>
+        <li><strong>First move.</strong> Pipeline / batch — issue the next request without waiting; combine into one. Move data closer (read replica in caller's region, edge cache, CDN).</li>
+        <li><strong>Second move.</strong> Reduce round-trips per logical request (fewer service hops, denormalize so one query suffices).</li>
+        <li><strong>Last resort.</strong> Speculative execution — issue several variants in parallel, take the first to return — at the cost of extra origin load.</li>
+        <li><strong>Anti-move.</strong> Vertical scaling — faster CPUs don't shorten the speed of light.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/20-distributed-rate-limiter.html">20-distributed-rate-limiter</a> (RTT to centralized counter).</li>
+      </ul>
+
+      <h3 id="lock-contention">Lock contention</h3>
+      <ul>
+        <li><strong>Signal.</strong> Latency rises with concurrency rather than throughput rising. CPU usage flat while QPS climbs; profiler shows time spent in <code>futex_wait</code> / lock acquisition; one critical section serialized.</li>
+        <li><strong>Mechanism.</strong> Mutual exclusion forces serialization regardless of how much hardware is available.</li>
+        <li><strong>First move.</strong> Shard the lock — partition by key so different keys don't contend. Per-thread local state with periodic merge.</li>
+        <li><strong>Second move.</strong> Lock-free structures (CAS-based counters, RCU, lock-free queues).</li>
+        <li><strong>Last resort.</strong> Re-architect to remove the shared mutable state — append-only log; CRDT; per-actor mailbox.</li>
+        <li><strong>Anti-move.</strong> Optimizing the work inside the critical section — even an O(1) critical section serializes throughput at 1/(critical-section-time). Shrinking it 10× only buys you 10×.</li>
+      </ul>
+
+      <h3 id="coordinator-bottleneck">Coordinator bottleneck</h3>
+      <ul>
+        <li><strong>Signal.</strong> A single leader, sequencer, scheduler, or metadata service at 100%. The whole system's throughput is pegged to this one component's capacity, regardless of how many workers exist.</li>
+        <li><strong>Mechanism.</strong> Some operation requires global ordering / global view (transaction sequencer, ID allocator, scheduler placement).</li>
+        <li><strong>First move.</strong> Put the coordinator on the metadata path only, not the data path (e.g., consensus only on shard placement; data writes go directly to shards). Lease-based delegation: coordinator hands out leases for ranges of work that workers execute autonomously.</li>
+        <li><strong>Second move.</strong> Partition the coordinator itself (per-tenant sequencer, per-region leader).</li>
+        <li><strong>Last resort.</strong> Eliminate the coordinator — switch to leaderless / CRDT-based coordination where order isn't strictly required.</li>
+        <li><strong>Anti-move.</strong> Horizontal-scaling stateless workers behind a single coordinator — the workers idle waiting for the coordinator.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/23-job-scheduler.html">23-job-scheduler</a> (single scheduler), <a href="../scenarios/29-resource-scheduler.html">29-resource-scheduler</a>.</li>
+      </ul>
+
+      <h3 id="connection-saturation">Connection saturation</h3>
+      <ul>
+        <li><strong>Signal.</strong> Caller pods × backend pods &gt; 10⁶ TCP connections. Symptoms: file-descriptor exhaustion, TLS-handshake CPU dominating backend, connection pool starvation timeouts.</li>
+        <li><strong>Mechanism.</strong> Every caller maintains a connection (or a pool) to every backend. At fleet scale this is an N×M matrix.</li>
+        <li><strong>First move.</strong> Deterministic subsetting — each caller talks to a subset of size k of the backend pool; subset chosen by a hash that's stable under churn (rendezvous hashing or a Maglev-style table).</li>
+        <li><strong>Second move.</strong> Connection multiplexing (HTTP/2, gRPC streams) so one connection carries many requests.</li>
+        <li><strong>Last resort.</strong> Service mesh sidecar that pools on behalf of the application.</li>
+        <li><strong>Anti-move.</strong> Random per-request connection — adds TLS handshake latency to every call.</li>
+        <li><strong>Scenarios.</strong> Backend-picker, sidecar fleets, microservices meshes (canonical: <em>40-experiment-bucket-router</em>).</li>
+      </ul>
+
+      <h3 id="hot-key">Hot key</h3>
+      <ul>
+        <li><strong>Signal.</strong> One key (or a small handful) at 100× the median QPS. One node pegged at 100% CPU regardless of cluster size; adding nodes doesn't help because the hot key still lands on one.</li>
+        <li><strong>Mechanism.</strong> Power-law / Zipfian access — a celebrity user, a viral post, a popular product on a flash sale. See <a href="access-patterns.html#power-law">access-patterns#power-law</a>.</li>
+        <li><strong>First move.</strong> Client-side L1 cache with short TTL; <a href="../design-moves/single-flight.html">single-flight on miss</a> to coalesce concurrent fetches.</li>
+        <li><strong>Second move.</strong> Replicate the hot key with key suffixing (<code>key#salt0..saltN-1</code>). Writes fan out to all N replicas; reads route to one of N. Trade write amp for read scale.</li>
+        <li><strong>Last resort.</strong> Move the hot key to a dedicated tier or cell; isolate from the rest of the cluster.</li>
+        <li><strong>Anti-move.</strong> More shards — the hot key still lands on one.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/21-distributed-cache.html#hot-key-iteration">21-distributed-cache (hot-key iteration)</a>, <a href="../scenarios/24-realtime-leaderboard.html">24-realtime-leaderboard</a>, <a href="../scenarios/41-home-timeline-fanout.html">41-home-timeline-fanout</a> (celebrity).</li>
+      </ul>
+
+      <h3 id="hot-partition">Hot partition</h3>
+      <ul>
+        <li><strong>Signal.</strong> Per-shard QPS or storage skewed &gt; 5× the median for &gt; 5 minutes. Often caused by a partition key correlated with insertion time (date prefix) or with a popular tenant.</li>
+        <li><strong>Mechanism.</strong> The partition key concentrates load. A range partition on <code>created_at</code> means every new write hits the same shard.</li>
+        <li><strong>First move.</strong> Salt the partition key with a short hash prefix (<code>{hash(key)%N}#key</code>). For range partitions, auto-split when a partition exceeds a size or QPS threshold.</li>
+        <li><strong>Second move.</strong> Choose a different partition key — one with naturally higher cardinality (user_id, request_id) — and accept the loss of co-located scans.</li>
+        <li><strong>Last resort.</strong> Move the hot range to a dedicated keyspace or tier.</li>
+        <li><strong>Anti-move.</strong> Just adding nodes — uniform sharding doesn't help if the key distribution is skewed.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/02-sharding-vs-replication.html">02-sharding-vs-replication</a>, <a href="../scenarios/18-hotspot-hashing.html">18-hotspot-hashing</a>, <a href="../scenarios/44-object-store-metadata.html">44-object-store-metadata</a> (hot prefixes).</li>
+      </ul>
+
+      <h3 id="fanout-asymmetry">Fanout asymmetry</h3>
+      <ul>
+        <li><strong>Signal.</strong> Top-percentile fanout count is orders of magnitude above the median (one user has 200M followers; one notification has 100k recipients). A uniform fan-out-on-write design makes the celebrity case a single-write meltdown.</li>
+        <li><strong>Mechanism.</strong> Two correct designs exist for the same problem — push (write to N inboxes) and pull (read by scanning N sources) — and each is wrong for the other end of the distribution. Push wastes work for cold readers; pull melts on celebrity writes.</li>
+        <li><strong>First move.</strong> Hybrid: push for normals, pull for celebrities (or the inverse — push for active readers, pull for inactive).</li>
+        <li><strong>Second move.</strong> Time-bucket the materialization — fan out once per hour to a per-user inbox of recent items; recompute on read for older.</li>
+        <li><strong>Last resort.</strong> Differential prefetch — predict who will read what, and pre-materialize only that intersection.</li>
+        <li><strong>Anti-move.</strong> Picking only push or only pull; the wrong end of the distribution always melts.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/41-home-timeline-fanout.html">41-home-timeline-fanout</a>, <a href="../scenarios/10-fan-out-notification.html">10-fan-out-notification</a>.</li>
+      </ul>
+
+      <h3 id="tail-latency">Tail-latency amplification</h3>
+      <ul>
+        <li><strong>Signal.</strong> A request makes N parallel sub-calls and waits for all (or many) to return. Even if each sub-call has p99 of 10 ms, the system's p99 is the <em>max</em> of N samples, which approaches p99.99 of one. For N = 100, system p99 ≈ component p99.99.</li>
+        <li><strong>Mechanism.</strong> The probability that <em>at least one</em> of N independent calls is in the slow tail rises with N: <code>P(any slow) ≈ 1 − (1 − p)<sup>N</sup></code>.</li>
+        <li><strong>First move.</strong> Hedged / speculative requests — issue the slow sub-call to a second backend after a short deadline, take the first response. Reduces system p99 toward component p95 at ~5–10% extra load.</li>
+        <li><strong>Second move.</strong> Reduce N — fewer fan-out branches, denormalize, batch.</li>
+        <li><strong>Last resort.</strong> Bound N by quantile — accept partial results past a deadline (return what came back; mark the rest as missing).</li>
+        <li><strong>Anti-move.</strong> Reducing component p99 alone — the curve flattens; you can't beat the multiplication.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/43-backup-dedup-storage.html">43-backup-dedup-storage</a> (parallel chunk fetches), <a href="../scenarios/41-home-timeline-fanout.html">41-home-timeline-fanout</a> (timeline assembly).</li>
+      </ul>
+
+      <h3 id="backlog-growth">Backlog growth</h3>
+      <ul>
+        <li><strong>Signal.</strong> Producer rate &gt; consumer rate, sustained. Queue depth (Kafka lag, SQS depth, in-memory queue length) growing monotonically. End-to-end latency = queue-depth / consume-rate, which goes to infinity if untreated.</li>
+        <li><strong>Mechanism.</strong> A consumer that can't keep up turns a queue into a memory leak with extra steps. The system <em>looks</em> healthy (no errors) until it runs out of buffer.</li>
+        <li><strong>First move.</strong> Backpressure — propagate "slow down" upstream (HTTP 429, gRPC RESOURCE_EXHAUSTED, TCP window). Shed by priority — drop low-priority requests at the ingress, never silently buffer them.</li>
+        <li><strong>Second move.</strong> Scale the consumer (auto-scale on queue depth, not on CPU). Parallelize the consumer (more partitions or more workers per partition).</li>
+        <li><strong>Last resort.</strong> Sample at ingress — accept a fraction (head sampling) and drop the rest, with clearly labeled SLO impact.</li>
+        <li><strong>Anti-move.</strong> "Just add more queue capacity" — bigger buffer = bigger latency at saturation, not fewer drops.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/13-backpressure.html">13-backpressure</a>, <a href="../scenarios/30-logging-system.html">30-logging-system</a>.</li>
+      </ul>
+
+      <h3 id="stampede">Stampede / thundering herd</h3>
+      <ul>
+        <li><strong>Signal.</strong> A cache key's TTL expires; in the next millisecond, N concurrent readers all miss simultaneously and stampede the origin. Origin QPS for that key spikes from 1/TTL to N × QPS<sub>read</sub>. Origin melts; cache stays cold; readers retry; pile-up cascades.</li>
+        <li><strong>Mechanism.</strong> Synchronization on a common expiry boundary. Easy to create accidentally by setting all entries to the same TTL.</li>
+        <li><strong>First move.</strong> <a href="../design-moves/single-flight.html">Single-flight on miss</a> — only the first miss fetches; the rest wait or get stale-while-revalidate.</li>
+        <li><strong>Second move.</strong> Jittered TTL — randomize ±20% so expiries don't synchronize. Refresh-ahead — refresh in background before TTL expires.</li>
+        <li><strong>Last resort.</strong> Request coalescing at a higher tier (Varnish, edge cache) so the origin only ever sees one request per (key, time-window).</li>
+        <li><strong>Anti-move.</strong> "Add more origin capacity" — provisioning for a 1000× spike when the spike is preventable.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/27-thundering-herd.html">27-thundering-herd</a>, <a href="../scenarios/21-distributed-cache.html">21-distributed-cache</a>.</li>
+      </ul>
+
+      <h3 id="retry-storm">Retry storm</h3>
+      <ul>
+        <li><strong>Signal.</strong> A failure causes retries from N callers; retries themselves overload, causing more failures, causing more retries. Load <em>grows</em> during the outage instead of shrinking.</li>
+        <li><strong>Mechanism.</strong> Retry is amplification under failure. If 1% of calls fail and each is retried 3×, total load is 1.03× — fine. If 50% fail, total load is 2.5× — failure begets failure.</li>
+        <li><strong>First move.</strong> Exponential backoff with full jitter; per-caller retry budget (max 10% of original calls); circuit breaker that fails fast when error rate crosses a threshold.</li>
+        <li><strong>Second move.</strong> Idempotency keys so the server can dedupe retries server-side; let the client retry without amplifying the work.</li>
+        <li><strong>Last resort.</strong> Adaptive concurrency limits (Netflix concurrency-limits, AIMD) — clients reduce concurrency when latency rises.</li>
+        <li><strong>Anti-move.</strong> Retrying with no budget; retrying on 5xx without classifying which 5xx are retryable.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/26-cascading-failure.html">26-cascading-failure</a>.</li>
+      </ul>
+
+      <h3 id="cardinality-explosion">Cardinality explosion</h3>
+      <ul>
+        <li><strong>Signal.</strong> Per-key state × N grows unboundedly with the input stream. Examples: a hashmap of error fingerprints for dedup, a per-user counter for rate limit, a per-(service, endpoint, region) histogram for percentiles. Memory grows linearly with input cardinality, which itself grows with time.</li>
+        <li><strong>Mechanism.</strong> The exact-state design is correct at small N but doesn't have a memory bound at large N.</li>
+        <li><strong>First move.</strong> Probabilistic sketch: <a href="sketches.html">CMS, HLL, t-digest, DDSketch, Bloom</a>. Memory becomes O(1/ε) instead of O(N), at the cost of bounded relative error.</li>
+        <li><strong>Second move.</strong> Cap N with eviction (LRU on rare keys); sample at ingress (head sampling preserves overall distribution).</li>
+        <li><strong>Last resort.</strong> Tiered: exact state for the top-K hot keys, sketch for the long tail.</li>
+        <li><strong>Anti-move.</strong> "Just add more RAM" — the input grows faster.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/15-topk-frequent.html">15-topk-frequent</a>, <a href="../scenarios/36-streaming-percentiles.html">36-streaming-percentiles</a>, <a href="../scenarios/42-error-aggregation-dedupe.html">42-error-aggregation-dedupe</a>.</li>
+      </ul>
+
+      <h3 id="index-write-amp">Index bloat / write amplification</h3>
+      <ul>
+        <li><strong>Signal.</strong> Each write touches K secondary indexes; per-row write IOPS = K × insertions. Index size approaches or exceeds data size. Write throughput plateaus despite headroom on the primary table.</li>
+        <li><strong>Mechanism.</strong> Every secondary index is a parallel structure that must be kept in sync on every write. Index update is the dominant cost when K is high.</li>
+        <li><strong>First move.</strong> Drop indexes that don't earn their cost — measure query frequency vs index size. Push rare-query paths to a separate read-optimized store (Elasticsearch, columnar replica) instead of a per-row index.</li>
+        <li><strong>Second move.</strong> Async / eventual index build — write to the primary table synchronously, build the index asynchronously from a CDC stream. Trades index freshness for write throughput.</li>
+        <li><strong>Last resort.</strong> Switch the storage engine — LSM optimizes writes at the cost of read amp; columnar optimizes scans at the cost of point-lookup latency.</li>
+        <li><strong>Anti-move.</strong> Adding "indexes for completeness" — every index has a cost paid on every write.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/25-slow-query.html">25-slow-query</a>, <a href="../scenarios/44-object-store-metadata.html">44-object-store-metadata</a>.</li>
+      </ul>
+
+      <h3 id="cold-start">Cold start / churn cost</h3>
+      <ul>
+        <li><strong>Signal.</strong> Per-instance warm-up time T (seconds to minutes). Churn rate (rolling deploys, autoscaling, spot interruption) such that the cluster is in warm-up state &gt; X% of the time. Aggregate effective capacity = (steady-state capacity) × (1 − warm-up-fraction).</li>
+        <li><strong>Mechanism.</strong> A new instance can't serve at full rate immediately — it needs to load model weights, populate caches, build local indexes, warm JIT, establish connection pools.</li>
+        <li><strong>First move.</strong> Pre-warm via shadow traffic before cutover — the new instance receives mirrored production load until its caches and pools are warm.</li>
+        <li><strong>Second move.</strong> Longer-lived instances; reduce churn rate (slower rolling deploys, fewer autoscale events with deeper buffer).</li>
+        <li><strong>Last resort.</strong> Tiered cache that absorbs cold-start (a shared L2 in front of cold instances).</li>
+        <li><strong>Anti-move.</strong> Aggressive autoscaling that spins instances up and down faster than warm-up — more instances make latency <em>worse</em> until they warm.</li>
+        <li><strong>Scenarios.</strong> <a href="../scenarios/21-distributed-cache.html">21-distributed-cache</a>, <a href="../scenarios/34-llm-inference-serving.html">34-llm-inference-serving</a> (model load).</li>
+      </ul>
+
+      <h3 id="cross-region">Cross-region latency / consistency</h3>
+      <ul>
+        <li><strong>Signal.</strong> p50 latency includes ≥ 1 cross-region RTT (US-EU ≈ 80 ms, US-AP ≈ 150 ms, EU-AP ≈ 200 ms). Synchronous strong-consistency replication forces every write to wait for cross-region quorum, blowing the latency SLO.</li>
+        <li><strong>Mechanism.</strong> The speed of light. A write committed to N regions synchronously must traverse the slowest path; reads-your-writes across regions force the read to wait for replication.</li>
+        <li><strong>First move.</strong> Per-dataset CAP choice. For most user-facing data: AP with bounded staleness (async replication, 1–10 s lag). For the small slice that needs CP: synchronous quorum, accept the latency, place users near the leader.</li>
+        <li><strong>Second move.</strong> Per-region writes with conflict resolution (CRDT, last-writer-wins with logical clocks, or per-record region-of-truth).</li>
+        <li><strong>Last resort.</strong> Single-region with read replicas elsewhere — accept that writes are far from non-home users.</li>
+        <li><strong>Anti-move.</strong> Default to "multi-region active-active strong consistency" without a per-dataset CAP audit. Some datasets cannot afford it; treating them all uniformly forces the worst latency on every dataset.</li>
+        <li><strong>Scenarios.</strong> Multi-region pages (TBD — first canonical to be authored).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Precedence -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Precedence: Which Bottleneck Do You Fix First?</h2>
+      <p>Real systems hit several at once. Three rules of thumb for ordering:</p>
+
+      <ol>
+        <li><strong>Fix the one that violates the most-load-bearing NFR.</strong> If the latency SLO is the gating contract (user-facing real-time UI), fix latency bottlenecks before cost bottlenecks. If the cost SLO is the gating contract (a budget-bound batch system), fix cost first.</li>
+        <li><strong>Fix the bottleneck whose move <em>also</em> reveals downstream bottlenecks.</strong> Adding a queue (for backlog growth) reveals the consumer-throughput bottleneck that was hidden by the synchronous chain. Adding a cache (for read latency) reveals the stampede bottleneck that didn't exist before. Sequence so you don't repeatedly redesign.</li>
+        <li><strong>Fix the bottleneck whose <em>not</em>-fixing breaks the system, before the one whose not-fixing degrades it.</strong> Backlog growth eventually fails (out of memory). Hot key degrades (one node slow but functional). Backlog first.</li>
+      </ol>
+
+      <p>Common multi-bottleneck patterns and the canonical order:</p>
+
+      <ul>
+        <li><strong>Read-heavy power-law.</strong> <a href="#hot-key">Hot key</a> first (single-flight + replication), then <a href="#memory-capacity-bound">memory-capacity</a> (tier the long tail), then <a href="#stampede">stampede</a> (jitter + refresh-ahead). Solving hot-key first is the unblocker.</li>
+        <li><strong>Write-burst with strict latency.</strong> <a href="#backlog-growth">Backlog</a> first (queue + backpressure), then <a href="#disk-io-bound">disk-IO</a> (LSM + batched fsync), then <a href="#index-write-amp">index amp</a> (drop or async).</li>
+        <li><strong>Multi-region active-active.</strong> <a href="#cross-region">Cross-region consistency</a> first (per-dataset CAP audit), then <a href="#cold-start">cold-start</a> in standby region, then <a href="#fanout-asymmetry">fanout</a> (region-local materializations).</li>
+        <li><strong>Streaming aggregation at scale.</strong> <a href="#cardinality-explosion">Cardinality</a> first (sketch), then <a href="#hot-partition">hot-partition</a> (key salting), then <a href="#tail-latency">tail-latency</a> in the merge step.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- NFR matrix -->
+  <section class="section">
+    <div class="container">
+      <h2>NFR-to-Bottleneck Index</h2>
+      <p>The reverse lookup: when an NFR is failing, which bottlenecks could be the cause? Use this during S0 to anticipate which bottlenecks each NFR could surface, and during S5 to narrow diagnosis.</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr><th>NFR violated</th><th>Likely bottlenecks (in order of frequency)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Latency (p99 high)</strong></td><td><a href="#tail-latency">Tail-latency amplification</a>, <a href="#network-rtt-bound">network-RTT</a>, <a href="#stampede">stampede</a>, <a href="#hot-key">hot key</a>, <a href="#cold-start">cold start</a>, <a href="#cross-region">cross-region</a>, <a href="#lock-contention">lock contention</a></td></tr>
+          <tr><td><strong>Throughput (QPS plateau)</strong></td><td><a href="#hot-partition">Hot partition</a>, <a href="#coordinator-bottleneck">coordinator</a>, <a href="#disk-io-bound">disk-IO</a>, <a href="#memory-bandwidth-bound">memory-bandwidth</a>, <a href="#compute-bound">compute</a>, <a href="#index-write-amp">index write-amp</a>, <a href="#lock-contention">lock contention</a></td></tr>
+          <tr><td><strong>Cost ($/req or $/GB high)</strong></td><td><a href="#network-bandwidth-bound">Egress</a>, <a href="#memory-capacity-bound">memory capacity</a>, <a href="#cardinality-explosion">cardinality</a>, <a href="#index-write-amp">index amp</a>, <a href="#fanout-asymmetry">fanout</a></td></tr>
+          <tr><td><strong>Availability (uptime)</strong></td><td><a href="#retry-storm">Retry storm</a>, <a href="#stampede">stampede</a>, <a href="#backlog-growth">backlog growth</a>, <a href="#coordinator-bottleneck">coordinator</a>, <a href="#connection-saturation">connection saturation</a></td></tr>
+          <tr><td><strong>Consistency (RYW / linearizable)</strong></td><td><a href="#cross-region">Cross-region</a>, <a href="#coordinator-bottleneck">coordinator</a> (often the trade), <a href="#fanout-asymmetry">fanout asymmetry</a> (replicas lag)</td></tr>
+          <tr><td><strong>Durability (RPO &gt; 0)</strong></td><td><a href="#disk-io-bound">Disk-IO</a> (sync writes blocked), <a href="#backlog-growth">backlog</a> (in-memory loss on crash)</td></tr>
+          <tr><td><strong>Cardinality / scale</strong></td><td><a href="#cardinality-explosion">Cardinality explosion</a>, <a href="#memory-capacity-bound">memory capacity</a>, <a href="#index-write-amp">index amp</a></td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- Cross-references -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="access-patterns.html">Access Patterns</a> — the input-shape taxonomy. Bottlenecks describe what saturates; access patterns describe the load shape that causes saturation. Power-law (access pattern) → hot key (bottleneck).</li>
+        <li><a href="failure-modes.html">Failure Modes</a> — what breaks under stress. Overlapping with stampede / retry-storm / backlog (which appear in both); failure-modes covers <em>abnormal</em> failure, bottlenecks cover <em>steady-state saturation</em>.</li>
+        <li><a href="../design-moves/index.html">Design Moves</a> — the trigger→mechanism catalog. Each bottleneck's "first move" links to the design-moves SoT for the move's full mechanism.</li>
+        <li><a href="cross-cutting.html">Cross-Cutting Concerns</a> — security, privacy, DR, capacity, subsetting, cells, push, edge. Often shape the design but rarely <em>are</em> the bottleneck per se.</li>
+        <li><a href="../back-of-envelope.html">Back-of-Envelope</a> — the hardware constants used in every signal calculation here.</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

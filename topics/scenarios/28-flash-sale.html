@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flash Sale: 10x Traffic Spike with Limited Inventory — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Flash Sale: 10x Traffic Spike with Limited Inventory</h1>
+      <p class="hero-subtitle">100,000 requests per second, 100 limited-quantity items, 10 million eager buyers. The system must not crash, must not oversell, and must be fair. Walk through the architecture that makes it work.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You run an e-commerce platform. Marketing has announced a flash sale starting tomorrow at noon: 100 products at deep discounts, each limited to 1,000 units. The sale runs for 30 minutes or until items sell out (whichever comes first). It has been promoted heavily &mdash; 10 million users have registered for sale reminders.</p>
+
+      <div>
+        <h3>The Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Normal</th><th>Flash Sale Peak</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Total requests/sec</td><td>10,000</td><td>100,000</td></tr>
+              <tr><td>Product page views/sec</td><td>7,000</td><td>80,000</td></tr>
+              <tr><td>Add-to-cart operations/sec</td><td>2,000</td><td>15,000</td></tr>
+              <tr><td>Checkout attempts/sec</td><td>1,000</td><td>5,000</td></tr>
+              <tr><td>App servers</td><td>20</td><td>Need: 200</td></tr>
+              <tr><td>DB write capacity</td><td colspan="2">10,000 writes/sec (max)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>The Constraints</h3>
+        <ul>
+          <li><strong>Must not crash:</strong> The site must stay up for the full 30 minutes. Non-sale pages (account, order history, customer support) must also work.</li>
+          <li><strong>Must not oversell:</strong> If an item has 1,000 units, exactly 1,000 orders can succeed. Not 1,001. Not 999 (unless genuinely unclaimed). Inventory must be atomically decremented.</li>
+          <li><strong>Must be fair:</strong> First-come, first-served. A user who clicks "Buy" at 12:00:01 should get the item before a user who clicks at 12:00:02. No one should get an unfair advantage from retrying or using bots (within reason).</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Inventory Math</h3>
+        <pre class="line-numbers"><code class="language-text">Total inventory: 100 items x 1,000 units = 100,000 units
+Checkout attempts: 5,000/sec x 30 min = 9,000,000 attempts
+Successful checkouts: 100,000 (at most)
+Failure rate: (9,000,000 - 100,000) / 9,000,000 = 98.9%
+
+98.9% of checkout attempts will fail because the item is sold out.
+These MUST fail fast — not after a slow DB roundtrip.
+Every millisecond spent on a doomed checkout is wasted capacity.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe-math">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Compute Requirements</h3>
+        <pre class="line-numbers"><code class="language-text">Normal capacity: 20 app servers x 500 req/sec each = 10,000 req/sec
+Flash sale requirement: 100,000 req/sec
+Servers needed: 100,000 / 500 = 200 app servers
+
+Auto-scaling from 20 to 200 servers:
+  Cloud provider VM boot time: ~60 seconds
+  Container (Kubernetes): ~10-30 seconds
+  But: 180 new instances need to:
+    - Pull container image
+    - Start application
+    - Warm JVM / establish DB connections
+    - Pass health checks
+  Realistic time: 3-5 minutes
+
+Those first 3-5 minutes:
+  20 servers handling 100,000 req/sec = 5,000 req/sec each
+  Normal capacity per server: 500 req/sec
+  Overload factor: 10x
+  Result: servers crash, 90% of requests fail</code></pre>
+      </div>
+
+      <div>
+        <h3>Database Write Capacity</h3>
+        <pre class="line-numbers"><code class="language-text">Normal write load:
+  Cart operations: 2,000/sec
+  Checkout (order creation + inventory update): 1,000/sec
+  Total: 3,000 writes/sec. DB capacity: 10,000. Utilization: 30%.
+
+Flash sale write load:
+  Cart operations: 15,000/sec
+  Checkout: 5,000/sec
+  Total: 20,000 writes/sec
+  DB capacity: 10,000 writes/sec
+  Overload: 2x
+
+The database cannot handle the raw write load.
+Even if servers can handle the traffic, the DB becomes the bottleneck.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Read Amplification</h3>
+        <pre class="line-numbers"><code class="language-text">80,000 product page views/sec, but only 100 products in the sale.
+  Average: 800 views/sec per product.
+  Hottest item: potentially 5,000-10,000 views/sec (Zipf distribution).
+
+Without caching: 80,000 DB reads/sec for 100 products.
+  DB read capacity: 20,000 reads/sec (with replicas). Overwhelmed.
+
+With caching: 100 product pages cached. Hit rate: ~100%.
+  DB reads for product pages: ~0/sec.
+  Caching is essential.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>The Naive Design: Hope for the Best</h2>
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-text">Plan: Rely on auto-scaling. Every request goes through the normal path.
+
+  User → Load Balancer → App Server → PostgreSQL
+                                     (reads AND writes)
+
+Checkout flow:
+  1. Start DB transaction
+  2. SELECT quantity FROM inventory WHERE product_id = 123 FOR UPDATE
+  3. If quantity > 0: UPDATE inventory SET quantity = quantity - 1
+  4. INSERT INTO orders (user_id, product_id, ...)
+  5. Process payment (external API call, ~500ms)
+  6. COMMIT transaction
+
+Problems with this approach:
+  - Step 2: FOR UPDATE takes a row lock. With 5,000 concurrent checkouts
+    for the same product, 4,999 of them wait on the lock.
+  - Step 5: Payment processing inside the transaction holds the lock for 500ms.
+    Lock hold time: 500ms. Throughput: ~2 orders/sec per product.
+    For 1,000 units: 1,000 / 2 = 500 seconds = 8+ minutes to sell out ONE item.
+  - Auto-scaling lag: first 3-5 minutes overwhelm 20 servers.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What Actually Happens</h3>
+        <pre class="line-numbers"><code class="language-text">T=0 (noon):     Sale starts. 100,000 req/sec hit 20 servers.
+T=0-5s:         Servers at 10x capacity. Response times go from 100ms to 10s.
+T=5-10s:        Thread pools full. 503 errors for 90% of users.
+T=10-30s:       DB connection pools exhausted. Even non-sale pages fail.
+T=1-3min:       Auto-scaler starts spinning up new instances.
+T=3-5min:       New instances coming online, but DB is the bottleneck.
+                Lock contention on inventory rows = ~2 orders/sec/product.
+T=5-10min:      Traffic starts subsiding (users give up).
+                Social media fills with "worst sale ever" posts.
+
+Result: Most users see errors. Few orders succeed. Brand damage.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Pre-Scaling                                      -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration1">
+    <div class="container">
+      <h2>Iteration 1: Pre-Scaling</h2>
+      <p>The sale is announced 24 hours in advance. You know exactly when the spike will happen. Auto-scaling is for unpredictable load. For a known event, <strong>pre-scale</strong>.</p>
+
+      <div class="full-width">
+        <h3>What to Pre-Scale</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Resource</th><th>Normal</th><th>Pre-Scale To</th><th>Lead Time</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>App servers</td><td>20</td><td>200</td><td>T-2 hours</td></tr>
+              <tr><td>Cache (Redis) memory</td><td>10 GB</td><td>20 GB</td><td>T-1 hour</td></tr>
+              <tr><td>DB read replicas</td><td>4</td><td>8</td><td>T-4 hours (replicas need to sync)</td></tr>
+              <tr><td>CDN capacity</td><td>Normal</td><td>Pre-warm sale product images</td><td>T-6 hours</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Pre-Warm the Caches</h3>
+        <pre class="line-numbers"><code class="language-python"># Run at T-1 hour: load all sale products into cache
+def pre_warm_sale_cache(sale_products):
+    """
+    Load sale product pages into Redis BEFORE the sale starts.
+    This ensures 100% cache hit rate from the first request.
+    """
+    for product in sale_products:
+        # Cache the product page data
+        key = f"product:{product['id']}"
+        redis.setex(key, 3600, json.dumps(product))  # 1 hour TTL
+
+        # Cache the inventory count
+        inv_key = f"inventory:{product['id']}"
+        redis.set(inv_key, product['quantity'])  # 1000 units
+
+    print(f"Pre-warmed {len(sale_products)} products")
+
+# Also pre-warm: sale landing page, category pages, static assets</code></pre>
+      </div>
+
+      <div>
+        <h3>Cost</h3>
+        <pre class="line-numbers"><code class="language-text">Extra compute cost:
+  180 additional app servers x 2 hours x $0.10/hour = $36
+  4 additional DB read replicas x 6 hours x $0.50/hour = $12
+  Extra Redis memory: negligible
+
+Total: ~$50-100 for the pre-scaling
+
+Revenue from a successful flash sale: $50K-500K+
+
+The ROI is obvious. Pre-scale.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Redis Inventory                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration2">
+    <div class="container">
+      <h2>Iteration 2: Atomic Inventory in Redis</h2>
+      <p>The database bottleneck for checkout is the inventory row lock. Every checkout attempt needs to read and decrement the inventory count. With 5,000 concurrent checkouts/sec for the same product, the database lock becomes a serialization point.</p>
+
+      <p class="full-width">Solution: move inventory to Redis. Redis is single-threaded and processes commands sequentially, which means atomic operations are trivially safe &mdash; and extremely fast (100,000+ operations/sec per instance).</p>
+
+      <div>
+        <h3>The DECR Trick</h3>
+        <pre class="line-numbers"><code class="language-python"># Redis-based inventory management
+def attempt_checkout(user_id, product_id):
+    inv_key = f"inventory:{product_id}"
+
+    # Atomically decrement inventory
+    # DECR returns the NEW value after decrementing
+    remaining = redis.decr(inv_key)
+
+    if remaining >= 0:
+        # Success! We got a unit.
+        # remaining=999 means we were the 1st buyer (1000 → 999)
+        # remaining=0 means we were the last (1 → 0)
+        return {"status": "reserved", "remaining": remaining}
+    else:
+        # remaining is negative — we went below 0.
+        # Undo the decrement (increment back).
+        redis.incr(inv_key)
+        return {"status": "sold_out"}
+
+# How it works, step by step:
+#
+# Redis key "inventory:12345" = 1000
+#
+# T=0.000s: User A: DECR inventory:12345 → 999 (>= 0, success!)
+# T=0.001s: User B: DECR inventory:12345 → 998 (>= 0, success!)
+# ...
+# T=0.050s: User 1000: DECR inventory:12345 → 0 (>= 0, success! Last one.)
+# T=0.051s: User 1001: DECR inventory:12345 → -1 (< 0, sold out!)
+#           User 1001: INCR inventory:12345 → 0 (undo)
+# T=0.052s: User 1002: DECR inventory:12345 → -1 (< 0, sold out!)
+#           User 1002: INCR inventory:12345 → 0 (undo)</code></pre>
+      </div>
+
+      <div>
+        <h3>Why This Is Fast</h3>
+        <pre class="line-numbers"><code class="language-text">PostgreSQL with row locks:
+  Lock acquisition: ~0.1ms
+  Disk I/O for UPDATE: ~1-5ms
+  Payment processing in transaction: ~500ms (if included)
+  Lock hold time: 1-500ms depending on design
+  Throughput: 2-1,000 orders/sec per product (serial)
+
+Redis DECR:
+  Network round trip to Redis: ~0.5ms
+  Redis command execution: ~0.001ms (in-memory, single-threaded)
+  No disk I/O, no locks, no transactions
+  Throughput: 100,000+ operations/sec
+
+  Sold-out check: 0.5ms (one Redis roundtrip)
+  No DB involvement at all for sold-out items.
+
+  98.9% of checkouts (sold-out) return in 0.5ms instead of 5ms+.
+  Massive reduction in system load.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>But What About Durability?</h3>
+        <p>Redis is in-memory. If it crashes, inventory state is lost. Solutions:</p>
+
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Strategy</th><th>How</th><th>Data Loss Risk</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>AOF (Append-Only File)</td><td>Redis writes every command to disk. <code>appendfsync everysec</code></td><td>Up to 1 second of operations</td></tr>
+              <tr><td>Redis Cluster</td><td>Replicate to secondary nodes. Automatic failover.</td><td>Commands in-flight during failover (milliseconds)</td></tr>
+              <tr><td>DB reconciliation</td><td>Write confirmed orders to PostgreSQL asynchronously. After sale, reconcile Redis count with DB orders.</td><td>None (DB is the eventual source of truth)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python"># Complete checkout flow with Redis inventory + async DB write
+def checkout(user_id, product_id):
+    # Step 1: Check inventory in Redis (fast path)
+    inv_key = f"inventory:{product_id}"
+    remaining = redis.decr(inv_key)
+
+    if remaining < 0:
+        redis.incr(inv_key)  # Undo
+        return {"status": "sold_out", "message": "This item is no longer available."}
+
+    # Step 2: Generate order ID
+    order_id = generate_uuid()
+
+    # Step 3: Enqueue the order for async processing
+    order = {
+        "order_id": order_id,
+        "user_id": user_id,
+        "product_id": product_id,
+        "reserved_at": time.time(),
+        "status": "pending"
+    }
+    message_queue.publish("orders", json.dumps(order))
+
+    # Step 4: Return immediately to the user
+    return {
+        "status": "reserved",
+        "order_id": order_id,
+        "message": "Your order is being processed. You'll receive confirmation shortly."
+    }
+    # User sees: "Order placed! Confirmation coming in a few seconds."
+    # Actual DB write + payment happens asynchronously in a worker.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Queue-Based Checkout                             -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration3">
+    <div class="container">
+      <h2>Iteration 3: Queue-Based Load Leveling</h2>
+      <p>The checkout path has three expensive operations: inventory decrement (now in Redis, fast), payment processing (external API, ~500ms), and order creation in the database (5-10ms). The payment and DB write don't need to happen synchronously with the user's request.</p>
+
+      <div class="full-width">
+        <h3>Synchronous vs Asynchronous Checkout</h3>
+        <pre class="line-numbers"><code class="language-text">Synchronous checkout (traditional):
+  User clicks "Buy"
+  → Reserve inventory (Redis: 0.5ms)
+  → Process payment (Stripe API: 500ms)
+  → Write order to DB (10ms)
+  → Return confirmation
+  Total: ~510ms per checkout. Thread held for 510ms.
+
+  At 5,000 checkouts/sec with 510ms processing:
+    Threads needed: 5,000 × 0.51 = 2,550
+    This is feasible but expensive.
+
+Asynchronous checkout:
+  User clicks "Buy"
+  → Reserve inventory (Redis: 0.5ms)
+  → Enqueue order (message queue: 1ms)
+  → Return "Processing..." (HTTP 202 Accepted)
+  Total: ~1.5ms per checkout. Thread freed almost instantly.
+
+  At 5,000 checkouts/sec with 1.5ms processing:
+    Threads needed: 5,000 × 0.0015 = 7.5
+    Virtually no thread pool pressure.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>The Worker Pipeline</h3>
+        <svg viewBox="0 0 700 420" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-pipe" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,3.5 L0,7z" fill="#64748b"/>
+            </marker>
+          </defs>
+
+          <!-- Incoming rate label -->
+          <text x="350" y="18" text-anchor="middle" font-size="14" font-weight="bold" fill="#334155">5,000 orders/sec</text>
+          <line x1="350" y1="24" x2="350" y2="50" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+
+          <!-- Order Queue -->
+          <rect x="175" y="50" width="350" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="68" text-anchor="middle" font-weight="bold" fill="#2563eb">Order Queue (Kafka)</text>
+          <text x="350" y="84" text-anchor="middle" font-size="11" fill="#64748b">Partition by product_id</text>
+
+          <!-- Fan-out arrows -->
+          <line x1="250" y1="94" x2="130" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="350" y1="94" x2="350" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="450" y1="94" x2="570" y2="140" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+
+          <!-- Worker 1 -->
+          <rect x="55" y="140" width="150" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="130" y="165" text-anchor="middle" font-weight="bold" fill="#334155">Worker 1</text>
+
+          <!-- Worker 2 -->
+          <rect x="275" y="140" width="150" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="165" text-anchor="middle" font-weight="bold" fill="#334155">Worker 2</text>
+
+          <!-- Worker N -->
+          <rect x="495" y="140" width="150" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="570" y="165" text-anchor="middle" font-weight="bold" fill="#334155">Worker N</text>
+
+          <!-- Worker label -->
+          <text x="130" y="198" text-anchor="middle" font-size="11" fill="#64748b">Process at DB rate</text>
+          <text x="350" y="198" text-anchor="middle" font-size="11" fill="#64748b">Process at DB rate</text>
+          <text x="570" y="198" text-anchor="middle" font-size="11" fill="#64748b">Process at DB rate</text>
+
+          <!-- Arrows to payment -->
+          <line x1="130" y1="204" x2="130" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="350" y1="204" x2="350" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="570" y1="204" x2="570" y2="230" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+
+          <!-- Payment API boxes -->
+          <rect x="65" y="230" width="130" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="255" text-anchor="middle" fill="#2563eb">Payment API</text>
+
+          <rect x="285" y="230" width="130" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="255" text-anchor="middle" fill="#2563eb">Payment API</text>
+
+          <rect x="505" y="230" width="130" height="40" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="255" text-anchor="middle" fill="#2563eb">Payment API</text>
+
+          <!-- Arrows to DB -->
+          <line x1="130" y1="270" x2="130" y2="300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="350" y1="270" x2="350" y2="300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+          <line x1="570" y1="270" x2="570" y2="300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-pipe)"/>
+
+          <!-- PostgreSQL -->
+          <rect x="100" y="300" width="500" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="350" y="327" text-anchor="middle" font-weight="bold" fill="#2563eb">PostgreSQL &mdash; Write Order</text>
+
+          <!-- Annotation box -->
+          <rect x="50" y="360" width="600" height="50" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4"/>
+          <text x="350" y="378" text-anchor="middle" font-size="12" fill="#334155">Workers process at DB's sustainable rate (10,000 writes/sec).</text>
+          <text x="350" y="396" text-anchor="middle" font-size="12" fill="#334155">Queue absorbs the spike. Only ~100K orders reach the queue (98.9% filtered by Redis).</text>
+        </svg>
+        <p>But wait &mdash; 98.9% of those 9M checkout attempts already failed at the Redis inventory check. Only ~100,000 orders actually make it to the queue. Those process in: 100,000 / 10,000 = 10 seconds. The queue drains almost instantly for successful orders.</p>
+      </div>
+
+      <div>
+        <h3>User Experience</h3>
+        <pre class="line-numbers"><code class="language-text">Happy path (got the item):
+  T=0ms:     User clicks "Buy Now"
+  T=1.5ms:   Response: "Order placed! Confirmation coming shortly."
+             Page shows: order status = "Processing"
+  T=200ms:   (Optional) WebSocket push: "Payment processing..."
+  T=700ms:   Worker completes payment + DB write
+             WebSocket push: "Order confirmed! #ORD-12345"
+
+Total user wait for confirmation: ~1 second.
+User perception: instant.
+
+Sold-out path:
+  T=0ms:     User clicks "Buy Now"
+  T=0.5ms:   Redis DECR returns -1. Sold out.
+  T=1ms:     Response: "Sorry, this item is sold out."
+
+Total: 1 millisecond. No queue, no DB hit, no wasted resources.</code></pre>
+      </div>
+
+      <div>
+        <h3>Handling Payment Failures</h3>
+        <pre class="line-numbers"><code class="language-python"># Worker: process orders from the queue
+def process_order(order):
+    try:
+        # Step 1: Process payment
+        payment_result = payment_gateway.charge(
+            user_id=order["user_id"],
+            amount=get_product_price(order["product_id"]),
+            idempotency_key=order["order_id"]  # Prevent double-charge on retry
+        )
+
+        if payment_result["status"] == "success":
+            # Step 2: Write to DB
+            db.execute("""
+                INSERT INTO orders (id, user_id, product_id, status, paid_at)
+                VALUES (%s, %s, %s, 'confirmed', NOW())
+            """, (order["order_id"], order["user_id"], order["product_id"]))
+
+            # Step 3: Notify user
+            notify_user(order["user_id"], "Order confirmed!", order["order_id"])
+        else:
+            # Payment failed — release the inventory back
+            redis.incr(f"inventory:{order['product_id']}")
+
+            # Notify user
+            notify_user(order["user_id"], "Payment failed. Item released.",
+                       order["order_id"])
+
+    except Exception as e:
+        # Transient error — retry (the queue handles retries)
+        raise RetryableError(f"Order processing failed: {e}")</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 4: Graceful Degradation                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration4">
+    <div class="container">
+      <h2>Iteration 4: Graceful Degradation</h2>
+      <p>Even with pre-scaling, some requests might exceed capacity during the initial surge. Prioritize the critical path (sale checkout) over non-essential features.</p>
+
+      <div class="full-width">
+        <h3>Priority Tiers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Priority</th><th>Feature</th><th>During Sale</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>P0 (Critical)</td><td>Sale product pages, cart, checkout</td><td>Full functionality. All resources allocated.</td></tr>
+              <tr><td>P1 (Important)</td><td>Non-sale product pages, user account</td><td>Served from cache. No DB writes.</td></tr>
+              <tr><td>P2 (Nice-to-have)</td><td>Recommendations, "You might like", reviews</td><td>Disabled entirely. Return empty.</td></tr>
+              <tr><td>P3 (Deferrable)</td><td>Analytics tracking, email triggers, search indexing</td><td>Queued for later processing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Feature Flags for Degradation</h3>
+        <pre class="line-numbers"><code class="language-python"># Configuration: toggle features based on system load
+DEGRADATION_CONFIG = {
+    "level_0": {  # Normal operation
+        "recommendations": True,
+        "reviews": True,
+        "search_suggestions": True,
+        "analytics_realtime": True,
+    },
+    "level_1": {  # Elevated traffic (> 50K req/sec)
+        "recommendations": False,  # Saves ~20% of backend calls
+        "reviews": True,
+        "search_suggestions": True,
+        "analytics_realtime": False,  # Queue analytics events
+    },
+    "level_2": {  # Flash sale peak (> 80K req/sec)
+        "recommendations": False,
+        "reviews": False,           # Serve cached reviews only
+        "search_suggestions": False, # Static suggestions
+        "analytics_realtime": False,
+    },
+    "level_3": {  # Emergency (> 95% capacity)
+        "recommendations": False,
+        "reviews": False,
+        "search_suggestions": False,
+        "analytics_realtime": False,
+        "non_sale_pages": "cache_only",  # No DB reads for non-sale pages
+    },
+}
+
+def get_degradation_level():
+    current_qps = metrics.get("request_rate")
+    cpu_usage = metrics.get("avg_cpu_percent")
+
+    if cpu_usage > 90 or current_qps > 95000:
+        return "level_3"
+    elif current_qps > 80000:
+        return "level_2"
+    elif current_qps > 50000:
+        return "level_1"
+    return "level_0"</code></pre>
+      </div>
+
+      <div>
+        <h3>Static Content Serving</h3>
+        <pre class="line-numbers"><code class="language-text">During the sale, product pages for the 100 sale items
+can be served as pre-rendered static HTML:
+
+  - Generate static HTML for each sale product at T-1 hour
+  - Upload to CDN (CloudFront, Fastly, etc.)
+  - CDN serves from edge cache: ~5ms response time globally
+  - No app server or DB involvement for product page views
+
+  80,000 product page views/sec → served entirely from CDN
+  App servers only handle: cart (15K/sec) + checkout (5K/sec)
+  = 20,000 req/sec (vs 100,000 without CDN offloading)
+  App servers needed: 20,000 / 500 = 40 (instead of 200)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anti-Abuse                                                    -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="anti-abuse">
+    <div class="container">
+      <h2>Iteration 5: Anti-Abuse and Fairness</h2>
+      <p>Flash sales attract bots and resellers who try to buy all available inventory before real customers can. Fairness measures are essential.</p>
+
+      <div>
+        <h3>Rate Limiting Per User</h3>
+        <pre class="line-numbers"><code class="language-python"># Rate limit checkout attempts: max 1 per product per user per 5 seconds
+def checkout_with_rate_limit(user_id, product_id):
+    rate_key = f"rate:{user_id}:{product_id}"
+
+    # Redis: SET NX with TTL = rate limit window
+    allowed = redis.set(rate_key, "1", nx=True, ex=5)
+
+    if not allowed:
+        return {
+            "status": "rate_limited",
+            "message": "Please wait a few seconds before trying again.",
+            "retry_after": 5
+        }
+
+    return attempt_checkout(user_id, product_id)</code></pre>
+      </div>
+
+      <div>
+        <h3>Quantity Limits</h3>
+        <pre class="line-numbers"><code class="language-python"># Limit: max 2 units of any sale item per user
+def checkout_with_limits(user_id, product_id, quantity=1):
+    limit_key = f"purchased:{user_id}:{product_id}"
+
+    # Check how many they've already bought
+    current = int(redis.get(limit_key) or 0)
+
+    if current + quantity > 2:
+        return {"status": "limit_exceeded",
+                "message": "Maximum 2 units per customer."}
+
+    # Attempt checkout
+    result = attempt_checkout(user_id, product_id)
+
+    if result["status"] == "reserved":
+        # Record the purchase count
+        redis.incr(limit_key)
+        redis.expire(limit_key, 86400)  # Keep for 24 hours
+
+    return result</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Virtual Waiting Room</h3>
+        <p>Instead of letting all 10 million users hit the site simultaneously at noon, put them in a queue and release them gradually:</p>
+
+        <pre class="line-numbers"><code class="language-text">T-5min:  Users start arriving at the sale page.
+         They see: "Sale starts in 5:00. You're in line."
+         The page is a static HTML page served from CDN — zero server load.
+
+T=0:     Sale starts. Users are assigned random positions in the queue.
+         (Random, not first-come, to prevent "refresh at 11:59:59" bots.)
+
+T=0s:    Release first 5,000 users into the sale.
+         They can browse and checkout.
+
+T=1s:    Release next 5,000 users.
+
+T=2s:    Release next 5,000.
+         ...and so on.
+
+Rate: 5,000 users/sec × 20 seconds = 100,000 users admitted.
+The remaining 9.9M see: "You're in line. Estimated wait: 2 minutes."
+Most items sell out in 20-60 seconds. Late arrivals are told
+"The sale is over" — no wasted server capacity.</code></pre>
+
+        <pre class="line-numbers"><code class="language-python"># Virtual waiting room implementation
+class WaitingRoom:
+    def __init__(self, release_rate=5000):
+        self.release_rate = release_rate  # users per second
+        self.queue = []
+        self.admitted = set()
+
+    def join(self, user_id):
+        """User arrives at the sale page."""
+        position = random.random()  # Random position (not arrival order)
+        redis.zadd("waiting_room", {user_id: position})
+        rank = redis.zrank("waiting_room", user_id)
+        estimated_wait = rank / self.release_rate
+        return {"position": rank, "estimated_wait_seconds": estimated_wait}
+
+    def release_batch(self):
+        """Called every second by a scheduler."""
+        # Pop the next batch of users from the sorted set
+        users = redis.zpopmin("waiting_room", self.release_rate)
+        for user_id, _ in users:
+            # Give them a time-limited admission token
+            token = generate_token(user_id, ttl=300)  # 5 min to complete purchase
+            redis.setex(f"admitted:{user_id}", 300, token)
+            notify_user(user_id, "It's your turn! You have 5 minutes to shop.")
+
+    def is_admitted(self, user_id):
+        """Check if user has been released from the waiting room."""
+        return redis.exists(f"admitted:{user_id}")</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design: The Complete Architecture</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 700 780" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-arch" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,3.5 L0,7z" fill="#64748b"/>
+            </marker>
+          </defs>
+
+          <!-- 10M Users -->
+          <rect x="250" y="5" width="200" height="36" rx="18" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="28" text-anchor="middle" font-weight="bold" fill="#2563eb">10M Users</text>
+          <line x1="350" y1="41" x2="350" y2="60" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Virtual Waiting Room -->
+          <rect x="200" y="60" width="300" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="78" text-anchor="middle" font-weight="bold" fill="#2563eb">Virtual Waiting Room</text>
+          <text x="350" y="94" text-anchor="middle" font-size="11" fill="#64748b">CDN-served static page</text>
+          <line x1="350" y1="104" x2="350" y2="120" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <text x="510" y="118" font-size="11" fill="#16a34a" font-weight="bold">5,000 users/sec admitted</text>
+
+          <!-- CDN / Edge Cache -->
+          <rect x="200" y="120" width="300" height="44" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="138" text-anchor="middle" font-weight="bold" fill="#334155">CDN / Edge Cache</text>
+          <text x="350" y="154" text-anchor="middle" font-size="11" fill="#64748b">Sale product pages: 80K/sec</text>
+          <line x1="350" y1="164" x2="350" y2="180" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Load Balancer -->
+          <rect x="200" y="180" width="300" height="44" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="198" text-anchor="middle" font-weight="bold" fill="#334155">Load Balancer</text>
+          <text x="350" y="214" text-anchor="middle" font-size="11" fill="#64748b">200 pre-scaled app servers</text>
+
+          <!-- Fan-out arrows to 3 services -->
+          <line x1="240" y1="224" x2="130" y2="260" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <line x1="350" y1="224" x2="350" y2="260" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <line x1="460" y1="224" x2="570" y2="260" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Product service -->
+          <rect x="55" y="260" width="150" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="130" y="276" text-anchor="middle" font-weight="bold" fill="#2563eb">Product</text>
+          <text x="130" y="292" text-anchor="middle" font-size="10" fill="#64748b">(cache)</text>
+
+          <!-- Cart service -->
+          <rect x="275" y="260" width="150" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="276" text-anchor="middle" font-weight="bold" fill="#2563eb">Cart</text>
+          <text x="350" y="292" text-anchor="middle" font-size="10" fill="#64748b">(Redis)</text>
+
+          <!-- Checkout service -->
+          <rect x="495" y="260" width="150" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="570" y="276" text-anchor="middle" font-weight="bold" fill="#2563eb">Checkout</text>
+          <text x="570" y="292" text-anchor="middle" font-size="10" fill="#64748b">(Redis + queue)</text>
+
+          <!-- Arrows down to Redis -->
+          <line x1="130" y1="300" x2="130" y2="330" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <line x1="350" y1="300" x2="350" y2="330" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+          <line x1="570" y1="300" x2="570" y2="330" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Redis Cache Cluster -->
+          <rect x="55" y="330" width="590" height="90" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="350" y="352" text-anchor="middle" font-weight="bold" font-size="14" fill="#ef4444">Redis Cache Cluster</text>
+          <text x="200" y="374" text-anchor="middle" font-size="11" fill="#334155">Product data (pre-warmed)</text>
+          <text x="200" y="392" text-anchor="middle" font-size="11" fill="#334155">Rate limits &amp; session data</text>
+          <text x="500" y="374" text-anchor="middle" font-size="11" fill="#334155">Inventory counts (atomic DECR)</text>
+          <text x="500" y="392" text-anchor="middle" font-size="11" fill="#334155">Waiting room state</text>
+
+          <!-- Arrow to Kafka -->
+          <line x1="350" y1="420" x2="350" y2="450" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Message Queue -->
+          <rect x="175" y="450" width="350" height="44" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="468" text-anchor="middle" font-weight="bold" fill="#2563eb">Message Queue (Kafka)</text>
+          <text x="350" y="484" text-anchor="middle" font-size="11" fill="#64748b">Confirmed orders only</text>
+
+          <!-- Arrow to Workers -->
+          <line x1="350" y1="494" x2="350" y2="520" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- Order Workers -->
+          <rect x="175" y="520" width="350" height="64" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="542" text-anchor="middle" font-weight="bold" fill="#334155">Order Workers (x20)</text>
+          <text x="350" y="558" text-anchor="middle" font-size="11" fill="#64748b">Payment processing</text>
+          <text x="350" y="574" text-anchor="middle" font-size="11" fill="#64748b">DB writes &amp; email confirmation</text>
+
+          <!-- Arrow to PostgreSQL -->
+          <line x1="350" y1="584" x2="350" y2="610" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-arch)"/>
+
+          <!-- PostgreSQL -->
+          <rect x="175" y="610" width="350" height="54" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="350" y="632" text-anchor="middle" font-weight="bold" font-size="14" fill="#2563eb">PostgreSQL</text>
+          <text x="350" y="652" text-anchor="middle" font-size="11" fill="#64748b">Orders (source of truth) &amp; inventory reconciliation</text>
+
+          <!-- Annotation: throughput -->
+          <rect x="80" y="700" width="540" height="65" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1" stroke-dasharray="4"/>
+          <text x="350" y="720" text-anchor="middle" font-size="12" font-weight="bold" fill="#16a34a">Key throughput numbers</text>
+          <text x="350" y="738" text-anchor="middle" font-size="11" fill="#334155">CDN: 80K page views/sec | Redis: 100K+ ops/sec | Queue: absorbs burst</text>
+          <text x="350" y="754" text-anchor="middle" font-size="11" fill="#334155">Workers drain at DB rate (10K writes/sec) | Only ~100K orders reach DB</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Timeline</h3>
+        <pre class="line-numbers"><code class="language-text">T-24h:   Marketing announces sale. Engineering notified.
+T-6h:    Pre-warm CDN with sale product images and static pages.
+T-4h:    Spin up additional DB read replicas.
+T-2h:    Pre-scale app servers from 20 to 200.
+T-1h:    Pre-warm Redis cache with sale product data.
+         Load inventory into Redis (100 items × 1,000 units).
+         Deploy feature flags: disable recommendations, analytics.
+T-5min:  Activate virtual waiting room. Users see countdown page.
+T=0:     Sale starts. Begin releasing users from waiting room.
+         CDN handles product page views (80K/sec, zero server load).
+         Redis handles inventory checks (5K/sec, sub-millisecond).
+         Order queue absorbs confirmed orders.
+T+2min:  Hottest items selling out. Redis returns "sold out" instantly.
+         Less traffic reaching the queue.
+T+10min: Half the items sold out. Traffic naturally declining.
+T+30min: Sale ends. All items sold or remaining inventory released.
+T+31min: Re-enable recommendations and analytics.
+         Begin scale-down (gradual, over 30 minutes).
+T+1h:    Reconcile Redis inventory with DB orders.
+         Investigate any discrepancies.
+         Send sale summary report.
+T+2h:    Scale fully back to normal (20 app servers).</code></pre>
+      </div>
+
+      <div>
+        <h3>Cost Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Item</th><th>Cost</th><th>Duration</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>180 extra app servers</td><td>$0.10/hr x 180 x 4 hrs</td><td>$72</td></tr>
+              <tr><td>4 extra DB replicas</td><td>$0.50/hr x 4 x 8 hrs</td><td>$16</td></tr>
+              <tr><td>Extra Redis capacity</td><td>$0.05/hr x 6 hrs</td><td>$0.30</td></tr>
+              <tr><td>CDN bandwidth surge</td><td>~$50 for 80K req/sec x 30min</td><td>$50</td></tr>
+              <tr><td>Kafka cluster (already exists)</td><td>$0</td><td>$0</td></tr>
+              <tr><td><strong>Total</strong></td><td></td><td><strong>~$140</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>$140 to handle a 10x traffic spike that generates $50K-500K in revenue. The alternative (letting the site crash) costs far more in lost sales, brand damage, and customer trust.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <div class="card full-width" style="padding: 2rem;">
+        <ol style="line-height: 2;">
+          <li><strong>Pre-scale for known events.</strong> Auto-scaling is for surprises. A flash sale announced 24 hours in advance is not a surprise. Scale up hours before, not minutes after.</li>
+          <li><strong>Move hot data to Redis.</strong> Inventory checks at 5,000/sec with row locks in PostgreSQL will create a serialization bottleneck. Redis DECR is atomic, in-memory, and handles 100K+ ops/sec. Use it as the real-time inventory ledger during the sale.</li>
+          <li><strong>Fail fast for sold-out items.</strong> 98.9% of checkout attempts will fail (sold out). Each one should take 0.5ms (Redis check), not 5ms (DB roundtrip) or 500ms (full checkout flow). Fast rejection preserves capacity for real orders.</li>
+          <li><strong>Decouple checkout from payment.</strong> Accept the order synchronously (1ms), process payment asynchronously (500ms). The user sees "Order placed!" instantly. The queue buffers the payment processing at the DB's sustainable rate.</li>
+          <li><strong>A virtual waiting room is a rate limiter for humans.</strong> Instead of 10M users hitting the site at once, release 5,000/sec. The system never exceeds its capacity. Users wait in a fair queue instead of experiencing crashes.</li>
+          <li><strong>Offload reads to CDN.</strong> 80% of flash sale traffic is product page views. Pre-render them as static HTML and serve from CDN. Zero app server load for the majority of traffic.</li>
+          <li><strong>Degrade gracefully under load.</strong> Disable non-essential features (recommendations, analytics, reviews) to free up resources for the critical path (browsing and checkout).</li>
+          <li><strong>Plan for reconciliation.</strong> When Redis is the real-time source of truth, reconcile with the database after the event. Check that Redis inventory counts match DB order counts. Handle any discrepancies (payment failures, race conditions).</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>Redis as a caching layer, cache pre-warming strategies, and TTL management.</p>
+        </a>
+        <a href="../rate-limiting.html" class="card topic-card">
+          <h3>Rate Limiting</h3>
+          <p>Token bucket, sliding window, and distributed rate limiting for per-user fairness controls.</p>
+        </a>
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>Queue-based load leveling, Kafka partitioning, and asynchronous order processing.</p>
+        </a>
+        <a href="../circuit-breakers.html" class="card topic-card">
+          <h3>Circuit Breakers</h3>
+          <p>Protecting downstream services during traffic spikes and graceful degradation patterns.</p>
+        </a>
+        <a href="../load-balancing.html" class="card topic-card">
+          <h3>Load Balancing</h3>
+          <p>Distributing 100K req/sec across 200 pre-scaled servers and health checking during surges.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

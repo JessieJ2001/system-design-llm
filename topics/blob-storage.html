@@ -1,0 +1,1630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Blob Storage — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="sql-vs-nosql.html">SQL vs NoSQL</a></li>
+        <li><a href="networking-fundamentals.html">Networking</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Blob Storage</h1>
+      <p class="hero-subtitle">Store and retrieve massive amounts of unstructured data &mdash; images, videos, backups, and logs &mdash; using a flat key-value namespace with an S3-like API that scales to exabytes.</p>
+      <span class="hero-meta">28 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>
+        <strong>Blob storage</strong> (also called <strong>object storage</strong>) is a data storage architecture designed for unstructured data: images, video files, application backups, log archives, machine learning datasets, and anything else that doesn't fit neatly into rows and columns. Unlike relational databases that organize data into tables with schemas, or file systems that use hierarchical directory trees, blob storage uses a <strong>flat namespace</strong> where every object is identified by a unique key (often a string that looks like a path, e.g., <code>images/2024/photo-001.jpg</code>, but there are no real directories).
+      </p>
+      <p>
+        The core abstraction is simple: each object consists of the <strong>blob</strong> (the raw bytes &mdash; could be 1 KB or 5 TB), <strong>metadata</strong> (key-value pairs like content type, creation date, custom tags), and a <strong>unique key</strong> used for retrieval. The API surface is deliberately minimal: <code>PUT</code> to upload, <code>GET</code> to download, <code>DELETE</code> to remove, and <code>LIST</code> to enumerate objects by prefix. This simplicity is what lets object stores scale to exabytes across thousands of nodes.
+      </p>
+      <p>
+        How does this differ from other storage paradigms? A <strong>file system</strong> (ext4, NTFS, NFS) provides POSIX semantics &mdash; open, seek, read, write, close &mdash; and supports in-place updates, locks, and directory hierarchies. It's optimized for small, frequently modified files. <strong>Block storage</strong> (EBS, iSCSI) exposes raw disk blocks and lets the OS layer a file system on top; it's used for databases and VMs that need low-latency random I/O. Blob storage sacrifices in-place updates and POSIX semantics in exchange for near-infinite horizontal scalability, built-in replication, and dirt-cheap per-GB pricing. If your data is "write once, read many," blob storage is almost always the right choice.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Animated Diagram: Object Upload &amp; Retrieval</h2>
+      <div class="animation-container" id="blob-animation-container">
+        <canvas id="blob-canvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+        <p class="animation-description">
+          Upload phase: client sends object to the storage service, which assigns a key and replicates across nodes. Retrieval phase: client requests by key, served from the nearest replica.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>PUT &mdash; Uploading an Object</h3>
+      <ol>
+        <li>The client sends an HTTP <code>PUT</code> request with the object key, metadata headers (content type, custom tags), and the binary payload.</li>
+        <li>The storage service front-end validates the request (authentication, authorization, quota checks) and computes a content hash (SHA-256 or MD5) for integrity verification.</li>
+        <li>The service determines placement: which storage nodes will hold the replicas. Typically 3 replicas across different failure domains (racks, availability zones, or regions).</li>
+        <li>The object is written to the primary node, then synchronously or asynchronously replicated to secondary nodes depending on the durability guarantee. S3, for instance, synchronously writes to at least 2 AZs before returning <code>200 OK</code>.</li>
+        <li>Metadata (key, size, content hash, storage class, ACL, custom metadata) is stored in a separate metadata store &mdash; often a distributed key-value store or database optimized for point lookups.</li>
+        <li>For objects larger than a threshold (typically 5-100 MB), <strong>multipart upload</strong> is used: the client splits the file into parts, uploads them in parallel, then sends a "complete" request. The service assembles the parts and creates a single logical object.</li>
+      </ol>
+
+      <h3>Multipart Upload Mechanics &mdash; Step by Step</h3>
+      <p>
+        Why does multipart upload exist? Imagine uploading a 5 GB video file over a single HTTP PUT request. If the connection drops at 4.8 GB (96% complete), you must <strong>restart the entire 5 GB upload from byte zero</strong>. On a 50 Mbps connection, that 5 GB upload takes about 13 minutes &mdash; and you just lost all of it. Multipart upload solves this by splitting the file into independently uploadable parts. If one part fails, you retry only that part, not the whole file.
+      </p>
+      <p>Here is a concrete walkthrough with a <strong>5 GB video file split into 4 parts of 1.25 GB each</strong>:</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Action</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1</strong></td>
+              <td><code>InitiateMultipartUpload</code></td>
+              <td>Client calls the API with the target key (<code>videos/concert.mp4</code>). The service returns an <strong>upload_id</strong> (e.g., <code>abc-123-xyz</code>). This upload_id ties all subsequent part uploads together. No data is transferred yet.</td>
+            </tr>
+            <tr>
+              <td><strong>2</strong></td>
+              <td>Upload parts 1&ndash;4 in parallel</td>
+              <td>
+                The client reads the file in 1.25 GB chunks and uploads each as a separate HTTP PUT:<br>
+                &bull; Part 1: bytes 0 &ndash; 1,342,177,279 (1.25 GB)<br>
+                &bull; Part 2: bytes 1,342,177,280 &ndash; 2,684,354,559<br>
+                &bull; Part 3: bytes 2,684,354,560 &ndash; 4,026,531,839<br>
+                &bull; Part 4: bytes 4,026,531,840 &ndash; 5,368,709,119<br>
+                Each part upload returns an <strong>ETag</strong> (content hash). All 4 uploads run in parallel &mdash; on a 100 Mbps connection, each 1.25 GB part takes ~100 seconds, so total wall-clock time is ~100 seconds (vs. ~400 seconds sequential).
+              </td>
+            </tr>
+            <tr>
+              <td><strong>3</strong></td>
+              <td>Part 3 fails at 600 MB &mdash; retry only part 3</td>
+              <td>
+                The connection drops while uploading Part 3. Parts 1, 2, and 4 completed successfully. The client <strong>retries only Part 3</strong> from byte 0 of that part (not byte 0 of the file). Cost of failure: re-upload 1.25 GB (one part), not 5 GB (the whole file). <strong>Without multipart: restart 5 GB. With multipart: restart 1.25 GB.</strong> That is a 4x reduction in wasted bandwidth on failure.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>4</strong></td>
+              <td><code>CompleteMultipartUpload</code></td>
+              <td>
+                Client sends the upload_id along with a list of (part_number, ETag) pairs for all 4 parts. The service verifies all parts are present, assembles them in order into a single 5 GB object, computes the final content hash, stores the metadata, and returns <code>200 OK</code> with the final ETag. The object is now accessible via a normal <code>GET</code> request.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Resumability example:</strong> Suppose you are uploading a 20 GB database backup in 10 parts of 2 GB each. After parts 1&ndash;7 complete successfully, your server restarts. When it comes back, you call <code>ListParts</code> with the upload_id to discover which parts already uploaded. The service returns parts 1&ndash;7 with their ETags. You only need to upload parts 8, 9, and 10 &mdash; saving 14 GB of re-upload. Without multipart, you would discard all 14 GB of progress and start over.
+      </p>
+      <p>
+        <strong>Important detail:</strong> incomplete multipart uploads consume storage but are not visible as objects. If a client initiates a multipart upload but never completes it, the uploaded parts sit in storage indefinitely, accruing costs. Always set a <strong>lifecycle rule to abort incomplete multipart uploads</strong> after 7 days: this automatically cleans up orphaned parts.
+      </p>
+
+      <h3>GET &mdash; Retrieving an Object</h3>
+      <ol>
+        <li>The client sends an HTTP <code>GET</code> request with the object key.</li>
+        <li>The service looks up the key in the metadata store to find which storage nodes hold the object and its storage class.</li>
+        <li>The service routes the request to the nearest or least-loaded replica node.</li>
+        <li>The node reads the object from disk and streams it back to the client. Range requests (<code>Range: bytes=0-1023</code>) are supported for partial reads.</li>
+        <li>The response includes the content hash in an ETag header so the client can verify integrity.</li>
+      </ol>
+
+      <h3>DELETE &mdash; Removing an Object</h3>
+      <ol>
+        <li>A <code>DELETE</code> request removes the metadata entry. With <strong>versioning enabled</strong>, the object is not physically deleted but marked with a delete marker; previous versions remain accessible.</li>
+        <li>Physical garbage collection runs asynchronously to reclaim storage from deleted or overwritten objects.</li>
+      </ol>
+
+      <h3>LIST &mdash; Enumerating Objects</h3>
+      <p>
+        <code>LIST</code> returns objects matching a key prefix, paginated by continuation token. This operation is <strong>eventually consistent</strong> in many implementations &mdash; a newly uploaded object may not appear in a <code>LIST</code> result for a few seconds. S3 achieved strong read-after-write consistency for <code>GET</code> and <code>LIST</code> in December 2020, but many S3-compatible stores still use eventual consistency for listings.
+      </p>
+
+      <h3>Content Addressing &amp; Deduplication</h3>
+      <p>
+        Some blob storage systems use <strong>content-addressable storage (CAS)</strong>, where the object's key is derived from its content hash. If two users upload the same file, only one copy is stored. This is how Git stores objects internally and how backup systems like Restic and Borg achieve deduplication.
+      </p>
+
+      <h4>How Content-Addressable Storage Works</h4>
+      <p>
+        The core idea is simple: instead of naming objects by user-chosen keys, you name them by <strong>the hash of their content</strong>. When you store an object, the system computes <code>SHA-256(object_bytes)</code> and uses that hash as the storage key. Two identical files, uploaded by different users at different times, produce the same hash and therefore map to the same storage location. The system stores only one copy.
+      </p>
+      <p>
+        But whole-file hashing only deduplicates exact copies. What about files that are <em>mostly</em> identical? This is where <strong>chunked deduplication</strong> comes in. The system splits each file into fixed-size or variable-size chunks (typically 1 MB each), hashes each chunk independently, and stores only unique chunks.
+      </p>
+
+      <h4>Worked Example: Chunked Deduplication</h4>
+      <p>Consider two files uploaded by different users:</p>
+      <ul>
+        <li><strong>File A:</strong> 100 MB video, split into 100 chunks of 1 MB each. Each chunk is hashed with SHA-256. All 100 chunks are unique (no prior data in the system), so all 100 are stored. <strong>Storage used: 100 MB.</strong></li>
+        <li><strong>File B:</strong> 100 MB video &mdash; a slightly re-edited version of File A. 95% of the content is identical. Split into 100 chunks of 1 MB each. The system hashes each chunk and checks: does this hash already exist in storage?</li>
+      </ul>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Without Dedup</th>
+              <th>With Chunked Dedup</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Total chunks across both files</td>
+              <td>200</td>
+              <td>200</td>
+            </tr>
+            <tr>
+              <td>Duplicate chunks (same hash)</td>
+              <td>0 (stored twice)</td>
+              <td>95 (stored once, referenced twice)</td>
+            </tr>
+            <tr>
+              <td>Unique chunks stored</td>
+              <td>200</td>
+              <td>105 (100 from File A + 5 new from File B)</td>
+            </tr>
+            <tr>
+              <td>Total storage used</td>
+              <td>200 MB</td>
+              <td>105 MB</td>
+            </tr>
+            <tr>
+              <td><strong>Dedup ratio</strong></td>
+              <td>1.0x</td>
+              <td><strong>1.9x</strong> (200 MB logical / 105 MB physical)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>The dedup ratio formula:</strong> <code>dedup_ratio = total_logical_size / total_physical_size</code>. A ratio of 2.0x means you are storing half the raw bytes. For VM snapshots and code repositories, dedup ratios of 5x&ndash;20x are common because successive versions share most of their content. For unique media files (photos, audio recordings), the ratio is close to 1.0x &mdash; dedup provides little benefit.
+      </p>
+      <p>
+        <strong>How retrieval works with CAS:</strong> The system stores a <em>manifest</em> (also called a <em>recipe</em>) for each logical file. The manifest is an ordered list of chunk hashes. To reconstruct File B, the system reads the manifest, fetches each chunk by hash from the chunk store, and concatenates them in order. The 95 shared chunks are read from the same physical location as File A's chunks &mdash; there is only one copy on disk.
+      </p>
+
+      <h3>Erasure Coding: Durability Without 3x Replication</h3>
+      <p>
+        <strong>The problem:</strong> The simplest way to protect against data loss is <strong>triple replication</strong> &mdash; store 3 complete copies of every object on different disks/nodes. If any one copy is lost (disk failure, node crash), two copies remain. This is simple and fast to read (any copy can serve a request), but it has a brutal cost: <strong>3x storage overhead</strong>. Storing 10 PB of data requires 30 PB of raw disk capacity.
+      </p>
+      <p>
+        <strong>The insight:</strong> What if instead of storing complete copies, you could store <em>mathematical fragments</em> that allow you to reconstruct the original data even if some fragments are lost? This is <strong>erasure coding</strong>, and it achieves the same (or better) durability as triple replication at a fraction of the storage cost.
+      </p>
+
+      <h4>Reed-Solomon Erasure Coding: How It Works</h4>
+      <p>
+        Reed-Solomon is the most widely used erasure coding algorithm (used by S3, Azure Blob Storage, Google Colossus, Ceph, and HDFS). The configuration is described as <strong>RS(k, m)</strong> where:
+      </p>
+      <ul>
+        <li><strong>k</strong> = number of <strong>data fragments</strong> the original object is split into</li>
+        <li><strong>m</strong> = number of <strong>parity fragments</strong> computed from the data fragments</li>
+        <li>Total fragments stored = k + m</li>
+        <li>You can lose <strong>any m fragments</strong> and still reconstruct the original object from the remaining k fragments</li>
+      </ul>
+
+      <h4>Worked Example: RS(6, 3)</h4>
+      <p>Let us walk through storing a <strong>10 MB object</strong> with Reed-Solomon (6, 3):</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Action</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Split</strong></td>
+              <td>Divide the 10 MB object into k=6 equal data fragments</td>
+              <td>6 data fragments, each 10 MB / 6 = <strong>1.67 MB</strong> (D1, D2, D3, D4, D5, D6)</td>
+            </tr>
+            <tr>
+              <td><strong>2. Encode</strong></td>
+              <td>Compute m=3 parity fragments using Reed-Solomon matrix math</td>
+              <td>3 parity fragments, each 1.67 MB (P1, P2, P3). Each parity fragment is a mathematical combination of all 6 data fragments.</td>
+            </tr>
+            <tr>
+              <td><strong>3. Distribute</strong></td>
+              <td>Store each of the 9 fragments on a different disk/node/AZ</td>
+              <td>9 fragments &times; 1.67 MB = <strong>15 MB total stored</strong></td>
+            </tr>
+            <tr>
+              <td><strong>4. Overhead</strong></td>
+              <td>Storage overhead = total stored / original size</td>
+              <td>15 MB / 10 MB = <strong>1.5x overhead</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Fault tolerance:</strong> With RS(6, 3), you can lose <strong>any 3 of the 9 fragments</strong> and still reconstruct the original 10 MB object from the remaining 6 fragments. This means the system survives the simultaneous failure of 3 disks, 3 nodes, or even 3 entire availability zones.
+      </p>
+      <p>
+        <strong>Reconstruction example:</strong> Suppose fragments D2, D5, and P1 are lost (their disks failed). The system reads the remaining 6 fragments: D1, D3, D4, D6, P2, P3. Using the Reed-Solomon decoding algorithm (which inverts the encoding matrix), it recomputes the original data and regenerates D2 and D5. The reconstruction is exact &mdash; no data loss, no approximation.
+      </p>
+
+      <h4>Cost Comparison: Replication vs. Erasure Coding at Scale</h4>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>10 PB of Logical Data</th>
+              <th>Raw Storage Required</th>
+              <th>Overhead</th>
+              <th>Monthly Cost (at $0.023/GB)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>3-way replication</td>
+              <td>10 PB</td>
+              <td>30 PB</td>
+              <td>3.0x</td>
+              <td>30,000 TB &times; $0.023 = <strong>$690,000</strong></td>
+            </tr>
+            <tr>
+              <td>RS(6, 3) erasure coding</td>
+              <td>10 PB</td>
+              <td>15 PB</td>
+              <td>1.5x</td>
+              <td>15,000 TB &times; $0.023 = <strong>$345,000</strong></td>
+            </tr>
+            <tr>
+              <td><strong>Savings</strong></td>
+              <td>&mdash;</td>
+              <td>15 PB saved</td>
+              <td>&mdash;</td>
+              <td><strong>~$345,000/month saved</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>The tradeoff:</strong> Erasure coding is not free. Reading an erasure-coded object requires fetching k fragments from k different nodes and decoding them, which is slower than reading a single complete replica. This is why hot data (frequently accessed) often uses replication for speed, while cold/warm data uses erasure coding for cost efficiency. S3 uses replication for Standard class and erasure coding for Infrequent Access, Glacier, and internal cold tiers.
+      </p>
+      <p>
+        <strong>Why not RS(10, 2) for even lower overhead?</strong> With k=10 and m=2, the overhead drops to 1.2x, but you can only tolerate 2 simultaneous failures. The choice of k and m is a tradeoff between storage efficiency and fault tolerance. Most production systems use m=3 or m=4 to handle multiple concurrent failures during the repair window (the time it takes to rebuild a failed fragment onto a new disk).
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Blob Storage When</h4>
+          <ul>
+            <li><strong>Storing images, videos, or audio</strong> &mdash; media files are large, immutable, and read-heavy; blob storage excels here.</li>
+            <li><strong>Application backups &amp; snapshots</strong> &mdash; cheap, durable, lifecycle policies auto-expire old backups.</li>
+            <li><strong>Serving static assets</strong> &mdash; CSS, JS, fonts served via CDN with S3 as origin; pay for storage, not compute.</li>
+            <li><strong>Data lake / analytics raw zone</strong> &mdash; Parquet, ORC, CSV files queried by Spark, Presto, or Athena directly from S3.</li>
+            <li><strong>Log archives</strong> &mdash; centralized, compressed log storage; lifecycle moves to Glacier after 30 days.</li>
+            <li><strong>ML training data</strong> &mdash; large datasets (TBs) that training jobs read sequentially.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Don't Use Blob Storage When</h4>
+          <ul>
+            <li><strong>Frequently updated small records</strong> &mdash; a relational or key-value database is far better for small, mutable data. Objects are not designed for in-place partial updates.</li>
+            <li><strong>Structured queries (SQL-like)</strong> &mdash; you can't <code>JOIN</code> or <code>WHERE</code> across objects natively. Use a database. (S3 Select is limited to single-file scans.)</li>
+            <li><strong>Low-latency transactional access</strong> &mdash; blob storage GETs are 10-100ms, not microseconds. Use Redis, DynamoDB, or a local cache for hot-path reads.</li>
+            <li><strong>POSIX file system needs</strong> &mdash; applications that use <code>seek()</code>, file locks, or in-place writes need EBS/EFS, not S3.</li>
+            <li><strong>Small, high-frequency writes</strong> &mdash; writing millions of 1 KB objects/sec is expensive (request costs dominate). Use a database or append-only log.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic: Simple File Storage</h3>
+      <p>
+        In the early days, unstructured data lived on NFS shares or SAN volumes. Files were organized in directories, accessed via POSIX APIs, and backed up with <code>rsync</code> or tape. This approach broke down at scale: NFS has limited concurrency, directory listings slow down with millions of files, and replication/durability required expensive hardware RAID or manual scripts. Capacity was bounded by the largest disk array you could buy.
+      </p>
+
+      <h3>Modern: Content-Addressable Storage &amp; Deduplication</h3>
+      <p>
+        Modern blob stores like S3, GCS, and Azure Blob Storage hash object content to detect duplicates. Sub-file deduplication (chunking the file and hashing each chunk) is used by backup tools like Restic and enterprise storage systems. This can reduce storage costs by 30-70% for workloads with redundant data (e.g., VM snapshots, code repositories).
+      </p>
+
+      <h3>Tiered Storage &amp; Lifecycle Policies</h3>
+      <p>
+        S3 introduced storage classes &mdash; Standard, Infrequent Access (IA), One Zone-IA, Glacier Instant Retrieval, Glacier Flexible Retrieval, and Glacier Deep Archive &mdash; with pricing that drops from $0.023/GB/month to $0.00099/GB/month. <strong>Lifecycle policies</strong> automatically transition objects between tiers based on age. A common pattern: keep data in Standard for 30 days, move to IA for 90 days, then archive to Glacier. This single feature can cut storage costs by 60-80%.
+      </p>
+
+      <h4>What Physically Backs Each Storage Class</h4>
+      <p>
+        The price difference between storage classes is not just marketing &mdash; it reflects fundamentally different hardware and access patterns behind the scenes:
+      </p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Storage Class</th>
+              <th>Physical Backing</th>
+              <th>How It Works</th>
+              <th>Retrieval Speed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>S3 Standard</strong></td>
+              <td>SSD/HDD on always-powered servers across 3+ AZs</td>
+              <td>Data is stored on spinning disks (or SSDs for metadata) that are always online and ready to serve requests. Replicated or erasure-coded across multiple availability zones. No special retrieval process needed &mdash; just read from disk.</td>
+              <td>Milliseconds (first-byte latency ~10&ndash;200 ms)</td>
+            </tr>
+            <tr>
+              <td><strong>S3 Infrequent Access (IA)</strong></td>
+              <td>Same hardware as Standard (same disks, same servers)</td>
+              <td>Physically identical to Standard. The difference is purely in <strong>billing</strong>: lower per-GB storage price, but you pay a per-GB <strong>retrieval fee</strong> ($0.01/GB) each time you read. This pricing model incentivizes storing data you rarely access. Minimum storage duration: 30 days (you pay for 30 days even if you delete sooner).</td>
+              <td>Milliseconds (same as Standard)</td>
+            </tr>
+            <tr>
+              <td><strong>Glacier Instant Retrieval</strong></td>
+              <td>Cold storage systems &mdash; data on always-on disks but in a lower-cost infrastructure tier</td>
+              <td>Uses cheaper storage infrastructure optimized for low access frequency. Data is erasure-coded aggressively (higher k values) to minimize raw storage. Retrieval is still fast because the disks are powered on, but the higher retrieval fee ($0.03/GB) discourages frequent reads.</td>
+              <td>Milliseconds</td>
+            </tr>
+            <tr>
+              <td><strong>Glacier Flexible Retrieval</strong></td>
+              <td>Tape library or offline disk arrays</td>
+              <td>Data may be stored on <strong>magnetic tape</strong> in robotic tape libraries, or on disk arrays that are powered off most of the time. When you request retrieval, the system must physically mount the tape or spin up the disks, then copy data to an online staging area. Three retrieval tiers: Expedited (1&ndash;5 min), Standard (3&ndash;5 hours), Bulk (5&ndash;12 hours).</td>
+              <td>Minutes to hours</td>
+            </tr>
+            <tr>
+              <td><strong>Glacier Deep Archive</strong></td>
+              <td>Offline tape in deep storage vaults</td>
+              <td>Data is written to tape and stored in secure, climate-controlled vaults. Tapes may need to be physically located and loaded into a tape drive before data can be read. This is the lowest-cost storage because tapes are extremely cheap per TB and consume no power when idle. Minimum storage duration: 180 days.</td>
+              <td>12&ndash;48 hours</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Cost Model: 1 TB Stored for 1 Year</h4>
+      <p>How much does it cost to store 1 TB (1,024 GB) for 12 months in each class, assuming no retrievals (storage cost only)?</p>
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Storage Class</th>
+              <th>$/GB/month</th>
+              <th>1 TB &times; 12 months</th>
+              <th>Annual Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>S3 Standard</td>
+              <td>$0.023</td>
+              <td>1,024 GB &times; $0.023 &times; 12</td>
+              <td><strong>$282</strong></td>
+            </tr>
+            <tr>
+              <td>S3 Infrequent Access</td>
+              <td>$0.0125</td>
+              <td>1,024 GB &times; $0.0125 &times; 12</td>
+              <td><strong>$154</strong> + retrieval fees when accessed</td>
+            </tr>
+            <tr>
+              <td>Glacier Instant Retrieval</td>
+              <td>$0.004</td>
+              <td>1,024 GB &times; $0.004 &times; 12</td>
+              <td><strong>$49</strong> + retrieval fees</td>
+            </tr>
+            <tr>
+              <td>Glacier Flexible Retrieval</td>
+              <td>$0.0036</td>
+              <td>1,024 GB &times; $0.0036 &times; 12</td>
+              <td><strong>$44</strong> + retrieval fees</td>
+            </tr>
+            <tr>
+              <td>Glacier Deep Archive</td>
+              <td>$0.00099</td>
+              <td>1,024 GB &times; $0.00099 &times; 12</td>
+              <td><strong>$12</strong> + retrieval fees</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The difference is dramatic: Deep Archive is <strong>23x cheaper</strong> than Standard for pure storage. But the retrieval fees and wait times mean you should only use it for data you almost never read &mdash; compliance archives, legal holds, disaster recovery backups. The key insight is to <strong>match the storage class to the access pattern</strong>: use lifecycle policies to automatically transition objects as they age and get accessed less frequently.
+      </p>
+
+      <h3>S3 Select &amp; Query-in-Place</h3>
+      <p>
+        Instead of downloading an entire object to filter it, <strong>S3 Select</strong> pushes a SQL expression to the storage layer. The service scans CSV, JSON, or Parquet files and returns only matching rows. This reduces data transfer and processing time by up to 400%. For heavier workloads, <strong>Athena</strong> and <strong>Presto</strong> provide full SQL over S3.
+      </p>
+
+      <h3>Table Formats on Object Storage</h3>
+      <p>
+        <strong>Delta Lake</strong>, <strong>Apache Iceberg</strong>, and <strong>Apache Hudi</strong> add ACID transactions, schema evolution, and time travel on top of Parquet files stored in S3. This turns blob storage into a data lakehouse &mdash; combining the low cost of object storage with the query capabilities of a data warehouse.
+      </p>
+
+      <h3>Pre-Signed URLs for Secure Direct Upload</h3>
+      <p>
+        Rather than proxying uploads through your application server (which becomes a bottleneck), generate a <strong>pre-signed URL</strong> that lets the client upload directly to blob storage. The URL embeds an expiring signature, so the client never needs storage credentials. This pattern is standard for user-uploaded content (profile photos, file attachments, video uploads) and eliminates the application server from the data path entirely.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions</h4>
+        <ul>
+          <li><strong>Objects are immutable (or rarely updated).</strong> Blob storage is optimized for write-once-read-many workloads. Overwriting an object creates a new version; there's no partial update. If your data changes every second, use a database instead.</li>
+          <li><strong>Eventual consistency for listings is acceptable.</strong> While individual GETs are strongly consistent (read-after-write), LIST operations may not immediately reflect recent writes in all implementations. Design your application to tolerate this (e.g., don't rely on LIST right after PUT to confirm upload success; use the returned ETag instead).</li>
+          <li><strong>Objects are accessed by key, not queried by content.</strong> There's no index on object contents. If you need to search "all images tagged sunset," maintain a separate metadata index in a database, not in the blob store itself.</li>
+          <li><strong>Durability over latency.</strong> Blob storage trades latency (10-100ms per GET) for extreme durability (11 nines). If you need sub-millisecond access, add a caching layer in front.</li>
+          <li><strong>Network egress is a significant cost.</strong> Many cost models assume storage is cheap but data retrieval (egress) is expensive. Always factor in how often objects are read, not just how much data is stored.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <h3>SLO-Driven Sizing Examples</h3>
+      <p>
+        Storage architecture decisions should be driven by concrete SLOs &mdash; not gut feel. Each example below starts with the business requirement and derives the infrastructure from it.
+      </p>
+
+      <!-- Example 1: Photo Sharing Platform -->
+      <h4>1. Photo Sharing Platform</h4>
+      <div class="callout callout-info">
+        <p><strong>SLOs:</strong> p95 upload &lt; 3 s &bull; p99 download &lt; 500 ms &bull; 10M photos/day &bull; avg 4 MB each</p>
+        <p><strong>Daily ingest:</strong> 10M &times; 4 MB = <strong>40 TB/day</strong> &asymp; 1.2 PB/month.</p>
+        <p><strong>Upload latency &le; 3 s at p95:</strong> At 4 MB per photo the minimum sustained throughput per upload must be &ge; 1.33 MB/s. Multipart upload with a <strong>4 MB chunk size</strong> (single PUT) avoids multipart overhead for 90% of images. For the top-10% larger images (&gt; 8 MB), use 3 parallel 4 MB parts &mdash; total wall-clock stays under 3 s on a 10 Mbps uplink.</p>
+        <p><strong>Download latency &le; 500 ms at p99:</strong> S3 Standard p99 TTFB is ~200 ms, leaving 300 ms for network transfer. A 4 MB image at 300 ms requires &ge; 13 MB/s &mdash; feasible within-region but not cross-continent. <strong>Derived decision:</strong> deploy a CDN (CloudFront / Cloudflare) with regional edge caches. Target cache-hit ratio &ge; 92% to keep origin load manageable. Pre-warm popular content at upload time via cache-push.</p>
+        <p><strong>Storage tier:</strong> S3 Standard for the first 30 days (hot access window), then lifecycle to S3 Infrequent Access. At steady state (12 months): ~1.2 PB hot + ~12 PB warm. Monthly cost: 1,200 TB &times; $0.023 + 12,000 TB &times; $0.0125 &asymp; <strong>$177,600/month</strong>.</p>
+      </div>
+
+      <!-- Example 2: Video Platform -->
+      <h4>2. Video Platform</h4>
+      <div class="callout callout-info">
+        <p><strong>SLOs:</strong> p95 first-byte time &lt; 2 s &bull; 100 PB total storage &bull; 99.999% durability (11-nines at object level)</p>
+        <p><strong>First-byte &le; 2 s at p95:</strong> Range-GET on the first segment of an HLS/DASH manifest must return in &lt; 2 s. S3 Standard GET p95 is ~150 ms; CDN edge-hit adds ~20 ms. The bottleneck is <em>cold miss at edge</em>: origin fetch + TLS + transfer of a 2&ndash;6 MB segment. <strong>Derived decision:</strong> keep the first 3 segments of every video in a hot cache tier (origin shield), and use <strong>S3 Standard</strong> for all content accessed within the last 7 days.</p>
+        <p><strong>Durability 99.999%:</strong> S3 already provides 99.999999999% (11-nines) durability via 3-AZ replication internally. To guard against <em>regional</em> failure, enable <strong>cross-region replication (CRR)</strong> to a second region for the canonical copy. <strong>Replication factor: 2 regions &times; 3 AZ = 6 effective copies.</strong></p>
+        <p><strong>Storage class mix (100 PB):</strong> Access-pattern analysis shows 5% hot (last 7 days), 15% warm (8&ndash;90 days), 80% cold (&gt; 90 days). Derived layout: 5 PB Standard + 15 PB IA + 80 PB Glacier Instant Retrieval. Monthly cost: 5,000 TB &times; $0.023 + 15,000 TB &times; $0.0125 + 80,000 TB &times; $0.004 &asymp; <strong>$622,500/month</strong> (vs. $2.3M all-Standard).</p>
+      </div>
+
+      <!-- Example 3: Document Management SaaS -->
+      <h4>3. Document Management SaaS</h4>
+      <div class="callout callout-info">
+        <p><strong>SLOs:</strong> p99 retrieval &lt; 1 s &bull; 50 TB total &bull; 99.99% availability &bull; compliance: 7-year retention</p>
+        <p><strong>Retrieval &le; 1 s at p99:</strong> Average document is 2 MB (PDF/DOCX). At p99, S3 Standard GET + transfer of 2 MB completes in ~250 ms within-region. The budget leaves 750 ms for application-layer lookup, auth, and pre-signed URL generation. <strong>Derived decision:</strong> metadata index in DynamoDB (single-digit ms), generate pre-signed URLs server-side, serve via <strong>S3 Standard</strong> for all documents accessed in the last 180 days.</p>
+        <p><strong>99.99% availability:</strong> S3 Standard is designed for 99.99% availability. No additional redundancy needed at the storage layer. <strong>Derived decision:</strong> focus availability budget on the metadata/auth layer &mdash; deploy across 2 AZs with automated failover.</p>
+        <p><strong>Hot/warm/cold tiering (50 TB):</strong> Usage analysis shows 20% of documents accessed monthly (hot), 30% accessed quarterly (warm), 50% untouched for &gt; 1 year but must be retrievable in &lt; 1 s for compliance audits. Layout: 10 TB Standard + 15 TB IA + 25 TB Glacier Instant Retrieval. Monthly cost: 10,000 GB &times; $0.023 + 15,000 GB &times; $0.0125 + 25,000 GB &times; $0.004 = <strong>$518/month</strong>.</p>
+        <p><strong>Retention:</strong> Enable S3 Object Lock (Compliance mode) with a 7-year retention period. Use S3 Lifecycle to transition to Glacier Deep Archive after 2 years for cost savings on the coldest 50%.</p>
+      </div>
+
+      <!-- Example 4: ML Training Data Lake -->
+      <h4>4. ML Training Data Lake</h4>
+      <div class="callout callout-info">
+        <p><strong>SLOs:</strong> sustained read throughput &gt; 10 GB/s &bull; 500 TB dataset &bull; training job start-to-first-batch &lt; 60 s</p>
+        <p><strong>10 GB/s sustained reads:</strong> A single S3 GET achieves ~100 MB/s. To hit 10 GB/s you need <strong>&ge; 100 parallel streams</strong>. <strong>Derived decision:</strong> shard the dataset into 100&ndash;500 prefix groups (e.g., <code>s3://bucket/shard-000/</code> through <code>s3://bucket/shard-499/</code>). S3 partitions throughput by prefix &mdash; distributing reads across prefixes avoids 503 SlowDown throttling at 5,500 GET/s per prefix.</p>
+        <p><strong>Storage layout:</strong> Store data as <strong>256 MB&ndash;1 GB Parquet/TFRecord files</strong> (not millions of small files). This maximizes sequential read throughput and minimizes LIST/GET request overhead. At 500 TB with 512 MB average file size = ~1M objects &mdash; manageable for S3.</p>
+        <p><strong>Start-to-first-batch &lt; 60 s:</strong> Pre-compute a shuffled manifest file listing all object keys. At job start, each worker reads its manifest shard and issues parallel GETs immediately. Use S3 Select or byte-range GETs to fetch only needed columns, reducing bytes transferred by up to 80%.</p>
+        <p><strong>Cost optimization:</strong> Training data is write-once, read-many during a training window (days&ndash;weeks), then cold. Use S3 Standard during active training, then lifecycle to IA after 30 days. 500 TB &times; $0.023 = <strong>$11,500/month</strong> (active) vs. 500 TB &times; $0.0125 = <strong>$6,250/month</strong> (idle).</p>
+        <p><strong>Parallel read architecture:</strong> Deploy training nodes in the <em>same region and AZ</em> as the S3 bucket. Use S3 Transfer Acceleration only for cross-region scenarios. For GPU clusters, mount via <strong>S3 Mountpoint (FUSE)</strong> or use a caching layer (Alluxio / FSx for Lustre backed by S3) to avoid re-reading the same data across epochs.</p>
+      </div>
+
+      <!-- Interactive Canvas: Cost vs Access Frequency -->
+      <h3>Interactive: Storage Cost vs. Access Frequency</h3>
+      <p>Hover over each data point to see the storage tier details. The chart shows how cost per GB/month drops as access frequency decreases, but retrieval latency increases &mdash; the fundamental tradeoff in blob storage tiering.</p>
+      <div style="position:relative; max-width:760px; margin:1.5rem auto;">
+        <canvas id="storageTierChart" width="760" height="420" style="width:100%; border:1px solid var(--border, #d0d7de); border-radius:8px; cursor:crosshair;"></canvas>
+        <div id="tierTooltip" style="
+          display:none; position:absolute; pointer-events:none;
+          background:rgba(30,30,30,0.92); color:#f0f0f0; padding:10px 14px;
+          border-radius:6px; font-size:0.85rem; line-height:1.5;
+          max-width:260px; box-shadow:0 2px 8px rgba(0,0,0,0.25);
+          z-index:10;
+        "></div>
+      </div>
+      <script>
+      (function() {
+        var canvas = document.getElementById('storageTierChart');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var tooltip = document.getElementById('tierTooltip');
+        var dpr = window.devicePixelRatio || 1;
+        canvas.width = 760 * dpr;
+        canvas.height = 420 * dpr;
+        ctx.scale(dpr, dpr);
+        var W = 760, H = 420;
+        var pad = { top: 40, right: 40, bottom: 70, left: 80 };
+        var plotW = W - pad.left - pad.right;
+        var plotH = H - pad.top - pad.bottom;
+
+        var tiers = [
+          { name: 'S3 Standard',              cost: 0.023,   freq: 10000, latency: '< 10 ms',     color: '#2563eb', desc: 'Frequent access. Ideal for hot data, serving live traffic.' },
+          { name: 'S3 Intelligent-Tiering',    cost: 0.023,   freq: 5000,  latency: '< 10 ms',     color: '#7c3aed', desc: 'Auto-tiers between frequent and infrequent. No retrieval fees.' },
+          { name: 'S3 Infrequent Access',      cost: 0.0125,  freq: 500,   latency: '< 10 ms',     color: '#0891b2', desc: 'Lower storage cost, per-GB retrieval fee. 30-day minimum.' },
+          { name: 'S3 One Zone-IA',            cost: 0.01,    freq: 200,   latency: '< 10 ms',     color: '#059669', desc: 'Single AZ. Good for re-creatable data (thumbnails, transcodes).' },
+          { name: 'Glacier Instant Retrieval',  cost: 0.004,   freq: 4,     latency: '< 10 ms',     color: '#d97706', desc: 'Archive with instant access. Quarterly access pattern.' },
+          { name: 'Glacier Flexible Retrieval', cost: 0.0036,  freq: 1,     latency: '1 - 12 hours', color: '#dc2626', desc: 'Bulk restore. For backups and disaster recovery data.' },
+          { name: 'Glacier Deep Archive',       cost: 0.00099, freq: 0.5,   latency: '12 - 48 hours',color: '#64748b', desc: 'Lowest cost. 7-10 year compliance archives. 180-day minimum.' }
+        ];
+
+        /* Log scales */
+        var maxCost = 0.03, minCost = 0.0008;
+        var maxFreq = 20000, minFreq = 0.2;
+        function logX(freq) { return pad.left + (Math.log10(freq) - Math.log10(minFreq)) / (Math.log10(maxFreq) - Math.log10(minFreq)) * plotW; }
+        function logY(cost) { return pad.top + plotH - (Math.log10(cost) - Math.log10(minCost)) / (Math.log10(maxCost) - Math.log10(minCost)) * plotH; }
+
+        function draw() {
+          ctx.clearRect(0, 0, W, H);
+          /* background */
+          ctx.fillStyle = '#fafbfc';
+          ctx.fillRect(0, 0, W, H);
+
+          /* grid lines */
+          ctx.strokeStyle = '#e5e7eb';
+          ctx.lineWidth = 1;
+          var xTicks = [0.5, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000];
+          xTicks.forEach(function(v) {
+            var x = logX(v);
+            if (x >= pad.left && x <= W - pad.right) {
+              ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+            }
+          });
+          var yTicks = [0.001, 0.002, 0.004, 0.008, 0.012, 0.023];
+          yTicks.forEach(function(v) {
+            var y = logY(v);
+            if (y >= pad.top && y <= pad.top + plotH) {
+              ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+            }
+          });
+
+          /* axes */
+          ctx.strokeStyle = '#374151';
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + plotH); ctx.lineTo(pad.left + plotW, pad.top + plotH); ctx.stroke();
+
+          /* axis labels */
+          ctx.fillStyle = '#374151';
+          ctx.font = '13px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          xTicks.forEach(function(v) {
+            var x = logX(v);
+            if (x >= pad.left && x <= W - pad.right) {
+              ctx.fillText(v >= 1000 ? (v/1000)+'k' : String(v), x, pad.top + plotH + 20);
+            }
+          });
+          ctx.textAlign = 'right';
+          yTicks.forEach(function(v) {
+            var y = logY(v);
+            if (y >= pad.top && y <= pad.top + plotH) {
+              ctx.fillText('$' + v, pad.left - 8, y + 4);
+            }
+          });
+
+          /* axis titles */
+          ctx.fillStyle = '#111827';
+          ctx.font = 'bold 13px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Access Frequency (requests/month per GB)', pad.left + plotW / 2, H - 8);
+          ctx.save();
+          ctx.translate(16, pad.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.fillText('Cost per GB/month', 0, 0);
+          ctx.restore();
+
+          /* title */
+          ctx.fillStyle = '#111827';
+          ctx.font = 'bold 15px JetBrains Mono, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('Storage Tier Cost vs. Access Frequency', W / 2, 24);
+
+          /* data points */
+          tiers.forEach(function(t) {
+            var x = logX(t.freq);
+            var y = logY(t.cost);
+            /* glow */
+            ctx.beginPath();
+            ctx.arc(x, y, 14, 0, 2 * Math.PI);
+            ctx.fillStyle = t.color + '22';
+            ctx.fill();
+            /* dot */
+            ctx.beginPath();
+            ctx.arc(x, y, 7, 0, 2 * Math.PI);
+            ctx.fillStyle = t.color;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          });
+        }
+        draw();
+
+        /* hover */
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * scaleX;
+          var hit = null;
+          tiers.forEach(function(t) {
+            var x = logX(t.freq);
+            var y = logY(t.cost);
+            var d = Math.sqrt((mx - x) * (mx - x) + (my - y) * (my - y));
+            if (d < 20) hit = { tier: t, sx: e.clientX - rect.left, sy: e.clientY - rect.top };
+          });
+          if (hit) {
+            tooltip.style.display = 'block';
+            var tx = hit.sx + 16;
+            var ty = hit.sy - 10;
+            if (tx + 260 > rect.width) tx = hit.sx - 270;
+            if (ty + 120 > rect.height) ty = hit.sy - 120;
+            tooltip.style.left = tx + 'px';
+            tooltip.style.top = ty + 'px';
+            tooltip.innerHTML = '<strong style="color:' + hit.tier.color + '">' + hit.tier.name + '</strong><br>' +
+              'Cost: <strong>$' + hit.tier.cost + '/GB/mo</strong><br>' +
+              'Retrieval: ' + hit.tier.latency + '<br>' +
+              '<span style="color:#aaa">' + hit.tier.desc + '</span>';
+            /* redraw with highlight */
+            draw();
+            var x = logX(hit.tier.freq);
+            var y = logY(hit.tier.cost);
+            ctx.beginPath();
+            ctx.arc(x, y, 11, 0, 2 * Math.PI);
+            ctx.fillStyle = hit.tier.color + '44';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(x, y, 7, 0, 2 * Math.PI);
+            ctx.fillStyle = hit.tier.color;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+          } else {
+            tooltip.style.display = 'none';
+            draw();
+          }
+        });
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+          draw();
+        });
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>
+        Capacity planning for blob storage should work <em>backward</em> from SLOs, not forward from estimated data volume. The process follows three phases:
+      </p>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Phase</th>
+            <th>Input</th>
+            <th>Output</th>
+            <th>Key Question</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>1. SLO Definition</strong></td>
+            <td>Business requirements, user expectations</td>
+            <td>Latency targets (p50/p95/p99), durability, availability</td>
+            <td>What does the user experience if we miss this?</td>
+          </tr>
+          <tr>
+            <td><strong>2. Architecture Derivation</strong></td>
+            <td>SLOs + estimated data volume + access patterns</td>
+            <td>Storage tier mix, replication factor, CDN strategy, chunk size</td>
+            <td>What is the cheapest architecture that meets every SLO?</td>
+          </tr>
+          <tr>
+            <td><strong>3. Cost Envelope</strong></td>
+            <td>Derived architecture + pricing model</td>
+            <td>Monthly cost range, cost-per-user, cost scaling curve</td>
+            <td>At what scale does this architecture break the budget?</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout callout-warning">
+        <p><strong>Common mistakes in capacity planning:</strong></p>
+        <p><strong>Over-provisioning durability:</strong> Cross-region replication doubles storage cost. Only enable it when the durability SLO exceeds what a single region provides (11-nines), or when the <em>availability</em> SLO requires surviving a full region outage.</p>
+        <p><strong>Ignoring egress:</strong> A 100 TB/month egress bill ($9,000) can exceed storage costs. CDN cache-hit ratios above 90% are not free &mdash; they require careful cache-key design and origin-shield placement.</p>
+        <p><strong>Wrong chunk size:</strong> Too small (e.g., 1 MB) increases request count and per-request overhead. Too large (e.g., 64 MB) wastes bandwidth on partial reads and hurts upload latency on slow connections. Derive chunk size from the upload latency SLO and the target connection speed at p95.</p>
+        <p><strong>Flat-tiering everything:</strong> Storing 100% of data in S3 Standard is 3&ndash;5x more expensive than a lifecycle-managed mix. Run access-frequency analysis before launch, then re-validate monthly.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K users</span>
+          <h4>Local Filesystem</h4>
+          <p>Store uploads in <code>/var/uploads</code> on your single server. Simple, zero cost, no external dependencies. Backup with <code>rsync</code> to a second machine. This works fine for a small app with hundreds of files.</p>
+          <p><strong>Signal to evolve:</strong> You need a second server (load balanced), and now uploads live on only one machine.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K users</span>
+          <h4>Single NFS or Object Store</h4>
+          <p>Move files to a shared NFS mount or a single MinIO/S3 bucket. Both app servers can now access uploads. S3 is preferable &mdash; it handles replication, durability, and capacity automatically. Start using pre-signed URLs for direct client uploads.</p>
+          <p><strong>Signal to evolve:</strong> Storage exceeds 1 TB, or you need to serve content globally with low latency.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M users</span>
+          <h4>S3 + CDN + Lifecycle</h4>
+          <p>Add CloudFront or Cloudflare in front of S3. Enable lifecycle policies to tier old data to IA/Glacier. Use S3 event notifications to trigger image resizing, video transcoding, or virus scanning via Lambda or SQS. Enable versioning and cross-region replication for disaster recovery.</p>
+          <p><strong>Signal to evolve:</strong> Egress costs are massive, or you need multi-region active-active writes.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ users</span>
+          <h4>Multi-Region + Custom Storage</h4>
+          <p>Run S3 with multi-region access points for geo-local reads and writes. Consider building custom storage (like Dropbox's Magic Pocket or Meta's f4) if you're at exabyte scale where S3 pricing doesn't make sense. Implement intelligent tiering (S3 Intelligent-Tiering) to automate class transitions based on access patterns. Use S3 Batch Operations for bulk migrations.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>Accidental Deletion Without Versioning</h3>
+      <p>
+        <strong>What happened:</strong> A developer ran a cleanup script with an overly broad prefix match, deleting 3 million production images from S3. With no versioning enabled, the objects were permanently gone. The only recovery path was restoring from a 36-hour-old backup, meaning all uploads in that window were lost.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No versioning, no MFA Delete, and the IAM policy granted <code>s3:DeleteObject</code> to the application role without requiring confirmation. The cleanup script used a prefix of <code>images/</code> instead of <code>images/temp/</code>.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Enable S3 versioning on all production buckets. Enable MFA Delete for permanent version removal. Use Object Lock for compliance-critical data. Restrict <code>DeleteObject</code> permissions to a dedicated cleanup role, never the application role.
+      </p>
+
+      <h3>Egress Cost Surprise</h3>
+      <p>
+        <strong>What happened:</strong> A startup used S3 to serve user-generated video content directly to browsers. Monthly storage cost was $2,000, but the first egress bill was <strong>$47,000</strong> &mdash; 500 TB of outbound transfer at $0.09/GB. Nobody had modeled the read-to-write ratio or egress pricing.
+      </p>
+      <p>
+        <strong>Root cause:</strong> No CDN layer, so every video view was a direct S3 fetch. Popular videos were fetched thousands of times from S3 instead of being cached.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Always put a CDN in front of public-facing blob storage. Model egress costs before launch: <code>monthly_views &times; avg_object_size &times; $0.09/GB</code>. Set up billing alerts at 50% and 80% of budget. Consider S3-compatible alternatives with free egress (Cloudflare R2, Backblaze B2 + Cloudflare).
+      </p>
+
+      <h3>Public Bucket Data Leak</h3>
+      <p>
+        <strong>What happened:</strong> Multiple companies (Capital One, Twitch, Accenture, the US DoD) have exposed sensitive data through misconfigured S3 bucket policies that allowed public read access. In Capital One's case, a misconfigured WAF combined with an overly permissive IAM role let an attacker exfiltrate 100 million credit card applications from S3.
+      </p>
+      <p>
+        <strong>Root cause:</strong> S3 buckets historically defaulted to private, but it was easy to accidentally add <code>"Principal": "*"</code> to a bucket policy. Legacy ACLs added confusion.
+      </p>
+      <p>
+        <strong>Prevention:</strong> Enable S3 Block Public Access at the account level. Use AWS Config rules to detect and auto-remediate public buckets. Never rely on bucket names being "secret" &mdash; they're enumerable. Audit bucket policies regularly. Use AWS Access Analyzer to identify unintended external access.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>What It Tells You</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>NumberOfObjects</code></td>
+            <td>Total object count; track growth rate for capacity planning</td>
+            <td>Alert if growth rate doubles unexpectedly</td>
+          </tr>
+          <tr>
+            <td><code>BucketSizeBytes</code></td>
+            <td>Total storage consumed</td>
+            <td>Alert at 80% of budget threshold</td>
+          </tr>
+          <tr>
+            <td><code>4xxErrors</code> (per bucket)</td>
+            <td>Client errors &mdash; 403s indicate permission issues, 404s indicate missing objects</td>
+            <td>Alert if 4xx rate &gt; 5% of total requests</td>
+          </tr>
+          <tr>
+            <td><code>5xxErrors</code></td>
+            <td>Service-side errors; indicates S3 throttling or outage</td>
+            <td>Page if any 5xx errors sustained &gt; 1 minute</td>
+          </tr>
+          <tr>
+            <td><code>FirstByteLatency</code></td>
+            <td>Time to first byte for GET requests</td>
+            <td>Alert if p99 &gt; 500ms for Standard class</td>
+          </tr>
+          <tr>
+            <td><code>BytesDownloaded</code></td>
+            <td>Egress bandwidth &mdash; directly maps to cost</td>
+            <td>Alert at 50% and 80% of monthly egress budget</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Uploads failing?</strong></p>
+        <p>&rarr; Check HTTP status: 403 = permissions/policy issue &rarr; Verify IAM role, bucket policy, and CORS config</p>
+        <p>&rarr; 400 = malformed request &rarr; Check content-length, multipart boundaries</p>
+        <p>&rarr; 503 = throttled &rarr; S3 returns 503 SlowDown when request rate exceeds partition limits (~5,500 GETs or 3,500 PUTs/sec per prefix). Add random prefixes to keys or use S3 Transfer Acceleration.</p>
+        <p><strong>Latency high?</strong></p>
+        <p>&rarr; Check if using the right storage class (Glacier retrieval is slow by design)</p>
+        <p>&rarr; Check region &mdash; are clients far from the bucket region?</p>
+        <p>&rarr; Check object size &mdash; large objects should use multipart + parallel download with byte-range fetches</p>
+        <p><strong>Costs spiking?</strong></p>
+        <p>&rarr; Enable S3 Storage Lens or Cost Explorer &rarr; Identify which bucket/prefix is driving cost</p>
+        <p>&rarr; Check if lifecycle policies are applied &rarr; Check if a CDN is absorbing reads or if every request hits S3</p>
+      </div>
+
+      <h3>S3 Prefix Partitioning and Request Throttling</h3>
+      <p>
+        S3 automatically partitions your bucket's key space to distribute load across many backend servers. Each partition can handle approximately <strong>5,500 GET/HEAD requests per second</strong> and <strong>3,500 PUT/COPY/POST/DELETE requests per second</strong>. When all your keys share the same prefix, they land on the same partition &mdash; and you hit the throttle limit far sooner than you might expect.
+      </p>
+
+      <h4>The Problem: Sequential Keys</h4>
+      <p>
+        Suppose you name your images with sequential numeric keys:
+      </p>
+      <pre class="line-numbers"><code class="language-text">images/001.jpg
+images/002.jpg
+images/003.jpg
+...
+images/999999.jpg</code></pre>
+      <p>
+        All of these keys share the prefix <code>images/0</code>, <code>images/00</code>, etc. S3 partitions by prefix, so all these objects are likely served by the <strong>same partition</strong>. Your maximum throughput is capped at <strong>5,500 GETs/second</strong> for the entire bucket &mdash; regardless of how many objects it contains.
+      </p>
+
+      <h4>The Solution: Random Prefixes</h4>
+      <p>
+        Add a random hash prefix to distribute keys across many partitions:
+      </p>
+      <pre class="line-numbers"><code class="language-text">a3f2/images/001.jpg
+b1x5/images/002.jpg
+7e9d/images/003.jpg
+c4a1/images/004.jpg</code></pre>
+      <p>
+        With a <strong>4 hex-character prefix</strong>, you create up to 16<sup>4</sup> = <strong>65,536 distinct prefix partitions</strong>. Each partition supports 5,500 GETs/sec, so the theoretical maximum throughput becomes:
+      </p>
+      <p style="text-align: center; font-size: 1.1em;">
+        <strong>65,536 partitions &times; 5,500 GETs/sec = ~360 million GETs/second</strong>
+      </p>
+      <p>
+        In practice, you will not reach 360M GETs/sec (network and other limits apply), but the point is that randomized prefixes remove the partition bottleneck entirely. S3 also auto-splits hot partitions over time, but this takes minutes to hours &mdash; random prefixes give you the throughput immediately.
+      </p>
+
+      <div class="table-responsive">
+        <table class="styled-table">
+          <thead>
+            <tr>
+              <th>Key Strategy</th>
+              <th>Example Key</th>
+              <th>Partitions</th>
+              <th>Max GET/sec</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Sequential numeric</td>
+              <td><code>images/000001.jpg</code></td>
+              <td>~1 (all share prefix)</td>
+              <td>~5,500</td>
+            </tr>
+            <tr>
+              <td>Date-prefixed</td>
+              <td><code>2024/03/09/photo.jpg</code></td>
+              <td>~1 per day (today's traffic on 1 partition)</td>
+              <td>~5,500</td>
+            </tr>
+            <tr>
+              <td>2 hex-char random prefix</td>
+              <td><code>a3/images/001.jpg</code></td>
+              <td>256</td>
+              <td>~1.4M</td>
+            </tr>
+            <tr>
+              <td>4 hex-char random prefix</td>
+              <td><code>a3f2/images/001.jpg</code></td>
+              <td>65,536</td>
+              <td>~360M</td>
+            </tr>
+            <tr>
+              <td>UUID as key</td>
+              <td><code>f47ac10b-58cc-4372.jpg</code></td>
+              <td>Effectively unlimited</td>
+              <td>Effectively unlimited</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Implementation tip:</strong> compute the prefix as the first N characters of <code>SHA-256(original_key)</code> or use a UUID. Store the mapping in your metadata database. When generating pre-signed URLs or building CDN paths, include the prefix. The prefix is invisible to end users if your CDN rewrites the URL.
+      </p>
+
+      <h3>Critical Configuration</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Config</th>
+            <th>What It Does</th>
+            <th>Recommended Setting</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Versioning</strong></td>
+            <td>Keeps all versions of an object; protects against accidental deletes/overwrites</td>
+            <td>Enable on all production buckets. Use lifecycle to expire old versions after 30-90 days.</td>
+          </tr>
+          <tr>
+            <td><strong>Server-Side Encryption</strong></td>
+            <td>Encrypts objects at rest (SSE-S3, SSE-KMS, or SSE-C)</td>
+            <td>Enable SSE-S3 (AES-256) as default. Use SSE-KMS for audit trail / key rotation.</td>
+          </tr>
+          <tr>
+            <td><strong>Lifecycle Policies</strong></td>
+            <td>Automatically transitions objects to cheaper tiers or deletes expired data</td>
+            <td>Define rules per prefix: e.g., <code>logs/*</code> &rarr; IA after 30d &rarr; Glacier after 90d &rarr; Delete after 365d.</td>
+          </tr>
+          <tr>
+            <td><strong>CORS Configuration</strong></td>
+            <td>Controls which domains can access the bucket from browser JavaScript</td>
+            <td>Restrict to your domain(s). Never use <code>*</code> in production.</td>
+          </tr>
+          <tr>
+            <td><strong>Bucket Policy / Block Public Access</strong></td>
+            <td>Controls who can read/write objects</td>
+            <td>Enable Block Public Access at account level. Use IAM policies and pre-signed URLs for access.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Blob Storage + CDN</h3>
+      <p>
+        The most common pattern: S3 as origin, CloudFront/Cloudflare as CDN cache. The CDN caches objects at edge locations worldwide, reducing both latency and S3 egress costs. <strong>Pitfall:</strong> CDN cache invalidation is not instant. If you overwrite an S3 object, the CDN may serve the stale version for minutes or hours until the TTL expires. Solutions: use versioned URLs (<code>image-v2.jpg</code> or <code>image.jpg?v=abc123</code>) instead of relying on cache purges. Also, CDN cache hit rates are low for long-tail content (unique per-user files) &mdash; don't expect CDN savings if every object is accessed only once.
+      </p>
+
+      <h3>Blob Storage + Database</h3>
+      <p>
+        <strong>Golden rule: never store blobs in a database.</strong> Store the blob in S3, store the S3 key (and metadata like size, content type, upload timestamp) in the database. This keeps your database small, fast, and easy to back up. A PostgreSQL table with 100M rows of metadata is manageable; 100M rows of 500 KB BLOBs is a 50 TB database &mdash; backups take days, queries are slow, and costs skyrocket. <strong>Pitfall:</strong> If the database insert succeeds but the S3 upload fails (or vice versa), you get orphaned records. Use the <strong>outbox pattern</strong>: upload to S3 first, then insert the key into the DB. If the DB insert fails, the S3 object becomes garbage (cleaned up by a periodic sweep). This is safer than the reverse because an orphaned S3 object is cheap; a database record pointing to nothing causes user-visible errors.
+      </p>
+
+      <h3>Blob Storage + Message Queues</h3>
+      <p>
+        S3 event notifications trigger processing pipelines: an image upload fires an SNS/SQS message, which triggers a Lambda function that resizes the image, generates thumbnails, runs OCR, or scans for malware. <strong>Pitfall:</strong> S3 event notifications guarantee at-least-once delivery, not exactly-once. Your processing Lambda must be idempotent &mdash; re-processing the same image should produce the same result without duplicating database entries or generating duplicate thumbnails. Also, event notifications can be delayed by seconds during high-throughput bursts; don't use them for time-critical workflows.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Dominant Cost Drivers</h4>
+        <p>Blob storage costs break down into three components: <strong>storage</strong> (per GB/month), <strong>requests</strong> (per 1,000 operations), and <strong>egress</strong> (per GB downloaded). For read-heavy workloads, egress often dominates. For write-heavy workloads with many small objects, request costs dominate. For archive-heavy workloads, storage is the primary cost.</p>
+      </div>
+
+      <h3>S3 Pricing Breakdown</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Operation</th>
+            <th>Cost</th>
+            <th>Example at Scale</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>PUT, COPY, POST, LIST</td>
+            <td>$0.005 / 1,000 requests</td>
+            <td>100M PUTs/month = $500</td>
+          </tr>
+          <tr>
+            <td>GET, SELECT</td>
+            <td>$0.0004 / 1,000 requests</td>
+            <td>1B GETs/month = $400</td>
+          </tr>
+          <tr>
+            <td>Data Transfer Out</td>
+            <td>$0.09/GB (first 10 TB), decreasing at volume</td>
+            <td>100 TB/month = ~$8,500</td>
+          </tr>
+          <tr>
+            <td>S3 to CloudFront</td>
+            <td>$0.00 (free)</td>
+            <td>Use CloudFront to eliminate S3 egress charges</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Cost Optimization Strategies</h3>
+      <ul>
+        <li><strong>CloudFront in front of S3:</strong> S3 &rarr; CloudFront transfer is free. CloudFront egress ($0.085/GB) is cheaper than direct S3 egress ($0.09/GB), and the CDN absorbs repeat requests entirely.</li>
+        <li><strong>Lifecycle policies:</strong> Automatically transition data from Standard to IA after 30 days, to Glacier after 90 days. A 50 TB bucket drops from $1,150/month to ~$300/month.</li>
+        <li><strong>S3 Intelligent-Tiering:</strong> For unpredictable access patterns. AWS automatically moves objects between tiers based on usage. Small per-object monitoring fee ($0.0025/1000 objects) but no retrieval charges.</li>
+        <li><strong>Compression:</strong> Gzip or Zstd compress text-based objects (logs, JSON, CSV) before upload. Typical 3-5x size reduction. Store compressed; decompress on read.</li>
+        <li><strong>Batch small objects:</strong> Aggregate tiny writes into larger objects. 1M &times; 1 KB objects costs $5 in PUTs; 1 &times; 1 GB object costs $0.005.</li>
+        <li><strong>Free-egress alternatives:</strong> Cloudflare R2 offers S3-compatible API with zero egress fees. Backblaze B2 + Cloudflare Bandwidth Alliance also eliminates egress costs.</li>
+      </ul>
+
+      <h3>Cost of NOT Using Blob Storage</h3>
+      <p>
+        Storing files on EBS volumes costs $0.08-$0.10/GB/month (4x more than S3 Standard), requires manual capacity management, and offers no built-in replication. Storing blobs in a database is even worse: RDS storage costs $0.115/GB/month, and large BLOBs destroy database performance, bloat backups, and make point-in-time recovery impractical.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Netflix on S3</h3>
+      <p>
+        Netflix stores every video asset in S3 &mdash; the master source files, encoded renditions at multiple bitrates and resolutions, subtitles, and artwork. When a new show or movie is ingested, the content goes through a pipeline: upload to S3, transcode into hundreds of renditions (via a fleet of encoding workers pulling from SQS), and push the encoded files to Netflix's Open Connect CDN appliances deployed in ISP data centers worldwide. S3 serves as the durable "source of truth" while the CDN handles the actual streaming. Netflix uses S3's cross-region replication for disaster recovery and lifecycle policies to archive older renditions.
+      </p>
+
+      <h3>Dropbox: From S3 to Custom Storage and Partly Back</h3>
+      <p>
+        Dropbox originally stored all user files on S3. By 2015, they were one of S3's largest customers, spending tens of millions of dollars annually. They built <strong>Magic Pocket</strong>, a custom exabyte-scale storage system running on bare metal in their own data centers. The migration saved them significant costs &mdash; at their scale, owning hardware was cheaper than renting S3. However, Dropbox continues to use S3 for specific workloads (cold storage, certain regions) where their own infrastructure doesn't have presence.
+      </p>
+
+      <h3>GitHub: Git Objects in Blob Storage</h3>
+      <p>
+        Git itself uses content-addressable storage: every file, commit, and tree is stored as a blob identified by its SHA-1 hash. GitHub stores these Git objects in a distributed storage layer. For large files, <strong>Git LFS (Large File Storage)</strong> replaces blobs with lightweight pointers and stores the actual binary content in a blob store (backed by S3 or equivalent). This keeps Git repositories fast while supporting multi-GB assets like game textures or trained ML models.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Code Example</h2>
+      <p>A Python client demonstrating the core blob storage operations using the <code>boto3</code> S3 SDK: upload, download, and pre-signed URL generation.</p>
+      <pre class="line-numbers"><code class="language-python">import boto3
+from botocore.config import Config
+
+# Initialize client with retry config
+s3 = boto3.client('s3', config=Config(
+    retries={'max_attempts': 3, 'mode': 'adaptive'}
+))
+
+BUCKET = 'my-app-assets'
+
+def upload_object(key, data, content_type='application/octet-stream'):
+    """Upload bytes to S3 with server-side encryption."""
+    s3.put_object(
+        Bucket=BUCKET, Key=key, Body=data,
+        ContentType=content_type,
+        ServerSideEncryption='AES256',
+        Metadata={'uploaded-by': 'api-service'}
+    )
+    return f"s3://{BUCKET}/{key}"
+
+def download_object(key):
+    """Download an object; returns bytes or None if missing."""
+    try:
+        resp = s3.get_object(Bucket=BUCKET, Key=key)
+        return resp['Body'].read()
+    except s3.exceptions.NoSuchKey:
+        return None
+
+def generate_presigned_upload_url(key, expires_in=3600):
+    """Generate a pre-signed URL for direct client upload."""
+    return s3.generate_presigned_url(
+        'put_object',
+        Params={'Bucket': BUCKET, 'Key': key},
+        ExpiresIn=expires_in
+    )
+
+def generate_presigned_download_url(key, expires_in=3600):
+    """Generate a pre-signed URL for time-limited download."""
+    return s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': BUCKET, 'Key': key},
+        ExpiresIn=expires_in
+    )
+
+# Usage
+uri = upload_object('photos/user42/avatar.jpg', image_bytes, 'image/jpeg')
+url = generate_presigned_upload_url('videos/upload-abc.mp4')
+# Client POSTs directly to `url` without needing AWS credentials</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Load Testing</h3>
+      <ul>
+        <li><strong>Upload throughput:</strong> Use <code>s3-benchmark</code> or a custom k6 script to measure max upload rate. Test with realistic object sizes (not just 1 KB). Measure at different concurrency levels (10, 100, 1000 parallel uploads).</li>
+        <li><strong>Download throughput:</strong> Test single-object download speed vs. parallel multi-object downloads. Measure the impact of byte-range requests for large objects.</li>
+        <li><strong>Multipart upload reliability:</strong> Upload a 5 GB file using multipart (100 &times; 50 MB parts). Simulate partial failures by killing the client mid-upload. Verify that incomplete multipart uploads are cleaned up (set a lifecycle rule to abort incomplete uploads after 7 days).</li>
+        <li><strong>Tools:</strong> <code>s3-benchmark</code>, <code>warp</code> (for S3-compatible stores), k6 with <code>aws-sdk</code> extension, or <code>vegeta</code> hitting pre-signed URLs.</li>
+      </ul>
+
+      <h3>Chaos Testing</h3>
+      <ul>
+        <li>Simulate S3 unavailability by pointing the SDK at a nonexistent endpoint or injecting 503 errors with a proxy (toxiproxy). Verify your application degrades gracefully &mdash; e.g., returns a placeholder image instead of crashing.</li>
+        <li>Test what happens when a pre-signed URL expires mid-upload. The client should detect the 403 and request a fresh URL.</li>
+        <li>For self-hosted object stores (MinIO, Ceph), kill a storage node and verify the remaining replicas continue serving reads. Restore the node and verify rebalancing completes.</li>
+      </ul>
+
+      <h3>Benchmarking Methodology</h3>
+      <ul>
+        <li><strong>Sweep object sizes:</strong> Performance characteristics differ dramatically between 1 KB, 1 MB, 100 MB, and 1 GB objects. Test each.</li>
+        <li><strong>Measure from the right location:</strong> Latency from an EC2 instance in the same region is very different from latency from a user's browser across the ocean.</li>
+        <li><strong>Account for S3 partitioning:</strong> S3 auto-partitions by key prefix. Sequential keys (<code>001.jpg</code>, <code>002.jpg</code>) may hit the same partition and get throttled. Use randomized prefixes for high-throughput benchmarks.</li>
+        <li><strong>Test lifecycle transitions:</strong> Upload objects, apply a lifecycle rule, advance the clock (or wait), and verify objects moved to the correct storage class. Check that retrieval from each tier works as expected.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>Design an image hosting service like Imgur</summary>
+        <div class="answer">
+          <p>
+            Start with the core flow: users upload images via a web form or API. The upload goes directly to S3 (using a pre-signed URL generated by your backend), bypassing your application server for the data transfer. On successful upload, the backend records the S3 key, original filename, content type, size, and uploader ID in a PostgreSQL database. The image URL is a deterministic function of the key: <code>https://cdn.example.com/{key}</code>.
+          </p>
+          <p>
+            For serving, put CloudFront in front of S3. Most images will be served from the CDN cache, keeping S3 egress near zero. Generate thumbnails asynchronously: S3 event notification triggers a Lambda that creates 3 sizes (small, medium, large) and writes them back to S3 under a <code>thumbs/</code> prefix. The database record is updated with thumbnail keys.
+          </p>
+          <p>
+            For scale: use S3's automatic partitioning (random prefixes like <code>a3f2/{uuid}.jpg</code>), lifecycle policies to tier old images to IA, and content-based deduplication by hashing uploads before storing (if the hash already exists, return the existing URL instead of storing a duplicate).
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How would you handle NSFW content detection? (Add a moderation Lambda in the pipeline.) How do you handle hot images that go viral? (CDN absorbs the load; S3 auto-scales.) How do you delete images reliably? (Soft delete in DB, S3 object deletion via background job, CDN cache invalidation.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does S3 achieve 11 nines of durability?</summary>
+        <div class="answer">
+          <p>
+            S3 promises 99.999999999% (11 nines) durability, meaning if you store 10 million objects, you'd statistically expect to lose one object every 10,000 years. This is achieved through multiple redundancy layers: every object is automatically replicated across at least <strong>three physically separated Availability Zones</strong> within a region. Each AZ has independent power, cooling, and networking.
+          </p>
+          <p>
+            Under the hood, S3 uses a combination of <strong>replication</strong> and <strong>erasure coding</strong>. For frequently accessed data, full replicas may be kept. For infrequently accessed data, erasure coding (e.g., Reed-Solomon) splits the object into data and parity fragments across devices. Even if multiple disks or entire AZs fail simultaneously, the object can be reconstructed from the surviving fragments.
+          </p>
+          <p>
+            S3 continuously monitors data integrity: every object has a checksum verified on write and periodically re-verified on disk. If a bit rot or disk failure is detected, S3 automatically re-replicates the affected data from surviving copies. The system is designed so that no single failure (disk, server, rack, or entire AZ) causes data loss.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What is the difference between durability and availability? (Durability = data not lost; availability = data accessible. S3 Standard offers 99.99% availability, meaning ~53 minutes of downtime per year.) Can you get higher than 11 nines? (Cross-region replication adds geographic redundancy but is about surviving region-level disasters, not increasing per-object durability.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How to optimize blob storage costs at scale?</summary>
+        <div class="answer">
+          <p>
+            Cost optimization is a multi-lever problem. First, classify your data by access pattern: hot (accessed frequently), warm (accessed occasionally), cold (rarely accessed), and archive (accessed almost never). Apply lifecycle policies to automatically move data through tiers: Standard &rarr; IA (after 30 days) &rarr; Glacier (after 90 days) &rarr; Deep Archive (after 1 year). This alone can cut storage costs by 60-80% for data with a decaying access curve.
+          </p>
+          <p>
+            Second, tackle egress costs. Put a CDN in front of S3 for public content (S3 &rarr; CloudFront transfer is free). For internal services, keep compute in the same region as storage to avoid cross-region transfer fees. Consider Cloudflare R2 or Backblaze B2 for workloads where egress dominates costs &mdash; both offer zero or near-zero egress fees.
+          </p>
+          <p>
+            Third, reduce request costs by batching. Instead of storing millions of tiny objects, aggregate them into larger files (e.g., tar archives or Parquet files) with an index. Use multipart upload for large objects to improve reliability without increasing cost. Finally, compress text-based data (logs, JSON) with Zstd before uploading &mdash; 3-5x reduction in both storage and egress.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> When does it make sense to build your own storage? (At exabyte scale, like Dropbox's Magic Pocket. Below ~100 PB, managed services are almost always cheaper when you factor in engineering time.) How do you handle data that's infrequently accessed but needs fast retrieval? (S3 Glacier Instant Retrieval: $0.004/GB with millisecond access.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Design a video processing pipeline using object storage</summary>
+        <div class="answer">
+          <p>
+            The pipeline has four stages: <strong>ingest</strong>, <strong>transcode</strong>, <strong>store</strong>, and <strong>deliver</strong>. For ingest, the client obtains a pre-signed URL from the API, then uploads the raw video directly to S3 (avoiding proxying through your servers). Use multipart upload for files over 100 MB &mdash; this allows parallel chunk uploads and resumability on network failure.
+          </p>
+          <p>
+            When the upload completes, S3 sends an event notification to an SQS queue. A fleet of transcode workers (EC2 Spot instances or Kubernetes jobs) polls the queue, downloads the raw video, and encodes it into multiple renditions (1080p, 720p, 480p) in formats like H.264/H.265 with HLS packaging. Each rendition is uploaded back to S3 under a structured key: <code>videos/{id}/1080p/manifest.m3u8</code>.
+          </p>
+          <p>
+            For delivery, a CDN serves the HLS manifests and video segments. The manifest file points to segment URLs under the CDN domain. For adaptive bitrate streaming, the player switches between renditions based on network conditions. Use S3 lifecycle policies to delete raw uploads after 30 days (keeping only the encoded renditions), and move old renditions to IA after 90 days.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle failed transcode jobs? (Dead letter queue + retry with backoff. Store the error in a status table. Alert if DLQ depth exceeds threshold.) How do you prioritize premium users? (Separate SQS queues with different worker pool sizes, or priority-based message attributes.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Pre-signed URLs &mdash; how do they work and when to use them?</summary>
+        <div class="answer">
+          <p>
+            A pre-signed URL is a regular S3 URL with an embedded <strong>cryptographic signature</strong> that grants temporary access to a specific operation (GET or PUT) on a specific object. The signature encodes: the AWS access key ID of the signer, the allowed operation, the object key, an expiration timestamp, and any conditions (e.g., max upload size, required content type). The URL can be used by anyone &mdash; no AWS credentials needed.
+          </p>
+          <p>
+            The flow: (1) Client requests an upload URL from your API. (2) Your backend generates a pre-signed PUT URL using the AWS SDK (requires IAM credentials with <code>s3:PutObject</code> permission). (3) Client uploads directly to S3 using the URL. (4) S3 verifies the signature, checks expiration, and if valid, accepts the upload. (5) Your backend is notified via S3 event or the client calls back.
+          </p>
+          <p>
+            Use pre-signed URLs when: clients need to upload/download large files (avoids proxying through your server), you want to grant temporary access without sharing credentials, or you need to serve private content with time-limited links (e.g., paid download links that expire after 1 hour). Don't use them when: the content is public (just use a public CDN), or when you need server-side validation of the content before it's stored (use a proxy upload instead and validate before forwarding to S3).
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What happens if the signing IAM credential is rotated? (URLs signed with the old key stop working. Use IAM roles with session credentials, not long-lived access keys.) Can you restrict the upload size? (Yes, use presigned POST with conditions that limit content-length-range.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How would you migrate from local storage to S3?</summary>
+        <div class="answer">
+          <p>
+            Migration happens in phases to avoid downtime. <strong>Phase 1 (dual-write):</strong> Modify the upload path to write to both local storage and S3. New uploads exist in both places. Verify S3 writes by comparing checksums. This phase validates that S3 integration works correctly in production without risking existing data.
+          </p>
+          <p>
+            <strong>Phase 2 (backfill):</strong> Run a background migration job that copies all existing files from local storage to S3. Use <code>aws s3 sync</code> or a custom script with parallelism. For large datasets (TBs), use AWS Snowball or S3 Transfer Acceleration. Track progress in a database table (file path, S3 key, migration status, checksum). Verify every migrated file's checksum matches.
+          </p>
+          <p>
+            <strong>Phase 3 (read fallback):</strong> Modify the read path to check S3 first. If the object doesn't exist in S3 (migration hasn't reached it yet), fall back to local storage. This is a read-through migration pattern. As the backfill completes, fewer and fewer reads hit local storage.
+          </p>
+          <p>
+            <strong>Phase 4 (cutover):</strong> Once backfill is 100% complete and verified, remove the local storage read fallback. Stop dual-writes. Decommission local storage volumes. Keep a backup of the local storage for 30 days as insurance. Update all URL references (database records, configs) from local paths to S3 keys or CDN URLs.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> How do you handle files uploaded during migration? (Dual-write ensures new files go to both places. The backfill only needs to cover files created before dual-write started.) What if the migration takes weeks and you can't afford downtime? (The dual-write + fallback approach is zero-downtime by design.)</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li>Blob/object storage is the default choice for unstructured data &mdash; images, videos, backups, logs, and data lake files. Its flat key-value model trades POSIX semantics for infinite horizontal scalability.</li>
+        <li>The API is simple by design: <code>PUT</code>, <code>GET</code>, <code>DELETE</code>, <code>LIST</code>. This simplicity enables the extreme durability (11 nines) and scale that S3-compatible stores achieve.</li>
+        <li>Never store blobs in a database. Store the S3 key in the database and the blob in object storage. This keeps your database fast and your storage costs low.</li>
+        <li>Egress is the hidden cost killer. Always put a CDN in front of public-facing blob storage, and consider zero-egress alternatives like Cloudflare R2 for read-heavy workloads.</li>
+        <li>Lifecycle policies are the single most impactful cost optimization. Automatically tiering data from Standard to IA to Glacier can cut storage costs by 60-80%.</li>
+        <li>Use pre-signed URLs for client uploads to avoid proxying large files through your application server. This eliminates a bandwidth bottleneck and reduces server costs.</li>
+        <li>Enable versioning on production buckets. Without it, an accidental delete is permanent. With it, recovery is a single API call.</li>
+        <li>Batch small objects. Writing millions of tiny objects is expensive in request costs and inefficient for storage. Aggregate into larger files where possible.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <ul>
+        <li><a href="cdn.html">Content Delivery Networks</a> &mdash; How CDNs cache and distribute content stored in blob storage to edge locations worldwide.</li>
+        <li><a href="sql-vs-nosql.html">SQL vs. NoSQL</a> &mdash; Understanding when to use a database vs. blob storage for different data types.</li>
+        <li><a href="message-queues.html">Message Queues</a> &mdash; How S3 event notifications integrate with queues to build processing pipelines.</li>
+        <li><a href="caching.html">Caching</a> &mdash; Adding a cache layer in front of blob storage for frequently accessed objects.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="sql-vs-nosql.html" class="prev">SQL vs NoSQL</a>
+      <a href="networking-fundamentals.html" class="next">Networking Fundamentals</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== Blob Storage Upload & Retrieval Animation =====
+    (function () {
+      var canvas = document.getElementById('blob-canvas');
+      var container = document.getElementById('blob-animation-container');
+
+      function drawStorageNode(ctx, x, y, label, highlight) {
+        var color = highlight ? '#16a34a' : '#2563eb';
+        var fill = highlight ? '#dcfce7' : '#eff6ff';
+        drawDatabase(ctx, x, y, { label: label, color: color, fill: fill, width: 44, height: 44 });
+      }
+
+      function drawBlobIcon(ctx, x, y, size) {
+        // Draw a small file/document icon
+        var s = size || 16;
+        ctx.save();
+        ctx.fillStyle = '#dbeafe';
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x - s/2, y - s/2);
+        ctx.lineTo(x + s/4, y - s/2);
+        ctx.lineTo(x + s/2, y - s/4);
+        ctx.lineTo(x + s/2, y + s/2);
+        ctx.lineTo(x - s/2, y + s/2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        // fold
+        ctx.beginPath();
+        ctx.moveTo(x + s/4, y - s/2);
+        ctx.lineTo(x + s/4, y - s/4);
+        ctx.lineTo(x + s/2, y - s/4);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawBlobAnimation(ctx, time, w, h) {
+        var centerY = h / 2;
+        var cycleDuration = 10; // seconds per full cycle
+        var t = time % cycleDuration;
+        var isUpload = t < 5;
+        var progress = isUpload ? t / 5 : (t - 5) / 5;
+
+        // Layout
+        var clientX = 70;
+        var serviceX = w / 2;
+        var node1X = w - 160;
+        var node2X = w - 90;
+        var node3X = w - 125;
+        var node1Y = centerY - 70;
+        var node2Y = centerY - 70;
+        var node3Y = centerY + 50;
+
+        // Draw static components
+        drawClient(ctx, clientX, centerY, { label: 'Client' });
+
+        // Storage service box
+        drawBox(ctx, serviceX - 50, centerY - 25, 100, 50, {
+          color: '#0891b2', fill: '#ecfeff', text: 'Storage API', fontSize: 12
+        });
+        drawLabel(ctx, serviceX, centerY + 38, 'Blob Service', { fontSize: 11, bold: true, color: '#0891b2' });
+
+        // Storage nodes
+        var highlightNodes = [];
+        if (isUpload && progress > 0.55) {
+          var replicateP = (progress - 0.55) / 0.35;
+          if (replicateP > 0) highlightNodes.push(0);
+          if (replicateP > 0.33) highlightNodes.push(1);
+          if (replicateP > 0.66) highlightNodes.push(2);
+        }
+        if (!isUpload) {
+          highlightNodes = [0]; // reading from node 1
+        }
+
+        drawStorageNode(ctx, node1X, node1Y, 'Node 1', highlightNodes.includes(0));
+        drawStorageNode(ctx, node2X, node2Y, 'Node 2', highlightNodes.includes(1));
+        drawStorageNode(ctx, node3X, node3Y, 'Node 3', highlightNodes.includes(2));
+
+        // Static arrows (service to nodes)
+        drawArrow(ctx, serviceX + 50, centerY - 10, node1X - 25, node1Y, {
+          color: '#e2e8f0', width: 1.5
+        });
+        drawArrow(ctx, serviceX + 50, centerY - 10, node2X - 25, node2Y, {
+          color: '#e2e8f0', width: 1.5
+        });
+        drawArrow(ctx, serviceX + 50, centerY + 10, node3X - 25, node3Y, {
+          color: '#e2e8f0', width: 1.5
+        });
+
+        // Phase label
+        if (isUpload) {
+          drawStatusBadge(ctx, w / 2, 22, 'UPLOAD (PUT)', 'info');
+        } else {
+          drawStatusBadge(ctx, w / 2, 22, 'RETRIEVAL (GET)', 'success');
+        }
+
+        // Animations
+        if (isUpload) {
+          if (progress < 0.25) {
+            // Client -> service: send object
+            var p = ease.inOut(progress / 0.25);
+            drawMovingDot(ctx, clientX + 25, centerY, serviceX - 50, centerY, p, {
+              color: '#2563eb', radius: 7
+            });
+            drawBlobIcon(ctx,
+              clientX + 25 + (serviceX - 50 - clientX - 25) * p,
+              centerY - 15, 14
+            );
+            drawLabel(ctx, (clientX + serviceX) / 2, centerY - 40, 'PUT /photos/img.jpg', {
+              color: '#2563eb', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.4) {
+            // Service assigns key
+            var flashP = (progress - 0.25) / 0.15;
+            var alpha = 0.5 + 0.5 * Math.sin(flashP * Math.PI);
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            drawBox(ctx, serviceX - 55, centerY - 30, 110, 60, {
+              color: '#0891b2', fill: '#cffafe', radius: 8
+            });
+            ctx.restore();
+            drawLabel(ctx, serviceX, centerY - 40, 'Assign key + checksum', {
+              color: '#0891b2', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.55) {
+            // Service -> Node 1
+            var p = ease.inOut((progress - 0.4) / 0.15);
+            drawMovingDot(ctx, serviceX + 50, centerY, node1X - 22, node1Y, p, {
+              color: '#16a34a', radius: 5
+            });
+            drawLabel(ctx, (serviceX + node1X) / 2, centerY - 60, 'Replicate to Node 1', {
+              color: '#16a34a', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.7) {
+            // Node 1 -> Node 2 (replication)
+            var p = ease.inOut((progress - 0.55) / 0.15);
+            drawMovingDot(ctx, node1X, node1Y, node2X, node2Y, p, {
+              color: '#16a34a', radius: 5
+            });
+            drawLabel(ctx, (node1X + node2X) / 2, node1Y - 35, 'Replicate to Node 2', {
+              color: '#16a34a', fontSize: 10, bold: true
+            });
+          } else if (progress < 0.85) {
+            // Node 1 -> Node 3 (replication)
+            var p = ease.inOut((progress - 0.7) / 0.15);
+            drawMovingDot(ctx, node1X, node1Y + 22, node3X, node3Y - 22, p, {
+              color: '#16a34a', radius: 5
+            });
+            drawLabel(ctx, (node1X + node3X) / 2 - 20, (node1Y + node3Y) / 2, 'Replicate to Node 3', {
+              color: '#16a34a', fontSize: 10, bold: true
+            });
+          } else {
+            // 200 OK back to client
+            var p = ease.inOut((progress - 0.85) / 0.15);
+            drawMovingDot(ctx, serviceX - 50, centerY, clientX + 25, centerY, p, {
+              color: '#16a34a', radius: 5
+            });
+            drawLabel(ctx, (clientX + serviceX) / 2, centerY - 40, '200 OK (3 replicas stored)', {
+              color: '#16a34a', fontSize: 11, bold: true
+            });
+          }
+        } else {
+          // Retrieval
+          if (progress < 0.2) {
+            // Client -> service
+            var p = ease.inOut(progress / 0.2);
+            drawMovingDot(ctx, clientX + 25, centerY, serviceX - 50, centerY, p, {
+              color: '#2563eb', radius: 6
+            });
+            drawLabel(ctx, (clientX + serviceX) / 2, centerY - 40, 'GET /photos/img.jpg', {
+              color: '#2563eb', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.35) {
+            // Service looks up key
+            var flashP = (progress - 0.2) / 0.15;
+            var alpha = 0.5 + 0.5 * Math.sin(flashP * Math.PI);
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            drawBox(ctx, serviceX - 55, centerY - 30, 110, 60, {
+              color: '#0891b2', fill: '#cffafe', radius: 8
+            });
+            ctx.restore();
+            drawLabel(ctx, serviceX, centerY - 40, 'Lookup key → Node 1', {
+              color: '#0891b2', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.55) {
+            // Service -> Node 1 (fetch)
+            var p = ease.inOut((progress - 0.35) / 0.2);
+            drawMovingDot(ctx, serviceX + 50, centerY, node1X - 22, node1Y, p, {
+              color: '#0891b2', radius: 5
+            });
+            drawLabel(ctx, (serviceX + node1X) / 2, centerY - 60, 'Fetch from nearest replica', {
+              color: '#0891b2', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.75) {
+            // Node 1 -> service (data)
+            var p = ease.inOut((progress - 0.55) / 0.2);
+            drawMovingDot(ctx, node1X - 22, node1Y, serviceX + 50, centerY, p, {
+              color: '#16a34a', radius: 7
+            });
+            drawBlobIcon(ctx,
+              node1X - 22 + (serviceX + 50 - node1X + 22) * p,
+              node1Y + (centerY - node1Y) * p - 15, 14
+            );
+            drawLabel(ctx, (serviceX + node1X) / 2, centerY - 60, 'Stream object data', {
+              color: '#16a34a', fontSize: 11, bold: true
+            });
+          } else if (progress < 0.92) {
+            // Service -> client (response)
+            var p = ease.inOut((progress - 0.75) / 0.17);
+            drawMovingDot(ctx, serviceX - 50, centerY, clientX + 25, centerY, p, {
+              color: '#16a34a', radius: 7
+            });
+            drawBlobIcon(ctx,
+              serviceX - 50 + (clientX + 25 - serviceX + 50) * p,
+              centerY - 15, 14
+            );
+            drawLabel(ctx, (clientX + serviceX) / 2, centerY - 40, '200 OK + object bytes', {
+              color: '#16a34a', fontSize: 11, bold: true
+            });
+          }
+          // 0.92-1.0: pause
+        }
+      }
+
+      var animation = createAnimation(canvas, drawBlobAnimation, { height: 320 });
+      setupControls(container, animation);
+    })();
+  </script>
+
+</body>
+</html>

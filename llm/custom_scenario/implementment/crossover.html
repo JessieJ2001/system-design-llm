@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crossover Reference &mdash; every break-even number on the Distributed KV Cache page</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 80rem; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    table.sheet td.val { font-family:'JetBrains Mono',monospace; font-weight:700; color:#0f172a; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.86rem; line-height:1.55;
+      white-space:pre-wrap; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* Crossover card */
+    .xo { background:#fff; border:1px solid var(--color-border); border-radius:10px;
+      padding:.9rem 1.2rem 1rem; margin:1.1rem 0; }
+    .xo h3 { margin:0 0 .15rem; color:#1e3a8a; }
+    .xo .xo-meta { font-size:.82rem; color:#64748b; margin:0 0 .5rem; }
+    .xo .xo-q { font-weight:700; color:#7c2d12; margin:.3rem 0 .15rem; }
+    .xo .xo-decides { font-weight:700; color:#14532d; }
+    .xo ul { margin:.25rem 0 .35rem 1.1rem; padding:0; }
+    .xo ul > li { margin:.18rem 0; }
+    .pill { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:700;
+      padding:.08rem .45rem; border-radius:999px; background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe; }
+    /* Number-source tags (rendered as inline chips, greppable). */
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+      font-weight:700; padding:.05rem .35rem; border-radius:4px; margin-left:.25rem; vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-k  { color:#6b21a8; background:#f3e8ff; border:1px solid #d8b4fe; }
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id], .xo[id] { scroll-margin-top: 5rem; }
+    .fam-head { background:linear-gradient(90deg,#eff6ff,#f8fafc); border-left:6px solid #2563eb;
+      border-radius:8px; padding:.55rem 1rem; margin:1.8rem 0 .5rem; }
+    .fam-head h2 { margin:0; }
+    .fam-head .fam-sub { font-size:.85rem; color:#475569; margin-top:.2rem; }
+    /* Per-section notation recap. */
+    .notation-box { background:#f0f9ff; border:1px solid #bae6fd; border-left:4px solid #0284c7;
+      border-radius:8px; padding:.6rem 1rem .7rem; margin:.5rem 0 1.1rem; }
+    .notation-box .nb-title { font-weight:700; color:#075985; font-size:.9rem; margin:0 0 .35rem; }
+    .notation-box dl.nb { display:grid; grid-template-columns:max-content 1fr; column-gap:1rem; row-gap:.22rem;
+      margin:.1rem 0 0; font-size:.85rem; align-items:baseline; }
+    .notation-box dl.nb dt { font-family:'JetBrains Mono',monospace; font-weight:700; color:#0c4a6e; }
+    .notation-box dl.nb dd { margin:0; color:#334155; line-height:1.45; }
+    @media (max-width:640px){ .notation-box dl.nb { grid-template-columns:1fr; row-gap:.05rem; }
+      .notation-box dl.nb dd { margin:0 0 .3rem; } }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <!-- ===================================================== -->
+  <!-- Left navigation sidebar (sticky on-page TOC)            -->
+  <!-- ===================================================== -->
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page (source)</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html">kv_store.html</a></li>
+          <li><a class="sidebar-section-link" href="cache_eviction_policy.html">cache_eviction_policy.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#summary">At a glance &mdash; 8 crossovers</a></li>
+          <li><a class="sidebar-section-link" href="#notation">Notation</a></li>
+          <li><a class="sidebar-section-link" href="#famA">A &mdash; transfer vs recompute</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#A1">&nbsp;&nbsp;A1 &mdash; tier vs re-prefill (length)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#A2">&nbsp;&nbsp;A2 &mdash; bandwidth break-even</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#A3">&nbsp;&nbsp;A3 &mdash; &alpha;-sensitivity</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#A4">&nbsp;&nbsp;A4 &mdash; recompute vs pool pull</a></li>
+          <li><a class="sidebar-section-link" href="#famB">B &mdash; quadratic vs linear</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#B1">&nbsp;&nbsp;B1 &mdash; prefill s* &asymp; 49 K</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#B2">&nbsp;&nbsp;B2 &mdash; decode &asymp; 53 K</a></li>
+          <li><a class="sidebar-section-link" href="#famC">C &mdash; decode batch &amp; TPOT</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#C1">&nbsp;&nbsp;C1 &mdash; B<sub>decode</sub> &asymp; 106</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#C2">&nbsp;&nbsp;C2 &mdash; spec-decode break-even</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===================================================== -->
+  <!-- Navigation                                              -->
+  <!-- ===================================================== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">KV Cache Walkthrough</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===================================================== -->
+  <!-- Hero                                                   -->
+  <!-- ===================================================== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Crossover Reference</h1>
+      <p class="hero-subtitle">Every <strong>break-even / crossover number</strong> derived in the <a href="distributed_kv_cache.html">Distributed KV Cache</a> walkthrough, in one place &mdash; the question each one answers, the equation that sets two costs equal, the substituted constants, the resulting threshold, and the design choice it decides. Nothing here is new: each number is the figure already derived on the source page, linked back to its section.</p>
+      <p class="hero-meta">
+        Source: <a href="distributed_kv_cache.html">distributed_kv_cache.html</a> &middot;
+        tags: <span class="tag tag-g">[G]</span> given &middot; <span class="tag tag-d">[D]</span> derived &middot; <span class="tag tag-k">[G&mdash;K]</span> from a knowledge page
+      </p>
+    </div>
+  </section>
+
+  <div class="container">
+
+    <!-- ===================================================== -->
+    <!-- At-a-glance summary table                              -->
+    <!-- ===================================================== -->
+    <section id="summary">
+      <h2>At a glance &mdash; eight crossovers</h2>
+      <p>The whole page is three families. <strong>Family A</strong> (transfer vs recompute) is one piece of algebra reused three times. <strong>Family B</strong> is where a quadratic compute term overtakes a linear one. <strong>Family C</strong> is the decode batch hitting its latency / capacity ceiling.</p>
+      <table class="sheet">
+        <thead>
+          <tr><th>#</th><th>Crossover</th><th>Two costs set equal</th><th>Threshold (the number)</th><th>Decides</th><th>Source</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="n">A1</td>
+            <td>Tier swap-in vs re-prefill <em>(length)</em></td>
+            <td class="c">&beta;<sub>t</sub>(N) = &beta;<sub>cold</sub>(N)</td>
+            <td class="val">SSD (7 GB/s): N* &asymp; 1 870 tok<br>DRAM (25 GB/s): none</td>
+            <td>On a miss, swap a tier in vs recompute; the tier ladder order</td>
+            <td><a href="distributed_kv_cache.html#iter1a-wait">&sect;6.5</a></td>
+          </tr>
+          <tr>
+            <td class="n">A2</td>
+            <td>Tier vs re-prefill <em>(bandwidth)</em></td>
+            <td class="c">&beta;<sub>t</sub> per tok = recompute per tok</td>
+            <td class="val">BW* &asymp; 7.2 GB/s</td>
+            <td>Which tiers beat recompute at <em>every</em> length</td>
+            <td><a href="distributed_kv_cache.html#iter1a-wait">&sect;6.5</a></td>
+          </tr>
+          <tr>
+            <td class="n">A3</td>
+            <td>A1 with the fixed overhead &alpha; restored</td>
+            <td class="c">a&middot;N&sup2; + b&middot;N &minus; &alpha; = 0</td>
+            <td class="val">&alpha;=0&rarr;1.9 K; 1 ms&rarr;2.4 K; 5 ms&rarr;3.6 K</td>
+            <td>Whether the pool admit gate widens for the p99 tail</td>
+            <td><a href="distributed_kv_cache.html#iter1a-wait">&sect;6.5</a></td>
+          </tr>
+          <tr>
+            <td class="n">A4</td>
+            <td>Recompute vs remote-pool pull</td>
+            <td class="c">&beta;<sub>pull</sub>(N) = &beta;<sub>cold</sub>(N)</td>
+            <td class="val">N* &asymp; 1 870 tok (NVMe back)<br>none at RDMA front; &rho;<sub>fabric</sub>&ge;0.29 &rArr; none</td>
+            <td>The ~1.9 K pool write-back length gate</td>
+            <td><a href="distributed_kv_cache.html#iter3b-nums">&sect;9b.4</a></td>
+          </tr>
+          <tr>
+            <td class="n">B1</td>
+            <td>Prefill: attention term vs linear term</td>
+            <td class="c">4&middot;n_layers&middot;N&sup2;&middot;d_model = 2&middot;P&middot;N</td>
+            <td class="val">s* = 6&middot;d_model &asymp; 49 K tok</td>
+            <td>When prefill stops being ~linear &rarr; forces CP (Iter 9)</td>
+            <td><a href="distributed_kv_cache.html#s3-prefill">&sect;4.1</a></td>
+          </tr>
+          <tr>
+            <td class="n">B2</td>
+            <td>Decode: attention term vs weights term</td>
+            <td class="c">2&middot;n_layers&middot;d_model&middot;(T<sub>in</sub>+T<sub>out</sub>/2) = P</td>
+            <td class="val">T<sub>in</sub> + T<sub>out</sub>/2 &asymp; 53 K</td>
+            <td>When decode attention FLOPs start to matter (L3 territory)</td>
+            <td><a href="distributed_kv_cache.html#iter0-numbers">&sect;5.4</a></td>
+          </tr>
+          <tr>
+            <td class="n">C1</td>
+            <td>Decode batch vs TPOT SLO / HBM capacity</td>
+            <td class="c">tick(B) = TPOT_SLO &amp; B = G<sub>KV</sub>/kv_per_slot</td>
+            <td class="val">B<sub>decode</sub> &asymp; 106 &rarr; tick &asymp; 22 ms &lt; 30 ms</td>
+            <td>How wide the continuous-batch can run (Iter 6)</td>
+            <td><a href="distributed_kv_cache.html#param-b-decode">&sect;12</a></td>
+          </tr>
+          <tr>
+            <td class="n">C2</td>
+            <td>Speculative decode vs vanilla autoregressive</td>
+            <td class="c">E[accept] &times; discount = 1</td>
+            <td class="val">at &alpha;=0.7: 2.0&times; speedup; break-even at &alpha; &Lt; 0.7</td>
+            <td>When to fall back from spec-decode to vanilla (Iter 7)</td>
+            <td><a href="distributed_kv_cache.html#iter7-nums">&sect;13.5</a></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ===================================================== -->
+    <!-- Notation                                               -->
+    <!-- ===================================================== -->
+    <section id="notation">
+      <div class="notation-box">
+        <p class="nb-title">Notation &mdash; the symbols every formula below reuses (all owned by the source page)</p>
+        <table class="sheet">
+          <thead>
+            <tr><th>Symbol</th><th>Meaning</th><th>Value / formula</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="c">N</td>
+              <td>token count to materialize in HBM &mdash; the KV block a decision must rebuild or move. <strong>Not an alias for <code>s</code> or <code>c</code>:</strong> binds to <code>s</code> (prompt length) on a first-turn miss, to <code>c</code> (full context) on a cross-turn swap-in.</td>
+              <td>neutral letter &mdash; the recompute-vs-transfer algebra depends only on the count, and in A1 neither <code>s</code> nor <code>c</code> fits both sides (swap-in restores a <code>c</code>-sized context; re-prefill is the <code>s</code>-quadratic prefill formula).</td>
+            </tr>
+            <tr>
+              <td class="c">s</td>
+              <td>prompt (prefill) length &mdash; queries processed in one prefill pass. <code>N</code> binds to <code>s</code> on a first-turn miss.</td>
+              <td class="c">workload mean <code>T<sub>in</sub></code> = 13 K (&sect;1)</td>
+            </tr>
+            <tr>
+              <td class="c">c</td>
+              <td>full context length a decode step attends over &mdash; grows by one each token, from <code>T<sub>in</sub></code> to <code>T<sub>in</sub>+T<sub>out</sub></code>. <code>N</code> binds to <code>c</code> on a cross-turn swap-in.</td>
+              <td class="c">&mdash;</td>
+            </tr>
+            <tr>
+              <td class="c">T<sub>in</sub> / T<sub>out</sub></td>
+              <td>per-request input (prompt) and output (generated) token counts &mdash; the workload&rsquo;s sequence-length distribution (a given, &sect;1). <code>T<sub>in</sub></code> = the mean <code>s</code>; a decode generates <code>T<sub>out</sub></code> tokens, so its mean attended context is <code>T<sub>in</sub> + T<sub>out</sub>/2</code>.</td>
+              <td class="c">mean 13 K / 400; <code>T<sub>out</sub></code> p99 = 3 K, hard-cap 65 K</td>
+            </tr>
+            <tr>
+              <td class="c">P</td>
+              <td>model parameter count (Llama-3-70B); <code>2&middot;P</code> is the prefill <em>linear</em> coefficient.</td>
+              <td class="c">70&middot;10&#8313;; 2&middot;P = 1.4&middot;10&#185;&#185; FLOP/tok</td>
+            </tr>
+            <tr>
+              <td class="c">n_layers / d_model</td>
+              <td><code>4&middot;n_layers&middot;d_model</code> is the prefill <em>attention</em> coefficient.</td>
+              <td class="c">80 / 8 192; 4&middot;n_layers&middot;d_model = 2.62&middot;10&#8310;</td>
+            </tr>
+            <tr>
+              <td class="c">KV<sub>per_tok</sub></td>
+              <td>per-token K,V bytes across all 80 layers.</td>
+              <td class="c">3.2&middot;10&#8309; B (320 KB); per-GPU at TP=8 = 40 KB</td>
+            </tr>
+            <tr>
+              <td class="c">n_q_heads / n_kv_heads / d_head</td>
+              <td>query-head count / key-value-head count / per-head width. <code>n_q_heads&middot;d_head = d_model</code> (query side is full width); GQA stores only <code>n_kv_heads</code> KV heads.</td>
+              <td class="c">64 / 8 / 128 (Llama-3-70B); 64&times;128 = 8 192 = d_model</td>
+            </tr>
+            <tr>
+              <td class="c">g</td>
+              <td>GQA group size = <code>n_q_heads / n_kv_heads</code> = how many query heads <em>share</em> each KV head (<em>not</em> the KV-head count itself). Equals the decode-attention arithmetic intensity exactly (<code>AI<sub>attn</sub> = g</code>): the query side keeps all heads, GQA only shrinks the stored-KV bytes.</td>
+              <td class="c">64 / 8 = <strong>8</strong> (Llama-3-70B) &mdash; coincidentally equals <code>n_kv_heads</code>=8 here, but a distinct quantity</td>
+            </tr>
+            <tr>
+              <td class="c">F<sub>sustained</sub></td>
+              <td>per-task sustained compute = <code>TP &times; GPU_peak_BF16 &times; MFU</code>.</td>
+              <td class="c">8 &times; 989&middot;10&#185;&sup2; &times; 0.40 = 3.17&middot;10&#185;&#8309; FLOP/s</td>
+            </tr>
+            <tr>
+              <td class="c">BW<sub>t</sub></td>
+              <td>effective swap-in bandwidth of tier <em>t</em>.</td>
+              <td class="c">HBM ~TB/s; DRAM 25 GB/s; single-NVMe SSD 7 GB/s; 4-SSD stripe / RDMA front 25 GB/s</td>
+            </tr>
+            <tr>
+              <td class="c">&beta;<sub>t</sub>(N)</td>
+              <td>size term of a swap-in from tier <em>t</em> &mdash; the <code>&beta;&middot;n</code> part of <code>&alpha;+&beta;&middot;n</code>.</td>
+              <td class="c">N &times; KV<sub>per_tok</sub> / BW<sub>t</sub></td>
+            </tr>
+            <tr>
+              <td class="c">&beta;<sub>cold</sub>(N)</td>
+              <td>re-prefill cost &mdash; linear + quadratic.</td>
+              <td class="c">(2&middot;P&middot;N + 4&middot;n_layers&middot;N&sup2;&middot;d_model) / F<sub>sustained</sub></td>
+            </tr>
+            <tr>
+              <td class="c">&alpha;</td>
+              <td>(A3) fixed per-transfer overhead (RTT + setup + index touch). <strong>Also</strong> (C2) the speculative-decode token <em>accept rate</em> &mdash; two unrelated uses, kept distinct by family.</td>
+              <td class="c">&micro;s locally / ms p99 on the pool</td>
+            </tr>
+            <tr>
+              <td class="c">&gamma;</td>
+              <td>speculative draft length &mdash; tokens proposed per target forward.</td>
+              <td class="c">4</td>
+            </tr>
+            <tr>
+              <td class="c">B / B<sub>decode</sub> / G<sub>KV</sub></td>
+              <td>decode batch width (<code>B</code> = generic, <code>B<sub>decode</sub></code> = the chosen ceiling) / per-task HBM budget for KV. <code>B</code> tokens share one weight read &rArr; weight-read <code>AI = B</code>.</td>
+              <td class="c">B<sub>decode</sub> = 106; G<sub>KV</sub> = 450 GB at TP=8</td>
+            </tr>
+            <tr>
+              <td class="c">HBM_BW</td>
+              <td>per-GPU HBM bandwidth; sets the decode tick.</td>
+              <td class="c">3.35 TB/s</td>
+            </tr>
+            <tr>
+              <td class="c">I*</td>
+              <td>roofline <em>ridge point</em> &mdash; arithmetic intensity (FLOP/byte) above which a kernel is compute-bound, below which memory-bound; hardware constant = peak FLOPs / HBM_BW.</td>
+              <td class="c">989&middot;10&#185;&sup2; / 3.35&middot;10&#185;&sup2; &asymp; 295 FLOP/byte</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===================================================== -->
+    <!-- FAMILY A                                               -->
+    <!-- ===================================================== -->
+    <div class="fam-head" id="famA">
+      <h2>Family A &mdash; transfer vs recompute (the &beta; crossovers)</h2>
+      <p class="fam-sub">One question, asked three ways: is it cheaper to <em>move</em> KV bytes in from a slower tier, or to <em>recompute</em> them with a fresh prefill? Set the transfer cost equal to the re-prefill cost and solve.</p>
+    </div>
+
+    <div class="xo" id="A1">
+      <h3>A1 &middot; Tier swap-in vs re-prefill &mdash; the length crossover N*</h3>
+      <p class="xo-meta"><span class="pill">&sect;6.5</span> &nbsp;the central crossover &mdash; everything else in Family A is a variation on it.</p>
+      <p class="xo-q">Q: below what context length N does re-prefilling beat swapping the KV in from tier <em>t</em>?</p>
+      <p>A tier beats re-prefill when its <em>linear</em> transfer cost <code>&beta;<sub>t</sub>(N)</code> is below the <em>linear + quadratic</em> re-prefill cost <code>&beta;<sub>cold</sub>(N)</code>. Set them equal and divide by N:</p>
+      <div class="formula-box"># Set tier swap-in = re-prefill, then solve for N:
+N &times; KV<sub>per_tok</sub> / BW<sub>t</sub>  =  ( 2&middot;P&middot;N + 4&middot;n_layers&middot;N&sup2;&middot;d_model ) / F<sub>sustained</sub>
+
+N* = ( F<sub>sustained</sub> &times; KV<sub>per_tok</sub> / BW<sub>t</sub>  &minus;  2&middot;P )  /  ( 4 &times; n_layers &times; d_model )
+
+# Constants (Llama-3-70B + TP=8):
+KV<sub>per_tok</sub>       = 3.2&middot;10&#8309; B            <span class="tag tag-d">[D &mdash; &sect;4.2]</span>
+2&middot;P              = 1.4&middot;10&#185;&#185; FLOP/tok       <span class="tag tag-k">[G &mdash; K1 &sect;3.3]</span>
+4&times;80&times;8 192      = 2.62&middot;10&#8310;
+F<sub>sustained</sub>      = 8 &times; 989&middot;10&#185;&sup2; &times; 0.40 = 3.17&middot;10&#185;&#8309; FLOP/s   <span class="tag tag-d">[D &mdash; &sect;1.5]</span></div>
+      <p>Substituting the two non-HBM tiers:</p>
+      <ul>
+        <li><strong>SSD vs cold</strong> (BW<sub>t</sub> = 7 GB/s): <code>N* = (3.17e15 &times; 3.2e5 / 7e9 &minus; 1.4e11) / 2.62e6 = (1.45e11 &minus; 1.4e11) / 2.62e6 &asymp; <strong>1 870 tok</strong></code>. Below ~1.9 K, re-prefill is cheaper than an SSD swap-in.</li>
+        <li><strong>DRAM vs cold</strong> (BW<sub>t</sub> = 25 GB/s): numerator goes <em>negative</em> &mdash; <code>4.06e10 &minus; 1.4e11 = &minus;9.94e10</code>. <strong>No positive crossover</strong>: DRAM beats re-prefill at <em>every</em> N, because the linear prefill term alone already exceeds the DRAM swap-in time.</li>
+      </ul>
+      <p class="xo-decides">Decides: the on-miss tier ladder &mdash; walk HBM &rarr; DRAM &rarr; SSD &rarr; recompute and stop at the first hit. DRAM always wins; SSD wins for any realistic conv (N &ge; ~1.9 K); only sub-2 K fragments are cheaper to recompute.</p>
+      <table class="sheet">
+        <thead><tr><th>N</th><th>&beta;<sub>DRAM</sub>(N) @25 GB/s</th><th>&beta;<sub>SSD</sub>(N) @7 GB/s</th><th>&beta;<sub>cold</sub>(N)</th><th>Best tier above re-prefill</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1 K</td><td class="n">12.8 ms</td><td class="n">45.7 ms</td><td class="n">45 ms</td><td>SSD &asymp; cold &mdash; the crossover</td></tr>
+          <tr><td class="n">4 K</td><td class="n">51.2 ms</td><td class="n">183 ms</td><td class="n">190 ms</td><td>SSD by ~4%; DRAM by 3.7&times;</td></tr>
+          <tr><td class="n">8 K (median)</td><td class="n">102 ms</td><td class="n">365 ms</td><td class="n">410 ms</td><td>SSD by ~11%; DRAM by 4&times;</td></tr>
+          <tr><td class="n">13 K (T<sub>in_mean</sub>)</td><td class="n">166 ms</td><td class="n">594 ms</td><td class="n">730 ms</td><td>SSD by ~19%; DRAM by 4.4&times;</td></tr>
+          <tr><td class="n">32 K</td><td class="n">410 ms</td><td class="n">1.46 s</td><td class="n">2.26 s</td><td>SSD by 35%; DRAM by 5.5&times;</td></tr>
+          <tr><td class="n">256 K (p99)</td><td class="n">3.28 s</td><td class="n">11.7 s</td><td class="n">65.5 s</td><td>SSD by 5.6&times;; DRAM by 20&times;</td></tr>
+        </tbody>
+      </table>
+      <p class="ref-box" style="margin-top:.4rem;"><strong>Why DRAM&rsquo;s lead widens with N.</strong> Both <code>&beta;<sub>DRAM</sub></code> and <code>&beta;<sub>SSD</sub></code> are linear in N; <code>&beta;<sub>cold</sub></code> carries the quadratic attention term that dominates above ~49 K (that&rsquo;s crossover <a href="#B1">B1</a>). At 256 K, cold is 5.6&times; SSD and 20&times; DRAM; at 1 M context the gap is ~68&times; &mdash; which is why deeper SSD isn&rsquo;t the p99.9 answer, context parallelism is.</p>
+    </div>
+
+    <div class="xo" id="A2">
+      <h3>A2 &middot; Tier vs re-prefill &mdash; the bandwidth break-even BW*</h3>
+      <p class="xo-meta"><span class="pill">&sect;6.5</span> &middot; <span class="pill">&sect;9b.4</span> &nbsp;the same algebra read as &ldquo;which tiers have <em>no</em> crossover&rdquo;.</p>
+      <p class="xo-q">Q: how fast must a path be to beat recompute at <em>every</em> length (no positive N*)?</p>
+      <p>N* goes negative exactly when the per-token transfer cost drops below the per-token <em>linear</em> recompute cost. Set those equal:</p>
+      <div class="formula-box">KV<sub>per_tok</sub> / BW*  =  2&middot;P / F<sub>sustained</sub>
+
+BW* = KV<sub>per_tok</sub> &times; F<sub>sustained</sub> / 2&middot;P
+    = 3.2e5 &times; 3.17e15 / 1.4e11
+    &asymp; <strong>7.2 GB/s</strong>   <span class="tag tag-d">[D]</span></div>
+      <ul>
+        <li>RDMA front (25 GB/s) and the 4-SSD stripe (25 GB/s) clear it &rarr; pull always beats recompute.</li>
+        <li>single-NVMe (7 GB/s) sits <em>right on it</em> &rarr; it only ties recompute at the 8 K median (366 vs 407 ms); that&rsquo;s why its finite crossover (A1, A4) lands at ~1.9 K rather than at zero.</li>
+      </ul>
+      <p class="xo-decides">Decides: which pool serving paths are &ldquo;always worth it&rdquo; vs which need the length gate &mdash; the RDMA front needs no gate; the NVMe back does.</p>
+    </div>
+
+    <div class="xo" id="A3">
+      <h3>A3 &middot; The crossover&rsquo;s &alpha;-sensitivity &mdash; restoring the fixed overhead</h3>
+      <p class="xo-meta"><span class="pill">&sect;6.5</span> &nbsp;why the gate doesn&rsquo;t move even though the tail says it should.</p>
+      <p class="xo-q">Q: A1/A2 drop the fixed per-transfer overhead &alpha;. How much does N* move once you put it back?</p>
+      <p>The true cost <em>of the transfer</em> (swapping/pulling the KV cache in, the alternative to recomputing it) is <code>&alpha; + &beta;&middot;n</code> &mdash; the standard latency&ndash;bandwidth model: <code>&alpha;</code> = fixed per-transfer overhead paid once regardless of size (setup / first-byte / queueing), <code>&beta;</code> = the <em>per-token</em> transfer cost <code>= KV<sub>per_tok</sub>/BW</code> (the slope &mdash; latency each extra token of history adds), and <code>n = N</code> tokens. So <code>&beta;&middot;n = N&middot;KV<sub>per_tok</sub>/BW</code> is exactly the size term <code>&beta;<sub>t</sub>(N)</code>; A1/A2 kept only that slope and dropped the <code>&alpha;</code> intercept. At the crossover the two <em>linear</em> terms nearly cancel (recompute is only ~3% cheaper per token than transfer), so a small &alpha; moves N* a lot. Solving the quadratic <code>a&middot;N&sup2; + b&middot;N &minus; &alpha; = 0</code> (where <code>b</code>&rsquo;s <code>&minus;KV<sub>per_tok</sub>/BW</code> term <em>is</em> <code>&minus;&beta;</code>):</p>
+      <div class="formula-box"># Restore &alpha;: set recompute_cost = transfer_cost, then move all to one side.
+recompute = (2&middot;P&middot;N + 4&middot;n_layers&middot;N&sup2;&middot;d_model) / F<sub>sustained</sub>     # linear + quadratic
+transfer  = &alpha; + (KV<sub>per_tok</sub>/BW)&middot;N                          # intercept + slope(&beta;)
+
+# recompute &minus; transfer = 0, grouped by powers of N:
+(4&middot;n_layers&middot;d_model/F<sub>sustained</sub>)&middot;N&sup2;  +  (2&middot;P/F<sub>sustained</sub> &minus; KV<sub>per_tok</sub>/BW)&middot;N  &minus;  &alpha;  = 0
+ \____________ a ____________/      \______________ b ______________/
+
+a = 4&middot;n_layers&middot;d_model / F<sub>sustained</sub>      &asymp;  8.3e&minus;10    # from the N&sup2; attention term
+b = 2&middot;P/F<sub>sustained</sub> &minus; KV<sub>per_tok</sub>/BW       &asymp; &minus;1.55e&minus;6   # linear recompute &minus; linear transfer; &lt;0 &rArr; a positive root exists
+
+# Positive root:  N* = ( &minus;b + &radic;(b&sup2; + 4&middot;a&middot;&alpha;) ) / (2&middot;a)
+&alpha; = 0      &rarr;  constant gone &rArr; N(aN+b)=0 &rArr; N* = &minus;b/a &asymp; 1.9 K   (identical to the A1 formula)
+&alpha; = 1 ms   &rarr;  N* &asymp; 2.4 K
+&alpha; = 5 ms   &rarr;  N* &asymp; 3.6 K</div>
+      <p class="ref-box"><strong>Why A1/A2 drop &alpha; in the first place.</strong> (1) On the tiers they cover &mdash; <em>local</em> swap-ins over PCIe/GDS &mdash; &alpha; (setup/first-byte) is &micro;s against a <code>&beta;&middot;n</code> of ~87 ms at the crossover, a &lt;0.1% term: the closed form is cleaner without it and <code>N*</code> barely moves. (2) It confines &alpha; to A3, the single path where it is large &mdash; the remote-pool pull&rsquo;s p99 PFC stall (<code>&alpha;&asymp;5 ms</code>) &mdash; so A1 stays the clean slope-vs-curve crossover and A3 owns the sensitivity. (The twist, above: &lt;0.1% in <em>magnitude</em> still swings <code>N*</code> 1.9 K &rarr; 3.6 K, because the two linear terms nearly cancel.)</p>
+      <p>Local swap-in &alpha; &asymp; &micro;s (negligible vs the ~87 ms <code>&beta;&middot;n</code> at 1.9 K). The <strong>remote-pool pull</strong> is &micro;s at median (RDMA RTT same-row/same-DC &asymp; 1&ndash;10 &micro;s <span class="tag tag-g">[G &mdash; NEW_BOE]</span> + CH-probe + index touch) but ~ms at p99: when a switch buffer fills, RoCE&rsquo;s <strong>PFC (Priority Flow Control)</strong> sends PAUSE frames upstream (each pause is tens of &micro;s, but cascading pauses / head-of-line blocking compound), and on a drop the go-back-N retransmit RTO adds another ~ms. That inflates the pull&rsquo;s fixed overhead from &micro;s to <code>&alpha; &asymp; 5 ms</code> <span class="tag tag-d">[D &mdash; order-of-magnitude p99 estimate, not a measured constant]</span>, which &mdash; via the &alpha;-hypersensitivity above &mdash; pushes the break-even length from 1.9 K to <strong>~3.6 K</strong>.</p>
+      <p><strong>The exact 5 ms is not load-bearing.</strong> Any ms-scale tail &alpha; (3 ms or 7 ms) lands the crossover in the same ~3&ndash;4 K band, and the decision is the same either way (below). The number is here to <em>illustrate</em> the &alpha;-sensitivity, not to pin a threshold: the crossover is not a constant &mdash; 1.9 K on the common fast path, widening to ~3.6 K only on the rare p99 PFC tail.</p>
+      <p class="xo-decides">Decides: the pool admit gate uses the <em>median-&alpha;</em> crossover (~1.9 K), <strong>not</strong> a widened ~3.6 K gate. The p99-&alpha; tail is absorbed by an abandon-to-recompute fallback (a pull that blows its TTFT budget is dropped for local recompute), not by changing the threshold.</p>
+    </div>
+
+    <div class="xo" id="A4">
+      <h3>A4 &middot; Recompute vs remote-pool pull &mdash; the write-back length gate</h3>
+      <p class="xo-meta"><span class="pill">&sect;9b.4</span> &middot; <a href="distributed_kv_cache.html#param-length-gate">length-gate <code>[param]</code></a> &nbsp;A1 reused for the cross-task store.</p>
+      <p class="xo-q">Q: a conv is being evicted &mdash; is it worth writing back to the pool so a later turn can pull it instead of recomputing?</p>
+      <p>A pull is just another tier read, so the crossover is the <em>same</em> algebra as A1/A2 with <code>BW<sub>pull</sub></code> in place of the tier BW:</p>
+      <ul>
+        <li><strong>Bandwidth break-even</strong> = the A2 number, <code>BW* &asymp; 7.2 GB/s</code>. The RDMA front (25 GB/s) clears it &rarr; pull always wins; single-NVMe sits on it.</li>
+        <li><strong>Length crossover (single-NVMe back)</strong> = the A1 number, <code>N* &asymp; 1 870 tok</code> &mdash; pull wins for any conv history &gt; ~1.9 K, i.e. essentially every multi-turn conv.</li>
+        <li><strong>Contention-aware form</strong>: <code>&rho;<sub>fabric</sub></code> &isin; (0,1] is the fraction of the nominal 25 GB/s the shared fabric actually delivers (contention, PFC pauses, retransmits), so the effective pull BW is <code>&rho;<sub>fabric</sub> &times; 25 GB/s</code>. There is <em>no</em> finite crossover as long as that still clears the A2 break-even <code>BW* &asymp; 7.2 GB/s</code> &mdash; i.e. <code>&rho;<sub>fabric</sub> &times; 25 &ge; 7.2 &rArr; &rho;<sub>fabric</sub> &ge; 7.2/25 &asymp; <strong>0.29</strong></code>. So the 0.29 is not an assumption but the derated-bandwidth point where the A2 result starts to fail: above 29%-of-nominal the effective pull BW still beats recompute at all lengths; below it the crossover is finite and &ge; 1.9 K &mdash; so ~1.9 K is the robust floor (worst case, fabric &gt;71% saturated), not a universal constant.</li>
+      </ul>
+      <div class="formula-box"># Why the conservative (slow-tier) crossover is the gate:
+recompute @256 K = &beta;<sub>cold</sub>(256 K) &asymp; 65 s   vs   pull @25 GB/s &asymp; 3.3 s   <span class="tag tag-d">[D]</span>
+write-through every turn = &lambda;<sub>avg</sub> &times; 400 tok &times; KV<sub>per_tok</sub>
+                        = 30 000 &times; 128 MB &asymp; <strong>3.84 TB/s</strong> of mostly-never-read ingest <span class="tag tag-d">[D]</span>
+&rarr; so: write-BACK, gated at the ~1.9 K SSD crossover, not write-through.</div>
+      <p class="xo-decides">Decides: the predictor-free admission gate &mdash; write a conv back only when (a) local residency failed <em>and</em> (b) cumulative context &gt; ~1.9 K. The dominant argument is FLOPs offload (recompute burns the scarce <em>prefill</em> roofline; a pull burns cheap I/O), so with the RDMA front there is effectively no crossover &mdash; pull always wins for cross-turn reuse.</p>
+    </div>
+
+    <!-- ===================================================== -->
+    <!-- FAMILY B                                               -->
+    <!-- ===================================================== -->
+    <div class="fam-head" id="famB">
+      <h2>Family B &mdash; where a quadratic term overtakes a linear one</h2>
+      <p class="fam-sub">Transformer compute has a term linear in sequence length (weights) and a term quadratic in it (attention). These crossovers are where the quadratic catches up &mdash; the points past which &ldquo;just make N bigger&rdquo; stops being cheap.</p>
+    </div>
+
+    <div class="xo" id="B1">
+      <h3>B1 &middot; Prefill &mdash; attention vs linear term (s*)</h3>
+      <p class="xo-meta"><span class="pill">&sect;4.1</span> &middot; <span class="tag tag-k">[G &mdash; K1 &sect;3.3]</span></p>
+      <p class="xo-q">Q: above what prompt length does prefill stop being ~linear in N?</p>
+      <div class="formula-box"># Set the two prefill_FLOPs terms equal:
+4&middot;n_layers&middot;N&sup2;&middot;d_model = 2&middot;P&middot;N        with P = 2&middot;n_layers&middot;d_model&middot;...
+
+s* = 6 &times; d_model = 6 &times; 8 192 &asymp; <strong>49 K tok</strong>   <span class="tag tag-k">[G &mdash; K1 &sect;3.3]</span></div>
+      <p>Below ~49 K, prefill is ~linear (weights dominate). The crossover is already visible in the &sect;4.1 table: at 32 K the attention term is ~60% of the linear term; by 256 K it is ~5&times; the linear term; at 1 M context, <code>&beta;<sub>cold</sub>(1 M) &asymp; 871 s</code> &mdash; &gt;2 000&times; the 400 ms TTFT SLO.</p>
+      <p><strong>Why no single TP=8 task can serve very long context.</strong> Two compounding reasons &mdash; one about compute time, one about why TP can&rsquo;t buy it back:</p>
+      <ul>
+        <li><strong>The quadratic term dominates at long N.</strong> At 1 M the attention FLOPs (<code>4&middot;n_layers&middot;N&sup2;&middot;d_model = 2.62&middot;10&#185;&#8312;</code>) are ~19&times; the weight FLOPs (<code>2&middot;P&middot;N = 1.4&middot;10&#185;&#8311;</code>); the 871 s prefill is essentially all attention. The first token cannot stream until that whole prefill finishes &mdash; &gt;2 000&times; past the 400 ms TTFT budget. It is a 3-orders-of-magnitude gap, not a tuning miss.</li>
+        <li><strong>More TP doesn&rsquo;t rescue it.</strong> <code>F<sub>sustained</sub></code> already folds in 8 GPUs. Raising TP further (a) adds an all-reduce per prefill step that, past ~8 ranks, grows faster than the compute it saves &mdash; TP scaling flattens; and (b) splits the <em>weight</em> axis, not the <em>sequence</em> axis &mdash; every rank still holds the full 1 M-token sequence and computes the full N&sup2; attention. The quadratic term is untouched.</li>
+        <li><strong>So the fix targets the sequence axis: context parallelism (Iter 9).</strong> Partition the 1 M tokens across CP ranks (Ring Attention) so each rank attends over a slice and the N&sup2; work is parallelized across tasks instead of serialized inside one.</li>
+      </ul>
+      <p class="xo-decides">Decides: why no single TP=8 task can serve very long context &mdash; it forces <strong>context parallelism (Iter 9)</strong> to partition the sequence dimension. It is also why DRAM/SSD widen their lead over recompute at large N (crossover A1).</p>
+    </div>
+
+    <div class="xo" id="B2">
+      <h3>B2 &middot; Decode &mdash; attention vs weights term</h3>
+      <p class="xo-meta"><span class="pill">&sect;5.4</span> &middot; <span class="tag tag-k">[G &mdash; K1 &sect;3.5]</span></p>
+      <p class="xo-q">Q: at what context does per-step decode attention FLOPs equal the weights FLOPs?</p>
+      <p>Decode FLOPs over <code>T<sub>out</sub></code> tokens carry an attention term linear in <code>T<sub>in</sub></code> and quadratic in <code>T<sub>out</sub></code>. The attention-vs-weights ratio is <code>(2&middot;n_layers&middot;d_model/P)&middot;(T<sub>in</sub> + (T<sub>out</sub>&minus;1)/2)</code>; setting it to 1:</p>
+      <div class="formula-box"># Per decode step at context c (B=1): two FLOP terms, MAC = 2 FLOPs throughout.
+WEIGHTS  = 2&middot;P per token  &rarr;  over T<sub>out</sub> tokens:  2&middot;P&middot;T<sub>out</sub>
+ATTN     = 4&middot;n_layers&middot;c&middot;d_model per step  (1 query &times; c keys; QK&#7488; + P&middot;V = two matmuls; c = T<sub>in</sub>+k at step k)
+
+# Sum attention over the T<sub>out</sub> generated tokens, k = 0 .. T<sub>out</sub>&minus;1 (at step k the context is c = T<sub>in</sub>+k):
+&Sigma;<sub>k=0</sub><sup>T<sub>out</sub>&minus;1</sup> (T<sub>in</sub> + k)  =  &Sigma; T<sub>in</sub>  +  &Sigma; k                       # split the constant and the index
+                  =  T<sub>out</sub>&middot;T<sub>in</sub>   +   (0 + 1 + &hellip; + (T<sub>out</sub>&minus;1))     # T<sub>in</sub> added once per step (T<sub>out</sub> steps)
+                  =  T<sub>out</sub>&middot;T<sub>in</sub>   +   T<sub>out</sub>(T<sub>out</sub>&minus;1)/2                # Gauss: 0+&hellip;+m = m(m+1)/2, m = T<sub>out</sub>&minus;1
+# &mdash; first term LINEAR in T<sub>in</sub> (every output token attends over the prompt);
+#   second term QUADRATIC in T<sub>out</sub> (output tokens attend over the growing generated tail).
+
+ATTN<sub>total</sub> = 4&middot;n_layers&middot;d_model &middot; [ T<sub>out</sub>&middot;T<sub>in</sub> + T<sub>out</sub>(T<sub>out</sub>&minus;1)/2 ]
+        = 4&middot;n_layers&middot;d_model&middot;T<sub>out</sub> &middot; [ T<sub>in</sub> + (T<sub>out</sub>&minus;1)/2 ]            # factor T<sub>out</sub> back out
+
+# Ratio &mdash; the (&hellip;)&middot;T<sub>out</sub> cancels; the 4 over 2 leaves a factor 2:
+ATTN<sub>total</sub> / WEIGHTS<sub>total</sub> = (2&middot;n_layers&middot;d_model / P) &middot; ( T<sub>in</sub> + (T<sub>out</sub>&minus;1)/2 )</div>
+      <p>Setting that ratio to 1 and approximating <code>(T<sub>out</sub>&minus;1)/2 &asymp; T<sub>out</sub>/2</code>:</p>
+      <div class="formula-box">T<sub>in</sub> + T<sub>out</sub>/2  &asymp;  P / (2&middot;n_layers &middot; d_model)
+                =  70&middot;10&#8313; / (2 &times; 80 &times; 8 192)
+                &asymp; <strong>53 K</strong>   <span class="tag tag-d">[D]</span></div>
+      <p><code>T<sub>in</sub> + T<sub>out</sub>/2</code> is the <strong>average context length a decode query attends over, across the whole generation</strong> &mdash; context grows one token per step from <code>T<sub>in</sub></code> (first output token) to <code>T<sub>in</sub>+T<sub>out</sub></code> (last), averaging <code>T<sub>in</sub>+(T<sub>out</sub>&minus;1)/2 &asymp; T<sub>in</sub>+T<sub>out</sub>/2</code>. So the crossover reads: when the mean cached-KV depth exceeds ~53 K, attention FLOPs overtake weight FLOPs over the generation (equivalently, per step, when the <em>instantaneous</em> context <code>c &gt; 53 K</code>).</p>
+      <p>The workload mean (T<sub>in</sub>=13 K, T<sub>out</sub>=400) sits at ~25% of this crossover; T<sub>out</sub> p99 = 3 K at ~27%; the hard-cap T<sub>out</sub>=65 K at ~85%. So decode is <em>weights/HBM-bandwidth-bound</em> across the whole realistic workload &mdash; the attention term never overtakes the weights term on the tick (the rare 65 K-output tail gets close, but stays under).</p>
+      <div class="warn-box"><strong>Why factor 4 &mdash; and why this is 53 K, not 107 K.</strong> Decode attention is <em>two</em> matmuls (<code>QK&#7488;</code> then <code>P&middot;V</code>), each a multiply-add (MAC = 2 FLOPs), so the per-step term is <code>4&middot;n_layers&middot;c&middot;d_model</code> &mdash; the same MAC=2 convention as the weight term <code>2&middot;P</code> (and as K1 &sect;3.5). <strong>The trap:</strong> counting attention at MAC=1 (<code>2&middot;n_layers&middot;c&middot;d_model</code>) while keeping weights at MAC=2 is a <em>mixed</em> convention &mdash; it mis-lands the crossover at 107 K. Count both at MAC=2 and it is <strong>53 K</strong>. (Same trap, same fix as the decode <em>batch</em> crossover <code>B* = 295</code> &mdash; the <code>2&middot;P</code> cancels, so <code>AI = B</code> not <code>2&middot;B</code>; below.) The distributed &sect;5.4 <em>time</em> estimate is dominated by Load regardless: decode is load-bound, so the ~24%-of-weights attention compute never sets the tick.</div>
+      <div class="note-box"><strong>Same crossover with <em>or</em> without the KV cache &mdash; caching moves the cost, not the crossover.</strong> First, <code>c</code> = 53 K is the <em>full</em> context depth and <strong>necessarily includes the already-cached tokens</strong> &mdash; the new query attends back over <em>all</em> prior tokens (that is what attention is), so you can&rsquo;t exclude them from <code>c</code>. The cache changes the <em>work over</em> those tokens, not how many there are, and it does so <em>asymmetrically</em>: it <strong>excludes</strong> the cached tokens from the <em>weight pass</em> (only the 1 new token is projected &rArr; weights drop from <code>2&middot;P&middot;c</code> to <code>2&middot;P</code>) but <strong>cannot exclude</strong> them from the <em>attention read</em> (the new query still dots against all <code>c</code> cached keys &rArr; attention stays <code>4&middot;n_layers&middot;c&middot;d_model</code>, still linear in the full cache). Without a cache, a decode step re-runs a full prefill over the whole <code>c</code>-token context: weights = <code>2&middot;P&middot;c</code> (all <code>c</code> tokens, not 1) and attention = <code>4&middot;n_layers&middot;c&sup2;&middot;d_model</code> (<code>c</code> queries &times; <code>c</code> keys). So the cache divides <em>both</em> by <code>c</code> &mdash; weights &rarr; <code>2&middot;P</code>, attention &rarr; <code>4&middot;n_layers&middot;c&middot;d_model</code> &mdash; and the attention/weights <em>ratio</em> (<code>2&middot;n_layers&middot;c&middot;d_model / P</code>) is unchanged, so the crossover stays put. It is exactly the prefill crossover <a href="#B1">B1</a>, <code>c* = P/(2&middot;n_layers&middot;d_model)</code> &mdash; <strong>53 K</strong> with the actual <code>P=70&middot;10&#8313;</code>, or <code>6&middot;d_model &asymp; 49 K</code> in B1&rsquo;s parametric form (same formula, the gap is only parametric-vs-actual <code>P</code>). What caching buys is absolute cost: each step <code>c&times;</code> cheaper, total <code>O(c&sup3;) &rarr; O(c&sup2;)</code> &mdash; not a different attention/weights balance. (The roofline <em>is</em> different, though: cacheless decode is a prefill &rArr; compute-bound past ~590 tok, vs <code>AI=g</code>, never, with the cache &mdash; see below.)</div>
+      <div class="callout">
+        <p><strong>The roofline asymmetry: prefill is compute-bound, decode is memory-bound &mdash; and exactly when.</strong> Both fall out of one comparison: a kernel&rsquo;s <em>arithmetic intensity</em> (AI = FLOPs per byte read from HBM) against the GPU&rsquo;s <em>ridge point</em> <code>I*</code> (the AI above which it is no longer memory-starved). A forward pass has <em>two</em> reads with independent AIs &mdash; the <strong>weight read</strong> (linear term) and the <strong>KV read</strong> (attention term); the algebra below does each separately, and the governing rule is the same for both: <em>AI = how many compute ops reuse each byte you loaded</em>.</p>
+        <div class="formula-box"># Ridge point &mdash; hardware constant (peak compute / peak bandwidth, no MFU):
+I* = peak_FLOPs / HBM_BW = 989&middot;10&#185;&sup2; / 3.35&middot;10&#185;&sup2; &asymp; <strong>295 FLOP/byte</strong>   <span class="tag tag-d">[D &mdash; H100 SXM, dense BF16]</span>
+
+# AI of the WEIGHT read alone (the LINEAR term), n tokens sharing ONE weight read:
+AI_lin(n) = 2&middot;P&middot;n / 2&middot;P = <strong>n</strong>  FLOP/byte
+#   numerator 2 FLOP/param/token (MAC); denominator 2 bytes/param (FP16) &mdash; different 2&rsquo;s, they cancel
+
+# Prefill ALSO carries the quadratic attention term; past s* = 6&middot;d_model &asymp; 49 K (B1) it dominates the FLOPs:
+AI_prefill(s) = (2&middot;P&middot;s + 4&middot;n_layers&middot;s&sup2;&middot;d_model) / 2&middot;P   &asymp; s only while s &Lt; 49 K; super-linear above it
+
+compute-bound  &hArr;  AI &gt; I*  &hArr;  <strong>n &gt; 295</strong>   (attention only pushes prefill deeper in &mdash; AI = n is a floor)</div>
+        <ul>
+          <li><strong>Prefill: n = s</strong> &mdash; all prompt tokens share one weight read. From the linear term alone <code>AI &asymp; s</code>, so prefill is <strong>compute-bound for any s &gt; 295 tok</strong>; and once <code>s &gt; 49 K</code> the quadratic attention term takes over (B1), so AI climbs faster than s &mdash; <code>AI = s</code> is a conservative floor, never an over-estimate. The 13 K I cited is <em>not</em> a threshold &mdash; it is <code>T<sub>in_mean</sub></code>, the <em>workload mean</em> prompt length (a given, &sect;1), ~44&times; past the ridge. This is why every prefill crossover (B1, A-family) is fought in FLOPs and why prefill is the scarce roofline you offload (A4).
+            <br><strong>Why the prefill crossover is 295, not 590</strong> &mdash; <code>min</code>, not <code>max</code>, of the two terms&rsquo; thresholds. The weight matmuls cross at <code>s&gt;295</code> (<code>AI=s</code>); the attention kernel only crosses at <code>s&gt;590</code> (<code>AI&asymp;s/2</code>). But the weight matmuls are the <em>dominant</em> cost of prefill &mdash; attention is <code>2&middot;n_layers&middot;s&middot;d_model/P</code> of the FLOPs, &lt;1% until <code>s</code> approaches the 49 K B1 crossover &mdash; so once the dominant term crosses (295), prefill-as-a-whole is compute-bound; the attention kernel lagging to 590 is a sub-1% sliver. <code>max(590)</code> answers the stricter &ldquo;every kernel compute-bound&rdquo; question, not the practical &ldquo;is prefill compute-bound&rdquo; one. (Moot for the workload: <code>s=13 K</code> is past both.)</li>
+          <li><strong>Decode: n = B</strong> &mdash; B sequences each advance one token, sharing one weight read &rArr; <code>AI = B</code>. At B=1, AI=1, sitting <strong>exactly 295&times; below the ridge</strong>: the 17.5 GB/GPU weight read (~5.22 ms) is ~295&times; the ~18 &micro;s of per-token compute at peak &mdash; deeply memory-bound. Here the linear estimate errs the <em>other</em> way and stays safe: decode attention never dominates the realistic workload (B2), while the growing KV read only <em>adds</em> to the byte denominator &mdash; both push decode further below the ridge, never above it. Batching that weight read (C1) is the only lever.</li>
+          <li><strong>The decode compute crossover is B* = I* &asymp; 295</strong> (<code>AI = B</code>, never <code>2&middot;B</code> &mdash; by the same algebra as prefill the <code>2&middot;P</code> cancels; a naive <code>2&middot;B</code> would mis-place it at 148). Below B*, more batch is &ldquo;free&rdquo; (you under-use a weight read already paid for); above it, decode turns compute-bound and more batch only adds latency. <strong>But this fleet never reaches B*:</strong> <code>B<sub>decode</sub></code> is capped at <strong>106</strong> by HBM capacity (C1), well below 295, so decode stays structurally memory-bound and the binding ceiling is the 30 ms TPOT SLO, not the roofline.</li>
+          <li><strong>The KV read (attention term) is a separate roofline.</strong> The bullets above are the <em>weight</em> read; the attention term reads the <em>KV cache</em> instead, so it has its own AI. What sets it is how many <em>queries</em> reuse each loaded KV element &mdash; decode reuses it <em>once</em> (&rarr; exactly <code>g</code>, the GQA group size), prefill reuses it <em>s</em> times (&rarr; ~<code>s/2</code>). The query count differs by phase, and that flips the verdict:
+            <div class="formula-box"># DECODE &mdash; B sequences, EACH advancing 1 query over its OWN c-token cache:
+AI_attn_decode = FLOPs / bytes
+  FLOPs = B &middot; 4&middot;n_layers&middot;c&middot;(n_q_heads&middot;d_head)   # query side: ALL n_q_heads work (QK&#7488; + P&middot;V, MAC=2)
+  bytes = B &middot; 4&middot;n_layers&middot;c&middot;(n_kv_heads&middot;d_head)  # KV side: only n_kv_heads stored (K,V &times; 2 B)
+        = (n_q_heads&middot;d_head) / (n_kv_heads&middot;d_head)     # B, n_layers, c, d_head ALL cancel
+        = n_q_heads / n_kv_heads = g = 64/8 = <strong>8 FLOP/byte</strong>   <span class="tag tag-d">[D]</span>
+#   B cancels top & bottom &rArr; batch does NOT change attention AI: each sequence reads its OWN
+#   KV (no sharing). Contrast the weight read, where B sequences SHARE one load &rArr; AI = B (grows).
+
+# PREFILL &mdash; s queries reuse each KV element (FlashAttention loads K,V once):
+AI_attn_prefill = FLOPs / bytes
+  FLOPs = 4&middot;n_layers&middot;s&sup2;&middot;d_model    # s queries &times; s keys (QK&#7488; + P&middot;V)
+  bytes &asymp; 8&middot;n_layers&middot;s&middot;d_model     # Q,K,V,O each s&middot;d_model elems &times; 2 B (FP16); KV read once
+        = (4&middot;n_layers&middot;s&sup2;&middot;d_model) / (8&middot;n_layers&middot;s&middot;d_model)   # n_layers, d_model, one s cancel
+        = <strong>s / 2</strong>   <span class="tag tag-d">[D]</span></div>
+            <ul>
+              <li><strong>Decode attention can NEVER reach the ridge &mdash; <em>with the KV cache</em>.</strong> The <code>c</code> cancels (FLOPs and bytes both scale with context), so <code>AI<sub>attn</sub> = g = 8</code> is a <em>constant</em> &mdash; <strong>~37&times; below <code>I*</code> = 295 at every <code>c</code> and every <code>B</code></strong>. Batch doesn&rsquo;t help (each sequence reads its <em>own</em> KV, no sharing across the batch); a longer context only <em>adds</em> bytes, pushing it deeper in. Structurally memory-bound &mdash; the only lever is the byte denominator (GQA/MQA, KV quant).
+                <br><strong>The cache is what makes this true.</strong> The memory-bound verdict is a <em>consequence of caching K,V</em>, not a property of decode itself: the cache trades recompute FLOPs for a byte read, which is exactly what pins the AI at <code>g</code>. <em>Without</em> a KV cache, each step would re-run the prefill over the whole <code>c</code>-token history (<code>O(c&sup2;)</code>/step, like a fresh prefill) &mdash; <code>AI &asymp; c/2</code>, <strong>compute-bound</strong> past ~590 tok. So decode is memory-bound precisely <em>because</em> we cache; the cache converts a quadratic recompute into a linear read.</li>
+              <li><strong>Prefill attention is compute-bound, and unbounded in <code>s</code>.</strong> <code>AI<sub>attn</sub> = s/2 &gt; I*</code> for any <code>s &gt; ~590 tok</code> &mdash; below every real prompt &mdash; and it climbs as <code>s</code> grows: <code>&asymp; 6.5 K FLOP/byte</code> at the <code>s = 13 K</code> workload mean, <code>&asymp; 500 K</code> at 1 M (where prefill is essentially all attention &mdash; the 871 s of B1).</li>
+              <li><strong>Both prefill terms point the same way.</strong> Weight read <code>AI = s</code>, attention <code>AI = s/2</code> &mdash; both compute-bound, both grow with <code>s</code>. That is why long context is fixed by <strong>context parallelism</strong> (spread the FLOPs, Iter 9), not more bandwidth.</li>
+            </ul>
+          </li>
+          <li><strong>Why this forces P/D disaggregation (Iter 2).</strong> A colocated task can only satisfy one roofline at a time: prefill wants B=1 (TTFT-safe), decode wants B&Gt;1 (to amortize the weight read). Splitting the pools lets prefill stay compute-bound at B=1 and decode independently raise B to spend the idle HBM bandwidth.</li>
+        </ul>
+      </div>
+      <p class="xo-decides">Decides: why decode optimization targets <em>bandwidth</em> (batch the weight read, crossover C1), not attention FLOPs &mdash; the long-output regime that would flip this is a separate scenario (L3).</p>
+    </div>
+
+    <!-- ===================================================== -->
+    <!-- FAMILY C                                               -->
+    <!-- ===================================================== -->
+    <div class="fam-head" id="famC">
+      <h2>Family C &mdash; the decode batch hits its ceiling</h2>
+      <p class="fam-sub">Decode at B=1 reads the whole weight shard to make one token (MBU ~1%). Batching amortizes that read &mdash; until either the latency SLO or HBM capacity stops it. Two crossovers bound how far decode throughput can go.</p>
+    </div>
+
+    <div class="xo" id="C1">
+      <h3>C1 &middot; Decode batch vs TPOT SLO &amp; HBM capacity &mdash; B<sub>decode</sub></h3>
+      <p class="xo-meta"><span class="pill">Iter 6 / &sect;12</span> &middot; <a href="distributed_kv_cache.html#param-b-decode"><code>B<sub>decode</sub></code> <code>[param]</code></a></p>
+      <p class="xo-q">Q: how wide can the continuous decode batch run before the per-token tick breaks the 30 ms TPOT SLO?</p>
+      <p>The weight read is fixed per tick; the KV read grows with B. The tick is the sum:</p>
+      <div class="formula-box">&beta;<sub>per_decode_tok</sub> = weights_per_GPU / HBM_BW = 17.5 GB / 3.35 TB/s &asymp; 5.22 ms   <span class="tag tag-d">[D]</span>
+kv_per_seq_per_GPU = (T<sub>in_mean</sub> + T<sub>out_mean</sub>/2) &times; KV<sub>per_tok</sub>/8 = 13.2 K &times; 40 KB &asymp; 528 MB   <span class="tag tag-d">[D]</span>
+
+tick(B) = &beta;<sub>per_decode_tok</sub> + B &times; kv_per_seq_per_GPU / HBM_BW
+
+# At the chosen batch (HBM-capacity bound = G<sub>KV</sub> / avg_kv_per_active_slot = 450 / 4.22):
+B<sub>decode</sub> &asymp; <strong>106</strong>
+tick(106) = 5.22 ms + (106 &times; 528 MB / 3.35 TB/s) = 5.22 + 16.7 &asymp; <strong>22 ms</strong>  &lt; 30 ms SLO   <span class="tag tag-d">[D]</span></div>
+      <p>Two ceilings meet near 106: the HBM-capacity bound (<code>B<sub>max,paged</sub> &asymp; 106</code>, itself unlocked by PagedAttention &mdash; static-max would cap at ~18) sets the batch, and the resulting tick (22 ms) lands just under the TPOT SLO so the KV-read term is the binding constraint on any further growth. The per-task throughput multiplier is <code>thr(106)/thr(1) = (106/22 ms)/(1/5.22 ms) &asymp; 4 818/192 &asymp; ~25&times;</code> &mdash; not the full 106&times;, because the tick grew ~4&times; as KV reads came to dominate.</p>
+      <p class="xo-decides">Decides: the realized continuous-batch width (Iter 6&rsquo;s ~25&times; per-task decode throughput, the page&rsquo;s biggest fleet-$ lever) &mdash; and that pushing B higher trades throughput for TPOT, so the next throughput lever has to be orthogonal to batch size (&rarr; C2).</p>
+    </div>
+
+    <div class="xo" id="C2">
+      <h3>C2 &middot; Speculative decode vs vanilla &mdash; the accept-rate break-even</h3>
+      <p class="xo-meta"><span class="pill">Iter 7 / &sect;13.5</span> &nbsp;the orthogonal lever once C1&rsquo;s batch is maxed.</p>
+      <p class="xo-q">Q: at what token accept rate &alpha; does speculative decoding stop being a win over vanilla autoregressive?</p>
+      <p>A draft proposes <code>&gamma;=4</code> tokens; the target verifies all <code>&gamma;+1=5</code> in one weight read. The expected accept run is a truncated geometric; the honest speedup discounts the draft forwards, the larger verify KV read, and reject-rollback waste:</p>
+      <div class="formula-box">E[accept] = (1 &minus; &alpha;<sup>&gamma;+1</sup>) / (1 &minus; &alpha;)
+          = (1 &minus; 0.7&#8309;) / (1 &minus; 0.7)
+          = (1 &minus; 0.16807) / 0.3 &asymp; <strong>2.77 tok / target weight-read</strong>   <span class="tag tag-d">[D &mdash; &alpha;=0.7, &gamma;=4]</span>
+
+accept_rate_speedup_factor = E[accept] &times; discount
+                           = 2.77 &times; 0.72 &asymp; <strong>2.0&times;</strong>   <span class="tag tag-d">[D]</span>
+
+# Break-even: speedup = 1  &rArr;  E[accept] = 1/discount &asymp; 1.39  &rArr;  &alpha; well below 0.7</div>
+      <p>Output is provably identical to vanilla sampling at <em>any</em> &alpha; (the verify uses the exact target distribution) &mdash; so a low &alpha; is never a correctness or quality bug, only a throughput regression. At &alpha; far below 0.7 (out-of-distribution traffic, adversarial input) the rollback waste exceeds the accept run and spec-decode goes <em>slower</em> than vanilla.</p>
+      <p class="xo-decides">Decides: the per-tenant fallback policy &mdash; monitor accept rate, and automatically revert that traffic slice to vanilla autoregressive once its &alpha; crosses below the break-even where the speedup factor = 1.</p>
+    </div>
+
+    <div class="note-box">
+      <strong>Two families, one moral.</strong> Family A is bandwidth-vs-FLOPs (move bytes or recompute them); Families B and C are FLOPs-vs-FLOPs and bandwidth-vs-latency. Notice the reuse: <strong>A1&rsquo;s 1 870-token crossover appears verbatim three times</strong> (A1 tier ladder, A3 &alpha;-sensitivity base, A4 pool write-back gate), because it is one piece of algebra &mdash; transfer cost equals re-prefill cost &mdash; applied wherever the system must choose between holding bytes and rebuilding them.
+    </div>
+
+  </div>
+
+  <!-- ===================================================== -->
+  <!-- Footer                                                  -->
+  <!-- ===================================================== -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning. &middot; <a href="distributed_kv_cache.html">&larr; full walkthrough</a></p>
+  </footer>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

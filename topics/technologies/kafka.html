@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apache Kafka — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-messaging.html">Messaging Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Apache Kafka</h1>
+    <p class="hero-subtitle">A distributed, partitioned, replicated <em>append-only log</em>. Each topic-partition is an ordered, immutable sequence of records on disk; consumers read by offset. Page cache + zero-copy give it &gt; 600 MB/s/broker. ISR replication guarantees durability; KRaft (5+) replaces ZooKeeper with Raft-based controller quorum.</p>
+    <p class="hero-meta">log &bull; partitioned &bull; pull-based &bull; KRaft (no ZK)</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <p>Three primitives: <strong>topic-partition is an append-only log file</strong>, <strong>broker is page-cache + sendfile()</strong>, and <strong>consumer is a cursor (offset)</strong>. Everything else is bookkeeping around those three.</p>
+
+    <div class="full-width">
+      <svg viewBox="0 0 1240 400" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+        <rect x="20" y="40" width="320" height="320" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="180" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Topic "events", 4 partitions</text>
+        <text x="180" y="85" text-anchor="middle" fill="#64748b" font-size="11">key &rarr; partition (hash mod count)</text>
+        <rect x="40" y="100" width="280" height="50" rx="3" fill="#fff" stroke="#2563eb"/>
+        <text x="50" y="120" fill="#334155" font-size="11">P0: [0..117][118..205][206..]</text>
+        <text x="50" y="140" fill="#64748b" font-size="10">segment files; .log + .index</text>
+        <rect x="40" y="160" width="280" height="50" rx="3" fill="#fff" stroke="#2563eb"/>
+        <text x="50" y="180" fill="#334155" font-size="11">P1: [0..89][90..]</text>
+        <text x="50" y="200" fill="#64748b" font-size="10">offset = byte position</text>
+        <rect x="40" y="220" width="280" height="50" rx="3" fill="#fff" stroke="#2563eb"/>
+        <text x="50" y="240" fill="#334155" font-size="11">P2: [0..150][151..]</text>
+        <rect x="40" y="280" width="280" height="50" rx="3" fill="#fff" stroke="#2563eb"/>
+        <text x="50" y="300" fill="#334155" font-size="11">P3: [0..200][201..]</text>
+        <text x="180" y="345" text-anchor="middle" fill="#dc2626" font-size="11">order is per partition only</text>
+
+        <rect x="380" y="40" width="320" height="320" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="540" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Broker (one node)</text>
+        <text x="540" y="85" text-anchor="middle" fill="#64748b" font-size="11">JVM, page cache, NIC</text>
+        <rect x="400" y="105" width="280" height="50" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="540" y="125" text-anchor="middle" fill="#334155" font-size="11">Network IO threads</text>
+        <text x="540" y="142" text-anchor="middle" fill="#64748b" font-size="10">parse RPCs (Produce / Fetch)</text>
+        <rect x="400" y="165" width="280" height="50" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="540" y="185" text-anchor="middle" fill="#334155" font-size="11">Request handler threads</text>
+        <text x="540" y="202" text-anchor="middle" fill="#64748b" font-size="10">log append, fetch read</text>
+        <rect x="400" y="225" width="280" height="50" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="540" y="245" text-anchor="middle" fill="#334155" font-size="11">OS page cache</text>
+        <text x="540" y="262" text-anchor="middle" fill="#64748b" font-size="10">writes &rarr; cache &rarr; lazy fsync</text>
+        <rect x="400" y="285" width="280" height="50" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="540" y="305" text-anchor="middle" fill="#334155" font-size="11">sendfile() zero-copy</text>
+        <text x="540" y="322" text-anchor="middle" fill="#64748b" font-size="10">disk &rarr; NIC, no user-space copy</text>
+
+        <rect x="740" y="40" width="240" height="160" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="860" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">ISR (in-sync replicas)</text>
+        <text x="860" y="85" text-anchor="middle" fill="#64748b" font-size="11">replication factor 3 typical</text>
+        <text x="860" y="110" text-anchor="middle" fill="#334155" font-size="11">Leader takes Produce</text>
+        <text x="860" y="128" text-anchor="middle" fill="#334155" font-size="11">Followers Fetch &amp; ack</text>
+        <text x="860" y="148" text-anchor="middle" fill="#334155" font-size="11">acks=all waits for ISR</text>
+        <text x="860" y="170" text-anchor="middle" fill="#dc2626" font-size="11">unclean.leader = data loss</text>
+        <text x="860" y="190" text-anchor="middle" fill="#dc2626" font-size="11">if enabled</text>
+
+        <rect x="740" y="220" width="240" height="140" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="860" y="245" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Consumer group</text>
+        <text x="860" y="265" text-anchor="middle" fill="#64748b" font-size="11">N consumers, M partitions</text>
+        <text x="860" y="290" text-anchor="middle" fill="#334155" font-size="11">each partition &rarr; one consumer</text>
+        <text x="860" y="308" text-anchor="middle" fill="#334155" font-size="11">offsets in __consumer_offsets</text>
+        <text x="860" y="326" text-anchor="middle" fill="#334155" font-size="11">cooperative-sticky rebalance</text>
+        <text x="860" y="346" text-anchor="middle" fill="#dc2626" font-size="10">hot partition = stuck consumer</text>
+
+        <rect x="1020" y="40" width="200" height="160" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="1120" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">KRaft controllers</text>
+        <text x="1120" y="85" text-anchor="middle" fill="#64748b" font-size="11">replaces ZooKeeper</text>
+        <text x="1120" y="110" text-anchor="middle" fill="#334155" font-size="11">Raft quorum (3 or 5)</text>
+        <text x="1120" y="128" text-anchor="middle" fill="#334155" font-size="11">metadata in-mem + log</text>
+        <text x="1120" y="148" text-anchor="middle" fill="#334155" font-size="11">leader election fast</text>
+        <text x="1120" y="170" text-anchor="middle" fill="#16a34a" font-size="11">simpler ops</text>
+
+        <rect x="1020" y="220" width="200" height="140" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="1120" y="245" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Tiered storage</text>
+        <text x="1120" y="265" text-anchor="middle" fill="#64748b" font-size="11">hot on broker SSD</text>
+        <text x="1120" y="290" text-anchor="middle" fill="#334155" font-size="11">cold to S3</text>
+        <text x="1120" y="308" text-anchor="middle" fill="#334155" font-size="11">cheap "infinite" retention</text>
+        <text x="1120" y="335" text-anchor="middle" fill="#dc2626" font-size="10">slower to read cold</text>
+      </svg>
+    </div>
+
+    <div class="dense-columns">
+      <div>
+        <h3>Why it's fast</h3>
+        <p>Sequential disk write to a single file is &gt; 100&times; faster than random. Producer batches records; broker appends to active segment in OS page cache; <code>sendfile()</code> serves consumers directly from page cache to NIC, no user-space copy. The only "slow" path is fsync on commit, which Kafka avoids by default.</p>
+      </div>
+      <div>
+        <h3>Durability story</h3>
+        <p>"Durable" means: leader has written + replicas have <em>fetched</em> the record. Not "fsync'd to disk." In a power-loss scenario, an unflushed page-cache write on all replicas is lost. RF=3 across 3 racks/AZs makes simultaneous loss unlikely; <code>flush.messages</code> / <code>flush.ms</code> can force fsync but tank throughput.</p>
+      </div>
+    </div>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Produce</h3>
+      <pre class="line-numbers"><code class="language-text">1. Producer batches records by partition (linger.ms, batch.size)
+2. Send Produce RPC to partition leader
+3. Leader appends to active segment in page cache
+4. Followers Fetch the new records, append, ack
+5. acks=0: don't wait
+   acks=1: wait for leader
+   acks=all: wait for ISR (durable)
+6. Producer ack &mdash; offset returned</code></pre>
+    </div>
+    <div>
+      <h3>Fetch</h3>
+      <pre class="line-numbers"><code class="language-text">1. Consumer sends Fetch from offset X
+2. Broker locates segment, range
+3. sendfile() &mdash; disk page cache &rarr; socket
+4. Consumer commits offset (auto or manual)
+5. New record at high-water mark only after replicated</code></pre>
+    </div>
+    <div>
+      <h3>Compaction (compacted topics)</h3>
+      <pre class="line-numbers"><code class="language-text">For topics with cleanup.policy=compact:
+- LogCleaner thread merges segments
+- For each key, keep only latest value
+- Tombstones (null value) eventually removed
+- Used for changelog topics, KTables, etc.</code></pre>
+    </div>
+    <div>
+      <h3>Rebalance</h3>
+      <pre class="line-numbers"><code class="language-text">When consumer joins/leaves group:
+1. Coordinator detects via heartbeat timeout
+2. Stop-the-world (eager) or incremental (cooperative-sticky)
+3. Partitions re-assigned
+4. Consumers commit then resume
+
+Rebalance time grows with partition count.</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li><strong>Topology:</strong> per-partition leader + N-1 followers; replicas distributed across brokers (and ideally racks/AZs).</li>
+      <li><strong>ISR:</strong> followers within <code>replica.lag.time.max.ms</code> are "in-sync." Producer with <code>acks=all</code> waits for full ISR.</li>
+      <li><strong>Min ISR:</strong> set <code>min.insync.replicas=2</code> with RF=3 &mdash; producer fails if fewer than 2 replicas in sync (better than silently dropping to one).</li>
+      <li><strong>Failover:</strong> if leader dies, controller (KRaft) elects a new leader from ISR. <code>unclean.leader.election.enable=false</code> (default modern) prevents promoting an out-of-sync follower at the cost of availability.</li>
+      <li><strong>Consistency:</strong> per-partition total order; cross-partition no guarantees. Idempotent producer + transactions give exactly-once <em>within Kafka</em> (read-process-write).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li><strong>Key &rarr; partition:</strong> default <code>murmur2(key) mod partition_count</code>. Same key always goes to same partition (=&gt; ordered).</li>
+      <li><strong>Custom partitioner:</strong> set per producer (geo-aware, sticky, etc.).</li>
+      <li><strong>Increasing partition count is destructive</strong> for ordering: hash mapping changes; same key may move. Plan partition count up-front.</li>
+      <li><strong>Hot partition</strong> = one key with disproportionate traffic; that partition saturates one broker. Composite key (user_id + hour-bucket) is the canonical fix.</li>
+      <li><strong>Cluster-wide cap:</strong> ~4k partitions per broker for stable controller behavior (KRaft scales higher than ZK). Beyond that, use Pulsar or split into multiple clusters.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>Append: O(1) (sequential write).</li>
+      <li>Fetch by offset: O(log segment_count) for index lookup, then sequential read.</li>
+      <li>Compaction: O(N log N) per cleaning cycle.</li>
+      <li>Rebalance: O(partition_count &times; consumer_count).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>Throughput: ~600 MB/s sequential write per broker on 10 GbE + NVMe.</li>
+      <li>Replication: same for inbound; cross-AZ network is the practical cap.</li>
+      <li>Latency: typical end-to-end 5&ndash;20 ms with <code>acks=all</code>.</li>
+      <li>Disk: a single broker can hold tens of TB; tiered storage moves cold to S3.</li>
+      <li>Partitions/broker: ~4k stable; many more with KRaft + tuning.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use Kafka when&hellip;</h3>
+      <ul>
+        <li>Distributed event log / event sourcing.</li>
+        <li>Many consumers / replay needed.</li>
+        <li>Buffer between fast producer and slow consumer.</li>
+        <li>CDC pipeline (Debezium).</li>
+        <li>Stream processing input (Flink, Spark Streaming, Kafka Streams).</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use Kafka when&hellip;</h3>
+      <ul>
+        <li>Sub-ms RPC; use NATS or gRPC.</li>
+        <li>Random KV reads &mdash; not what it does.</li>
+        <li>Millions of low-throughput topics &mdash; Pulsar or NATS.</li>
+        <li>Complex routing (topic exchanges) &mdash; RabbitMQ.</li>
+        <li>Truly small / tiny scale &mdash; Redis Streams or SQS overkill-avoidance.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li>Hot partition kills throughput regardless of cluster size.</li>
+      <li>Partition count is hard to change; over-provision early.</li>
+      <li>Consumer rebalance time grows linearly with partitions.</li>
+      <li>Default <code>acks=1</code> can lose data on leader crash; use <code>acks=all</code> + <code>min.insync.replicas=2</code>.</li>
+      <li><code>unclean.leader.election.enable=true</code> (legacy default) trades durability for availability.</li>
+      <li>Schema evolution without a Schema Registry = silent data corruption.</li>
+      <li>Consumer commit offset before processing = "at-most-once" by accident.</li>
+      <li>EOS (exactly-once) is "exactly-once within Kafka," not external side effects.</li>
+      <li>Cross-AZ replication network is often the single biggest line item.</li>
+      <li>Mirror Maker 2 has gotchas with offsets / idempotency.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>AWS: MSK, MSK Serverless; Confluent Cloud on AWS.</li>
+      <li>GCP: Managed Service for Apache Kafka; Confluent Cloud on GCP.</li>
+      <li>Azure: Event Hubs (Kafka-compatible API); Confluent Cloud on Azure.</li>
+      <li>Open-source: Kafka itself; Redpanda (C++ compat); WarpStream (S3-backed).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives you</th><th>How it works</th><th>Cost / failure</th></tr></thead>
+      <tbody>
+        <tr><td>Single broker (toy)</td><td>Dev / test</td><td>One node, RF=1</td><td>No durability; broker death = data loss</td></tr>
+        <tr><td>3-broker cluster + RF=3</td><td>Production minimum</td><td>3 brokers across racks/AZs</td><td>Loss of 1 node OK; loss of 2 = unavailability</td></tr>
+        <tr><td>Multi-rack with rack.id</td><td>Rack-aware replica placement</td><td>Replicas spread across racks/AZs</td><td>Same as above; AZ loss survivable</td></tr>
+        <tr><td>MirrorMaker 2 active-passive</td><td>Cross-region DR</td><td>Replicate topics from primary to DR region</td><td>Async replication; offset translation pain</td></tr>
+        <tr><td>Cluster Linking (Confluent)</td><td>Active-active region</td><td>Mirror with consistent offsets</td><td>Commercial; simpler than MM2</td></tr>
+        <tr><td>Stretch cluster</td><td>Synchronous multi-AZ</td><td>Brokers span AZs; quorum across</td><td>Good for AZ failover; bad for region</td></tr>
+        <tr><td>Tiered storage</td><td>Cheap long retention</td><td>Hot on broker SSD; cold to S3</td><td>Slower cold reads</td></tr>
+        <tr><td>KRaft (no ZK)</td><td>Operational simplification</td><td>Raft-based controller quorum</td><td>Required for new clusters &gt; 3.5</td></tr>
+        <tr><td>Schema Registry sidecar</td><td>Schema evolution discipline</td><td>Confluent or Apicurio</td><td>Operational overhead</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Event log / event sourcing.</li>
+      <li>Outbox pattern (DB write + outbox row + Debezium &rarr; Kafka).</li>
+      <li>CDC sink (Debezium).</li>
+      <li>Stream-table join with Kafka Streams (KStream &times; KTable).</li>
+      <li>Pub/sub for many downstream services.</li>
+      <li>Buffer between producer and slow consumer.</li>
+      <li>Replayable analytics / training data.</li>
+      <li>Reprocessing: reset consumer group offset, re-run pipeline.</li>
+      <li>Tiered "infinite" log via tiered storage.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li><code>acks</code> &mdash; <code>all</code> for durable.</li>
+      <li><code>min.insync.replicas</code> &mdash; 2 with RF=3.</li>
+      <li><code>replica.lag.time.max.ms</code> &mdash; how long a follower can lag before being booted from ISR.</li>
+      <li><code>unclean.leader.election.enable</code> &mdash; <code>false</code> for durability.</li>
+      <li><code>retention.ms</code> / <code>retention.bytes</code> &mdash; per topic.</li>
+      <li><code>compression.type</code> &mdash; <code>lz4</code> or <code>zstd</code>; massive throughput win.</li>
+      <li><code>linger.ms</code> + <code>batch.size</code> on producer &mdash; latency vs throughput.</li>
+      <li><code>max.poll.records</code> + <code>session.timeout.ms</code> on consumer.</li>
+      <li><code>num.partitions</code> default for new topics.</li>
+      <li><code>log.cleaner.*</code> for compacted topics.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>Disk: <code>retention_hours &times; peak_MB_per_sec &times; 3600 &times; replication_factor</code>.</li>
+      <li>Partitions: at least <code>peak_consumer_throughput / per-partition-throughput</code>.</li>
+      <li>Brokers: at least 3; scale by total throughput / 600 MB/s + headroom.</li>
+      <li>Network: cross-AZ replication doubles or triples network bytes.</li>
+      <li>Consumer groups: more groups = more disk read, but page cache absorbs replay.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Single broker loss: leader for its partitions re-elected; ISR shrinks; min ISR may pause writes.</li>
+      <li>AZ loss with rack-aware: ISR stays &gt;=2 with RF=3; cluster continues.</li>
+      <li>Cluster-wide controller loss (KRaft): no leader elections possible until quorum restored.</li>
+      <li>Disk full on broker: shrinks ISR; client errors; cluster degraded.</li>
+      <li>Slow consumer: lag grows; disk fills with retention; eventually messages dropped.</li>
+      <li>ZK quorum loss (legacy): no leader elections; stuck.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>MirrorMaker 2 / Cluster Linking: continuous mirror to DR region.</li>
+      <li>Tiered storage: cold log already in S3 = inherent backup.</li>
+      <li>Topic offsets need to be mirrored separately (or re-derive from data).</li>
+      <li>Restore: cluster from backup snapshot of broker disks + offsets.</li>
+      <li>RPO: replication lag.</li>
+      <li>RTO: cluster spin-up + offset translation + consumer reset.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Rolling broker upgrade; bump <code>inter.broker.protocol.version</code> after all nodes upgraded.</li>
+      <li>Bump <code>log.message.format.version</code> only after all consumers upgraded.</li>
+      <li>ZK &rarr; KRaft migration: multi-stage state machine; documented carefully.</li>
+      <li>Repartitioning a topic (changing partition count): destroys ordering; do via dual-write to a new topic + cutover.</li>
+      <li>Migrate to Pulsar: Pulsar's KoP (Kafka-on-Pulsar) protocol shim or dual-publish.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>SASL: PLAIN / SCRAM / Kerberos / OAUTHBEARER.</li>
+      <li>mTLS at broker port.</li>
+      <li>ACLs per topic / consumer group / cluster operation.</li>
+      <li>Encryption at rest: rely on disk encryption.</li>
+      <li>Network: brokers behind firewall; client connections via TLS.</li>
+      <li>Audit: limited native; commercial extensions.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>One cluster per tenant tier (free / paid / enterprise).</li>
+      <li>Within a cluster: ACLs + quotas (<code>producer_byte_rate</code>, <code>consumer_byte_rate</code>, <code>request_percentage</code>).</li>
+      <li>Pulsar's namespace model is more native multi-tenant than Kafka.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>Under-replicated partitions (URP) &mdash; should be 0.</li>
+      <li>ISR shrink rate.</li>
+      <li>Request handler idle %.</li>
+      <li>Consumer lag per group / topic / partition.</li>
+      <li>Disk %.</li>
+      <li>Controller failover count.</li>
+      <li>Network IO threads idle %.</li>
+      <li>Bytes-in / bytes-out per broker.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>One topic per user / per tenant (partition explosion).</li>
+      <li>Tiny messages without batching (kills throughput).</li>
+      <li>Random key (no ordering, but also no skew).</li>
+      <li>Storing huge payloads (multi-MB) in records.</li>
+      <li>Trusting EOS for external side effects.</li>
+      <li>Disabling replication for "speed."</li>
+      <li>Manually managing offsets in app DB without idempotency.</li>
+      <li>No schema registry for non-trivial schemas.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>Self-host: brokers + disk + cross-AZ network.</li>
+      <li>Cross-AZ: typically the single biggest line item with RF=3.</li>
+      <li>MSK / Confluent / Managed Kafka: per-broker-hour + ingress GB.</li>
+      <li>Tiered storage: cheaper at scale; complexity tradeoff.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>Kafka</th><th>Pulsar</th><th>Redpanda</th><th>WarpStream</th></tr></thead>
+      <tbody>
+        <tr><td>Storage</td><td>Local disk + tiered S3</td><td>BookKeeper + tiered S3</td><td>Local disk; same protocol as Kafka</td><td>S3 only (zero local disk)</td></tr>
+        <tr><td>Threading</td><td>JVM + many threads</td><td>JVM</td><td>C++ thread-per-core (Seastar)</td><td>Stateless brokers</td></tr>
+        <tr><td>Multi-tenancy</td><td>ACLs + quotas</td><td>Native (tenants/namespaces)</td><td>Same as Kafka</td><td>Same as Kafka</td></tr>
+        <tr><td>Geo</td><td>MM2 / Cluster Linking</td><td>Native geo-replication</td><td>Same as Kafka</td><td>Single-region currently</td></tr>
+        <tr><td>Pick when</td><td>Default; large ecosystem</td><td>Multi-tenant SaaS, geo, &gt; 4k partitions</td><td>Lower latency / simpler ops</td><td>Cloud-native zero-local-disk; cheaper at scale</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy</td><td>Multiple consumer groups</td><td>Page cache absorbs; sendfile()</td><td>More brokers + partitions</td></tr>
+        <tr><td>Write-heavy</td><td>~600 MB/s/broker</td><td>Add brokers; raise compression</td><td>Multiple clusters by domain</td></tr>
+        <tr><td>Hot partition</td><td>Pegs one broker</td><td>Composite key (user_id + bucket)</td><td>Custom partitioner</td></tr>
+        <tr><td>Many topics (millions)</td><td>~4k partitions/broker cap</td><td>Pulsar / NATS</td><td>Consolidate topics by tenant</td></tr>
+        <tr><td>Bursty</td><td>Log absorbs</td><td>Producer linger.ms tuning</td><td>Larger brokers / more brokers</td></tr>
+        <tr><td>Long retention</td><td>Disk-bound</td><td>Tiered storage to S3</td><td>WarpStream / Pulsar</td></tr>
+        <tr><td>Strict ordering</td><td>Per partition</td><td>Single partition for the entity</td><td>Composite key with care</td></tr>
+        <tr><td>Exactly-once</td><td>Idempotent producer + transactions</td><td>EOS within Kafka</td><td>External idempotency keys for side effects</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>"Kafka: The Definitive Guide" (Narkhede et al.).</li>
+      <li>Original LinkedIn paper "Kafka: a Distributed Messaging System for Log Processing."</li>
+      <li>Confluent blog (deep dives, KIPs, architecture posts).</li>
+      <li>Jay Kreps' "The Log: What every software engineer should know..."</li>
+      <li>KIPs (Kafka Improvement Proposals) &mdash; the design history.</li>
+      <li>Production: LinkedIn (origin), Uber, Netflix, Slack, Airbnb.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-messaging.html">Messaging comparison</a></li>
+    <li><a href="../message-queues.html">Message queues (concept)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

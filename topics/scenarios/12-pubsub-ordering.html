@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pub/Sub with Ordering Guarantees — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Pub/Sub with Ordering Guarantees: Chat System</h1>
+      <p class="hero-subtitle">Delivering 500K messages/sec across 100 million conversations with strict per-conversation ordering &mdash; while handling consumer rebalancing, hot partitions, and duplicate delivery gracefully.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~15 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are designing the messaging backend for a chat application. The core invariant: messages within a single conversation must be delivered to all participants in the exact order they were sent. If Alice sends "Hello" then "How are you?", every participant must see those messages in that order, never reversed.</p>
+
+      <div class="full-width">
+        <h3>Concrete Numbers</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Concurrent users</td><td>10 million</td></tr>
+              <tr><td>Messages per second (platform-wide)</td><td>500,000</td></tr>
+              <tr><td>Average message size</td><td>200 bytes</td></tr>
+              <tr><td>Active conversations</td><td>100 million</td></tr>
+              <tr><td>Average participants per conversation</td><td>2&ndash;5</td></tr>
+              <tr><td>Ordering requirement</td><td>Strict order within a conversation</td></tr>
+              <tr><td>Cross-conversation ordering</td><td>Not required</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Why Ordering Matters</h3>
+        <p>In a chat application, out-of-order messages break the conversation. If Bob asks "Where should we eat?" and Carol replies "Italian sounds good!", but the messages arrive reversed, it looks like Carol randomly says "Italian sounds good!" and then Bob asks "Where should we eat?" The conversation is nonsensical.</p>
+        <p>Ordering is easy with a single server: messages arrive sequentially and are stored/forwarded in order. The challenge is maintaining order when the system is distributed across multiple servers for scalability.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+
+      <div>
+        <h3>Throughput</h3>
+<pre class="line-numbers"><code class="language-text">Message throughput:
+  500,000 msgs/sec × 200 bytes = 100 MB/sec inbound
+
+Delivery throughput (each message goes to all participants):
+  Average 3 participants per conversation.
+  500K msgs/sec × 3 recipients = 1,500,000 deliveries/sec
+
+If each delivery is a WebSocket push of 200 bytes:
+  1.5M × 200 bytes = 300 MB/sec outbound</code></pre>
+      </div>
+
+      <div>
+        <h3>Kafka Partition Sizing</h3>
+<pre class="line-numbers"><code class="language-text">Kafka provides ordering WITHIN a partition, not across partitions.
+
+To guarantee per-conversation ordering:
+  All messages for conversation X must go to the same partition.
+  Partition key = conversation_id
+  Kafka routes: partition = hash(conversation_id) % num_partitions
+
+How many partitions?
+
+  Option A: 100 partitions
+    500K msgs/sec / 100 = 5,000 msgs/sec per partition
+    Each partition handles: 100M conversations / 100 = 1M conversations
+    Kafka per-partition throughput limit: 10K-100K msgs/sec → fine
+
+  Option B: 1,000 partitions
+    500K / 1,000 = 500 msgs/sec per partition
+    Each handles 100K conversations → more headroom
+
+  Going with 1,000 partitions for safety and parallelism.
+
+Consumer instances:
+  100 consumer instances (each handles 10 partitions)
+  Each consumer: 500K / 100 = 5,000 msgs/sec
+  Each consumer delivers to: 5,000 × 3 = 15,000 WebSocket pushes/sec</code></pre>
+      </div>
+
+      <div>
+        <h3>Storage</h3>
+<pre class="line-numbers"><code class="language-text">Message storage (for history):
+  500K msgs/sec × 200 bytes × 86,400 sec = 8.64 TB/day
+
+With 30-day retention:
+  8.64 TB × 30 = 259.2 TB
+
+Indexed by (conversation_id, sequence_number) for retrieval.
+Sharded by conversation_id across a distributed DB
+(Cassandra or DynamoDB).</code></pre>
+      </div>
+
+      <div>
+        <h3>WebSocket Server Sizing</h3>
+<pre class="line-numbers"><code class="language-text">10M concurrent connections.
+Each WebSocket server handles ~50,000 connections.
+  10M / 50K = 200 WebSocket servers.
+
+Deliveries per WebSocket server:
+  1.5M deliveries/sec / 200 servers = 7,500 deliveries/sec per server.
+  At 200 bytes each: 1.5 MB/sec outbound per server. Trivial.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Single Kafka Topic with Partition Key</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 800 480" style="width:100%;max-width:800px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-naive" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+          </defs>
+          <!-- Client -->
+          <rect x="20" y="30" width="120" height="50" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="80" y="52" text-anchor="middle" fill="#334155" font-weight="600">Client</text>
+          <text x="80" y="68" text-anchor="middle" fill="#64748b" font-size="11">(Alice)</text>
+          <!-- Arrow Client -> API -->
+          <line x1="140" y1="55" x2="240" y2="55" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <text x="190" y="48" text-anchor="middle" fill="#64748b" font-size="10">send message</text>
+          <!-- Chat API Server -->
+          <rect x="248" y="16" width="220" height="80" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="358" y="40" text-anchor="middle" fill="#334155" font-weight="600">Chat API Server</text>
+          <text x="358" y="58" text-anchor="middle" fill="#64748b" font-size="11">1. Assign sequence_number</text>
+          <text x="358" y="72" text-anchor="middle" fill="#64748b" font-size="11">2. Publish to Kafka (key=conv_id)</text>
+          <!-- Arrow API -> Kafka -->
+          <line x1="358" y1="96" x2="358" y2="150" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <!-- Kafka -->
+          <rect x="210" y="158" width="300" height="100" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="180" text-anchor="middle" fill="#2563eb" font-weight="700">Kafka</text>
+          <text x="360" y="198" text-anchor="middle" fill="#334155" font-size="11">topic: chat-messages &middot; 1,000 partitions</text>
+          <text x="360" y="216" text-anchor="middle" fill="#64748b" font-size="11">partition 0: [conv_A msgs]</text>
+          <text x="360" y="230" text-anchor="middle" fill="#64748b" font-size="11">partition 1: [conv_B msgs] ...</text>
+          <text x="360" y="244" text-anchor="middle" fill="#64748b" font-size="11">partition 999: [conv_Z msgs]</text>
+          <!-- Arrows Kafka -> Consumers -->
+          <line x1="280" y1="258" x2="120" y2="320" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <line x1="360" y1="258" x2="360" y2="320" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <line x1="440" y1="258" x2="620" y2="320" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <!-- Consumer 1 -->
+          <rect x="40" y="328" width="160" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="120" y="350" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Consumer 1</text>
+          <text x="120" y="366" text-anchor="middle" fill="#64748b" font-size="10">partitions 0&ndash;9</text>
+          <!-- Consumer 2 -->
+          <rect x="280" y="328" width="160" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="360" y="350" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Consumer 2</text>
+          <text x="360" y="366" text-anchor="middle" fill="#64748b" font-size="10">partitions 10&ndash;19</text>
+          <!-- Consumer 100 -->
+          <rect x="540" y="328" width="160" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="620" y="350" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Consumer 100</text>
+          <text x="620" y="366" text-anchor="middle" fill="#64748b" font-size="10">partitions 990&ndash;999</text>
+          <!-- Ellipsis between consumers -->
+          <text x="240" y="360" text-anchor="middle" fill="#94a3b8" font-size="18">...</text>
+          <text x="490" y="360" text-anchor="middle" fill="#94a3b8" font-size="18">...</text>
+          <!-- Arrows Consumers -> WS Servers -->
+          <line x1="120" y1="378" x2="120" y2="420" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <line x1="360" y1="378" x2="360" y2="420" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <line x1="620" y1="378" x2="620" y2="420" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-naive)"/>
+          <!-- WS Server 1 -->
+          <rect x="40" y="428" width="160" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="120" y="453" text-anchor="middle" fill="#2563eb" font-size="12">WebSocket Servers</text>
+          <!-- WS Server 2 -->
+          <rect x="280" y="428" width="160" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="360" y="453" text-anchor="middle" fill="#2563eb" font-size="12">WebSocket Servers</text>
+          <!-- WS Server 3 -->
+          <rect x="540" y="428" width="160" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="620" y="453" text-anchor="middle" fill="#2563eb" font-size="12">WebSocket Servers</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>How Ordering Works</h3>
+<pre class="line-numbers"><code class="language-text">All messages for conversation "conv_42" hash to partition 7.
+
+  Kafka partition 7 (in order):
+    offset 0: {conv: "conv_42", seq: 1, sender: "Alice", text: "Hello"}
+    offset 1: {conv: "conv_99", seq: 5, sender: "Dave",  text: "OK"}
+    offset 2: {conv: "conv_42", seq: 2, sender: "Bob",   text: "Hi!"}
+    offset 3: {conv: "conv_42", seq: 3, sender: "Alice", text: "How are you?"}
+
+  Consumer 1 reads partition 7 in offset order:
+    → Processes conv_42 seq 1, then conv_99 seq 5, then conv_42 seq 2, ...
+    → For conv_42: messages arrive in order 1, 2, 3. Correct!
+
+  Different conversations on the same partition are interleaved,
+  but WITHIN a conversation, order is preserved because:
+    1. Kafka preserves order within a partition.
+    2. All messages for a conversation go to the same partition.
+    3. The consumer reads sequentially from the partition.</code></pre>
+      </div>
+
+      <div>
+        <h3>Sequence Number Assignment</h3>
+<pre class="line-numbers"><code class="language-python">import time, uuid
+
+# Per-conversation sequence counter (in Redis)
+def assign_sequence(conversation_id, message):
+    """Atomically assign the next sequence number for this conversation."""
+    seq = redis_client.incr(f"seq:{conversation_id}")
+    message['sequence_number'] = seq
+    message['message_id'] = str(uuid.uuid4())
+    message['timestamp'] = time.time()
+    return message
+
+def send_message(conversation_id, sender_id, text):
+    message = {
+        'conversation_id': conversation_id,
+        'sender_id': sender_id,
+        'text': text,
+    }
+    message = assign_sequence(conversation_id, message)
+
+    # Publish to Kafka with conversation_id as partition key
+    kafka_producer.send(
+        topic='chat-messages',
+        key=conversation_id.encode(),  # determines partition
+        value=json.dumps(message).encode()
+    )</code></pre>
+      </div>
+
+      <p class="full-width">This design works correctly for the common case. Messages are ordered within each conversation, consumers process them sequentially, and WebSocket servers deliver them to recipients.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+
+      <div>
+        <h3>Problem 1: Consumer Rebalancing Causes Downtime and Duplicates</h3>
+        <p>When a consumer crashes or a new consumer joins the group, Kafka triggers a rebalance: it reassigns partitions among the remaining consumers. During rebalancing, affected partitions are not consumed. Messages queue up.</p>
+<pre class="line-numbers"><code class="language-text">Rebalance scenario: Consumer 3 crashes.
+
+  Before crash:
+    Consumer 1: partitions 0-9     (handles 5K msgs/sec)
+    Consumer 2: partitions 10-19   (handles 5K msgs/sec)
+    Consumer 3: partitions 20-29   (handles 5K msgs/sec)  ← CRASHES
+    ...
+
+  Rebalance triggered (takes 5-30 seconds with eager assignor):
+    t=0s    Consumer 3 crashes.
+    t=3s    Kafka detects missing heartbeat (session.timeout.ms = 10s).
+    t=10s   Consumer 3 declared dead. Rebalance starts.
+            ALL consumers stop consuming during rebalance.
+    t=15s   Rebalance completes. Partitions 20-29 assigned to others.
+            Consumption resumes.
+
+  During 15-second rebalance:
+    ALL 1,000 partitions paused (eager rebalance stops everything).
+    Messages queued: 500K msgs/sec × 15s = 7.5M messages.
+
+  After rebalance:
+    Consumers race to drain 7.5M backlog.
+    Users experience 15+ seconds of no messages, then a burst.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 2: Duplicate Messages on Crash</h3>
+<pre class="line-numbers"><code class="language-text">Duplicate delivery scenario:
+
+  t=0ms    Consumer 3 reads message M1 from partition 22, offset 100.
+  t=5ms    Consumer 3 pushes M1 to WebSocket server for delivery.
+  t=6ms    WebSocket server delivers M1 to recipients. ✓
+  t=7ms    Consumer 3 about to commit offset 101 to Kafka...
+  t=7ms    CRASH. Offset 100 is the last committed offset.
+
+  After rebalance:
+  t=15s    Consumer 5 is assigned partition 22.
+           Reads from last committed offset: 100.
+           Reads message M1 AGAIN.
+           Pushes M1 to WebSocket server.
+           Recipients see M1 TWICE.
+
+  In a chat app: "Hello" appears twice. Annoying but not catastrophic.
+  In a payment system: double-charge. Much worse.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 3: Hot Partitions from Popular Group Chats</h3>
+<pre class="line-numbers"><code class="language-text">A group chat with 1,000 members generates 100 msgs/sec.
+All 100 msgs/sec go to ONE partition (same conversation_id).
+
+The consumer assigned to that partition must:
+  1. Read 100 msgs/sec from Kafka (easy).
+  2. For each message, deliver to 1,000 recipients via WebSocket.
+     100 msgs/sec × 1,000 recipients = 100,000 deliveries/sec.
+  3. The consumer's other 9 partitions also need processing:
+     9 × 500 = 4,500 msgs/sec of normal traffic.
+
+Total for this consumer: 4,500 + 100 = 4,600 msgs/sec
+But delivery load: 4,500 × 3 + 100 × 1,000 = 113,500 deliveries/sec
+vs a normal consumer: 5,000 × 3 = 15,000 deliveries/sec
+
+This consumer is 7.5x more loaded than its peers.
+It falls behind. Messages in the hot conversation are delayed.
+Messages in 9 other normal partitions are ALSO delayed
+(collateral damage from sharing a consumer).</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 4: Sequence Number Gaps</h3>
+<pre class="line-numbers"><code class="language-text">If the API server assigns sequence number 5, publishes to Kafka,
+but the Kafka publish fails (broker down), the client retries
+and gets sequence number 6. The conversation now has:
+  seq 1, 2, 3, 4, 6 (seq 5 is missing).
+
+Clients that buffer by sequence number will wait forever for seq 5.
+The conversation appears "stuck" on the recipient's device.</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <strong>Summary of problems:</strong> (1) Rebalancing pauses ALL consumption for seconds, (2) crashes cause duplicate deliveries, (3) hot conversations overload a single consumer, (4) sequence number gaps can freeze the client.
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Client-Side Deduplication and Cooperative Rebalancing</h2>
+
+      <div>
+        <h3>Client-Side Deduplication</h3>
+        <p>Since at-least-once delivery means duplicates will happen, the client must handle them. Each message has a unique <code>message_id</code>. The client tracks the last N message IDs it has seen for each conversation and silently discards duplicates.</p>
+<pre class="line-numbers"><code class="language-python"># Client-side (JavaScript pseudocode)
+class ChatClient:
+    def __init__(self):
+        # Track last 1000 message IDs per conversation
+        self.seen_messages = {}  # conversation_id -> set of message_ids
+
+    def on_message_received(self, message):
+        conv_id = message['conversation_id']
+        msg_id = message['message_id']
+
+        # Initialize set for this conversation if needed
+        if conv_id not in self.seen_messages:
+            self.seen_messages[conv_id] = OrderedSet(max_size=1000)
+
+        # Check for duplicate
+        if msg_id in self.seen_messages[conv_id]:
+            return  # duplicate, ignore
+
+        # Not a duplicate — add to seen set and display
+        self.seen_messages[conv_id].add(msg_id)
+        self.display_message(message)</code></pre>
+      </div>
+
+      <div>
+        <h3>Client-Side Reordering Buffer</h3>
+        <p>For handling out-of-order delivery (which can happen briefly during rebalancing), the client maintains a small reorder buffer per conversation.</p>
+<pre class="line-numbers"><code class="language-text">Reordering example:
+
+  Client expects next sequence number: 5
+
+  Messages arrive: seq 5, seq 7, seq 6
+
+  Processing:
+    Receive seq 5: expected=5, match! Display. Next expected: 6.
+    Receive seq 7: expected=6, mismatch. Buffer seq 7.
+                   Buffer: {7: msg}
+    Receive seq 6: expected=6, match! Display. Next expected: 7.
+                   Check buffer: seq 7 exists! Display. Next expected: 8.
+                   Buffer: {} (empty)
+
+  Result: User sees messages in order 5, 6, 7. Correct!
+
+  Timeout: If seq 6 never arrives after 2 seconds, display
+  seq 7 anyway (showing a gap is better than waiting forever).
+  Request missed messages via HTTP fallback.</code></pre>
+      </div>
+
+      <div>
+        <h3>Cooperative Sticky Rebalancing</h3>
+        <p>The default Kafka rebalance protocol (eager) stops ALL consumers during rebalancing. The cooperative sticky assignor performs incremental rebalances: only the affected partitions are revoked and reassigned. Other partitions continue being consumed without interruption.</p>
+<pre class="line-numbers"><code class="language-text">Eager rebalance (default):
+  Consumer 3 crashes.
+  ALL 100 consumers stop. ALL 1,000 partitions paused.
+  15 seconds of total downtime.
+  7.5M messages queued.
+
+Cooperative sticky rebalance:
+  Consumer 3 crashes.
+  Only partitions 20-29 (Consumer 3's partitions) are revoked.
+  Consumers 1, 2, 4-100 continue processing normally.
+  Partitions 20-29 are reassigned to other consumers.
+  Only 10 out of 1,000 partitions affected.
+
+  Impact during rebalance:
+    10 partitions paused × 500 msgs/sec × 5 seconds = 25,000 messages queued.
+    vs 7,500,000 with eager rebalance.
+    Reduction: 99.7%
+
+  Users in 990 unaffected partitions: zero disruption.
+  Users in 10 affected partitions: ~5 second delay.</code></pre>
+      </div>
+
+      <div>
+        <h4>Kafka Consumer Configuration</h4>
+<pre class="line-numbers"><code class="language-text">Kafka consumer configuration:
+
+  partition.assignment.strategy = CooperativeStickyAssignor
+  session.timeout.ms = 10000      # 10s until declared dead
+  heartbeat.interval.ms = 3000    # heartbeat every 3s
+  max.poll.interval.ms = 300000   # max time between polls</code></pre>
+      </div>
+
+      <div>
+        <h3>Handling Sequence Number Gaps</h3>
+        <p>Instead of assigning sequence numbers BEFORE publishing to Kafka, we use Kafka's own offset as the ordering mechanism. Within a partition, offsets are sequential and gap-free. The per-conversation sequence number is assigned AFTER the message is durably stored in Kafka, using the Kafka offset to derive ordering.</p>
+<pre class="line-numbers"><code class="language-text">Revised approach:
+
+  1. API server publishes message to Kafka (no sequence number yet).
+  2. Kafka assigns offset 4,721 to the message on partition 7.
+  3. Consumer reads from partition 7 in offset order.
+  4. For each message, consumer assigns a per-conversation sequence number:
+     SELECT MAX(sequence_number) FROM messages
+       WHERE conversation_id = 'conv_42'
+     → Returns 4. Assign seq 5 to this message.
+  5. Store message with seq=5 in the messages DB.
+  6. Deliver to recipients with seq=5.
+
+  Why this is better: Kafka offsets are always sequential and
+  gap-free within a partition. No message is ever "lost" in
+  the ordering sequence because the consumer processes them
+  in exact offset order.</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Solving Hot Partitions with Fan-Out Separation</h2>
+
+      <div>
+        <h3>The Problem Restated</h3>
+        <p>A group chat with 1,000 members produces 100 msgs/sec. Each message must be delivered to 1,000 WebSocket connections. The Kafka consumer that processes this partition is responsible for both reading messages in order AND delivering them to recipients. The delivery work (100K pushes/sec) dwarfs the ordering work (100 msgs/sec).</p>
+      </div>
+
+      <div>
+        <h3>Solution: Separate Ordering from Delivery</h3>
+        <p>Split the consumer's job into two stages:</p>
+        <ol>
+          <li><strong>Ordering consumer:</strong> Reads from Kafka partition in order. Assigns sequence numbers. Stores messages in the database. Publishes to a per-conversation delivery channel. This is lightweight (no fan-out).</li>
+          <li><strong>Delivery service:</strong> Reads from delivery channels. Looks up conversation participants. Pushes to each participant's WebSocket connection. This is parallelized and scales independently.</li>
+        </ol>
+      </div>
+
+      <div class="full-width">
+        <svg viewBox="0 0 800 400" style="width:100%;max-width:800px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-iter2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+          </defs>
+          <!-- Stage 1 label -->
+          <text x="400" y="20" text-anchor="middle" fill="#2563eb" font-weight="700" font-size="14">Stage 1: Ordering (sequential, per-partition)</text>
+          <!-- Kafka Partition -->
+          <rect x="30" y="40" width="160" height="60" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="110" y="64" text-anchor="middle" fill="#2563eb" font-weight="600">Kafka</text>
+          <text x="110" y="82" text-anchor="middle" fill="#64748b" font-size="11">Partition 7 (in order)</text>
+          <!-- Arrow Kafka -> Ordering Consumer -->
+          <line x1="190" y1="70" x2="280" y2="70" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-iter2)"/>
+          <!-- Ordering Consumer -->
+          <rect x="288" y="40" width="170" height="60" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="373" y="64" text-anchor="middle" fill="#334155" font-weight="600">Ordering Consumer</text>
+          <text x="373" y="82" text-anchor="middle" fill="#64748b" font-size="11">(lightweight)</text>
+          <!-- Arrow Ordering Consumer -> Messages DB -->
+          <line x1="458" y1="70" x2="548" y2="70" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-iter2)"/>
+          <!-- Messages DB -->
+          <rect x="556" y="40" width="170" height="60" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="641" y="64" text-anchor="middle" fill="#334155" font-weight="600">Messages DB</text>
+          <text x="641" y="82" text-anchor="middle" fill="#64748b" font-size="11">(store with seq number)</text>
+          <!-- Arrow down from Ordering Consumer -->
+          <line x1="373" y1="100" x2="373" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-iter2)"/>
+          <text x="373" y="140" text-anchor="middle" fill="#64748b" font-size="11">Redis Pub/Sub: "deliver:conv_42"</text>
+          <!-- Stage 2 label -->
+          <text x="400" y="185" text-anchor="middle" fill="#16a34a" font-weight="700" font-size="14">Stage 2: Delivery (parallel, scalable)</text>
+          <!-- Delivery Service box -->
+          <rect x="80" y="200" width="640" height="180" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="400" y="228" text-anchor="middle" fill="#334155" font-weight="600" font-size="14">Delivery Service</text>
+          <text x="400" y="250" text-anchor="middle" fill="#64748b" font-size="12">Subscribes to "deliver:conv_42" via Redis Pub/Sub</text>
+          <!-- Steps inside delivery -->
+          <text x="140" y="280" fill="#334155" font-size="12">1. Look up conversation participants (cached)</text>
+          <text x="140" y="300" fill="#334155" font-size="12">2. Find each participant's WebSocket server (consistent hash)</text>
+          <text x="140" y="320" fill="#334155" font-size="12">3. Send delivery request to that WS server</text>
+          <text x="140" y="350" fill="#16a34a" font-size="12" font-weight="600">Parallelized across many instances &mdash; ordering guaranteed by Stage 1</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Why This Solves the Hot Partition Problem</h3>
+<pre class="line-numbers"><code class="language-text">Before (single-stage):
+  Consumer for partition 7:
+    Read 4,600 msgs/sec from Kafka           ← CPU: low
+    Deliver 113,500 pushes/sec via WebSocket  ← CPU: HIGH (bottleneck)
+    One consumer does everything. Overloaded.
+
+After (two-stage):
+  Ordering consumer for partition 7:
+    Read 4,600 msgs/sec from Kafka           ← CPU: low
+    Publish 4,600 events to Redis Pub/Sub    ← CPU: low
+    Total: very lightweight. No bottleneck.
+
+  Delivery service (pool of N instances):
+    Subscribe to delivery channels.
+    Process fan-out in parallel.
+    Hot conversation (conv_42): 100 msgs × 1,000 recipients
+      = 100K deliveries/sec, spread across multiple delivery instances.
+    Each delivery instance handles a subset of recipients.
+
+  The ordering guarantee is maintained because:
+    1. Stage 1 publishes messages in order (sequential per partition).
+    2. Redis Pub/Sub delivers in order per channel.
+    3. Each recipient receives messages in the order published.</code></pre>
+      </div>
+
+      <div>
+        <h3>Handling Very Hot Conversations</h3>
+        <p>For extremely popular group chats (10K+ members), even the delivery fan-out per message is expensive. Additional optimizations:</p>
+<pre class="line-numbers"><code class="language-text">Optimization 1: Batch deliveries
+  Instead of pushing each message individually,
+  batch messages in 100ms windows.
+  10 messages in 100ms × 10K recipients = 10K batch pushes
+  vs 10 × 10K = 100K individual pushes.
+  Each push carries 10 messages instead of 1.
+
+Optimization 2: Tree-based fan-out
+  Instead of one service sending to 10K WebSocket servers:
+
+  Level 1: Delivery coordinator sends to 10 fan-out nodes.
+  Level 2: Each fan-out node sends to 1,000 WebSocket servers.
+
+  Latency: 2 hops instead of 1, but coordinator is not a bottleneck.
+  Parallel delivery at each level.
+
+Optimization 3: Server-side subscription
+  For a 10K-member group, most members are offline.
+  Only push to currently connected members.
+  If 10% are online: 1,000 pushes instead of 10,000.
+  Offline members pull missed messages on reconnect.</code></pre>
+      </div>
+
+      <div>
+        <h3>Consumer Lag Monitoring</h3>
+        <p>If a consumer falls behind (processing slower than message arrival), messages queue up in Kafka. We need to detect this early.</p>
+<pre class="line-numbers"><code class="language-text">Consumer lag = Latest offset in partition - Consumer's committed offset
+
+Example:
+  Partition 7 latest offset: 1,000,000
+  Consumer's committed offset: 999,500
+  Lag: 500 messages
+
+  At 500 msgs/sec per partition, 500 messages = 1 second of lag.
+  Acceptable.
+
+Alert thresholds:
+  Lag > 5,000 (10 seconds):    WARNING — consumer may be slow
+  Lag > 50,000 (100 seconds):  CRITICAL — messages delayed by 1.5+ minutes
+  Lag > 500,000 (1000 seconds): EMERGENCY — 16+ minutes behind
+
+  Action on CRITICAL: add more consumer instances (rebalance
+  distributes partitions among more consumers) or investigate
+  the slow consumer (is the delivery service overwhelmed? is
+  the DB slow?).</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Message History and Offline Delivery</h2>
+
+      <div>
+        <h3>Persistent Message Storage</h3>
+        <p>Kafka provides temporary storage (retention period), but chat messages need permanent storage for history (scroll up to see old messages). The ordering consumer writes every message to a persistent store, indexed by conversation and sequence number.</p>
+<pre class="line-numbers"><code class="language-text">Messages table (Cassandra, partitioned by conversation_id):
+
+  Partition key: conversation_id
+  Clustering key: sequence_number (ascending)
+
+  ┌─────────────────┬───────┬──────────┬──────────────────┬───────────┐
+  │ conversation_id │ seq   │ sender   │ text             │ timestamp │
+  ├─────────────────┼───────┼──────────┼──────────────────┼───────────┤
+  │ conv_42         │ 1     │ alice    │ Hello            │ 10:00:01  │
+  │ conv_42         │ 2     │ bob      │ Hi!              │ 10:00:03  │
+  │ conv_42         │ 3     │ alice    │ How are you?     │ 10:00:05  │
+  │ conv_42         │ 4     │ bob      │ Good, you?       │ 10:00:08  │
+  │ conv_42         │ 5     │ alice    │ Great!           │ 10:00:10  │
+  └─────────────────┴───────┴──────────┴──────────────────┴───────────┘
+
+Query for history (scrolling up):
+  SELECT * FROM messages
+  WHERE conversation_id = 'conv_42'
+  AND sequence_number < 5
+  ORDER BY sequence_number DESC
+  LIMIT 20
+
+  Returns: seq 4, 3, 2, 1 (reverse order for display).
+  Cassandra returns this efficiently because sequence_number
+  is the clustering key.</code></pre>
+      </div>
+
+      <div>
+        <h3>Offline Message Delivery</h3>
+        <p>When a user is offline, they miss real-time WebSocket pushes. On reconnect, the client must fetch all messages it missed.</p>
+<pre class="line-numbers"><code class="language-text">Client reconnection flow:
+
+  1. Client connects via WebSocket.
+  2. Client sends: {"type": "sync", "conversations": {
+       "conv_42": {"last_seq": 3},
+       "conv_99": {"last_seq": 15},
+       ...
+     }}
+  3. Server queries for each conversation:
+     SELECT * FROM messages
+     WHERE conversation_id = 'conv_42'
+     AND sequence_number > 3
+     ORDER BY sequence_number ASC
+     → Returns: seq 4, 5 (missed messages while offline)
+  4. Server pushes missed messages to client.
+  5. Client applies deduplication and reordering (in case
+     some messages arrived via push before disconnect).
+
+Optimization: If user was offline for a long time (>7 days),
+  don't sync all conversations. Only sync when user opens
+  a specific conversation (lazy loading).</code></pre>
+      </div>
+
+      <div>
+        <h3>Read Receipts and Typing Indicators</h3>
+        <p>These are high-frequency, low-importance signals. They do NOT need ordering guarantees or persistence.</p>
+<pre class="line-numbers"><code class="language-text">Typing indicators:
+  - Sent as fire-and-forget UDP-style messages.
+  - No Kafka, no persistence.
+  - Direct WebSocket push to conversation participants.
+  - If lost: no harm (user just doesn't see "Alice is typing...").
+  - Rate limited: max 1 typing event per 3 seconds per user.
+
+Read receipts:
+  - Slightly more important (want to persist "Alice read up to seq 5").
+  - Store in DB: UPDATE read_receipts
+    SET last_read_seq = 5 WHERE user_id = 'alice' AND conv_id = 'conv_42'
+  - Broadcast to other participants via WebSocket.
+  - Don't need Kafka ordering — last-write-wins is fine.
+  - If duplicate: idempotent (max of current and new sequence number).</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="full-width">
+        <svg viewBox="0 0 820 520" style="width:100%;max-width:820px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrow-final" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+            <marker id="arrow-final-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+          </defs>
+
+          <!-- Client -->
+          <rect x="20" y="40" width="120" height="55" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="80" y="63" text-anchor="middle" fill="#334155" font-weight="600">Client</text>
+          <text x="80" y="80" text-anchor="middle" fill="#64748b" font-size="11">(send &amp; receive)</text>
+
+          <!-- Arrow Client -> Chat API -->
+          <line x1="140" y1="60" x2="220" y2="60" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <text x="180" y="52" text-anchor="middle" fill="#64748b" font-size="10">send msg</text>
+
+          <!-- Chat API Server -->
+          <rect x="228" y="30" width="170" height="70" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="313" y="55" text-anchor="middle" fill="#334155" font-weight="600">Chat API Server</text>
+          <text x="313" y="73" text-anchor="middle" fill="#64748b" font-size="11">(validates, publishes)</text>
+
+          <!-- Arrow API -> Kafka -->
+          <line x1="398" y1="65" x2="490" y2="65" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <text x="444" y="57" text-anchor="middle" fill="#64748b" font-size="10">publish</text>
+
+          <!-- Kafka -->
+          <rect x="498" y="30" width="180" height="70" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="588" y="55" text-anchor="middle" fill="#2563eb" font-weight="700">Kafka</text>
+          <text x="588" y="73" text-anchor="middle" fill="#64748b" font-size="11">1,000 partitions &middot; key=conv_id</text>
+
+          <!-- Arrow Kafka -> Ordering Consumers -->
+          <line x1="588" y1="100" x2="588" y2="150" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+          <text x="610" y="130" fill="#64748b" font-size="10">consume</text>
+
+          <!-- Ordering Consumers -->
+          <rect x="478" y="158" width="220" height="85" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="588" y="180" text-anchor="middle" fill="#334155" font-weight="600">Ordering Consumers</text>
+          <text x="588" y="196" text-anchor="middle" fill="#64748b" font-size="11">(100 instances)</text>
+          <text x="588" y="214" text-anchor="middle" fill="#64748b" font-size="10">1. Assign seq num</text>
+          <text x="588" y="228" text-anchor="middle" fill="#64748b" font-size="10">2. Store in DB &middot; 3. Publish to delivery</text>
+
+          <!-- Arrow Ordering -> Delivery Service -->
+          <line x1="588" y1="243" x2="588" y2="300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+
+          <!-- Delivery Service -->
+          <rect x="478" y="308" width="220" height="70" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="588" y="335" text-anchor="middle" fill="#2563eb" font-weight="600">Delivery Service</text>
+          <text x="588" y="353" text-anchor="middle" fill="#64748b" font-size="11">(scalable pool &middot; fan-out)</text>
+
+          <!-- Arrow Delivery -> Client (WebSocket push) -->
+          <line x1="478" y1="340" x2="140" y2="75" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-final-blue)"/>
+          <text x="280" y="195" text-anchor="middle" fill="#2563eb" font-size="10" transform="rotate(-30 280 195)">WebSocket push</text>
+
+          <!-- Messages DB -->
+          <rect x="200" y="310" width="180" height="70" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="290" y="338" text-anchor="middle" fill="#334155" font-weight="600">Messages DB (Cassandra)</text>
+          <text x="290" y="356" text-anchor="middle" fill="#64748b" font-size="11">Partitioned by conv_id</text>
+          <text x="290" y="370" text-anchor="middle" fill="#64748b" font-size="11">Ordered by seq_number</text>
+
+          <!-- Arrow Client -> Messages DB (sync on reconnect) -->
+          <line x1="80" y1="95" x2="210" y2="310" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-final)"/>
+          <text x="120" y="210" fill="#94a3b8" font-size="10" transform="rotate(68 120 210)">sync on reconnect</text>
+
+          <!-- Arrow Ordering -> Messages DB -->
+          <line x1="478" y1="220" x2="380" y2="320" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow-final)"/>
+
+          <!-- Supporting services row -->
+          <text x="410" y="420" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Supporting Services</text>
+          <!-- Redis -->
+          <rect x="80" y="435" width="170" height="65" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="165" y="458" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Redis</text>
+          <text x="165" y="475" text-anchor="middle" fill="#64748b" font-size="10">seq nums, presence, pub/sub</text>
+          <!-- WebSocket Servers -->
+          <rect x="290" y="435" width="200" height="65" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="390" y="458" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">WebSocket Servers</text>
+          <text x="390" y="475" text-anchor="middle" fill="#64748b" font-size="10">200 servers &middot; 50K conns each</text>
+          <!-- Monitoring -->
+          <rect x="530" y="435" width="190" height="65" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="625" y="458" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Monitoring</text>
+          <text x="625" y="475" text-anchor="middle" fill="#64748b" font-size="10">consumer lag, msg latency</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Guarantees Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Guarantee</th><th>How It Is Achieved</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Per-conversation message ordering</td>
+                <td>All messages for a conversation route to the same Kafka partition. Consumer reads in offset order. Sequence numbers assigned sequentially.</td>
+              </tr>
+              <tr>
+                <td>No duplicate display</td>
+                <td>Client-side deduplication via message_id. At-least-once from Kafka, exactly-once at display.</td>
+              </tr>
+              <tr>
+                <td>Minimal rebalance disruption</td>
+                <td>Cooperative sticky assignor. Only affected partitions pause. 99.7% reduction in queued messages vs eager rebalance.</td>
+              </tr>
+              <tr>
+                <td>Hot conversation handling</td>
+                <td>Two-stage architecture separates ordering (sequential) from delivery (parallel). Delivery scales independently.</td>
+              </tr>
+              <tr>
+                <td>Offline message delivery</td>
+                <td>Messages persisted to Cassandra with seq numbers. Client syncs missed messages on reconnect.</td>
+              </tr>
+              <tr>
+                <td>Message history</td>
+                <td>Cassandra partitioned by conversation_id, clustered by sequence_number. Efficient range queries for scrolling.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Rebalance Impact Comparison</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Eager Rebalance</th><th>Cooperative Sticky</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Partitions affected</td><td>ALL 1,000</td><td>10 (crashed consumer's)</td></tr>
+              <tr><td>Rebalance duration</td><td>15 seconds</td><td>5 seconds</td></tr>
+              <tr><td>Messages queued</td><td>7,500,000</td><td>25,000</td></tr>
+              <tr><td>Users impacted</td><td>All 10M connected</td><td>~100K (1% of partitions)</td></tr>
+              <tr><td>Backlog drain time</td><td>15 seconds</td><td>< 1 second</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul class="full-width">
+        <li><strong>Partition-level ordering is Kafka's fundamental guarantee.</strong> If you need messages in order, route related messages to the same partition via a consistent partition key. Do not rely on cross-partition ordering &mdash; it does not exist.</li>
+        <li><strong>At-least-once delivery means duplicates are inevitable.</strong> Design for it. Client-side deduplication using unique message IDs is simple and effective. Never assume exactly-once delivery from the infrastructure.</li>
+        <li><strong>Cooperative sticky rebalancing is not optional for latency-sensitive applications.</strong> The default eager rebalance pauses ALL consumers. For a chat app, this means ALL users experience a 15-second blackout. Cooperative sticky limits the blast radius to only the affected partitions.</li>
+        <li><strong>Separate ordering from delivery.</strong> Ordering is inherently sequential (must be done by one consumer per partition). Delivery is embarrassingly parallel (can be fanned out to many workers). Putting both in the same consumer makes the sequential part a bottleneck for the parallel part.</li>
+        <li><strong>Hot partitions are unavoidable with partition-key routing.</strong> If one conversation generates 100x more traffic than average, its partition is 100x hotter. You cannot solve this by adding more partitions (all messages for that conversation MUST go to one partition). You solve it by making the per-partition consumer lightweight and offloading heavy work to a scalable layer.</li>
+        <li><strong>Sequence numbers should be assigned after durable storage, not before.</strong> Assigning a sequence number before publishing to Kafka risks gaps (if the publish fails). Assigning after Kafka storage (using Kafka offsets for ordering) guarantees gap-free sequences.</li>
+        <li><strong>Always calculate the rebalance impact.</strong> How many messages queue up? How long to drain? How many users are affected? These numbers determine whether your design meets latency requirements during operational events.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../message-queues.html" class="card topic-card">
+          <h3>Message Queues</h3>
+          <p>Kafka partitions, consumer groups, offsets, and delivery guarantees explained in depth.</p>
+        </a>
+        <a href="../websockets.html" class="card topic-card">
+          <h3>WebSockets</h3>
+          <p>Persistent connections for real-time message delivery. Connection management at scale.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>Routing users to WebSocket servers. Minimizing connection disruption during server changes.</p>
+        </a>
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>Cassandra replication for message storage. Consistency levels for chat history reads.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

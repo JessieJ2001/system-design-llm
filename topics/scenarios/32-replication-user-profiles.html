@@ -1,0 +1,1500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Database Replication for a Global User Profile Service — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Database Replication: Global User Profile Service</h1>
+      <p class="hero-subtitle">Designing the storage layer for 200M user profiles across 3 regions &mdash; why replication is the right tool, and the challenges it introduces.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~20 min read</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are designing the storage layer for a global user profile service. Every time a user logs in, views someone&rsquo;s profile, or changes their settings, this service handles the request. It must be fast, reliable, and serve users on three continents.</p>
+
+      <div>
+        <h3>Data</h3>
+        <ul>
+          <li><strong>200 million user profiles.</strong> Each profile contains: name, email, avatar URL, preferences (language, theme, notification settings), timezone. Average size: ~1 KB per record.</li>
+          <li><strong>Total data size:</strong> 200M &times; 1 KB = <strong>200 GB</strong>.</li>
+          <li><strong>Schema is simple</strong> &mdash; this is a key-value-like workload. Almost every query is <code>SELECT * FROM profiles WHERE user_id = ?</code>.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Access Patterns</h3>
+        <ul>
+          <li><strong>Reads (50,000/sec peak):</strong> Profile lookups by user_id (login, profile page views, avatar rendering, authorization checks). Read-heavy &mdash; 100:1 read-to-write ratio.</li>
+          <li><strong>Writes (500/sec peak):</strong> Profile updates (name change, email change, avatar upload, settings toggle). Infrequent and small &mdash; typically updating 1&ndash;3 fields at a time.</li>
+          <li><strong>Geographic distribution:</strong> Users are spread across 3 regions &mdash; US (40%), EU (35%), Asia (25%). Each region needs &lt;50 ms read latency.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Quantified Constraints</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Value</th><th>Derivation</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Total profiles</td><td>200M</td><td>Given</td></tr>
+              <tr><td>Profile size</td><td>~1 KB</td><td>name + email + avatar URL + preferences + timezone</td></tr>
+              <tr><td>Total data</td><td>200 GB</td><td>200M &times; 1 KB</td></tr>
+              <tr><td>Peak read QPS</td><td>50,000/sec</td><td>Given &mdash; profile lookups, auth checks, page views</td></tr>
+              <tr><td>Peak write QPS</td><td>500/sec</td><td>Given &mdash; profile updates, settings changes</td></tr>
+              <tr><td>Read latency target</td><td>&lt;50 ms p99</td><td>Users expect snappy profile loads</td></tr>
+              <tr><td>Availability target</td><td>99.99%</td><td>~52 min downtime/year. Profiles are on the critical path for login.</td></tr>
+              <tr><td>Regions</td><td>3 (US, EU, Asia)</td><td>Given</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Back-of-Envelope Math                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>Before choosing any architecture, let&rsquo;s calculate whether a single server can handle this workload. These numbers will drive every decision.</p>
+
+      <div>
+        <h3>Storage: Does It Fit on One Machine?</h3>
+<pre class="line-numbers"><code class="language-text">Total data: 200M profiles × 1 KB = 200 GB
+
+A modern database server has 256–512 GB of RAM.
+200 GB fits entirely in memory on a single machine.
+
+PostgreSQL with shared_buffers = 200 GB can serve
+every profile lookup from RAM — no disk I/O needed.
+
+Disk for persistence: 200 GB on SSD = trivial.
+WAL (write-ahead log): 500 writes/sec × 1 KB × 86,400 sec
+  = 43 GB/day. Standard SSD handles this easily.</code></pre>
+      </div>
+
+      <div>
+        <h3>Throughput: Can One Server Handle the QPS?</h3>
+<pre class="line-numbers"><code class="language-text">Read capacity of a single PostgreSQL instance:
+  Simple primary-key lookups from RAM → ~10,000 reads/sec
+  (B-tree index lookup: O(log n), depth 3-4 for 200M rows,
+   all index pages cached in shared_buffers → ~0.1 ms each)
+
+We need: 50,000 reads/sec
+We have: 10,000 reads/sec per server
+
+Servers needed for reads: 50,000 / 10,000 = 5 servers
+
+Write capacity of a single PostgreSQL instance:
+  Simple UPDATE by primary key → ~5,000-10,000 writes/sec
+  (WAL write + index update, fsync in batches)
+
+We need: 500 writes/sec
+We have: 5,000+ writes/sec per server
+
+Writes are trivial — one server can handle 10× our peak.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Key insight:</strong> The data is small (200 GB), writes are low (500/sec), but reads are high (50K/sec). We need 5&times; the read capacity of a single PostgreSQL. Sharding would split 200 GB into, say, 10 &times; 20 GB shards &mdash; pointless overhead for data this small. Each shard would still need its own server, backup strategy, and failover. <strong>Replication</strong> is the right tool: keep the full dataset on multiple servers, spread reads across them, and get high availability as a bonus.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design: Single PostgreSQL</h2>
+      <p>Start with the simplest thing that could work. One PostgreSQL instance serving all reads and writes.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 560 200" style="width:100%;max-width:967px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+          <!-- Clients -->
+          <rect x="10" y="30" width="100" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="60" y="47" text-anchor="middle" font-weight="600" fill="#334155" font-size="11">US Users</text>
+          <text x="60" y="62" text-anchor="middle" fill="#64748b" font-size="10">20K reads/sec</text>
+          <rect x="10" y="80" width="100" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="60" y="97" text-anchor="middle" font-weight="600" fill="#334155" font-size="11">EU Users</text>
+          <text x="60" y="112" text-anchor="middle" fill="#64748b" font-size="10">17.5K reads/sec</text>
+          <rect x="10" y="130" width="100" height="40" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="60" y="147" text-anchor="middle" font-weight="600" fill="#334155" font-size="11">Asia Users</text>
+          <text x="60" y="162" text-anchor="middle" fill="#64748b" font-size="10">12.5K reads/sec</text>
+          <!-- Arrows -->
+          <line x1="110" y1="50" x2="260" y2="90" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrGray)"/>
+          <line x1="110" y1="100" x2="260" y2="100" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrGray)"/>
+          <line x1="110" y1="150" x2="260" y2="110" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrGray)"/>
+          <text x="185" y="75" text-anchor="middle" fill="#64748b" font-size="10">all traffic</text>
+          <!-- PostgreSQL -->
+          <rect x="260" y="55" width="280" height="95" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="400" y="80" text-anchor="middle" font-weight="700" fill="#2563eb">PostgreSQL (single, US region)</text>
+          <rect x="278" y="90" width="100" height="28" rx="4" fill="#dbeafe" stroke="#93c5fd"/>
+          <text x="328" y="109" text-anchor="middle" fill="#1e40af" font-size="11">profiles</text>
+          <text x="400" y="137" text-anchor="middle" fill="#64748b" font-size="11">200 GB &mdash; capacity: 10K reads/sec</text>
+          <!-- Latency labels -->
+          <text x="440" y="90" fill="#64748b" font-size="10">~2 ms (US)</text>
+          <text x="440" y="103" fill="#ef4444" font-size="10">~120 ms (EU)</text>
+          <text x="440" y="116" fill="#ef4444" font-size="10">~200 ms (Asia)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Schema</h3>
+<pre class="line-numbers"><code class="language-sql">CREATE TABLE profiles (
+  user_id      BIGINT PRIMARY KEY,
+  name         VARCHAR(128),
+  email        VARCHAR(256) UNIQUE,
+  avatar_url   TEXT,
+  preferences  JSONB,       -- {language, theme, notifications}
+  timezone     VARCHAR(64),
+  updated_at   TIMESTAMP DEFAULT NOW(),
+  created_at   TIMESTAMP DEFAULT NOW()
+);
+
+-- Most queries:
+SELECT * FROM profiles WHERE user_id = 12345;
+-- ~0.1 ms from RAM (B-tree depth 4 for 200M rows)</code></pre>
+      </div>
+
+      <div>
+        <h3>What This Gets Right</h3>
+        <ul>
+          <li>Simple to operate &mdash; one server, one database, no replication complexity.</li>
+          <li>Strong consistency &mdash; every read sees the latest write (single node, no lag).</li>
+          <li>ACID transactions &mdash; email uniqueness constraints, atomic profile updates.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+      <p>The single-server design fails on three fronts. Let&rsquo;s quantify each.</p>
+
+      <div>
+        <h3>Problem 1: Read Throughput</h3>
+<pre class="line-numbers"><code class="language-text">Single PostgreSQL capacity:   10,000 reads/sec
+Peak demand:                  50,000 reads/sec
+
+50,000 / 10,000 = 5× over capacity.
+
+At 50K reads/sec, PostgreSQL's connection pool saturates.
+Each connection consumes ~10 MB RAM for buffers.
+At 200 connections × 0.1 ms/query = 2,000 QPS.
+At 500 connections × 0.1 ms/query = 5,000 QPS.
+(Past ~500 connections, contention on locks, buffers,
+ and process scheduling causes throughput to plateau
+ or even decline — the "connection scaling wall.")
+
+Result: requests queue up, latency spikes from 0.1 ms
+to 100+ ms, then timeouts and errors cascade.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 2: Availability</h3>
+<pre class="line-numbers"><code class="language-text">A single server gives us roughly 99.9% availability:
+  - Planned downtime: OS patches, PostgreSQL upgrades,
+    hardware maintenance → ~4 hours/year
+  - Unplanned downtime: disk failure, OOM, kernel panic,
+    network issues → ~4 hours/year
+  - Total: ~8.7 hours/year → 99.9%
+
+We need 99.99%:
+  - Allowed downtime: 52 minutes/year
+  - A SINGLE hardware failure exceeds our entire budget
+
+With one server, any failure = total outage.
+No reads, no writes, no logins.
+
+Profiles are on the critical path for authentication.
+If the profile service is down, users cannot log in.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 3: Geographic Latency</h3>
+<pre class="line-numbers"><code class="language-text">Network round-trip times (RTT) to a US-based server:
+
+  US users  → US server:    ~2 ms     ✓ under 50 ms
+  EU users  → US server:    ~120 ms   ✗ over 50 ms target
+  Asia users → US server:   ~200 ms   ✗ over 50 ms target
+
+Physics constraint: light in fiber travels at ~200,000 km/sec.
+  US-EU distance:   ~6,000 km → 30 ms one-way → 60 ms RTT
+  US-Asia distance: ~10,000 km → 50 ms one-way → 100 ms RTT
+
+Add TCP overhead, TLS handshake, and processing time:
+  US-EU total:    ~120 ms
+  US-Asia total:  ~200 ms
+
+No amount of code optimization can fix the speed of light.
+The only solution is to put the data closer to the user.</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>Replication solves all three problems:</strong> (1) Multiple replicas multiply read capacity &mdash; 5 servers &times; 10K reads/sec = 50K reads/sec. (2) If one server dies, the others keep serving &mdash; no single point of failure. (3) Replicas in EU and Asia serve local reads in &lt;5 ms instead of 120&ndash;200 ms. But replication introduces its own set of challenges &mdash; the rest of this page walks through them.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Primary + Read Replicas (Same Region)</h2>
+      <p>The simplest replication setup: one primary that handles all writes, and multiple replicas that handle reads. All servers are in the same region (US) for now.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 720 300" style="width:100%;max-width:1072px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="a1b" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="a1g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="a1r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+            <marker id="a1gn" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+
+          <!-- Region box -->
+          <rect x="140" y="10" width="560" height="280" rx="12" fill="none" stroke="#e2e8f0" stroke-width="1.5" stroke-dasharray="8"/>
+          <text x="420" y="30" text-anchor="middle" fill="#94a3b8" font-size="11" font-weight="600">US REGION</text>
+
+          <!-- Application -->
+          <rect x="10" y="100" width="100" height="55" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="60" y="122" text-anchor="middle" font-weight="600" fill="#334155" font-size="11">Application</text>
+          <text x="60" y="138" text-anchor="middle" fill="#64748b" font-size="10">50K reads/sec</text>
+          <text x="60" y="150" text-anchor="middle" fill="#64748b" font-size="10">500 writes/sec</text>
+
+          <!-- Primary -->
+          <rect x="180" y="45" width="150" height="65" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="255" y="67" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">Primary</text>
+          <text x="255" y="83" text-anchor="middle" fill="#64748b" font-size="10">200 GB &bull; reads + writes</text>
+          <text x="255" y="98" text-anchor="middle" fill="#64748b" font-size="10">500 writes/sec + 10K reads/sec</text>
+
+          <!-- Write arrow -->
+          <line x1="110" y1="115" x2="178" y2="80" stroke="#2563eb" stroke-width="1.5" marker-end="url(#a1b)"/>
+          <text x="130" y="88" fill="#2563eb" font-size="9">writes</text>
+
+          <!-- Replicas -->
+          <rect x="180" y="140" width="130" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="245" y="162" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Replica 1</text>
+          <text x="245" y="178" text-anchor="middle" fill="#64748b" font-size="10">10K reads/sec</text>
+
+          <rect x="330" y="140" width="130" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="395" y="162" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Replica 2</text>
+          <text x="395" y="178" text-anchor="middle" fill="#64748b" font-size="10">10K reads/sec</text>
+
+          <rect x="480" y="140" width="130" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="545" y="162" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Replica 3</text>
+          <text x="545" y="178" text-anchor="middle" fill="#64748b" font-size="10">10K reads/sec</text>
+
+          <rect x="330" y="210" width="130" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="395" y="232" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Replica 4</text>
+          <text x="395" y="248" text-anchor="middle" fill="#64748b" font-size="10">10K reads/sec</text>
+
+          <!-- Read arrows -->
+          <line x1="110" y1="140" x2="178" y2="160" stroke="#16a34a" stroke-width="1.5" marker-end="url(#a1gn)"/>
+          <line x1="110" y1="140" x2="328" y2="160" stroke="#16a34a" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1gn)"/>
+          <line x1="110" y1="140" x2="478" y2="160" stroke="#16a34a" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1gn)"/>
+          <line x1="110" y1="140" x2="328" y2="230" stroke="#16a34a" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1gn)"/>
+          <text x="130" y="155" fill="#16a34a" font-size="9">reads (round-robin)</text>
+
+          <!-- Replication arrows -->
+          <line x1="255" y1="110" x2="245" y2="138" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4" marker-end="url(#a1r)"/>
+          <line x1="270" y1="110" x2="395" y2="138" stroke="#ef4444" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1r)"/>
+          <line x1="285" y1="110" x2="545" y2="138" stroke="#ef4444" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1r)"/>
+          <line x1="270" y1="110" x2="395" y2="208" stroke="#ef4444" stroke-width="1" stroke-dasharray="4" marker-end="url(#a1r)"/>
+          <text x="490" y="128" fill="#ef4444" font-size="9">async replication</text>
+
+          <!-- Capacity label -->
+          <rect x="430" y="240" width="260" height="40" rx="6" fill="#ecfdf5" stroke="#86efac"/>
+          <text x="560" y="256" text-anchor="middle" fill="#16a34a" font-weight="600" font-size="11">Total read capacity: 5 × 10K = 50K reads/sec</text>
+          <text x="560" y="272" text-anchor="middle" fill="#16a34a" font-size="10">(primary handles reads too)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>How Async Replication Works</h3>
+<pre class="line-numbers"><code class="language-text">1. Client sends UPDATE profiles SET name='Alice B'
+   WHERE user_id = 12345 to the PRIMARY.
+
+2. Primary writes the change to its WAL (Write-Ahead Log)
+   — a sequential, append-only file on disk.
+
+3. Primary applies the change to its data pages in memory
+   and returns "UPDATE 1" to the client.
+
+4. In the background (async), the primary streams the WAL
+   record to each replica over a TCP connection.
+
+5. Each replica receives the WAL record and replays it:
+   applies the same change to its own copy of the data.
+
+Timeline:
+  t=0 ms    Client sends UPDATE to primary
+  t=0.5 ms  Primary writes WAL, applies change, responds
+  t=1-5 ms  WAL record arrives at Replica 1 (same rack)
+  t=1-5 ms  WAL record arrives at Replicas 2-4
+  t=5-10 ms All replicas have the new data
+
+The gap between t=0.5 ms (primary responds) and
+t=1-5 ms (replicas catch up) is the REPLICATION LAG.</code></pre>
+      </div>
+
+      <div>
+        <h3>Capacity Math</h3>
+<pre class="line-numbers"><code class="language-text">Servers: 1 primary + 4 replicas = 5 servers total
+
+Read distribution:
+  Each server handles ~10,000 reads/sec
+  5 servers × 10,000 = 50,000 reads/sec ✓
+
+Write handling:
+  All 500 writes/sec go to the primary only.
+  Primary capacity: 5,000+ writes/sec → 10% utilized ✓
+
+Storage per server: 200 GB (full copy of all data)
+Total storage: 5 × 200 GB = 1 TB
+  (Compare: sharding into 5 shards would also use 5 servers
+   but each would hold only 40 GB. Same server count,
+   more operational complexity, no availability benefit.)
+
+Availability:
+  Any single server can die without service interruption.
+  P(one server up) = 99.9% (annual)
+  P(all 5 down simultaneously) ≈ (0.001)^5 ≈ 0
+  P(at least one read server up) = 1 - (0.001)^5 ≈ 99.9999%
+  With automated failover: 99.99%+ achievable ✓</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>This works for US-based users.</strong> But there are two problems hiding in async replication: (1) <strong>replication lag</strong> causes stale reads, and (2) <strong>failover</strong> can lose the most recent writes. Let&rsquo;s examine both.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Replication Lag Deep Dive                                     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="replication-lag">
+    <div class="container">
+      <h2>The Replication Lag Problem</h2>
+      <p>Async replication means replicas are always slightly behind the primary. Usually this lag is 1&ndash;5 ms (imperceptible). But it creates a real user experience bug.</p>
+
+      <div class="full-width">
+        <h3>The &ldquo;Read-Your-Own-Writes&rdquo; Bug</h3>
+<pre class="line-numbers"><code class="language-text">Scenario: Alice updates her display name.
+
+  t=0 ms      Alice sends: UPDATE profiles SET name='Alice B.' WHERE user_id=42
+              → routed to PRIMARY
+
+  t=0.5 ms    Primary applies the change, responds "success" to Alice.
+              Primary now has: name = 'Alice B.'
+              Replicas still have: name = 'Alice A.'
+
+  t=1 ms      Alice's browser reloads the profile page.
+              → GET /profile/42 is routed to REPLICA 2 (round-robin)
+              Replica 2 hasn't received the WAL record yet.
+              Returns: name = 'Alice A.'
+
+  t=3 ms      WAL record arrives at Replica 2. It now has 'Alice B.'
+              But Alice already saw her old name and thinks the update failed.
+
+Alice sees: "I changed my name but it didn't save!"
+She tries again. And again. Files a support ticket.</code></pre>
+      </div>
+
+      <div>
+        <h3>How Often Does This Happen?</h3>
+<pre class="line-numbers"><code class="language-text">Replication lag in the same data center: 1-5 ms typical.
+
+A user who updates their profile and immediately
+refreshes the page will hit this bug if the page load
+arrives at a replica within that 1-5 ms window.
+
+Page reload time:
+  DNS lookup:     ~0 ms (cached)
+  TCP + TLS:      ~0 ms (connection reuse)
+  HTTP request:   ~1 ms (same data center)
+  Total:          ~1 ms
+
+So the reload arrives ~1 ms after the write completes.
+Replication lag is 1-5 ms. The race condition is:
+
+  P(stale read) ≈ P(replica lag > reload time)
+                ≈ P(lag > 1 ms)
+                ≈ 50-80% of the time!
+
+This is not a rare edge case — it happens to roughly
+half the users who update and immediately check.</code></pre>
+      </div>
+
+      <div>
+        <h3>Failover Data Loss</h3>
+<pre class="line-numbers"><code class="language-text">Scenario: primary crashes with async replication.
+
+  t=0        Primary has committed writes up to LSN 1000.
+  t=-3 ms    Replicas have received up to LSN 997.
+             3 ms of WAL records (LSN 998, 999, 1000) are
+             in flight — sent by primary but not yet received.
+
+  t=0        Primary crashes (hardware failure, OOM, etc.)
+             Those 3 WAL records are LOST — they were in the
+             primary's send buffer, which is now gone.
+
+  t=30 sec   Automated failover promotes Replica 1 to primary.
+             New primary's latest LSN: 997.
+             Writes at LSN 998, 999, 1000 are permanently lost.
+
+How many profile updates were lost?
+  500 writes/sec × 0.003 sec lag = 1.5 writes lost
+  In a worst case (lag spike to 100 ms): 50 writes lost.
+
+For most profile data (name, avatar), losing 1-2 updates
+is tolerable — the user just re-submits. For email changes
+tied to verification flows, it could cause confusion.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The core tension:</strong> Synchronous replication guarantees zero data loss (the primary waits for the replica to confirm before responding to the client) but adds latency to every write. Async replication is fast but risks losing the most recent writes on failover. The next iteration solves both problems.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Solving Read-Your-Own-Writes</h2>
+      <p>There are two practical approaches to guarantee a user sees their own writes. Both are widely used in production.</p>
+
+      <div>
+        <h3>Approach A: Sticky Routing After Write</h3>
+<pre class="line-numbers"><code class="language-text">Idea: After a user writes, route that user's reads
+to the PRIMARY for the next N seconds.
+
+Implementation:
+  1. User sends a write (UPDATE profile).
+  2. Application server sets a flag:
+       cache.set("read-from-primary:{user_id}", true, TTL=5s)
+  3. On subsequent reads from this user:
+       if cache.get("read-from-primary:{user_id}"):
+           route to PRIMARY
+       else:
+           route to any REPLICA (round-robin)
+
+Timeline with sticky routing:
+  t=0 ms    Alice updates name → routed to PRIMARY
+  t=0.5 ms  Primary responds. App sets sticky flag (TTL=5s).
+  t=1 ms    Alice reloads profile → sticky flag is set
+            → routed to PRIMARY (not a replica)
+            → sees the updated name ✓
+  t=5 sec   Sticky flag expires. Future reads go to replicas.
+            By now, all replicas have caught up (lag < 5 ms).
+
+Tradeoff:
+  + Simple to implement (just a cache flag)
+  + No changes to PostgreSQL
+  - Increases primary load after bursts of writes
+  - If user has multiple browser tabs, only the tab that
+    wrote gets the sticky flag (unless stored in a shared
+    session or cookie)
+  - TTL is a guess — if replication lag exceeds TTL (rare
+    but possible under heavy load), the bug reappears</code></pre>
+      </div>
+
+      <div>
+        <h3>Approach B: LSN-Based Read-After-Write</h3>
+<pre class="line-numbers"><code class="language-text">Idea: After a write, the primary returns its current
+LSN (Log Sequence Number). Subsequent reads include
+this LSN, and the replica waits until it's caught up
+to that LSN before responding.
+
+What is an LSN?
+  The LSN (Log Sequence Number) is a monotonically
+  increasing position in the WAL. Every write advances it.
+  LSN 1000 means "the 1000th byte of WAL written."
+  If a replica's replay position is at LSN 997, it's
+  3 bytes (or 3 records) behind the primary.
+
+  PostgreSQL exposes this:
+    Primary: SELECT pg_current_wal_lsn();  → '0/174A8B0'
+    Replica: SELECT pg_last_wal_replay_lsn(); → '0/174A890'
+
+Implementation:
+  1. User sends UPDATE → primary applies it.
+  2. Primary returns the LSN of this write:
+       response.headers['X-Read-After'] = '0/174A8B0'
+  3. Client stores this LSN (cookie, header, or session).
+  4. On next read, client sends:
+       GET /profile/42
+       X-Read-After: 0/174A8B0
+  5. Application server picks a replica and checks:
+       SELECT pg_last_wal_replay_lsn();
+       If replica_lsn >= requested_lsn:
+           serve the read from this replica ✓
+       Else:
+           wait (up to 50 ms) for replica to catch up
+           or fall back to reading from primary
+
+Timeline:
+  t=0 ms    Alice writes. Primary LSN advances to 0/174A8B0.
+  t=0.5 ms  Response includes X-Read-After: 0/174A8B0.
+  t=1 ms    Alice reads. Request includes the LSN.
+  t=1 ms    App server asks Replica 2: "Are you at 0/174A8B0?"
+            Replica 2 is at 0/174A890 (not caught up yet).
+  t=3 ms    Replica 2 catches up to 0/174A8B0.
+  t=3 ms    App server reads from Replica 2 → returns new data ✓
+
+Tradeoff:
+  + Precise — no wasted primary reads, no TTL guessing
+  + Works across browser tabs (LSN stored in session)
+  - More complex to implement (LSN propagation in headers)
+  - Adds 2-3 ms latency on reads that must wait for replay
+  - Requires PostgreSQL-specific LSN functions</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Which approach do production systems use?</strong> Both. AWS Aurora uses LSN-based tracking internally. Google Cloud SQL uses a variant of sticky routing. For a user profile service where reads vastly outnumber writes and the consistency window is tiny (1&ndash;5 ms), sticky routing is simpler and usually sufficient. LSN-based is more precise and worth the complexity if you have strict consistency requirements (e.g., financial data).</p>
+      </div>
+
+      <div>
+        <h3>Solving Failover Data Loss: Semi-Synchronous Replication</h3>
+<pre class="line-numbers"><code class="language-text">The problem: with pure async replication, the primary
+responds to the client BEFORE any replica confirms.
+If the primary crashes, those in-flight writes are lost.
+
+Solution: make ONE replica synchronous.
+
+Semi-synchronous replication:
+  Primary sends WAL to ALL replicas.
+  Waits for ONE replica to confirm (sync replica).
+  Other replicas are still async.
+
+  Write path:
+    t=0 ms    Client sends UPDATE.
+    t=0.2 ms  Primary writes WAL to local disk.
+    t=0.3 ms  Primary sends WAL to Replica 1 (sync)
+              AND Replicas 2-4 (async) simultaneously.
+    t=1 ms    Replica 1 writes WAL to its disk, sends ACK.
+    t=1 ms    Primary receives ACK from Replica 1.
+    t=1 ms    Primary responds to client: "UPDATE 1"
+
+  Write latency: ~1 ms (was ~0.5 ms with pure async)
+  — only 0.5 ms slower, because we wait for ONE LAN ACK.
+
+Failover with semi-sync:
+  Primary crashes at LSN 1000.
+  Replica 1 (sync) is guaranteed to have LSN 1000.
+  Promote Replica 1 → ZERO data loss.
+
+  Replicas 2-4 might be at LSN 997-999 (async).
+  They catch up from new primary (Replica 1).
+
+Configuration: 1 primary + 1 sync replica + 3 async replicas
+  Total servers: 5
+  Write latency: ~1 ms (acceptable for 500 writes/sec)
+  Failover guarantee: zero data loss when promoting sync replica</code></pre>
+      </div>
+
+      <div>
+        <h3>Iteration 2 Architecture</h3>
+<pre class="line-numbers"><code class="language-text">1 Primary (US)
+  ├── 1 Sync Replica (US, same AZ or nearby AZ)
+  │     → zero-loss failover target
+  │     → serves reads + ready for instant promotion
+  ├── 1 Async Replica (US, different AZ)
+  │     → additional read capacity
+  ├── 1 Async Replica (US, different AZ)
+  │     → additional read capacity
+  └── 1 Async Replica (US, different AZ)
+        → additional read capacity
+
+Read routing:
+  - After a write: route to primary for 5 sec (sticky)
+  - Otherwise: round-robin across all 5 servers
+
+Write routing:
+  - Always to primary
+  - Primary waits for sync replica ACK before responding
+
+Total read capacity: 5 × 10K = 50K reads/sec ✓
+Total write capacity: limited by sync round-trip (~1 ms)
+  = ~1000 writes/sec throughput → 500/sec fits ✓</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>Remaining problem:</strong> All 5 servers are in the US. EU users still see 120 ms latency. Asia users see 200 ms. We need replicas closer to those users.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3                                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Multi-Region Replicas</h2>
+      <p>To serve EU and Asia users with &lt;50 ms latency, we place read replicas in those regions. But cross-ocean replication introduces much higher lag.</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 800 380" style="width:100%;max-width:1072px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="a3b" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="a3r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+            <marker id="a3gn" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+            <marker id="a3g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+
+          <!-- US Region -->
+          <rect x="220" y="10" width="340" height="170" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" fill-opacity="0.3"/>
+          <text x="390" y="30" text-anchor="middle" fill="#2563eb" font-weight="700" font-size="12">US REGION</text>
+
+          <!-- Primary -->
+          <rect x="240" y="40" width="130" height="55" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="305" y="62" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">Primary</text>
+          <text x="305" y="80" text-anchor="middle" fill="#64748b" font-size="10">writes + reads</text>
+
+          <!-- US Sync Replica -->
+          <rect x="240" y="110" width="130" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="305" y="130" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Sync Replica</text>
+          <text x="305" y="148" text-anchor="middle" fill="#64748b" font-size="10">failover target</text>
+
+          <!-- Sync arrow -->
+          <line x1="305" y1="95" x2="305" y2="108" stroke="#16a34a" stroke-width="1.5" marker-end="url(#a3gn)"/>
+          <text x="340" y="105" fill="#16a34a" font-size="9">sync (1ms)</text>
+
+          <!-- US Async Replica -->
+          <rect x="410" y="55" width="130" height="45" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="475" y="74" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Async Replica</text>
+          <text x="475" y="90" text-anchor="middle" fill="#64748b" font-size="10">US reads</text>
+
+          <line x1="370" y1="65" x2="408" y2="70" stroke="#ef4444" stroke-width="1" stroke-dasharray="4" marker-end="url(#a3r)"/>
+
+          <!-- EU Region -->
+          <rect x="10" y="220" width="280" height="140" rx="10" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" fill-opacity="0.3"/>
+          <text x="150" y="240" text-anchor="middle" fill="#d97706" font-weight="700" font-size="12">EU REGION</text>
+
+          <!-- EU Replica -->
+          <rect x="30" y="255" width="120" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="90" y="275" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">EU Replica</text>
+          <text x="90" y="293" text-anchor="middle" fill="#64748b" font-size="10">17.5K reads/sec</text>
+
+          <!-- EU Users -->
+          <rect x="30" y="320" width="100" height="30" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="80" y="340" text-anchor="middle" fill="#334155" font-size="10">EU Users → 3 ms</text>
+
+          <line x1="80" y1="320" x2="80" y2="307" stroke="#16a34a" stroke-width="1" marker-end="url(#a3gn)"/>
+
+          <!-- Async replication to EU -->
+          <line x1="270" y1="150" x2="152" y2="260" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5" marker-end="url(#a3r)"/>
+          <text x="185" y="200" fill="#ef4444" font-size="10" font-weight="600">async: 80-100 ms lag</text>
+
+          <!-- Asia Region -->
+          <rect x="510" y="220" width="280" height="140" rx="10" fill="#fce7f3" stroke="#db2777" stroke-width="1.5" fill-opacity="0.3"/>
+          <text x="650" y="240" text-anchor="middle" fill="#db2777" font-weight="700" font-size="12">ASIA REGION</text>
+
+          <!-- Asia Replica -->
+          <rect x="550" y="255" width="120" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="610" y="275" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Asia Replica</text>
+          <text x="610" y="293" text-anchor="middle" fill="#64748b" font-size="10">12.5K reads/sec</text>
+
+          <!-- Asia Users -->
+          <rect x="560" y="320" width="100" height="30" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="610" y="340" text-anchor="middle" fill="#334155" font-size="10">Asia Users → 5 ms</text>
+
+          <line x1="610" y1="320" x2="610" y2="307" stroke="#16a34a" stroke-width="1" marker-end="url(#a3gn)"/>
+
+          <!-- Async replication to Asia -->
+          <line x1="340" y1="150" x2="575" y2="253" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5" marker-end="url(#a3r)"/>
+          <text x="500" y="195" fill="#ef4444" font-size="10" font-weight="600">async: 120-150 ms lag</text>
+
+          <!-- Write path labels -->
+          <rect x="160" y="255" width="110" height="40" rx="6" fill="#fef2f2" stroke="#fca5a5"/>
+          <text x="215" y="272" text-anchor="middle" fill="#dc2626" font-size="10">EU writes →</text>
+          <text x="215" y="286" text-anchor="middle" fill="#dc2626" font-size="10">US Primary (120 ms)</text>
+
+          <rect x="680" y="255" width="100" height="40" rx="6" fill="#fef2f2" stroke="#fca5a5"/>
+          <text x="730" y="272" text-anchor="middle" fill="#dc2626" font-size="10">Asia writes →</text>
+          <text x="730" y="286" text-anchor="middle" fill="#dc2626" font-size="10">US Primary (200 ms)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Read Latency: Solved</h3>
+<pre class="line-numbers"><code class="language-text">With local replicas in each region:
+
+  US users  → US replica:     ~2 ms    ✓
+  EU users  → EU replica:     ~3 ms    ✓
+  Asia users → Asia replica:  ~5 ms    ✓
+
+All under 50 ms target. The data is physically close
+to the user — network RTT is minimal.</code></pre>
+      </div>
+
+      <div>
+        <h3>The New Problem: Cross-Ocean Replication Lag</h3>
+<pre class="line-numbers"><code class="language-text">Within a data center, replication lag = 1-5 ms.
+Across the Atlantic (US → EU), lag = 80-100 ms.
+Across the Pacific (US → Asia), lag = 120-150 ms.
+
+This is physics, not a software problem:
+  US → EU:   6,000 km of fiber → 30 ms one-way propagation
+             + TCP overhead + WAL processing = 80-100 ms RTT
+  US → Asia: 10,000 km → 50 ms one-way = 120-150 ms RTT
+
+Read-your-writes is now much harder:
+
+  Scenario: EU user updates profile.
+    t=0 ms     Write goes to US primary (120 ms RTT).
+    t=120 ms   Primary responds "success."
+    t=121 ms   User reloads page → reads from EU replica.
+    t=121 ms   EU replica is 80-100 ms behind primary.
+               It hasn't received this write yet!
+    t=200 ms   EU replica catches up.
+
+  The stale-read window is 80-100 ms — much worse than
+  the 1-5 ms within a single region.
+
+Sticky routing to PRIMARY doesn't work well here either:
+  If we route the EU user's reads to the US primary,
+  reads take 120 ms RTT — worse than the 50 ms target.
+  We're right back to the original latency problem.</code></pre>
+      </div>
+
+      <div>
+        <h3>Three Options for Multi-Region Writes</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Option</th><th>How It Works</th><th>Write Latency</th><th>Consistency</th><th>Complexity</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>A: Single primary (US)</strong></td>
+                <td>All writes go to US. Accept 120&ndash;200 ms write latency from EU/Asia.</td>
+                <td>US: 1 ms, EU: 120 ms, Asia: 200 ms</td>
+                <td>Strong (with LSN-based read-after-write)</td>
+                <td>Low</td>
+              </tr>
+              <tr>
+                <td><strong>B: Region-local primary (multi-primary)</strong></td>
+                <td>Each region has its own primary. Writes are local (~1 ms). Cross-region replication syncs data.</td>
+                <td>All regions: ~1 ms</td>
+                <td>Eventual (conflicting writes possible)</td>
+                <td>High</td>
+              </tr>
+              <tr>
+                <td><strong>C: Single primary + local write buffer</strong></td>
+                <td>Writes go to a local queue, forwarded to US primary async. Client gets immediate ACK.</td>
+                <td>All regions: ~1 ms (apparent)</td>
+                <td>Eventual (write may fail at primary)</td>
+                <td>Medium</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Why Option A Is Best for User Profiles</h3>
+<pre class="line-numbers"><code class="language-text">User profiles have specific properties that favor Option A:
+
+1. WRITES ARE RARE.
+   500 writes/sec globally. Per-user, a profile update
+   happens maybe once a week. The 120-200 ms write latency
+   affects only the rare update — the user clicks "Save"
+   and waits 200 ms. That's imperceptible in a UI flow
+   that already has form validation, button animation, etc.
+
+2. READS ARE FREQUENT AND LATENCY-SENSITIVE.
+   50,000 reads/sec. Every page load, every API call.
+   This is where sub-50 ms matters. Local replicas solve this.
+
+3. CONFLICTS ARE DANGEROUS.
+   Profile data includes email (used for login) and
+   preferences (used for authorization scoping). If two
+   regions accept conflicting writes to the same profile:
+     Region US: SET email = 'alice@new.com'
+     Region EU: SET email = 'alice@other.com'
+   Which email is correct? Last-writer-wins (LWW) might
+   pick the wrong one. The user can't log in.
+
+   With a single primary, writes are serialized — no conflicts.
+
+4. SIMPLICITY.
+   Multi-primary replication requires conflict detection,
+   conflict resolution strategies, and extensive testing.
+   For data that's written 100x less than it's read,
+   this complexity isn't justified.
+
+Decision: Option A — single US primary, multi-region read replicas.
+  EU/Asia users accept 120-200 ms write latency.
+  All users get <5 ms read latency from local replicas.
+  Read-your-writes: after a write, route that user's reads
+  to the PRIMARY for 5 seconds (sticky routing via cookie).
+  Since writes are rare (once a week per user), the
+  occasional 120 ms read from primary is acceptable.</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>When IS multi-primary worth it?</strong> When writes are frequent AND latency-sensitive AND conflicts are rare or easily resolvable. Examples: collaborative editing (CRDTs handle merges), shopping carts (merge = union of items), counters (commutative). User profiles don&rsquo;t fit this pattern &mdash; writes are rare, and email conflicts are costly.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 4                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-4">
+    <div class="container">
+      <h2>Iteration 4: Handling Split-Brain and Failover</h2>
+      <p>With servers spread across 3 regions, network partitions between regions become a real concern. What happens when the US primary can&rsquo;t communicate with the EU and Asia replicas?</p>
+
+      <div class="full-width">
+        <svg viewBox="0 0 820 340" style="width:100%;max-width:1072px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrSB" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrSBr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+            <marker id="arrSBg" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+          </defs>
+          <!-- Title -->
+          <text x="410" y="20" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Split-Brain Scenario &amp; Fencing Token Prevention</text>
+          <!-- Partition line -->
+          <line x1="410" y1="35" x2="410" y2="310" stroke="#ef4444" stroke-width="2" stroke-dasharray="8,4"/>
+          <text x="410" y="328" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">Network Partition</text>
+          <!-- US side -->
+          <rect x="30" y="45" width="350" height="115" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="205" y="65" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">US Region</text>
+          <!-- US Primary -->
+          <rect x="50" y="78" width="130" height="45" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="115" y="98" text-anchor="middle" font-weight="600" fill="#1e40af" font-size="11">US Primary</text>
+          <text x="115" y="114" text-anchor="middle" fill="#64748b" font-size="9">Token = 7 ✓</text>
+          <!-- US Sync Replica -->
+          <rect x="220" y="78" width="130" height="45" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="285" y="98" text-anchor="middle" fill="#334155" font-size="11">US Sync Replica</text>
+          <text x="285" y="114" text-anchor="middle" fill="#64748b" font-size="9">up-to-date</text>
+          <!-- Arrow US -->
+          <line x1="180" y1="100" x2="218" y2="100" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrSB)"/>
+          <!-- Token service (US side: 2 of 3 nodes) -->
+          <rect x="100" y="135" width="200" height="22" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+          <text x="200" y="150" text-anchor="middle" fill="#16a34a" font-size="9" font-weight="600">Token Service: 2 of 3 nodes (majority ✓)</text>
+          <!-- EU side -->
+          <rect x="440" y="45" width="350" height="115" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="615" y="65" text-anchor="middle" font-weight="700" fill="#ef4444" font-size="12">EU Region (partitioned)</text>
+          <!-- EU Replica -->
+          <rect x="490" y="78" width="130" height="45" rx="6" fill="#f1f5f9" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="555" y="98" text-anchor="middle" fill="#334155" font-size="11">EU Replica</text>
+          <text x="555" y="114" text-anchor="middle" fill="#ef4444" font-size="9">wants to promote</text>
+          <!-- EU token service (1 of 3 - no majority) -->
+          <rect x="480" y="135" width="200" height="22" rx="4" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+          <text x="580" y="150" text-anchor="middle" fill="#ef4444" font-size="9" font-weight="600">Token Service: 1 of 3 nodes (no majority ✗)</text>
+          <!-- Blocked arrow -->
+          <line x1="555" y1="123" x2="555" y2="133" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrSBr)"/>
+          <text x="680" y="130" fill="#ef4444" font-size="10" font-weight="600">Can't get token 8</text>
+          <text x="680" y="143" fill="#ef4444" font-size="10">→ Promotion blocked!</text>
+          <!-- WITHOUT fencing (bottom left) -->
+          <rect x="30" y="180" width="350" height="120" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1" stroke-dasharray="4"/>
+          <text x="205" y="200" text-anchor="middle" font-weight="700" fill="#ef4444" font-size="11">WITHOUT Fencing Tokens</text>
+          <text x="205" y="220" text-anchor="middle" fill="#334155" font-size="10">EU auto-promotes → TWO primaries</text>
+          <rect x="55" y="232" width="135" height="30" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+          <text x="122" y="251" text-anchor="middle" fill="#1e40af" font-size="9">US: email='alice@us.com'</text>
+          <rect x="220" y="232" width="135" height="30" rx="4" fill="#fecaca" stroke="#ef4444" stroke-width="1"/>
+          <text x="287" y="251" text-anchor="middle" fill="#ef4444" font-size="9">EU: email='alice@eu.com'</text>
+          <text x="205" y="285" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">Conflicting writes! Which is correct?</text>
+          <!-- WITH fencing (bottom right) -->
+          <rect x="440" y="180" width="350" height="120" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1" stroke-dasharray="4"/>
+          <text x="615" y="200" text-anchor="middle" font-weight="700" fill="#16a34a" font-size="11">WITH Fencing Tokens</text>
+          <text x="615" y="220" text-anchor="middle" fill="#334155" font-size="10">EU can't get majority → stays read-only</text>
+          <rect x="475" y="232" width="135" height="30" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+          <text x="542" y="251" text-anchor="middle" fill="#1e40af" font-size="9">US: continues writing ✓</text>
+          <rect x="640" y="232" width="135" height="30" rx="4" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="707" y="251" text-anchor="middle" fill="#64748b" font-size="9">EU: read-only, safe ✓</text>
+          <text x="615" y="285" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">No conflicting writes. Partition heals → EU catches up.</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>What Is Split-Brain?</h3>
+<pre class="line-numbers"><code class="language-text">Split-brain occurs when a network partition causes
+two parts of the system to each believe the other is down,
+and both attempt to act as the primary.
+
+Scenario: Network cable between US and EU is severed.
+
+  US side sees: Primary (US) is healthy. EU replica is
+  unreachable. "EU must have crashed."
+
+  EU side sees: EU replica is healthy. US primary is
+  unreachable. "US primary must have crashed."
+
+  If the EU side automatically promotes its replica to
+  primary, we now have TWO primaries accepting writes:
+
+    US Primary:  UPDATE email = 'alice@us.com' WHERE user_id = 42
+    EU Primary:  UPDATE email = 'alice@eu.com' WHERE user_id = 42
+
+  When the network heals, which email is correct?
+  Both writes were committed. Both sides believe they're
+  authoritative. This is split-brain — the most dangerous
+  failure mode in replicated systems.
+
+Why it's dangerous for user profiles:
+  - User can't log in (which email is the real one?)
+  - Email verification flows break
+  - Account recovery sends to the wrong address
+  - Preferences conflict (one region says dark mode,
+    the other says light mode)</code></pre>
+      </div>
+
+      <div>
+        <h3>Prevention: Fencing Tokens</h3>
+<pre class="line-numbers"><code class="language-text">A fencing token is a monotonically increasing number
+that identifies the "current" primary. Only the holder
+of the latest token can perform writes.
+
+How it works:
+  1. Primary is elected with fencing token = 7.
+  2. Primary includes token=7 in every write to storage.
+  3. Storage layer rejects writes with token < current.
+
+  Scenario with fencing:
+    t=0      US Primary holds token 7. Writes normally.
+    t=100ms  Network partition. EU can't reach US.
+    t=30s    EU failover system tries to promote EU replica.
+             It requests a new token from the token service
+             (which uses a consensus protocol like Raft).
+             Token service is split — US side has 2 nodes,
+             EU side has 1 node. Majority (2/3) is on US side.
+             EU CANNOT get a new token. Promotion blocked. ✓
+
+    If token service nodes are: US(2), EU(1), Asia(1):
+             EU + Asia = 2 nodes, US = 2 nodes.
+             Neither side has majority (3/4). Neither can
+             elect a new primary. System stays read-only
+             until partition heals. This is the correct
+             behavior — availability is sacrificed to prevent
+             split-brain (CP choice in CAP theorem).
+
+  The token service itself must be distributed and use
+  consensus (e.g., etcd, ZooKeeper, Consul) — otherwise
+  it becomes a single point of failure.</code></pre>
+      </div>
+
+      <div>
+        <h3>Automated vs. Manual Failover</h3>
+<pre class="line-numbers"><code class="language-text">AUTOMATED FAILOVER:
+  A health checker pings the primary every 1 second.
+  If 3 consecutive pings fail (3 seconds), declare primary dead.
+  Promote the sync replica to primary.
+
+  Pros: Fast recovery (~5-10 sec total downtime).
+  Cons: False positives. The primary might be:
+    - Temporarily overloaded (GC pause, slow query)
+    - Experiencing a brief network blip (1-2 sec)
+    - Actually fine but the health checker's network failed
+
+  A false positive causes:
+    1. Promote replica to primary → now TWO primaries briefly
+    2. Old primary comes back → split-brain until it's fenced
+    3. Clients connected to old primary send writes → lost or
+       conflicting when old primary realizes it's been deposed
+
+  Mitigation: use fencing tokens, so even if old primary
+  accepts writes briefly, the storage layer rejects them.
+
+MANUAL FAILOVER:
+  On-call engineer gets an alert. Investigates.
+  Decides whether to promote or wait.
+
+  Pros: No false positives — a human verifies.
+  Cons: Slow — minutes to hours depending on response time.
+        At 99.99% target (52 min/year), manual failover
+        might consume the entire budget on one incident.
+
+HYBRID (recommended for our service):
+  Automated failover with fencing tokens + human review.
+  1. Health checker detects failure (3 consecutive misses).
+  2. Verify with secondary signal (can other services reach
+     the primary? Is the primary's host reporting healthy
+     in the infrastructure monitoring system?).
+  3. If confirmed: automated promotion with fencing token.
+  4. Alert on-call engineer for post-incident review.
+  5. If ambiguous: alert and wait for human decision.
+
+  Expected downtime per incident: 10-30 seconds.
+  With 2-3 incidents/year: 30-90 sec total → 99.999% ✓</code></pre>
+      </div>
+
+      <div>
+        <h3>False Positive Detection</h3>
+<pre class="line-numbers"><code class="language-text">The hardest problem in failure detection: distinguishing
+a dead server from a slow server or a network partition.
+
+Signals that the primary is truly dead:
+  1. Health check fails from MULTIPLE vantage points
+     (not just one checker — use 3+ checkers in different
+      network zones). If all 3 fail, it's likely real.
+  2. The primary's host-level metrics stop updating
+     (CPU, memory, disk I/O all flatline in monitoring).
+  3. The primary's TCP connections are RST or timeout
+     (not just slow).
+
+Signals that might be a false positive:
+  1. Only ONE health checker fails → could be checker's
+     network, not the primary's.
+  2. Health check is slow but eventually responds →
+     primary is overloaded, not dead.
+  3. Other services in the same data center are also
+     unreachable → data center network issue, not
+     individual server failure.
+
+Decision matrix:
+  All checkers fail + host metrics dead → auto-promote
+  Some checkers fail → wait 10 more seconds, recheck
+  Health check slow but responding → do NOT promote
+  Data center-wide issue → do NOT promote (would make
+    things worse — the new primary can't reach clients
+    in that data center either)</code></pre>
+      </div>
+
+      <div class="callout callout-warning full-width">
+        <p><strong>The CAP tradeoff in practice:</strong> During a network partition between US and EU, our system chooses <strong>consistency over availability</strong> for writes. EU users can still read (from their local replica), but writes are rejected or queued until the partition heals. For a user profile service, this is the right tradeoff &mdash; a brief period of read-only mode is far less damaging than conflicting profile data.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="final">
+    <div class="container">
+      <h2>Final Design</h2>
+
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr><th>Component</th><th>Specification</th><th>Why</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Primary</td>
+              <td>1 &times; PostgreSQL (US)</td>
+              <td>Handles all writes (500/sec). Serializes updates to prevent conflicts. Also serves US reads.</td>
+            </tr>
+            <tr>
+              <td>Sync Replica</td>
+              <td>1 &times; PostgreSQL (US, different AZ)</td>
+              <td>Zero-loss failover target. Primary waits for sync ACK before responding. Adds ~0.5 ms to writes.</td>
+            </tr>
+            <tr>
+              <td>US Async Replicas</td>
+              <td>1 &times; PostgreSQL (US, third AZ)</td>
+              <td>Additional US read capacity. 3 US servers &times; 10K = 30K reads/sec for US users (need 20K).</td>
+            </tr>
+            <tr>
+              <td>EU Replicas</td>
+              <td>2 &times; PostgreSQL (EU region)</td>
+              <td>Serves EU reads locally (~3 ms). 17.5K reads/sec; 2 &times; 10K = 20K capacity. 80&ndash;100 ms replication lag from US.</td>
+            </tr>
+            <tr>
+              <td>Asia Replicas</td>
+              <td>2 &times; PostgreSQL (Asia region)</td>
+              <td>Serves Asia reads locally (~5 ms). 12.5K reads/sec; 2 &times; 10K = 20K capacity. 120&ndash;150 ms replication lag from US.</td>
+            </tr>
+            <tr>
+              <td>Failover</td>
+              <td>Automated with fencing tokens (etcd/Consul)</td>
+              <td>Prevents split-brain. 10&ndash;30 sec recovery. Token service on 3+ nodes across regions.</td>
+            </tr>
+            <tr>
+              <td>Read-your-writes</td>
+              <td>Sticky routing (5 sec TTL via cookie)</td>
+              <td>After a write, route that user&rsquo;s reads to primary. Simple, sufficient for rare writes.</td>
+            </tr>
+            <tr>
+              <td>Geo-routing</td>
+              <td>DNS-based or anycast</td>
+              <td>US users &rarr; US replicas. EU &rarr; EU replica. Asia &rarr; Asia replica. Based on client IP geolocation.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="full-width">
+        <svg viewBox="0 0 820 480" style="width:100%;max-width:1072px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="afb" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="afr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+            <marker id="afg" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+            <marker id="afgy" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+            <marker id="afd" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#7c3aed"/></marker>
+          </defs>
+
+          <!-- Title -->
+          <text x="410" y="18" text-anchor="middle" font-weight="700" fill="#1e293b" font-size="14">Final Architecture: Global User Profile Service</text>
+
+          <!-- Geo Router -->
+          <rect x="320" y="35" width="180" height="50" rx="8" fill="#f8fafc" stroke="#334155" stroke-width="1.5"/>
+          <text x="410" y="57" text-anchor="middle" font-weight="700" fill="#334155" font-size="12">Geo Router / DNS</text>
+          <text x="410" y="73" text-anchor="middle" fill="#64748b" font-size="10">routes by user region</text>
+
+          <!-- Users -->
+          <rect x="30" y="40" width="80" height="35" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="70" y="63" text-anchor="middle" fill="#334155" font-size="10">All Users</text>
+          <line x1="110" y1="58" x2="318" y2="58" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#afgy)"/>
+
+          <!-- ============ US REGION ============ -->
+          <rect x="220" y="100" width="380" height="170" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" fill-opacity="0.25"/>
+          <text x="410" y="118" text-anchor="middle" fill="#2563eb" font-weight="700" font-size="12">US REGION (40% of traffic)</text>
+
+          <!-- Primary -->
+          <rect x="240" y="130" width="140" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="310" y="152" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="12">Primary</text>
+          <text x="310" y="168" text-anchor="middle" fill="#64748b" font-size="10">writes (500/sec)</text>
+          <text x="310" y="180" text-anchor="middle" fill="#64748b" font-size="9">+ reads (10K/sec)</text>
+
+          <!-- Sync Replica -->
+          <rect x="240" y="205" width="140" height="50" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+          <text x="310" y="225" text-anchor="middle" font-weight="700" fill="#16a34a" font-size="11">Sync Replica</text>
+          <text x="310" y="242" text-anchor="middle" fill="#16a34a" font-size="9">zero-loss failover</text>
+
+          <!-- Sync arrow -->
+          <line x1="310" y1="190" x2="310" y2="203" stroke="#16a34a" stroke-width="2" marker-end="url(#afg)"/>
+          <text x="345" y="200" fill="#16a34a" font-size="8" font-weight="600">sync 1ms</text>
+
+          <!-- US Async Replica -->
+          <rect x="420" y="130" width="140" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="490" y="152" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Async Replica</text>
+          <text x="490" y="168" text-anchor="middle" fill="#64748b" font-size="10">reads (10K/sec)</text>
+          <text x="490" y="180" text-anchor="middle" fill="#64748b" font-size="9">US AZ-3</text>
+
+          <line x1="380" y1="155" x2="418" y2="155" stroke="#ef4444" stroke-width="1" stroke-dasharray="4" marker-end="url(#afr)"/>
+          <text x="398" y="148" fill="#ef4444" font-size="8">async</text>
+
+          <!-- Router to US -->
+          <line x1="410" y1="85" x2="410" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#afb)"/>
+          <text x="430" y="110" fill="#2563eb" font-size="9">US reads/writes</text>
+
+          <!-- ============ EU REGION ============ -->
+          <rect x="20" y="300" width="300" height="160" rx="10" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" fill-opacity="0.25"/>
+          <text x="170" y="318" text-anchor="middle" fill="#d97706" font-weight="700" font-size="12">EU REGION (35% of traffic)</text>
+
+          <!-- EU Replica -->
+          <rect x="40" y="335" width="140" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="110" y="357" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">EU Replica</text>
+          <text x="110" y="373" text-anchor="middle" fill="#64748b" font-size="10">reads (17.5K/sec)</text>
+          <text x="110" y="385" text-anchor="middle" fill="#64748b" font-size="9">~3 ms local latency</text>
+
+          <!-- EU Users -->
+          <rect x="40" y="410" width="140" height="35" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="110" y="432" text-anchor="middle" fill="#334155" font-size="10">EU Users: reads ~3 ms, writes ~120 ms</text>
+          <line x1="110" y1="410" x2="110" y2="397" stroke="#16a34a" stroke-width="1" marker-end="url(#afg)"/>
+
+          <!-- EU to Primary (writes) -->
+          <rect x="200" y="335" width="100" height="50" rx="6" fill="#fef2f2" stroke="#fca5a5"/>
+          <text x="250" y="355" text-anchor="middle" fill="#dc2626" font-size="9" font-weight="600">Writes → US</text>
+          <text x="250" y="370" text-anchor="middle" fill="#dc2626" font-size="9">Primary (120 ms)</text>
+
+          <!-- Replication from US to EU -->
+          <line x1="280" y1="250" x2="120" y2="333" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5" marker-end="url(#afr)"/>
+          <text x="170" y="285" fill="#ef4444" font-size="9" font-weight="600">async 80-100 ms</text>
+
+          <!-- Router to EU -->
+          <line x1="370" y1="85" x2="170" y2="333" stroke="#d97706" stroke-width="1" stroke-dasharray="4"/>
+          <text x="250" y="200" fill="#d97706" font-size="9">EU reads</text>
+
+          <!-- ============ ASIA REGION ============ -->
+          <rect x="500" y="300" width="300" height="160" rx="10" fill="#fce7f3" stroke="#db2777" stroke-width="1.5" fill-opacity="0.25"/>
+          <text x="650" y="318" text-anchor="middle" fill="#db2777" font-weight="700" font-size="12">ASIA REGION (25% of traffic)</text>
+
+          <!-- Asia Replica -->
+          <rect x="530" y="335" width="140" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+          <text x="600" y="357" text-anchor="middle" font-weight="600" fill="#16a34a" font-size="11">Asia Replica</text>
+          <text x="600" y="373" text-anchor="middle" fill="#64748b" font-size="10">reads (12.5K/sec)</text>
+          <text x="600" y="385" text-anchor="middle" fill="#64748b" font-size="9">~5 ms local latency</text>
+
+          <!-- Asia Users -->
+          <rect x="530" y="410" width="140" height="35" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+          <text x="600" y="432" text-anchor="middle" fill="#334155" font-size="10">Asia Users: reads ~5 ms, writes ~200 ms</text>
+          <line x1="600" y1="410" x2="600" y2="397" stroke="#16a34a" stroke-width="1" marker-end="url(#afg)"/>
+
+          <!-- Asia to Primary (writes) -->
+          <rect x="690" y="335" width="100" height="50" rx="6" fill="#fef2f2" stroke="#fca5a5"/>
+          <text x="740" y="355" text-anchor="middle" fill="#dc2626" font-size="9" font-weight="600">Writes → US</text>
+          <text x="740" y="370" text-anchor="middle" fill="#dc2626" font-size="9">Primary (200 ms)</text>
+
+          <!-- Replication from US to Asia -->
+          <line x1="380" y1="250" x2="595" y2="333" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5" marker-end="url(#afr)"/>
+          <text x="520" y="280" fill="#ef4444" font-size="9" font-weight="600">async 120-150 ms</text>
+
+          <!-- Router to Asia -->
+          <line x1="450" y1="85" x2="650" y2="333" stroke="#db2777" stroke-width="1" stroke-dasharray="4"/>
+          <text x="580" y="200" fill="#db2777" font-size="9">Asia reads</text>
+
+          <!-- Fencing / Token Service -->
+          <rect x="600" y="100" width="180" height="50" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+          <text x="690" y="120" text-anchor="middle" font-weight="700" fill="#7c3aed" font-size="11">Token Service (etcd)</text>
+          <text x="690" y="136" text-anchor="middle" fill="#7c3aed" font-size="9">fencing tokens, leader election</text>
+
+          <line x1="600" y1="125" x2="562" y2="155" stroke="#7c3aed" stroke-width="1" stroke-dasharray="3" marker-end="url(#afd)"/>
+          <text x="595" y="148" fill="#7c3aed" font-size="8">fence</text>
+
+          <!-- Summary box -->
+          <rect x="600" y="165" width="200" height="95" rx="8" fill="#ecfdf5" stroke="#86efac" stroke-width="1.5"/>
+          <text x="700" y="185" text-anchor="middle" font-weight="700" fill="#059669" font-size="12">Totals</text>
+          <text x="700" y="202" text-anchor="middle" fill="#059669" font-size="10">5 PostgreSQL servers</text>
+          <text x="700" y="217" text-anchor="middle" fill="#059669" font-size="10">50K reads/sec capacity</text>
+          <text x="700" y="232" text-anchor="middle" fill="#059669" font-size="10">99.99% availability</text>
+          <text x="700" y="247" text-anchor="middle" fill="#059669" font-size="10">&lt;5 ms read latency globally</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Request Flow: Reading a Profile</h3>
+        <div class="flow-diagram" data-flow='{
+          "participants":[
+            {"name":"EU User","color":"slate"},
+            {"name":"Geo Router","color":"blue"},
+            {"name":"EU Replica","color":"green"},
+            {"name":"US Primary","color":"violet"}
+          ],
+          "steps":[
+            {"from":"EU User","to":"Geo Router","label":"GET /profile/42"},
+            {"from":"Geo Router","to":"Geo Router","label":"resolve client IP -> EU region"},
+            {"from":"Geo Router","to":"Geo Router","label":"check sticky-routing cookie"},
+            {"note":"NO cookie -> route locally to EU","span":["Geo Router","EU Replica"]},
+            {"from":"Geo Router","to":"EU Replica","label":"SELECT * FROM profiles WHERE user_id=42"},
+            {"from":"EU Replica","to":"EU User","label":"profile (~0.1 ms in RAM, ~3 ms RTT)","style":"dashed"},
+            {"note":"YES cookie (wrote recently) -> route to US primary instead","span":["Geo Router","US Primary"]}
+          ]}'></div>
+        <p><strong>Capacity:</strong> US 3 servers × 10K = 30K (need 20K). EU/Asia 2 servers × 10K = 20K each (need 17.5K / 12.5K). Total 7 servers (3 US + 2 EU + 2 Asia).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Request Flow: Updating a Profile</h3>
+        <div class="flow-diagram" data-flow='{
+          "participants":[
+            {"name":"Asia User","color":"slate"},
+            {"name":"Geo Router","color":"blue"},
+            {"name":"US Primary","color":"violet"},
+            {"name":"Sync Repl","color":"green"},
+            {"name":"Async Repls","color":"amber"}
+          ],
+          "steps":[
+            {"from":"Asia User","to":"Geo Router","label":"PUT /profile/42 {name:\"Alice B.\"}"},
+            {"from":"Geo Router","to":"US Primary","label":"writes always go to primary","detail":"~200 ms RTT"},
+            {"from":"US Primary","to":"US Primary","label":"UPDATE + WAL append"},
+            {"from":"US Primary","to":"Sync Repl","label":"stream WAL"},
+            {"from":"Sync Repl","to":"US Primary","label":"ACK (~1 ms)","style":"dashed"},
+            {"from":"US Primary","to":"Async Repls","label":"stream WAL (no wait)","style":"async"},
+            {"from":"US Primary","to":"Asia User","label":"200 OK + Set-Cookie sticky=5s","style":"dashed"},
+            {"note":"Asia replica catches up within 120-150 ms; sticky cookie hides lag for 5s","span":["Async Repls","Async Repls"]}
+          ]}'></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Provisioning Summary                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="provisioning">
+    <div class="container">
+      <h2>Provisioning Summary</h2>
+      <p>Here is the concrete infrastructure needed to run this service.</p>
+
+      <div>
+        <h3>Server Specifications</h3>
+<pre class="line-numbers"><code class="language-text">Each PostgreSQL server:
+  CPU:     16 cores (handles connection processing)
+  RAM:     256 GB (200 GB shared_buffers + OS + connections)
+  Disk:    500 GB NVMe SSD (200 GB data + WAL + headroom)
+  Network: 10 Gbps (WAL streaming + client connections)
+
+Cost estimate (cloud pricing, rough):
+  ~$2,000/month per server (e.g., AWS r6g.4xlarge)
+  7 servers × $2,000 = $14,000/month
+  + etcd cluster (3 small instances): ~$300/month
+  Total: ~$14,300/month for a global, highly available
+         profile service serving 50K reads/sec.</code></pre>
+      </div>
+
+      <div>
+        <h3>Availability Calculation</h3>
+<pre class="line-numbers"><code class="language-text">Target: 99.99% (52 minutes downtime/year)
+
+Failure modes and their impact:
+
+1. Single replica dies:
+   Impact: None. Reads redistribute to remaining replicas.
+   Recovery: Replace server, resync (200 GB at 1 Gbps = ~27 min).
+
+2. US async replica dies:
+   Impact: US read capacity drops from 30K to 20K.
+   20K is at capacity for US peak (20K). No immediate issue
+   unless there's a traffic spike.
+   Recovery: Auto-replace, resync.
+
+3. Sync replica dies:
+   Impact: Writes continue (primary falls back to async).
+   Failover safety degrades until sync replica is restored.
+   Recovery: Promote another async replica to sync role.
+
+4. Primary dies:
+   Impact: Writes fail for ~10-30 seconds (failover time).
+   Reads continue from replicas (stale by a few ms).
+   Recovery: Promote sync replica (zero data loss).
+   Duration: 10-30 seconds automated.
+
+5. Network partition (US ↔ EU):
+   Impact: EU reads continue locally (stale by 80-100ms).
+   EU writes fail (can't reach US primary).
+   Recovery: Automatic when partition heals.
+   Duration: Minutes to hours (depends on network repair).
+
+6. Entire US region down:
+   Impact: No primary → no writes anywhere.
+   Reads in EU and Asia continue from local replicas.
+   Recovery: Manual promotion of EU replica to primary.
+   Duration: 5-30 minutes.
+
+Availability math:
+  P(primary or sync replica available) for writes:
+    Each server: 99.95% uptime individually.
+    Both US servers down simultaneously:
+      P(both down) = (0.0005)² = 0.00000025 = 99.999975%
+    Write availability: ~99.999%
+
+  P(at least one replica per region available) for reads:
+    US (3 replicas): 1 - (0.0005)³ ≈ 99.9999999%
+    EU (1 replica): 99.95% (add second for 99.9999%)
+    Asia (1 replica): 99.95% (add second for 99.9999%)
+
+  Overall: write availability (~99.999%) is the bottleneck.
+  Adding the second EU and Asia replicas makes read
+  availability effectively 100%. Target 99.99% → achieved ✓</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Capacity Headroom</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Current</th><th>Capacity</th><th>Headroom</th><th>Scaling Path</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>US reads</td><td>20K/sec</td><td>30K/sec</td><td>50%</td><td>Add US replica (+10K/sec each)</td></tr>
+              <tr><td>EU reads</td><td>17.5K/sec</td><td>10&ndash;20K/sec</td><td>0&ndash;14%</td><td>Add EU replica</td></tr>
+              <tr><td>Asia reads</td><td>12.5K/sec</td><td>10&ndash;20K/sec</td><td>0&ndash;60%</td><td>Add Asia replica</td></tr>
+              <tr><td>Writes</td><td>500/sec</td><td>5,000/sec</td><td>900%</td><td>Single primary handles 10&times; peak</td></tr>
+              <tr><td>Storage</td><td>200 GB</td><td>500 GB SSD</td><td>150%</td><td>Larger disks; data growth is slow (~1 KB per new user)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul class="full-width">
+        <li><strong>Replication solves three problems at once:</strong> read scalability (5&times; throughput from 5 replicas), high availability (no single point of failure), and geographic latency (local replicas in each region). For read-heavy workloads with small data, it&rsquo;s the right tool &mdash; simpler than sharding.</li>
+        <li><strong>Replication introduces real challenges:</strong> replication lag (stale reads), read-your-writes consistency bugs, failover data loss risk, multi-region write latency, and split-brain danger. Every benefit has a cost.</li>
+        <li><strong>Async replication is fast but lossy.</strong> The primary responds before replicas confirm. This means sub-millisecond write latency but up to N milliseconds of data loss on failover. Semi-synchronous replication (wait for one replica) gives you zero-loss failover with minimal latency overhead.</li>
+        <li><strong>Read-your-own-writes is a user experience bug, not a system crash.</strong> But it causes support tickets, confusion, and lost trust. Sticky routing (route writes to primary for N seconds) is the simplest fix. LSN-based tokens are more precise.</li>
+        <li><strong>Multi-region replication amplifies the lag problem.</strong> Cross-ocean lag is 80&ndash;150 ms (physics). For write-rare data like profiles, accepting higher write latency from remote regions is the simplest and safest tradeoff. Multi-primary replication is only worth the complexity when writes are frequent AND latency-sensitive AND conflict-free.</li>
+        <li><strong>Split-brain is the most dangerous failure mode.</strong> Two primaries accepting conflicting writes can corrupt data permanently. Fencing tokens (monotonically increasing IDs from a consensus-based token service) prevent stale primaries from writing. Always use fencing in any automated failover system.</li>
+        <li><strong>Start with the math.</strong> 200 GB fits in RAM &rarr; no sharding needed. 50K reads &divide; 10K per server = 5 replicas. 500 writes/sec &times; 0.003 sec lag = 1.5 lost writes on failover. Every design decision was driven by a concrete number, not intuition.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../database-replication.html" class="card topic-card">
+          <h3>Database Replication</h3>
+          <p>Deep dive into primary-replica setups, Raft consensus, CRDTs, chain replication, and replication lag.</p>
+        </a>
+        <a href="../cap-theorem.html" class="card topic-card">
+          <h3>CAP Theorem</h3>
+          <p>Why you can&rsquo;t have consistency, availability, and partition tolerance all at once.</p>
+        </a>
+        <a href="../database-sharding.html" class="card topic-card">
+          <h3>Database Sharding</h3>
+          <p>When replication isn&rsquo;t enough and you need to split data across servers.</p>
+        </a>
+        <a href="../leader-election.html" class="card topic-card">
+          <h3>Leader Election</h3>
+          <p>Raft, Bully, ZooKeeper &mdash; how distributed systems elect a single leader and prevent split-brain.</p>
+        </a>
+        <a href="02-sharding-vs-replication.html" class="card topic-card">
+          <h3>Scenario: Sharding vs Replication</h3>
+          <p>When to shard, when to replicate, and when to do both.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="../../js/sequence-diagram.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+
+</body>
+</html>

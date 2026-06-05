@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amazon DynamoDB — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-datastores.html">Datastores Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Amazon DynamoDB</h1>
+    <p class="hero-subtitle">Fully-managed, serverless KV / wide-column store. Consistent-hash partitioning by partition key; per-partition leader with multi-AZ replicated storage; log-structured. Trades query expressiveness for predictable single-digit-ms latency at any scale.</p>
+    <p class="hero-meta">managed &bull; PK + SK &bull; GSI &bull; auto-scale</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <p>From the published Dynamo / DynamoDB papers: a request routes by partition key &rarr; partition (hash); each partition has its own leader and 2 replica copies across AZs; storage uses a log-structured engine for write amplification; reads either eventually-consistent (any replica) or strongly consistent (leader).</p>
+    <p>The decisive constraint: <strong>one partition is capped at 1,000 WCU / 3,000 RCU</strong>. This shapes everything you do with DDB. Your data model is "design partition keys to distribute load."</p>
+
+    <ul>
+      <li><strong>Item:</strong> a row. Identified by partition key (PK), optionally + sort key (SK). Up to 400 KB.</li>
+      <li><strong>Partition key (PK / hash key):</strong> determines partition.</li>
+      <li><strong>Sort key (SK / range key):</strong> within a partition, items sorted by SK; range queries supported.</li>
+      <li><strong>Secondary indexes:</strong> GSI (Global) or LSI (Local). GSI is a separate partitioned table maintained async.</li>
+      <li><strong>Streams:</strong> change log per table; consumed by Lambda / Kinesis.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>PutItem / UpdateItem</h3>
+      <pre class="line-numbers"><code class="language-text">1. Hash PK &rarr; partition
+2. Route to partition leader (request router)
+3. Leader writes to its log
+4. Replicates to 2 followers (other AZs)
+5. Quorum of 2 ack &rarr; commit
+6. Stream record emitted (if enabled)
+7. GSIs updated async</code></pre>
+    </div>
+    <div>
+      <h3>GetItem / Query</h3>
+      <pre class="line-numbers"><code class="language-text">GetItem (PK + SK):
+  Hash &rarr; partition &rarr; replica (eventual) or leader (strong)
+  Read; return item
+
+Query (PK = X):
+  All items with same PK, filtered by SK range
+  All from one partition
+
+Scan:
+  Sequential scan of ALL partitions
+  Eats RCU; expensive; avoid</code></pre>
+    </div>
+    <div>
+      <h3>Strong vs eventual</h3>
+      <pre class="line-numbers"><code class="language-text">Default reads: eventually consistent (1/2 RCU)
+Strongly consistent: 1 RCU per 4 KB
+Always-strong on PutItem (returns after quorum)
+Cross-region (Global Tables): eventual + LWW</code></pre>
+    </div>
+    <div>
+      <h3>Streams</h3>
+      <pre class="line-numbers"><code class="language-text">Each item change &rarr; record in stream (24 hr retention)
+Consumed by Lambda triggers, Kinesis adapter
+Used for CDC, cache invalidation, analytics fan-out</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li>Per-partition leader; 2 replicas across AZs; quorum write. Single-region: strong-consistency option per read.</li>
+      <li>Global Tables: per-region writable; replicated last-write-wins by timestamp; cross-region eventual.</li>
+      <li>Failure: leader loss &rarr; one of replicas promoted automatically (single-digit seconds).</li>
+      <li>No notion of "transaction across all partitions": <code>TransactWriteItems</code> supports up to 100 items, single region only, 2&times; cost.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li>Partitioning fully managed; you don't see partitions directly. But you must design PK to spread load.</li>
+      <li>Hot PK = throttling. Solutions: write-shard (suffix PK with random bucket and fan-in on read), or pre-distribute via composite key.</li>
+      <li>Auto-scaling: provisioned mode adjusts capacity within bounds; on-demand mode handles 2&times; previous peak instantly without configuration.</li>
+      <li>Resharding: invisible to you; DDB splits/joins partitions as needed.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>GetItem / PutItem: O(1) routing + log-structured read/write.</li>
+      <li>Query (within partition): O(log K + M) where M = items returned.</li>
+      <li>Scan: O(N) full-table.</li>
+      <li>GSI write: O(1) but doubles write cost.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>Partition cap: 1,000 WCU / 3,000 RCU.</li>
+      <li>Item size: 400 KB max.</li>
+      <li>Latency: P50 ~5&ndash;10ms; P99 ~10&ndash;30ms; DAX (in-mem cache) cuts P50 to &lt; 1 ms.</li>
+      <li>Throughput: effectively unlimited via partition fan-out (managed).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use DDB when&hellip;</h3>
+      <ul>
+        <li>Hot KV with predictable PK access.</li>
+        <li>Need fully managed; small ops budget.</li>
+        <li>AWS-native stack; Lambda triggers via Streams.</li>
+        <li>Idempotency table.</li>
+        <li>Session store; user-prefs; metadata.</li>
+        <li>Single-table design with PK+SK + GSIs.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use DDB when&hellip;</h3>
+      <ul>
+        <li>Ad-hoc queries / analytics &mdash; use Athena/Redshift via export.</li>
+        <li>Heavy joins &mdash; not its model.</li>
+        <li>Items &gt; 400 KB &mdash; use S3 + DDB pointer.</li>
+        <li>Multi-region strong consistency.</li>
+        <li>You don't yet know access patterns.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li>Hot partition &mdash; uneven PK distribution &rarr; throttling.</li>
+      <li>Item-size 400 KB cap &mdash; large data must go to S3.</li>
+      <li>Scan cost &mdash; 1 RCU per 4 KB read; full table scan = $$.</li>
+      <li>GSI eventual &mdash; reading just-written item via GSI may miss.</li>
+      <li>GSI write cost &mdash; doubles write capacity.</li>
+      <li>Filter expressions don't reduce RCU &mdash; they filter <em>after</em> read.</li>
+      <li>Conditional update with <code>attribute_not_exists</code> for idempotency &mdash; must be careful with retries.</li>
+      <li>BatchWriteItem cap: 25 items / 16 MB per call.</li>
+      <li>Backups: PITR window 35 days; on-demand backups separate.</li>
+      <li>Cost: throughput-driven; storage is cheap.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>AWS only (this is the cloud).</li>
+      <li>GCP analog: Bigtable (wide-column) or Firestore (document); shape differs.</li>
+      <li>Azure analog: Cosmos DB Table API.</li>
+      <li>Self-host analogs: Cassandra / ScyllaDB.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th><th>Cost / failure</th></tr></thead>
+      <tbody>
+        <tr><td>Provisioned</td><td>Predictable cost</td><td>Set RCU/WCU; auto-scale within bounds</td><td>Throttling on burst beyond ceiling</td></tr>
+        <tr><td>On-demand</td><td>Bursty traffic</td><td>Pay per request; auto handles 2&times; previous peak</td><td>~7&times; cost per RCU/WCU vs provisioned</td></tr>
+        <tr><td>Global Tables</td><td>Multi-region active-active</td><td>Replicate to N regions; LWW</td><td>2&times; write cost per region; eventual cross-region</td></tr>
+        <tr><td>DAX in front</td><td>Sub-ms reads</td><td>Cluster of cache nodes</td><td>Stale data; another tier to operate</td></tr>
+        <tr><td>Streams + Lambda</td><td>Event-driven processing</td><td>Each item change &rarr; Lambda invocation</td><td>Lambda concurrency limits</td></tr>
+        <tr><td>Single-table design</td><td>Complex access patterns in one table</td><td>PK + SK + GSI overload to model many entities</td><td>Hard to evolve; needs careful design up front</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Hot KV (session, user prefs).</li>
+      <li>Idempotency table (PutItem with <code>attribute_not_exists(idempotency_key)</code>).</li>
+      <li>Single-table design with PK+SK overloading.</li>
+      <li>Streams for CDC into Lambda / S3 / Kinesis.</li>
+      <li>Global tables for multi-region.</li>
+      <li>Saga / distributed transaction state (with TransactWriteItems).</li>
+      <li>Counters via update with ADD; spread by suffix to avoid hot partition.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li>Capacity mode: on-demand vs provisioned.</li>
+      <li>Auto-scaling target utilization.</li>
+      <li>GSI projections: KEYS_ONLY / INCLUDE / ALL.</li>
+      <li>TTL attribute (background expiry; eventual).</li>
+      <li>Streams: NEW_IMAGE / OLD_IMAGE / NEW_AND_OLD / KEYS_ONLY.</li>
+      <li>PITR on/off; export-to-S3 for analytics.</li>
+      <li>DAX cluster size.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>1 WCU = 1 KB write/sec; 1 RCU = 4 KB strongly-consistent read/sec (or 2 eventually).</li>
+      <li>Partition cap: 1k WCU / 3k RCU.</li>
+      <li>Throttling = redesign keys to spread.</li>
+      <li>GSI: same WCU as base table for writes; separate RCU for reads.</li>
+      <li>Burst: provisioned has 5-min burst credit; on-demand handles 2&times; previous peak.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Leader loss: replica promoted automatically; few seconds.</li>
+      <li>AZ loss: writes continue; replicas re-balance.</li>
+      <li>Region loss: Global Tables continue serving from other regions.</li>
+      <li>Throttling: 4xx ProvisionedThroughputExceeded; client SDK retries.</li>
+      <li>GSI eventual: stale reads on the GSI.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>PITR (continuous backup): up to 35 days; restore to any second.</li>
+      <li>On-demand backups: snapshots; long retention.</li>
+      <li>Restore creates a new table (cutover required).</li>
+      <li>Export to S3: full data dump for analytics or DR.</li>
+      <li>Global Tables = built-in geo DR.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>No version upgrades (managed).</li>
+      <li>Schema evolution: add attributes anytime; sparse GSIs let you add indexes incrementally.</li>
+      <li>Migration in: AWS DMS or DynamoDB import from S3.</li>
+      <li>Migration out: streams &rarr; Lambda &rarr; new store; or export to S3.</li>
+      <li>Single-table redesign: hardest migration; usually means dual-write + cutover.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>IAM: per-table, per-action, fine-grained via condition keys (<code>dynamodb:LeadingKeys</code>).</li>
+      <li>Encryption at rest: SSE-S3 / SSE-KMS; on by default.</li>
+      <li>VPC endpoints: keep traffic off the internet.</li>
+      <li>No row-level ACL; use IAM condition on partition key for tenant isolation.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Tenant ID as PK prefix; IAM <code>dynamodb:LeadingKeys</code> condition for isolation.</li>
+      <li>One table can serve many tenants if PK design spreads them.</li>
+      <li>Hot tenant = hot partition (the canonical DDB problem).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>Consumed vs provisioned RCU/WCU.</li>
+      <li>Throttled events.</li>
+      <li>Hot partition events (Contributor Insights).</li>
+      <li>GSI throttle.</li>
+      <li>Item collection size (for LSI).</li>
+      <li>Successful request latency p99.</li>
+      <li>System errors (5xx).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Scan-based access patterns.</li>
+      <li>Hot PK (e.g., date as PK).</li>
+      <li>Items close to 400 KB.</li>
+      <li>Filter expression instead of indexed access (still pays read RCU for filtered items).</li>
+      <li>GSIs with low-cardinality PK &rarr; hot GSI partition.</li>
+      <li>Treating DDB as a relational DB.</li>
+      <li>BatchGet for many items rather than parallelizing GetItem (BatchGet returns partial; needs retry logic).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>Provisioned: per RCU/WCU/hour + storage.</li>
+      <li>On-demand: per-request + storage; ~7&times; per-unit but no min.</li>
+      <li>GSI: same WCU as base table for writes; doubles cost.</li>
+      <li>Global Tables: 2&times; writes per region.</li>
+      <li>Streams: per-million read requests by Lambda.</li>
+      <li>PITR: per GB-month of "continuous backup."</li>
+      <li>Storage: cheap; throughput is the bill.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>DynamoDB</th><th>Cassandra</th><th>Bigtable</th><th>Cosmos DB</th></tr></thead>
+      <tbody>
+        <tr><td>Managed</td><td>Yes (AWS-only)</td><td>No (or Keyspaces)</td><td>Yes (GCP-only)</td><td>Yes (Azure)</td></tr>
+        <tr><td>Consistency</td><td>Strong / eventual / global LWW</td><td>Tunable quorum</td><td>Strong row-level</td><td>5 levels (configurable)</td></tr>
+        <tr><td>Indexes</td><td>GSI / LSI</td><td>Limited 2nd indexes (avoid)</td><td>Row-key only</td><td>Auto-indexed</td></tr>
+        <tr><td>Cost</td><td>Throughput-driven</td><td>Hardware</td><td>Node-hours</td><td>RU-based</td></tr>
+        <tr><td>Pick when</td><td>AWS, fully managed, predictable PK access</td><td>Self-host, multi-DC, eventual OK</td><td>GCP, time-series, big scans</td><td>Azure, global with 5-level consistency</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy uniform</td><td>Auto-scale RCU</td><td>DAX cache; eventually-consistent reads</td><td>Pre-warm; provisioned ceiling</td></tr>
+        <tr><td>Write-heavy uniform</td><td>Auto-scale WCU</td><td>On-demand mode</td><td>Move to Cassandra</td></tr>
+        <tr><td>Hot partition</td><td>Hard 1k WCU cap</td><td>Write-shard (PK + suffix)</td><td>Pre-compute via streams; cache</td></tr>
+        <tr><td>Bursty</td><td>On-demand handles 2&times;</td><td>Use on-demand</td><td>Provisioned + auto-scale + warm</td></tr>
+        <tr><td>Scan-heavy</td><td>Scan eats RCU</td><td>Export to S3 + Athena</td><td>Stream into a warehouse</td></tr>
+        <tr><td>Cold storage</td><td>Cheap storage; throughput drives cost</td><td>Archive to S3; remove from DDB</td><td>Glacier for true cold</td></tr>
+        <tr><td>Multi-region</td><td>Global Tables</td><td>LWW; tolerate eventual</td><td>Run separate region tables; manual sync</td></tr>
+        <tr><td>Large items</td><td>400 KB cap</td><td>Blob in S3; pointer in DDB</td><td>Chunk in DDB (rarely)</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>"DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service" (USENIX ATC 2022).</li>
+      <li>Original Dynamo paper (Amazon, SOSP 2007) for ancestry.</li>
+      <li>Marc Brooker's blog (deep DDB internals + AWS-internal perspectives).</li>
+      <li>Alex DeBrie's "DynamoDB Book" for single-table design.</li>
+      <li>AWS docs: best practices guide.</li>
+      <li>Production: Amazon retail, prime, ad serving; Lyft; Disney+.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-datastores.html">Datastores comparison</a></li>
+    <li><a href="cassandra.html">Cassandra (sibling)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

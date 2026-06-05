@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MySQL (InnoDB) — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-datastores.html">Datastores Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>MySQL (InnoDB)</h1>
+    <p class="hero-subtitle">Relational SQL DB whose default storage engine InnoDB stores rows in a <em>clustered B+tree on the primary key</em> &mdash; the table is the index. Undo log gives MVCC, redo log gives crash recovery, binlog gives replication. The most-deployed open-source DB in the world; the web stack's default.</p>
+    <p class="hero-meta">SQL &bull; clustered-PK lookups &bull; binlog replication</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <p>The single biggest difference from Postgres: <strong>rows live in the leaves of the primary-key B+tree</strong>. There is no separate "heap." Look up by PK = traverse one B+tree to the row. Look up by secondary index = secondary tree returns PK, then primary tree returns row (two B+tree walks).</p>
+
+    <div class="full-width">
+      <svg viewBox="0 0 1240 360" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+        <rect x="20" y="40" width="380" height="280" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="210" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Clustered B+tree (PK)</text>
+        <text x="210" y="83" text-anchor="middle" fill="#64748b" font-size="11">rows live in the leaves</text>
+        <rect x="120" y="100" width="180" height="30" rx="3" fill="#fff" stroke="#2563eb"/>
+        <text x="210" y="120" text-anchor="middle" fill="#334155" font-size="11" font-family="monospace">internal: [25, 50, 75]</text>
+        <line x1="160" y1="130" x2="80" y2="160" stroke="#334155"/>
+        <line x1="210" y1="130" x2="210" y2="160" stroke="#334155"/>
+        <line x1="260" y1="130" x2="340" y2="160" stroke="#334155"/>
+        <rect x="40" y="160" width="80" height="40" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="80" y="178" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">leaf 1</text>
+        <text x="80" y="194" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">id=1, ada, ...</text>
+        <rect x="170" y="160" width="80" height="40" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="210" y="178" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">leaf 50</text>
+        <text x="210" y="194" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">id=50, bob, ...</text>
+        <rect x="300" y="160" width="80" height="40" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="340" y="178" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">leaf 75</text>
+        <text x="340" y="194" text-anchor="middle" fill="#334155" font-size="10" font-family="monospace">id=75, cal, ...</text>
+        <text x="210" y="240" text-anchor="middle" fill="#334155" font-size="11">Range scan = sibling-pointer walk through leaves</text>
+        <text x="210" y="260" text-anchor="middle" fill="#dc2626" font-size="11">Random PK = "page split" pain (use auto-increment)</text>
+        <text x="210" y="285" text-anchor="middle" fill="#16a34a" font-size="11">PK lookup = ONE B+tree walk &mdash; very fast</text>
+
+        <rect x="430" y="40" width="320" height="280" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="590" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Secondary index (idx_email)</text>
+        <text x="590" y="83" text-anchor="middle" fill="#64748b" font-size="11">key &rarr; PK (not row)</text>
+        <rect x="450" y="110" width="280" height="35" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="590" y="132" text-anchor="middle" fill="#334155" font-size="11" font-family="monospace">'ada@x.com' &rarr; PK 1</text>
+        <rect x="450" y="155" width="280" height="35" rx="3" fill="#fff" stroke="#d97706"/>
+        <text x="590" y="177" text-anchor="middle" fill="#334155" font-size="11" font-family="monospace">'bob@x.com' &rarr; PK 50</text>
+        <text x="590" y="220" text-anchor="middle" fill="#334155" font-size="11">Lookup by email:</text>
+        <text x="590" y="240" text-anchor="middle" fill="#334155" font-size="11">1. Walk secondary tree &rarr; PK</text>
+        <text x="590" y="260" text-anchor="middle" fill="#334155" font-size="11">2. Walk PK tree &rarr; row</text>
+        <text x="590" y="290" text-anchor="middle" fill="#dc2626" font-size="11">2 B+tree walks; covering index avoids step 2</text>
+
+        <rect x="780" y="40" width="220" height="280" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="890" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Logs</text>
+        <text x="890" y="83" text-anchor="middle" fill="#64748b" font-size="11">Three of them</text>
+        <text x="800" y="115" fill="#1e293b" font-weight="700" font-size="12">Redo log</text>
+        <text x="800" y="135" fill="#334155" font-size="11">crash recovery</text>
+        <text x="800" y="153" fill="#334155" font-size="11">circular, fixed-size</text>
+        <text x="800" y="180" fill="#1e293b" font-weight="700" font-size="12">Undo log</text>
+        <text x="800" y="200" fill="#334155" font-size="11">MVCC + rollback</text>
+        <text x="800" y="218" fill="#334155" font-size="11">old row versions</text>
+        <text x="800" y="245" fill="#1e293b" font-weight="700" font-size="12">Binary log (binlog)</text>
+        <text x="800" y="265" fill="#334155" font-size="11">replication + PITR</text>
+        <text x="800" y="283" fill="#334155" font-size="11">row / statement / mixed</text>
+        <text x="800" y="305" fill="#dc2626" font-size="10">async by default</text>
+
+        <rect x="1030" y="40" width="200" height="280" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="1130" y="65" text-anchor="middle" fill="#1e293b" font-weight="700" font-size="14">Buffer pool</text>
+        <text x="1130" y="83" text-anchor="middle" fill="#64748b" font-size="11">in-memory page cache</text>
+        <text x="1130" y="115" text-anchor="middle" fill="#334155" font-size="11">LRU + young/old</text>
+        <text x="1130" y="135" text-anchor="middle" fill="#334155" font-size="11">change buffer for</text>
+        <text x="1130" y="152" text-anchor="middle" fill="#334155" font-size="11">non-unique idx writes</text>
+        <text x="1130" y="180" text-anchor="middle" fill="#334155" font-size="11">~70% of RAM typical</text>
+        <text x="1130" y="210" text-anchor="middle" fill="#dc2626" font-size="11">Cold start = slow</text>
+        <text x="1130" y="230" text-anchor="middle" fill="#334155" font-size="11">until pool warm</text>
+      </svg>
+    </div>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Write path</h3>
+      <pre class="line-numbers"><code class="language-text">1. Acquire row lock (gap lock for repeatable read isolation)
+2. Write change to undo log (for rollback + MVCC)
+3. Modify the row (in-memory page in buffer pool)
+4. Append to redo log (in memory)
+5. On COMMIT: redo log fsync to disk; binlog fsync
+   (sync_binlog=1, innodb_flush_log_at_trx_commit=1)
+6. Replicas pull binlog and replay
+7. Buffer pool dirty pages flushed lazily by background threads</code></pre>
+    </div>
+    <div>
+      <h3>Read path</h3>
+      <pre class="line-numbers"><code class="language-text">PK lookup:
+  Walk PK B+tree &rarr; row (one tree walk)
+
+Secondary index:
+  Walk secondary tree &rarr; PK
+  Walk PK tree &rarr; row
+  (Covering index returns from secondary tree directly)
+
+Range:
+  Find leaf, walk via sibling pointers</code></pre>
+    </div>
+    <div>
+      <h3>Replication</h3>
+      <pre class="line-numbers"><code class="language-text">primary: writes to binlog
+replica's IO thread: pulls binlog &rarr; relay log
+replica's SQL thread: replays relay log
+GTID since 5.6: each event has unique global tx id
+
+modes: async (default) | semi-sync | group replication</code></pre>
+    </div>
+    <div>
+      <h3>Crash recovery</h3>
+      <pre class="line-numbers"><code class="language-text">on startup:
+  redo log replay applies committed-but-not-flushed pages
+  undo log rolls back uncommitted txns
+  buffer pool gets warmed slowly via warmup file (5.7+)</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li><strong>Topology:</strong> single-leader binlog replication; cascading + multi-replica common.</li>
+      <li><strong>Modes:</strong> async (default), semi-sync (primary waits for at least one replica ack), Group Replication (Paxos-based; multi-primary or single-primary with auto-failover).</li>
+      <li><strong>Consistency:</strong> linearizable on primary; replicas eventually consistent. Read-after-write requires session affinity or <code>WAIT_FOR_EXECUTED_GTID_SET</code>.</li>
+      <li><strong>Failover:</strong> manual unless using Orchestrator / MHA / cloud-managed (RDS / Aurora). Group Replication enables auto-failover.</li>
+      <li><strong>GTID:</strong> 5.6+; replaces "binlog file + position" with globally-unique transaction IDs &mdash; mandatory for any modern setup.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li><strong>Native:</strong> declarative partitioning (range / list / hash / key); same-table abstraction.</li>
+      <li><strong>Sharding:</strong> not native. <strong>Vitess</strong> is the gold standard (YouTube origin, used by Slack / Square / GitHub). App-level sharding also common.</li>
+      <li><strong>Hot row:</strong> InnoDB row-level locks; gap locks under <code>REPEATABLE READ</code>. Avoid hot-spot contention via redesign.</li>
+      <li><strong>PK choice matters:</strong> auto-increment INT/BIGINT keeps inserts at the end of the B+tree (cheap). Random UUIDs cause page splits all over the tree (expensive); use UUIDv7 (time-ordered) or convert to BINARY(16).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Op</th><th>Complexity</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>PK lookup</td><td>O(log N)</td><td>One B+tree walk (clustered)</td></tr>
+        <tr><td>Secondary index lookup</td><td>O(log N) &times; 2</td><td>Two B+tree walks unless covering</td></tr>
+        <tr><td>Range scan (PK)</td><td>O(log N + K)</td><td>Sibling pointer walk</td></tr>
+        <tr><td>Insert (auto-inc PK)</td><td>O(log N)</td><td>End-of-tree append; no page splits</td></tr>
+        <tr><td>Insert (random PK)</td><td>O(log N) + page splits</td><td>Costly at scale</td></tr>
+        <tr><td>Update</td><td>O(log N) per affected index</td><td>Old version &rarr; undo log</td></tr>
+        <tr><td>JOIN (block nested)</td><td>O(N&times;M)</td><td>Avoid; needs index</td></tr>
+        <tr><td>JOIN (idx)</td><td>O(N log M)</td><td>Inner table indexed</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>OLTP TPS: ~10&ndash;30k for simple ops on tuned hardware.</li>
+      <li>P99 latency (LAN): 1&ndash;5 ms point reads.</li>
+      <li>Connections: ~500 direct; thousands via ProxySQL.</li>
+      <li>Storage: 10s of TB single instance; one big buffer pool.</li>
+      <li>Throughput limit: redo log + binlog fsync rate on commit.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use MySQL when&hellip;</h3>
+      <ul>
+        <li>Web stack default; PHP / Rails / Node ecosystems lean MySQL.</li>
+        <li>Workload dominated by clustered-PK access (e.g., row-by-id).</li>
+        <li>You already have MySQL ops expertise.</li>
+        <li>Need Vitess for SQL sharding at scale.</li>
+        <li>Aurora MySQL for cloud-native.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use MySQL when&hellip;</h3>
+      <ul>
+        <li>You need Postgres-class indexing (GIN / BRIN / partial / expression).</li>
+        <li>Need rich extensions (Postgres has more).</li>
+        <li>Heavy JSONB workloads (Postgres is more mature).</li>
+        <li>Cross-region strong consistency (use Spanner / CRDB).</li>
+        <li>OLAP &mdash; use ClickHouse / BigQuery.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li><strong>Random UUID PK</strong> &rarr; page splits + B+tree fragmentation. Use auto-inc or UUIDv7.</li>
+      <li><strong>Gap locks under REPEATABLE READ</strong> can deadlock unexpectedly with mixed read/write txns.</li>
+      <li><strong>Implicit type conversion</strong> in WHERE (e.g., string vs int) silently loses index usage.</li>
+      <li><strong>Online DDL but not always online.</strong> Some ALTERs lock; use <code>pt-online-schema-change</code> or <code>gh-ost</code>.</li>
+      <li><strong>Secondary index is "PK + secondary key."</strong> Big PK = bigger secondary indexes.</li>
+      <li><strong>Replication lag spikes</strong> on big single-statement updates (binlog replays serially without parallel slave).</li>
+      <li><strong>InnoDB row format</strong> matters for column count / NULL ratio; default DYNAMIC is usually right.</li>
+      <li><strong>SHOW PROCESSLIST</strong> is one snapshot; use <code>performance_schema</code> for real diagnosis.</li>
+      <li><strong><code>SELECT *</code> with TEXT/BLOB</strong> &rarr; off-page fetch each row.</li>
+      <li><strong>Group Replication split-brain</strong> with bad network; understand <code>group_replication_consistency</code>.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li><strong>AWS:</strong> RDS MySQL; Aurora MySQL (log-as-DB; storage decoupled from compute).</li>
+      <li><strong>GCP:</strong> Cloud SQL MySQL.</li>
+      <li><strong>Azure:</strong> Azure DB for MySQL Flexible Server.</li>
+      <li><strong>Open-source:</strong> MySQL, MariaDB (fork), Percona Server (drop-in).</li>
+      <li><strong>Sharding:</strong> Vitess (open-source, used at YouTube/Slack), PlanetScale (managed Vitess).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives you</th><th>How it works</th><th>Cost / failure mode</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Single primary</strong></td><td>Simplicity</td><td>One node, local binlog, periodic backups</td><td>No HA; manual restore</td></tr>
+        <tr><td><strong>Async replicas</strong></td><td>Read scale + warm spare</td><td>Binlog stream over IO thread &rarr; relay log &rarr; SQL thread</td><td>Replicas may lag; async = data loss on failover</td></tr>
+        <tr><td><strong>Semi-sync replication</strong></td><td>Reduced data loss on failover</td><td>Primary waits for at least one replica ack on commit</td><td>Higher write latency; reverts to async on timeout</td></tr>
+        <tr><td><strong>Orchestrator + MHA</strong></td><td>Automatic failover</td><td>External orchestrator detects primary failure; promotes replica; updates VIP</td><td>5&ndash;30s failover; needs careful network partition handling</td></tr>
+        <tr><td><strong>Group Replication</strong></td><td>Multi-primary or single-primary with auto-failover</td><td>Paxos-based group consensus; certifies and replicates txns</td><td>Tight network req; conflict-aware</td></tr>
+        <tr><td><strong>InnoDB Cluster</strong></td><td>Group Replication + MySQL Router + MySQL Shell</td><td>Bundled HA stack from Oracle</td><td>Recommended modern HA setup</td></tr>
+        <tr><td><strong>Vitess</strong></td><td>Sharded SQL at scale</td><td>vtgate proxy + vttablet per shard; CDC via VStream</td><td>App needs sharding-aware queries; rich tooling</td></tr>
+        <tr><td><strong>Aurora MySQL</strong></td><td>Log-as-DB cloud-native</td><td>Compute writes redo log to shared storage layer (6&times; replicated)</td><td>Vendor lock-in; storage I/O charge can dominate</td></tr>
+        <tr><td><strong>ProxySQL in front</strong></td><td>Connection pooling + read/write split</td><td>L7 proxy understands SQL; routes by query class</td><td>Extra hop; another tier to operate</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li><strong>Primary OLTP</strong> &mdash; users, orders, inventory.</li>
+      <li><strong>Auto-increment ID generation</strong> &mdash; classic ID source.</li>
+      <li><strong>Write-heavy with <code>INSERT ... ON DUPLICATE KEY UPDATE</code></strong> for upserts.</li>
+      <li><strong>Vitess sharding</strong> &mdash; horizontally scale beyond one box.</li>
+      <li><strong>CDC via Debezium / Maxwell / Canal</strong> reading binlog.</li>
+      <li><strong>Read-heavy workload with replicas + ProxySQL routing</strong>.</li>
+      <li><strong>FULLTEXT index</strong> for basic full-text (replace with ES at scale).</li>
+      <li><strong>Spatial</strong> &mdash; native types and indexes for geo (less mature than PostGIS).</li>
+      <li><strong>JSON column</strong> &mdash; native since 5.7; less indexable than Postgres jsonb.</li>
+      <li><strong>Outbox pattern</strong> &mdash; outbox table + Debezium on binlog.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs that matter</h2>
+    <ul>
+      <li><code>innodb_buffer_pool_size</code> &mdash; ~70% of RAM. The single most important setting.</li>
+      <li><code>innodb_log_file_size</code> &mdash; bigger redo log = fewer flushes; modern default is fine but tune for write-heavy.</li>
+      <li><code>innodb_flush_log_at_trx_commit</code> &mdash; <code>1</code> (durable, default), <code>2</code> (lose 1s on crash), <code>0</code> (lose more).</li>
+      <li><code>sync_binlog</code> &mdash; <code>1</code> (durable, slowest), <code>0</code> (let OS), <code>N</code> (group commit).</li>
+      <li><code>binlog_format</code> &mdash; <code>ROW</code> (default, recommended for replication safety), <code>STATEMENT</code> (older; risky with non-deterministic statements).</li>
+      <li><code>gtid_mode</code> &mdash; <code>ON</code> always.</li>
+      <li><code>max_connections</code> &mdash; hundreds direct; use ProxySQL past that.</li>
+      <li><code>innodb_flush_method</code> &mdash; <code>O_DIRECT</code> on Linux to avoid double-buffer with OS page cache.</li>
+      <li><code>transaction_isolation</code> &mdash; default REPEATABLE READ; READ COMMITTED is more Postgres-like and avoids gap locks.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>RAM: buffer pool fits hot data + working set. If &gt; RAM, expect IO-bound performance.</li>
+      <li>Storage: 30% headroom for online DDL + temp tables.</li>
+      <li>Connections: 500 direct typical; 5000+ via ProxySQL.</li>
+      <li>Redo log: large enough to absorb peak write rate without checkpoints stalling.</li>
+      <li>Replication: replica must be at least as fast as primary to keep up.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Primary crash: replicas have lag; semi-sync minimizes data loss; manual or orchestrator failover.</li>
+      <li>Replica falls behind: SQL thread CPU-bound on big statement; consider parallel slave.</li>
+      <li>Disk full: stops writes; clear binlog or expand disk.</li>
+      <li>Long-running transaction: bloat undo log; <code>history list length</code> grows.</li>
+      <li>Slave gets ahead via direct write: split-brain; use <code>read_only=ON</code> on replicas.</li>
+      <li>Group Replication network partition: minority offline; majority continues.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>Logical: <code>mysqldump</code>; slow restore.</li>
+      <li>Physical: <code>xtrabackup</code> (Percona); fast, parallel, supports PITR via binlog replay.</li>
+      <li>RPO: binlog interval; near-zero with continuous archive.</li>
+      <li>RTO: bound by restore speed; 1 TB takes hours.</li>
+      <li>Cross-region DR: async replica or RDS / Aurora cross-region replica.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Minor: in-place; replicas first.</li>
+      <li>Major (5.7 &rarr; 8.0): in-place upgrade or rebuild from logical dump; check deprecated features.</li>
+      <li>Online schema change: <code>pt-online-schema-change</code> / <code>gh-ost</code>; build a shadow table, copy data, atomic rename.</li>
+      <li>Sharding migration: introduce Vitess; unsharded keyspace first; gradually shard tables.</li>
+      <li>Migrate to Postgres: Debezium + dual-write; DDL differences (auto-increment vs sequence; index types).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security model</h2>
+    <ul>
+      <li>Auth: <code>caching_sha2_password</code> (8.0 default), pluggable plugins (LDAP, AD, IAM on RDS).</li>
+      <li>Authz: GRANT system; column-level GRANT exists.</li>
+      <li>TLS: optional for client + replication; mandatory in cloud-managed.</li>
+      <li>Encryption at rest: InnoDB tablespace encryption (8.0).</li>
+      <li>Audit: MySQL Enterprise Audit (commercial); MariaDB Audit Plugin (FOSS).</li>
+      <li>Network: bind to private subnet; never expose 3306 publicly.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Schema-per-tenant: <code>CREATE DATABASE tenant_42</code>; clean isolation; doesn't scale to thousands.</li>
+      <li>Row-level (shared schema): tenant_id column + per-query filter; most common pattern.</li>
+      <li>Vitess keyspaces: one keyspace per tenant tier with its own sharding.</li>
+      <li>Resource: <code>max_user_connections</code> per user; no native CPU/IOPS isolation.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>QPS + p99 (performance_schema).</li>
+      <li>Replica lag (<code>Seconds_Behind_Source</code>) &mdash; coarse; use <code>pt-heartbeat</code> for accuracy.</li>
+      <li>Buffer pool hit ratio &mdash; aim &gt; 99%.</li>
+      <li>Innodb row lock waits.</li>
+      <li>Long-running transactions (<code>information_schema.innodb_trx</code>).</li>
+      <li>Slow query log + pt-query-digest.</li>
+      <li>Connection count vs max_connections.</li>
+      <li>Disk usage per database / largest tables.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Random UUID PKs (page split storms).</li>
+      <li><code>SELECT *</code> on wide tables (off-page TEXT/BLOB).</li>
+      <li>Heavy single-statement DML on replicated table (replica lag).</li>
+      <li>Many small connections without pooling.</li>
+      <li>Implicit charset/collation conversions losing indexes.</li>
+      <li>Multi-statement transactions without idempotency.</li>
+      <li>Group Replication on flaky network &rarr; group thrash.</li>
+      <li>Binlog disabled (loses replication + PITR).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>RDS / Cloud SQL: instance + storage + IOPS-provisioning.</li>
+      <li>Aurora MySQL: compute + storage GB + I/O ops; I/O ops can dominate hot workloads.</li>
+      <li>Cross-AZ replication: separate line item.</li>
+      <li>Backup: extra storage cost.</li>
+      <li>Self-host: hardware + on-call.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling / alternative comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>MySQL (InnoDB)</th><th>Postgres</th><th>MariaDB</th><th>Aurora MySQL</th></tr></thead>
+      <tbody>
+        <tr><td>Storage</td><td>Clustered B+tree</td><td>Heap + B+tree</td><td>Same as MySQL</td><td>Compute + shared storage layer</td></tr>
+        <tr><td>MVCC</td><td>Undo log</td><td>xmin/xmax in heap</td><td>Same as MySQL</td><td>Same wire-compat</td></tr>
+        <tr><td>Index types</td><td>B-tree, FULLTEXT, spatial, hash (MEMORY)</td><td>Many more (GIN, BRIN, partial, ...)</td><td>+ a few extras</td><td>Same as MySQL</td></tr>
+        <tr><td>Replication</td><td>Binlog</td><td>Streaming WAL + logical</td><td>Same; ColumnStore, Galera</td><td>Storage-layer 6&times;</td></tr>
+        <tr><td>JSON</td><td>JSON type 5.7+</td><td>jsonb (richer)</td><td>JSON</td><td>Same as MySQL</td></tr>
+        <tr><td>Pick when</td><td>Default web stack; clustered-PK access</td><td>Default unless above</td><td>Drop-in replacement; some extra features</td><td>Cloud-native scale on AWS</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy</td><td>Async replicas</td><td>ProxySQL routing; sticky-by-session</td><td>Vitess for read fan-out per keyspace</td></tr>
+        <tr><td>Write-heavy</td><td>Vertical first</td><td>Bigger box; tune redo log; batch via LOAD DATA</td><td>Vitess sharding</td></tr>
+        <tr><td>Hot row</td><td>Row + gap locks</td><td>Switch to READ COMMITTED; redesign to append + rollup</td><td>Skip-lock queue pattern</td></tr>
+        <tr><td>Bursty</td><td>Buffer pool absorbs reads</td><td>Queue + COPY-style bulk insert</td><td>Aurora's elastic compute or replicas</td></tr>
+        <tr><td>Scan-heavy</td><td>Range scan via PK / covering idx</td><td>Sort/dist keys (in MariaDB ColumnStore)</td><td>CDC to ClickHouse</td></tr>
+        <tr><td>Long-tail cold</td><td>InnoDB compresses</td><td>Partition + archive old partitions</td><td>Move to warehouse</td></tr>
+        <tr><td>Many tenants</td><td>One DB per tenant or row-level</td><td>Shared schema + tenant_id index</td><td>Vitess keyspaces per tier</td></tr>
+        <tr><td>Vector / search</td><td>FULLTEXT; spatial</td><td>Limited; pair with ES / vector DB via CDC</td><td>External system</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>"High Performance MySQL" (Schwartz et al.) &mdash; the canonical text.</li>
+      <li>Percona blog &mdash; deep operational insight.</li>
+      <li>Jean-Fran&ccedil;ois Gagn&eacute;'s blog on replication / GTID.</li>
+      <li>Vitess docs &amp; tutorials &mdash; horizontal-scale story.</li>
+      <li>Aurora paper (Verbitski et al., SIGMOD 2017).</li>
+      <li>Production: YouTube on Vitess; GitHub on MySQL; Square's payment stack.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-datastores.html">Datastores comparison</a></li>
+    <li><a href="postgresql.html">Postgres</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

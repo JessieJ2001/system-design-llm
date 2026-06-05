@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K14 — Quantization — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K14 &mdash; Quantization <span style="font-weight:400;font-size:.55em;color:#64748b;">(fewer bytes &rarr; the four-effect cascade)</span></h1>
+      <p class="hero-subtitle"><strong>How do you build a <em>scalable</em> serving stack on fewer bytes per parameter &mdash; when decode is HBM-bandwidth-bound on the weights (and KV) it re-reads every token &mdash; by turning one knob (precision) that <em>cascades</em> into faster decode &rarr; bigger batch &rarr; smaller fleet &rarr; lower&nbsp;$, while an accuracy gate stops the silent quality regression that ships with it?</strong> This page derives the four-effect cascade (so you cannot reason about quant locally) and its <em>regime ceiling</em> (the W&middot;A axis, <strong>D64</strong> &mdash; weight-only quant helps only memory-bound decode), then D16 (rollout safety) and D42 (weight-quant vs KV-quant &mdash; different bytes, different cascades).</p>
+      <p class="hero-meta">GPU-serving SoT &bull; a <a href="K1_serving-fundamentals.html#decode">K1</a> consumer (the memory-BW-bound decode byte budget) &bull; cites <a href="K1_serving-fundamentals.html">K1</a> / <a href="K2_kv-cache.html">K2</a> / <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> / <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> &bull; <strong>the cascade is derived here</strong> from K1&rsquo;s sheet (the dtype is the variable, the cascade is the invariant) &bull; dedicated scenario: <strong>L7</strong> &bull; ~17 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span>. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the quantization cascade chain). Approve / redirect the arc, the <strong>four-effect cascade derivation</strong>, deep-dive placement (<strong>D16 rollout safety &mdash; co-host L7; D42 weight-quant vs KV-quant</strong>), the <strong>rule-11 precision/method spectrum</strong>, and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>TPOT / ITL (primary)</strong> &mdash; the memory-bound decode step is <code>bytes / HBM_BW</code>; halving bytes/parameter &asymp; halves the step (cascade effect&nbsp;1).</li>
+          <li><strong>Throughput (tokens/s)</strong> &mdash; freed HBM &rarr; larger KV pool &rarr; larger batch <code>B</code> &rarr; more tokens/s (cascade effect&nbsp;2, cite K1 <code>B*</code>).</li>
+          <li><strong>MBU</strong> &mdash; fewer bytes moved per token at the same HBM BW raises memory-bandwidth utilisation toward the roofline.</li>
+          <li><strong>Cost-shape ($/mo)</strong> &mdash; fewer GPUs for the same load (cascade effects&nbsp;3&ndash;4) &mdash; with the accuracy gate as the binding constraint, not a free lunch.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> Decode re-reads weights (and KV) from HBM every token; fewer bytes/parameter chains into <em>four</em> coupled effects &mdash; faster decode, bigger batch, fewer GPUs, lower&nbsp;$ &mdash; so quant cannot be reasoned about locally; the cascade fires only in the <em>memory-bound</em> regime, so weight-only quant is net-slower in prefill / past <code>B*</code> and the <strong>W&middot;A axis</strong> (D64) chooses W8A8/FP8 there; lower precision loses accuracy, so an <em>eval gate</em> (a failure-skewed slice suite) + <em>mixed precision</em> + <em>canary-on-eval</em> bound the loss; weight-quant and KV-quant are different bytes with different cascades and are commonly conflated.</p>
+      <ul>
+        <li><strong>Is:</strong> the four-effect <em>cascade</em> derived from K1&rsquo;s sheet (the &ldquo;everything cascades&rdquo; pitfall <em>is</em> the point) and its regime ceiling (D64 &mdash; the W&middot;A axis: weight-only vs weight+activation, the cascade fires only memory-bound); D16 (quantization rollout safety &mdash; accuracy-regression gate as a failure-skewed slice suite, mixed precision, canary-on-eval, calibration-skew; co-host <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a>); D42 (weight-quant vs KV-quant &mdash; different bytes, different cascades); the precision/method rule-11 spectrum (FP16 &rarr; FP8 &rarr; INT8 &rarr; INT4 &rarr; FP4/MXFP4).</li>
+        <li><strong>Is not:</strong> the memory-BW-bound decode roofline / <code>B*</code> / fleet&amp;cost formulas (<a href="K1_serving-fundamentals.html#decode">K1</a> owns them &mdash; the cascade is <em>derived from</em> them, never re-derived); KV-quant <em>as a cache-sizing lever</em> (<a href="K2_kv-cache.html#quant">K2</a> owns that &mdash; K14 owns the <em>method/precision</em>; D42 is the rule-of-two boundary); the quant <em>kernel</em> + read-path dequant (<a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> &mdash; the dtype must be kernel-supported); quantization-aware <em>training</em>&nbsp;/&nbsp;QAT (training-side &mdash; K14 is post-training/serving PTQ); floating-point-format numerical theory (name FP8/INT4/MXFP4 + their serving effect, not the bit-level math); <em>which</em> eval benchmark (application/eval concern &mdash; K14 owns &ldquo;a gate exists&rdquo;).</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> The byte budget the cascade acts on (<code>decode_step = bytes/HBM_BW</code>), the ridge <code>B*</code>, and the fleet&amp;cost formulas are <a href="K1_serving-fundamentals.html#decode">K1</a>&rsquo;s &mdash; this page <em>derives the cascade from</em> them and never re-states them. KV-quant as a cache lever is <a href="K2_kv-cache.html#quant">K2</a>&rsquo;s; the kernel/dtype support and read-path dequant are <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a>&rsquo;s; which tensors/outlier channels are <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a>&rsquo;s vocabulary. <strong>This page owns the cascade, the rollout-safety gate (D16), and the weight-vs-KV decision (D42) &mdash; nothing else.</strong></div>
+    </div>
+  </section>
+
+  <!-- Spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Quantization Spine (stated up front, before &sect;1)</h2>
+      <p>Every section is one link in a naive&rarr;problem&rarr;fix chain; the decision-tree SVG below <em>is</em> this chain:</p>
+      <ul>
+        <li><strong>Decode is HBM-BW-bound on the bytes it re-reads every token</strong> (weights + KV) &mdash; cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a>.</li>
+        <li>&rarr; fewer bytes/parameter &rArr; faster decode + bigger batch + smaller fleet + lower&nbsp;$ &mdash; <strong>the cascade</strong> (one knob, four coupled effects &mdash; you cannot reason about quant locally).</li>
+        <li><strong>New problem (the cascade&rsquo;s own ceiling):</strong> the cascade fires only in the <em>memory-bound</em> regime &mdash; <strong>weight-only</strong> quant (W4A16) does nothing for compute-bound <em>prefill</em> or <em>large-batch</em> decode, where the per-tile dequant is pure overhead &rArr; it can be <em>slower</em> there. Effect&nbsp;2 (bigger batch) eventually crosses K1 <code>B*</code> and <em>cannibalises</em> effect&nbsp;1 (faster decode).</li>
+        <li>&rarr; the <strong>W&middot;A axis</strong> (<strong>D64</strong>): use <strong>W8A8 / FP8</strong> (the low-precision <em>tensor-core</em> path, &asymp;2&times; FLOPs) when compute-bound; weight-only only when memory-bound.</li>
+        <li><strong>New problem:</strong> lower precision loses accuracy &mdash; and it ships <em>silently</em> (no crash; PTQ calibration&harr;serving distribution skew is a prime cause).</li>
+        <li>&rarr; an <strong>accuracy-regression eval gate</strong> (must pass within &epsilon; before rollout).</li>
+        <li><strong>New problem:</strong> different tensors tolerate different precision.</li>
+        <li>&rarr; <strong>mixed precision</strong> (keep attention / embedding / final layers, or outlier channels, higher).</li>
+        <li><strong>New problem:</strong> a quant change shifts latency / batch / cost <em>simultaneously</em> (the cascade) &mdash; you cannot A/B on latency alone.</li>
+        <li>&rarr; <strong>canary-on-eval, not canary-on-latency</strong> (D16).</li>
+        <li><strong>And:</strong> which bytes? &mdash; weight-quant (fixed per-step, uniform) vs KV-quant (per-token-growing, long-ctx/large-batch) are different cascades, commonly conflated (D42).</li>
+        <li><strong>Objective:</strong> the minimum bytes/parameter whose <code>eval_delta</code> stays under the quality budget &mdash; the precision floor.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 0. Decision tree -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>The arc: <em>decode is HBM-BW-bound on re-read bytes &rarr; fewer bytes/param cascades into 4 coupled effects &rarr; the cascade&rsquo;s own ceiling: weight-only quant helps only the memory-bound regime, the W&middot;A axis (D64) &rarr; new problem: accuracy loss, silent &rarr; eval gate &rarr; new problem: tensors differ &rarr; mixed precision &rarr; new problem: the cascade shifts latency+batch+cost at once &rarr; canary-on-eval (D16) &rarr; which bytes? weight vs KV (D42) &rarr; objective: minimum bytes under the accuracy gate</em>. Each box is a section below.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1240 900" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <rect class="b" x="270" y="16" width="700" height="56" rx="8"/>
+        <text class="t" x="620" y="40" text-anchor="middle">Decode is HBM-BW-bound on the bytes it re-reads every token</text>
+        <text class="s" x="620" y="58" text-anchor="middle">weights + KV &middot; decode_step = bytes / HBM_BW (K1) &middot; §1</text>
+
+        <line x1="620" y1="72" x2="620" y2="100"/>
+        <text class="l" x="636" y="89">fewer bytes/param</text>
+
+        <rect class="bp" x="215" y="100" width="810" height="78" rx="8"/>
+        <text class="t" x="620" y="122" text-anchor="middle">THE CASCADE &mdash; one knob, four coupled effects</text>
+        <text class="s" x="620" y="140" text-anchor="middle">faster decode &rarr; bigger batch &rarr; fewer GPUs &rarr; lower $ &mdash; cannot reason locally &middot; §2</text>
+        <text class="s" x="620" y="156" text-anchor="middle">cost side: a read-path dequant op + the kernel must support the dtype (K17)</text>
+        <text class="s" x="620" y="172" text-anchor="middle">holds in the MEMORY-BOUND regime only &mdash; W8A8 extends it via tensor cores</text>
+
+        <line x1="620" y1="178" x2="620" y2="206"/>
+        <text class="l" x="636" y="195">the cascade&rsquo;s own ceiling</text>
+
+        <rect class="bs" x="210" y="206" width="820" height="66" rx="8"/>
+        <text class="t" x="620" y="230" text-anchor="middle">D64 &mdash; the W&middot;A axis: weight-only vs weight+activation</text>
+        <text class="s" x="620" y="248" text-anchor="middle">W4A16 helps mem-bound decode only; past B* / in prefill the dequant is pure overhead &rarr; slower</text>
+        <text class="s" x="620" y="264" text-anchor="middle">fix: W8A8 / FP8 (low-precision tensor-core path, &asymp;2&times; FLOPs) when compute-bound &middot; §3</text>
+
+        <line x1="620" y1="272" x2="620" y2="300"/>
+        <text class="l" x="636" y="289">new problem</text>
+
+        <rect class="bd" x="290" y="300" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="324" text-anchor="middle">Lower precision loses accuracy &mdash; and ships SILENTLY</text>
+        <text class="s" x="620" y="342" text-anchor="middle">no crash; calibration&harr;serving distribution skew a prime cause &middot; §3</text>
+
+        <line x1="620" y1="356" x2="620" y2="384"/>
+        <text class="l" x="636" y="373">fix</text>
+
+        <rect class="bp" x="290" y="384" width="660" height="56" rx="8"/>
+        <text class="t" x="620" y="408" text-anchor="middle">Accuracy-regression eval gate (pass within &epsilon; before rollout)</text>
+        <text class="s" x="620" y="426" text-anchor="middle">+ mixed precision: sensitive tensors / outlier channels stay higher &middot; §3</text>
+
+        <line x1="620" y1="440" x2="620" y2="468"/>
+        <text class="l" x="636" y="456">new problem</text>
+
+        <rect class="bd" x="270" y="468" width="700" height="56" rx="8"/>
+        <text class="t" x="620" y="492" text-anchor="middle">The cascade shifts latency + batch + cost SIMULTANEOUSLY</text>
+        <text class="s" x="620" y="510" text-anchor="middle">cannot A/B on latency alone &middot; §3</text>
+
+        <line x1="620" y1="524" x2="620" y2="552"/>
+        <text class="l" x="636" y="541">fix (D16)</text>
+
+        <rect class="bs" x="255" y="552" width="730" height="66" rx="8"/>
+        <text class="t" x="620" y="576" text-anchor="middle">D16 &mdash; canary-on-EVAL, not canary-on-latency (co-host L7)</text>
+        <text class="s" x="620" y="594" text-anchor="middle">precision floor = the dtype where eval_delta = the quality budget</text>
+        <text class="s" x="620" y="610" text-anchor="middle">gate = failure-skewed slice suite (long-ctx / JSON / low-resource / safety), not an aggregate</text>
+
+        <line x1="620" y1="618" x2="620" y2="646"/>
+        <text class="l" x="636" y="635">which bytes? (D42)</text>
+
+        <rect class="bs" x="250" y="646" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="670" text-anchor="middle">D42 &mdash; weight-quant (fixed/uniform) vs KV-quant (per-token-growing)</text>
+        <text class="s" x="620" y="688" text-anchor="middle">different cascades, commonly conflated; KV-quant pays iff B&middot;s&middot;kv_bytes &gt; W_bytes &middot; §3</text>
+
+        <line x1="620" y1="702" x2="620" y2="730"/>
+        <text class="l" x="636" y="719">and precision depth varies</text>
+
+        <rect class="bs" x="250" y="730" width="740" height="56" rx="8"/>
+        <text class="t" x="620" y="754" text-anchor="middle">Rule 11 &mdash; the precision/method spectrum</text>
+        <text class="s" x="620" y="772" text-anchor="middle">FP16 &rarr; FP8 &rarr; INT8 &rarr; INT4 &rarr; FP4/MXFP4 (orthogonal to the W&middot;A axis) &middot; §3</text>
+
+        <line x1="620" y1="786" x2="620" y2="814"/>
+
+        <rect class="bc" x="290" y="814" width="660" height="62" rx="8"/>
+        <text class="t" x="620" y="838" text-anchor="middle">Objective: minimum bytes/parameter under the accuracy gate</text>
+        <text class="s" x="620" y="856" text-anchor="middle">the cascade is the invariant; the specific dtype is the variable &middot; §4</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root</strong> &mdash; decode re-reads weights+KV from HBM every token; the step is <code>bytes/HBM_BW</code> (K1).</li>
+        <li><span class="bp">&#9313;</span> <strong>The cascade</strong> &mdash; fewer bytes/param &rArr; faster decode &rarr; bigger batch &rarr; fewer GPUs &rarr; lower $; <em>memory-bound regime only</em>; cost side = read-path dequant + kernel dtype support (K17).</li>
+        <li><span class="bs">&#9314;</span> <strong>D64 &mdash; the W&middot;A axis</strong> &mdash; the cascade&rsquo;s ceiling: weight-only (W4A16) helps mem-bound decode only and is pure dequant overhead in prefill / past <code>B*</code>; W8A8/FP8 (tensor-core path) extends the win to the compute-bound regime.</li>
+        <li><span class="bd">&#9315;</span> <strong>New problem</strong> &mdash; accuracy loss, shipped silently (no crash; calibration&harr;serving skew a prime cause).</li>
+        <li><span class="bp">&#9316;</span> <strong>Eval gate + mixed precision</strong> &mdash; must pass within &epsilon;; keep sensitive tensors / outlier channels higher.</li>
+        <li><span class="bd">&#9317;</span> <strong>New problem</strong> &mdash; the cascade moves latency+batch+cost together &rarr; cannot A/B on latency.</li>
+        <li><span class="bs">&#9318;</span> <strong>D16</strong> &mdash; canary-on-eval not canary-on-latency; precision floor = where <code>eval_delta</code> = the quality budget; the gate is a failure-skewed slice suite, not an aggregate (co-host L7).</li>
+        <li><span class="bs">&#9319;</span> <strong>D42</strong> &mdash; weight-quant vs KV-quant: different bytes, different cascades; KV-quant pays iff <code>B&middot;s&middot;kv_bytes &gt; W_bytes</code>.</li>
+        <li><span class="bs">&#9320;</span> <strong>Rule 11</strong> &mdash; the precision/method (bit-depth) spectrum, orthogonal to the W&middot;A axis; each with its cascade factor / accuracy cost / hardware gate.</li>
+        <li><span class="bc">&#9321;</span> <strong>Objective</strong> &mdash; the minimum bytes/parameter that still passes the accuracy gate; the cascade, not the dtype, is the invariant.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 1. Problem -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> the decode step re-reads the entire weight set (and the growing KV) from HBM for every single token &mdash; arithmetic intensity &asymp; 1 &mdash; so TPOT is bounded below by <code>bytes / HBM_BW</code> and the fleet is sized by that byte bill, no matter how much spare FLOP capacity the GPU has (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a> / <a href="K1_serving-fundamentals.html#roofline">#roofline</a> &mdash; do not re-derive). <b>Solution (what the page builds):</b> store each parameter (and optionally each KV element) in fewer bits, so the same model moves fewer bytes per token &mdash; and trace the four coupled effects that one change sets off.<span class="meta">number: decode TPOT floor = W_bytes/HBM_BW on the trace at FP16 (the baseline the cascade halves) &mdash; cites K1 #decode, #roofline &middot; canonical: gpu-inference-cost-shapes.html (the $ is decode GPU-hours)</span></p>
+    </div>
+  </section>
+
+  <!-- 2. Mechanism -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where quantization lives &mdash; the weight (and KV) read path, dequant before the GEMM</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the reader needs to know what physically changes &mdash; quantization is not a layer. <b>Solution:</b> the stored weight matrices (and, for KV-quant, the cached K/V) are held in a low-bit format; on the read path each tile is <em>dequantized</em> (scale &times; int) just before the matmul, so the math runs in higher precision but the <em>bytes moved from HBM</em> are fewer. Prefill (compute-bound, weights reused across all prompt tokens) benefits little; <strong>decode (memory-bound, one token per weight-load) is where the cascade fires</strong> &mdash; state this before any math (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a> for why decode, not prefill).<span class="meta">no number (placement fact) &mdash; cites K1 #decode (memory-bound decode), K17 (the dequant kernel + dtype support), K0 (which tensors) &middot; diagram: the forward pass with low-bit weight blocks + an inline dequant op on the read edge into each GEMM</span></p>
+
+      <h3 id="walkthrough">The walkthrough on the canonical trace &mdash; with vs without quantization, on decode</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace T1 <code>&quot;I like cat, why?&quot;</code> (6 tokens), prefill done, decoding <code>&quot;Cats&quot;</code>. <b>Without quantization (FP16):</b> the decode step reads <code>W_bytes</code> of weights from HBM to emit one token &rarr; step = <code>W_bytes / HBM_BW</code>. <b>With FP8:</b> the same weights are <code>W_bytes/2</code> &rarr; the decode step roughly halves &rArr; ~2&times; faster TPOT on this exact token &mdash; <em>and</em> the freed HBM lets more sequences sit resident (bigger batch) on the very next iteration. Show with-vs-without explicitly on this trace; numbers symbolic until &sect;3 ties them to the K1 sheet.<span class="meta">numbers: symbolic until §3 (the cascade derivation puts the H100/H200 constants in) &middot; diagram: two decode steps side by side &mdash; FP16 (W bytes) vs FP8 (W/2 bytes), same HBM BW, the step-time bar halving</span></p>
+
+      <h3 id="derive">The four-effect cascade (derived &mdash; the page&rsquo;s home; the &ldquo;everything cascades&rdquo; pitfall IS the point)</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, sub-bulleted).</span> <b>Problem:</b> engineers reason about quant as &ldquo;2&times; smaller weights&rdquo; and stop &mdash; missing that the one change propagates. <b>Solution, the chain derived on the trace (each leg cites K1, none re-derived):</b> (1) <strong>decode step</strong> <code>&asymp; bytes/HBM_BW</code> halves FP16&rarr;FP8 &rArr; ~2&times; TPOT (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a>); (2) freed HBM &rarr; larger KV pool &rarr; larger batch <code>B</code> &rarr; higher throughput (cite <a href="K1_serving-fundamentals.html#roofline">K1 B*</a>); (3) fewer GPUs for the same offered load (cite <a href="K1_serving-fundamentals.html#fleet">K1 fleet</a>); (4) fleet &amp; <code>$/mo</code> shrink (cite <a href="K1_serving-fundamentals.html#cost">K1 cost</a>). <strong>Cost side:</strong> a dequant op on the read path + the kernel must support the dtype (the K2/D32 KV-quant-cost insight generalised to weights &mdash; cite <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a>). <em>One knob, four coupled effects &rArr; you cannot reason about quant locally &mdash; that is the cascade pitfall.</em><span class="meta">number: the full FP16&rarr;FP8 chain on the trace &mdash; TPOT &times;0.5, B &times;~2, GPUs &divide;~2, $/mo &divide;~2 (every leg cites the K1 anchor; nothing re-derived) &middot; diagram: the 4-stage cascade, each stage labelled with its K1 citation + the dequant-cost back-pressure arrow</span></p>
+    </div>
+  </section>
+
+  <!-- 3. System-design view -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 id="topology">Where quantization sits in the GPU topology</h3>
+      <p class="stub"><span class="ps">Stub.</span> Quantized weights are produced by an <strong>offline PTQ calibration pipeline leg</strong> (a calibration dataset &rarr; fitted scales) and shipped as the served artifact; the serving engine loads them, the kernel dequantizes per-tile on read (W4A16) or runs the low-precision tensor-core path (W8A8 &mdash; D64). KV-quant is an <em>online</em> per-block transform on the K2 cache. The artifact carries per-tensor / per-channel scales; the served model version pins {dtype, <strong>W&middot;A scheme</strong>, scale scheme, which tensors kept high, <strong>calibration-set id</strong>}. The calibration leg re-runs per model version &rarr; it is on the L7 rollout-cadence critical path, and the calibration set is a gated, version-pinned input (skew &rarr; D16 silent regression).<span class="meta">no new number &mdash; cites K2 #quant (KV-quant as a cache lever), K17 (kernel dtype support + tensor-core path), K0 (per-tensor vs per-channel granularity), L7 (calibration on the rollout-cadence path) &middot; SVG below</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; the served artifact + read-path dequant</strong>offline PTQ calibration &rarr; low-bit weight shards (+ scale tables) &rarr; engine load &rarr; per-tile dequant into each GEMM; KV-quant shown as an online transform on the K2 block table. Drawn after arc approval.</div>
+
+      <h3 id="d16" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D16 &mdash; quantization rollout safety (accuracy gate, mixed precision, canary-on-eval; co-host <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a>)</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a quant change is invisible until quality regresses in production (it does <em>not</em> crash) &mdash; <em>and</em> the cascade shifts latency/batch/cost simultaneously, so you cannot A/B on latency alone. Two named silent causes: (i) <strong>calibration&harr;serving distribution skew</strong> &mdash; PTQ (GPTQ/AWQ) fits scales on a calibration set; calibrate on web text, serve code / multilingual / long-context &rarr; quality drops <em>on the unseen slice</em> while an aggregate gate passes; (ii) <strong>non-uniform degradation</strong> &mdash; quant craters long-context recall, JSON/tool-call validity, low-resource languages and safety/refusal while MMLU stays flat (KV-quant especially: perplexity barely moves, needle-in-haystack collapses). <b>Solution:</b> an accuracy-regression <strong>gate</strong> that is a <em>failure-skewed slice suite</em> (long-ctx recall, structured-output validity, low-resource langs, safety &mdash; not an aggregate benchmark), passing within &epsilon; before rollout; <strong>mixed precision</strong> (keep attention / embedding / final layers, or outlier channels, higher; quantize the rest); calibration set drawn from the <em>serving</em> distribution and pinned to the model version; <strong>canary-on-eval, not canary-on-latency</strong>. <b>Crossover:</b> the precision floor where <code>eval_delta = the quality budget</code> on the <em>worst</em> slice, not the mean. <b>Rule of two:</b> L7 owns the rollout/canary <em>scenario</em>; K14 owns the quant-specific gate + mixed-precision policy; <em>which</em> benchmark is application/eval-side (K14 owns &ldquo;the gate is a slice suite&rdquo;, not the suite&rsquo;s contents).<span class="meta">number: INT4-weight-only 70B &rarr; aggregate-MMLU drop X% vs long-context-recall drop Y% (Y &Gt; X) &rarr; the per-slice gate threshold on the trace &mdash; cites K1 (cascade legs) &middot; real: AWQ, SmoothQuant, GPTQ, FP8 per-tensor/per-channel + URLs</span></p>
+
+      <h3 id="d42" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D42 &mdash; weight-quant vs KV-quant: different bytes, different cascades, commonly conflated</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> &ldquo;quantize&rdquo; is ambiguous &mdash; weight-quant shrinks the <em>fixed</em> per-step weight read (helps every request uniformly; accuracy cost on model quality); KV-quant shrinks the <em>per-token-growing</em> KV read (helps long-context / large-batch most; accuracy cost on long-context recall &mdash; it is the K2/D32 boundary). Conflating them mis-prioritises. <b>Solution:</b> weight-quant first (biggest, uniform win); add KV-quant when KV dominates the decode byte budget. <b>Crossover:</b> KV-quant pays iff <code>KV_bytes_per_step &gt; weight_bytes_per_step</code>, i.e. <code>B&middot;s&middot;kv_bytes_tok &gt; W_bytes</code> (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a> / <a href="K1_serving-fundamentals.html#memory">#memory</a>) &mdash; derive the <code>s,B</code> where it flips. <b>Rule of two:</b> K14 owns the <em>method/precision</em>; <a href="K2_kv-cache.html#quant">K2</a> owns KV-quant <em>as a cache lever</em> (its cascade consumer).<span class="meta">number: the (s,B) crossover where KV-quant overtakes weight-quant on the trace &mdash; cites K1 #decode/#memory, K2 #quant &middot; real: FP8 KV (vLLM), KVQuant + URLs</span></p>
+
+      <h3 id="d64-wa" style="border-top:3px solid #7c3aed;padding-top:.6rem;background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D64 &mdash; the W&middot;A axis: weight-only vs weight+activation quant, and the cascade&rsquo;s regime ceiling</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (sibling of D42; the second &ldquo;which quant&rdquo; axis).</span> <b>Problem:</b> the cascade as derived assumes <strong>weight-only</strong> quant (W4A16: low-bit weights, dequant to FP16, FP16 matmul) &mdash; which saves only <em>bytes</em>, so it speeds the <em>memory-bound</em> regime (small-batch decode) but does <strong>nothing</strong> for compute-bound <em>prefill</em> or <em>large-batch</em> decode, where the per-tile dequant is pure added work &rArr; quant can make those <em>slower</em>. This means cascade effect&nbsp;2 (bigger batch) eventually crosses K1 <code>B*</code> and <em>cannibalises</em> effect&nbsp;1 (faster decode) &mdash; the four effects are not all mutually-reinforcing. <b>Solution:</b> the <strong>W&middot;A axis</strong> &mdash; <strong>weight+activation</strong> quant (W8A8 / FP8, e.g. SmoothQuant) runs the matmul on low-precision <em>tensor cores</em> (&asymp;2&times; FP16 FLOPs on Hopper/Ada/Blackwell) &rArr; it wins in the <em>compute-bound</em> regime too, at a more fragile accuracy cost (activation outliers &rarr; SmoothQuant migration / rotations). <b>Crossover:</b> memory-bound (interactive small-batch decode) &rarr; weight-only INT4 is the biggest TPOT win; compute-bound (prefill-heavy, batch/offline, large <code>B</code> past <code>B*</code>) &rarr; W8A8/FP8 (tensor-core path) &mdash; weight-only there is a latency <em>regression</em>. Derive the <code>B</code> where weight-only&rsquo;s benefit inverts (cite <a href="K1_serving-fundamentals.html#decode">K1 #decode</a> / <a href="K1_serving-fundamentals.html#roofline">B*</a>). <b>Rule of two:</b> orthogonal to D42 (which <em>bytes</em>: weight vs KV) and to rule-11 (which <em>bit-depth</em>); K14 owns the W&middot;A choice, <a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> owns the tensor-core/dequant kernel.<span class="meta">number: the (B,phase) crossover where W4A16 inverts to net-slower vs W8A8 on the trace (decode small-B vs prefill / large-B) &mdash; cites K1 #decode/#roofline (B*), K17 (tensor-core path) &middot; real: AWQ/GPTQ (W4A16, weight-only), SmoothQuant + FP8 W8A8 (vLLM/TRT-LLM), QuaRot/SpinQuant (rotations for low-bit activations) + URLs &middot; <b>D64 &mdash; wired load-bearing: L1, L5, L6, L8</b></span></p>
+
+      <h3 id="rule11">Rule&nbsp;11 &mdash; the precision/method (bit-depth) spectrum</h3>
+      <p class="stub"><span class="ps">Selection-sweep stub (the invariant is the cascade, not the dtype; orthogonal to the D64 W&middot;A axis).</span> FP16 (baseline) &rarr; FP8 (&asymp;free accuracy, 2&times; cascade, modern default; cliff: needs Hopper+) &rarr; INT8 (SmoothQuant / per-channel; cliff: activation outliers) &rarr; INT4-weight-only (AWQ/GPTQ, 4&times; weight cascade; cliff: measurable quality drop &rarr; eval gate mandatory) &rarr; FP4/MXFP4 (Blackwell, extends the ladder; cliff: hardware-gated, accuracy frontier). Each: cascade factor, accuracy cost, named method, hardware requirement. State explicitly that this ladder is the <em>bit-depth</em> knob, <strong>orthogonal to D64&rsquo;s W&middot;A knob</strong> (depth and what-gets-quantized are independent &mdash; do not conflate), and that the cascade is the invariant while the specific dtype is the hardware-dated variable (hardware-trend sensitivity).<span class="meta">number: per-dtype cascade factor + accuracy delta on the trace &mdash; cites K1 (cascade), pricing-constants.html ($ leg) &middot; real: FP8 (vLLM/TRT-LLM), SmoothQuant, AWQ, GPTQ, MXFP4 (Blackwell) + URLs</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> <b>Target precision (weights):</b> the rule-11 ladder; floor set by the D16 eval gate. <b>KV precision:</b> independent knob, gated by the D42 crossover. <b>Granularity (per-tensor vs per-channel vs group):</b> finer &rarr; better accuracy, more scale-table overhead + slower dequant. <b>Which tensors kept high (mixed precision):</b> attention/embedding/final or outlier channels &mdash; more kept high = safer accuracy, smaller cascade. Each with its chosen value, reason, and the cliff on each side.<span class="meta">numbers: the per-knob crossover (composes with D16 / D42 / rule-11) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- 4. Alternatives -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>A smaller / distilled model</b> &mdash; disq: a different model with its own quality profile and re-training; <em>wins</em> when the quality budget is large and you control the model; <em>composes</em> with quant (quantize the small model too). (b) <b>KV-offload / tiering (K2)</b> &mdash; disq: pays PCIe/NVMe BW and only helps the KV byte leg, not weights; <em>wins</em> for cold long-context KV where accuracy must be untouched. (c) <b>More HBM / bigger GPU</b> &mdash; disq: buys capacity not bandwidth-per-byte and costs $; <em>wins</em> when accuracy cannot be touched at all and budget is unconstrained. (d) <b>Quantization-aware training / QAT</b> &mdash; disq: training-side, needs the training pipeline; <em>out of scope</em> &mdash; K14 is post-training PTQ; flag the boundary, do not cover.<span class="meta">number: the crossover disqualifying each (quality delta for (a); BW cost for (b); $ for (c)) &mdash; cites K1 #decode, K2 #tier, K6 #d36 (quantize-to-fit composes here) &middot; contrast L5/L1 (FP8-to-fit)</span></p>
+    </div>
+  </section>
+
+  <!-- 5. Failure modes -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> <b>Silent accuracy regression</b> &mdash; quant ships, no crash, quality drops on a traffic slice not in the eval set; first move: the D16 eval gate + per-slice eval (gpu-inference-cost-shapes.html / llm-bottlenecks.html). <b>Calibration&harr;serving distribution skew</b> &mdash; PTQ scales fitted on a mismatched calibration set &rarr; degradation only on the unseen serving slice while the aggregate gate passes; first move: calibration set drawn from serving traffic + the D16 slice suite (llm-bottlenecks.html). <b>Weight-only quant slower when compute-bound</b> &mdash; W4A16 in prefill or past <code>B*</code> &rarr; the dequant is pure overhead, no byte-saving benefit &rarr; latency regression that looks like &ldquo;quant didn&rsquo;t help&rdquo;; first move: the D64 W&middot;A axis (W8A8/FP8 tensor-core path) &mdash; cite K1 B*, K17 (llm-bottlenecks.html). <b>Activation-outlier blow-up</b> &mdash; INT8/INT4 without outlier handling &rarr; a few channels saturate &rarr; large error; first move: SmoothQuant / rotations / keep outlier channels high (llm-bottlenecks.html). <b>Dtype unsupported by the kernel</b> &mdash; falls back to a slow generic path &rarr; the cascade&rsquo;s latency win evaporates (cite K17 &mdash; kernel/dtype support; gpu-failure-modes.html). <b>KV-quant long-context recall loss</b> &mdash; aggressive KV precision degrades retrieval over long context silently (cite K2 #quant; llm-bottlenecks.html). <b>Scale-table / version skew</b> &mdash; wrong scales loaded &rarr; silent garbage (gpu-failure-modes.html &mdash; version-mismatch).<span class="meta">cites llm/canonicals/llm-bottlenecks.html (outlier blow-up, KV-quant recall, calibration skew, weight-only-compute-bound trap), llm/canonicals/gpu-failure-modes.html (kernel-fallback, scale/version skew) &middot; <b>ACTION: seed/extend these canonical entries in this same change</b></span></p>
+    </div>
+  </section>
+
+  <!-- 6. Real systems -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> AWQ (activation-aware salient-weight protection), SmoothQuant (migrate activation outliers to weights), GPTQ (second-order PTQ), FP8 in vLLM / TensorRT-LLM (per-tensor / per-channel scales, Hopper+), FP8/INT8 KV in vLLM &amp; KVQuant, MXFP4 on Blackwell. Each: which point on the rule-11 spectrum it implements, weight-vs-KV (D42), its accuracy gate story (D16), + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- 7. Used by & cross-references -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a> (dedicated home &mdash; quant canary/rollout, D16 load-bearing); <a href="../scenarios/L3-long-context-serving.html">L3</a> (KV-quant for long context &mdash; D42); <a href="../scenarios/L1-prefill-decode-disaggregation.html">L1</a> / <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (FP8 to fit / cheapen &mdash; composes with <a href="K6_parallelism-overview.html">K6</a>/D36). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html#decode">K1</a> &mdash; the #decode byte budget the cascade acts on; <code>B*</code> (the regime boundary D64 hinges on), fleet, cost &mdash; the cascade is <em>derived from</em> these, never re-derived.</li>
+        <li><a href="K2_kv-cache.html#quant">K2</a> &mdash; KV-quant <em>as a cache-sizing lever</em> (the D42 boundary &mdash; K14 owns the method/precision, K2 owns it as a cache lever; rule of two).</li>
+        <li><a href="K17_attention-kernels-and-cuda-graphs.html">K17</a> &mdash; the kernel must support the dtype + the read-path dequant (W4A16) / low-precision tensor-core path (W8A8, D64) (rule of two with K17 kernels).</li>
+        <li><a href="K4_continuous-batching-and-scheduling.html">K4</a> / <a href="K16_batch-inference-pipelines.html">K16</a> &mdash; batch size / prefill-vs-decode set the memory-vs-compute regime that decides D64 (interactive small-B decode &rarr; W4A16; offline/large-B / prefill &rarr; W8A8).</li>
+        <li><a href="K13_speculative-decoding.html">K13</a> &mdash; the draft model can be aggressively quantized on a far looser gate (target verifies); quantizing the <em>target</em> shifts acceptance &alpha; &mdash; the draft and target have different D16 gates.</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> &mdash; which tensors / outlier channels (the dimensional vocabulary).</li>
+        <li><a href="K6_parallelism-overview.html">K6</a> &mdash; D36: quantize-to-fit is the no-parallelism escape; the cascade is its mechanism.</li>
+        <li><strong>Out of scope (named, not covered):</strong> quantization-aware <em>training</em> / QAT (training-side &mdash; K14 is serving PTQ); floating-point-format numerical theory (named, not the bit-level math); the eval-benchmark <em>choice</em> (application/eval &mdash; K14 owns &ldquo;a gate exists&rdquo;, not which benchmark).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apache ZooKeeper — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-coordination.html">Coordination Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>Apache ZooKeeper</h1>
+    <p class="hero-subtitle">CP coordination service: hierarchical znodes, ZAB consensus protocol (Paxos-like), session-based ephemeral nodes, one-shot watches. The original distributed-systems primitives library &mdash; Kafka (until KRaft), HBase, Hadoop, Solr, and many more depend on it. Heavyweight but battle-tested.</p>
+    <p class="hero-meta">CP &bull; ZAB &bull; ephemeral znodes &bull; watches</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <ul>
+      <li><strong>Ensemble</strong> of 3 or 5 servers (always odd for quorum). One leader, rest followers.</li>
+      <li><strong>ZAB protocol</strong> (Atomic Broadcast): leader assigns zxid (transaction id) to every write; broadcasts; quorum acks; commits.</li>
+      <li><strong>Reads</strong> can be served by any follower (with relaxed consistency) or only via leader (linearizable). Default reads are sequentially consistent.</li>
+      <li><strong>Hierarchical znodes</strong>: filesystem-like tree (<code>/services/myapp/instance-001</code>). Each znode has data, children, ACLs, version, ephemeral flag.</li>
+      <li><strong>Ephemeral znodes</strong>: tied to a client session; auto-deleted when session expires. The basis for service discovery + leader election.</li>
+      <li><strong>Sequential znodes</strong>: server appends a unique 10-digit suffix; useful for queues + leader-election recipes.</li>
+      <li><strong>Watches</strong>: one-shot. Client registers watch on znode; on change, single notification; client must re-register.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Write (create / setData)</h3>
+      <pre class="line-numbers"><code class="language-text">1. Client &rarr; any server (forwards to leader)
+2. Leader assigns zxid, proposes to followers
+3. Followers write to disk, ack
+4. Leader waits for quorum (n/2 + 1)
+5. Commits + broadcasts
+6. Client gets success
+7. Followers apply in zxid order</code></pre>
+    </div>
+    <div>
+      <h3>Read (getData)</h3>
+      <pre class="line-numbers"><code class="language-text">Default: sequentially consistent (might be stale)
+With watch: server registers callback
+sync(): client forces leader-side read for linearizable read
+Only sync()+read = "fresh"</code></pre>
+    </div>
+    <div>
+      <h3>Session</h3>
+      <pre class="line-numbers"><code class="language-text">Client connects, gets session ID + timeout
+Heartbeats keep session alive
+Server tracks timeout
+On expiry: ephemeral znodes deleted; watches discarded
+Client must reconnect with new session</code></pre>
+    </div>
+    <div>
+      <h3>Watch</h3>
+      <pre class="line-numbers"><code class="language-text">Set watch on znode
+On change: server sends single notification
+Client must re-register to see further changes
+"Watch storms" possible if many clients watch same znode</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li>ZAB consensus; quorum-based; CP (sacrifices availability under partition).</li>
+      <li>Sequential consistency by default; linearizable via <code>sync()</code> + read.</li>
+      <li>3 nodes survive 1 loss; 5 nodes survive 2.</li>
+      <li>Cross-DC: not really. <strong>Observers</strong> are read-only non-voting nodes that span regions.</li>
+      <li>Failover: leader loss triggers election; new leader elected from quorum (~few seconds).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning</h2>
+    <ul>
+      <li>None. Single ensemble holds the entire data set.</li>
+      <li>Don't store data in ZK; only metadata.</li>
+      <li>If one ensemble isn't enough, run multiple ensembles by domain.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>Write: O(log N) for znode tree manipulation + quorum ack latency.</li>
+      <li>Read: O(log N) tree walk + zxid check.</li>
+      <li>Watch fire: O(N) watchers on a znode.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>~10k writes/sec/cluster (limited by quorum + disk fsync).</li>
+      <li>Reads: 50k+ QPS (followers serve).</li>
+      <li>Latency P99: 5&ndash;20 ms.</li>
+      <li>Data size: a few GB total; explicitly not for "data."</li>
+      <li>Connections / watches: thousands per node.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use ZK when&hellip;</h3>
+      <ul>
+        <li>Existing system requires ZK (Kafka pre-KRaft, HBase, Solr Cloud).</li>
+        <li>Need leader election with watch-based notification.</li>
+        <li>Distributed locks with fencing tokens.</li>
+        <li>Configuration with watch-based push.</li>
+        <li>Service discovery (registration via ephemeral znodes).</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use ZK when&hellip;</h3>
+      <ul>
+        <li>You're starting from scratch &mdash; etcd is simpler.</li>
+        <li>You don't need it: most apps don't.</li>
+        <li>Application data store (it's not for that).</li>
+        <li>High-throughput writes (~10k/sec ceiling).</li>
+        <li>Cross-region: ZAB tolerates cross-DC poorly.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li><strong>One-shot watches</strong> must be re-registered. Forgetting = missed events.</li>
+      <li><strong>Watch storm</strong>: 1000 clients watching one znode &rarr; 1000 notifications on every change.</li>
+      <li><strong>Session expiry</strong>: ephemeral znodes vanish; clients must rebuild state.</li>
+      <li><strong>Default 1 MB znode size cap</strong>; raise carefully &mdash; large znodes slow everything.</li>
+      <li><strong>Many znodes (millions)</strong> &rarr; long bootstrap + recovery times.</li>
+      <li><strong>Operator footprint</strong>: JVM tuning, GC tuning, snapshot management.</li>
+      <li><strong>Disk fsync</strong> latency caps write throughput; SSD essential.</li>
+      <li><strong>Mismatched ZK version</strong> across clients &rarr; protocol bugs.</li>
+      <li>Leader-election recipes are non-trivial; use Curator instead of rolling your own.</li>
+      <li><strong>Distributed lock anti-patterns</strong>: no fencing token by default; you must check version after acquire.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>None managed natively in any cloud.</li>
+      <li>You self-host on EC2/GCE/AKS.</li>
+      <li>Alternatives that <em>are</em> cloud-managed in spirit: AWS Cloud Map (service discovery), GCP Service Directory, Consul on HCP.</li>
+      <li>Open-source alternatives: etcd (Raft, simpler), Consul (Raft + gossip), Eureka (AP).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>3-node ensemble</td><td>Production minimum; survives 1 loss</td><td>3 servers; quorum = 2</td></tr>
+        <tr><td>5-node ensemble</td><td>Survives 2 simultaneous losses</td><td>Quorum = 3; more replication overhead</td></tr>
+        <tr><td>Observer nodes</td><td>Read scale + cross-DC reads</td><td>Non-voting nodes apply state changes; serve reads</td></tr>
+        <tr><td>Multi-region with observers</td><td>Local reads in remote region</td><td>Voting members in primary region; observers elsewhere</td></tr>
+        <tr><td>Hierarchical (admin partitions)</td><td>Multi-tenant sub-trees</td><td>Per-tenant root znodes with ACLs</td></tr>
+        <tr><td>Curator framework above</td><td>Higher-level recipes</td><td>App library, not deployment, but mandatory in practice</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Service registry (ephemeral znode per instance).</li>
+      <li>Leader election (sequential ephemeral; lowest seq is leader).</li>
+      <li>Distributed lock (sequential ephemeral; with fencing tokens).</li>
+      <li>Distributed barrier / latch.</li>
+      <li>Configuration with live update (set + watch).</li>
+      <li>Group membership.</li>
+      <li>Counter / queue (recipes; rarely the right tool).</li>
+      <li>Metadata for distributed systems (Kafka, HBase).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li><code>tickTime</code>: heartbeat unit.</li>
+      <li><code>initLimit</code> / <code>syncLimit</code>: follower sync windows.</li>
+      <li>JVM heap (4-8 GB typical).</li>
+      <li>Snapshot interval / autopurge config.</li>
+      <li>Max client connections per host.</li>
+      <li>Disk: snap dir + log dir &mdash; fast SSD essential.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>Ensemble size: 3 or 5; larger = more replication overhead, no big availability win past 5.</li>
+      <li>Memory: in-memory tree fits in RAM (znodes + watches).</li>
+      <li>Disk: snapshots + tx logs.</li>
+      <li>Plan for 10k writes/sec ceiling.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Quorum loss (lose &gt;= n/2): cluster goes read-only / unresponsive.</li>
+      <li>Leader loss: ~few seconds for election.</li>
+      <li>Slow follower: slows writes (waits for quorum).</li>
+      <li>Disk slow: write latency spikes.</li>
+      <li>Long GC pause: session timeouts; ephemeral znodes vanish.</li>
+      <li>Network partition: minority side becomes read-only.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>Snapshot files + transaction log; copy off-site.</li>
+      <li>Restore: deploy fresh ensemble, restore data dir.</li>
+      <li>RPO: snapshot interval.</li>
+      <li>RTO: ensemble bootstrap + replay.</li>
+      <li>Cross-region: observers + manual cut over for DR.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Rolling upgrade: one node at a time; quorum maintained.</li>
+      <li>Major version: read upgrade notes; format may change.</li>
+      <li>Migrate to KRaft (for Kafka): documented multi-stage state machine; once migrated, ZK can go.</li>
+      <li>Migrate to etcd: usually means rewriting client code.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>ACLs per znode: world / auth / digest / IP / SASL.</li>
+      <li>TLS for client + quorum since 3.5+.</li>
+      <li>SASL Kerberos for enterprise auth.</li>
+      <li>No native encryption at rest; use disk encryption.</li>
+      <li>No native audit log; ops via JMX / 4-letter words.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Per-tenant subtree with ACLs.</li>
+      <li>No native quotas (since 3.5 there's a quota mechanism, rarely used).</li>
+      <li>One ensemble per tenant tier in practice.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>Four-letter words: <code>stat</code>, <code>mntr</code>, <code>cons</code>, <code>dump</code>.</li>
+      <li>JMX MBeans.</li>
+      <li>Prometheus exporter (since 3.6+).</li>
+      <li>Key SLIs: outstanding requests, watch count, znode count, leader vs follower role, fsync time.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Storing application data in ZK.</li>
+      <li>Many small znodes for high-volume metadata.</li>
+      <li>Many watches on one hot znode (watch storm).</li>
+      <li>Cross-region voting members (latency ruins quorum).</li>
+      <li>Distributed lock without understanding fencing.</li>
+      <li>Rolling your own leader-election recipe (use Curator).</li>
+      <li>Treating session expiry as a transient blip.</li>
+      <li>Big znode payloads &mdash; 1 MB cap; even 100 KB is suspect.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>3&ndash;5 JVM nodes &times; instance hours.</li>
+      <li>SSD storage (small).</li>
+      <li>Cross-AZ replication network.</li>
+      <li>Operator time: tuning + on-call &mdash; the silent biggest cost.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>ZooKeeper</th><th>etcd</th><th>Consul</th><th>Eureka</th></tr></thead>
+      <tbody>
+        <tr><td>Algorithm</td><td>ZAB</td><td>Raft</td><td>Raft + gossip</td><td>Eventual (AP)</td></tr>
+        <tr><td>Data model</td><td>Hierarchical znodes</td><td>Flat KV (with prefix dir)</td><td>KV + service catalog</td><td>Service registry</td></tr>
+        <tr><td>Watches</td><td>One-shot</td><td>Streaming</td><td>Streaming</td><td>Polling</td></tr>
+        <tr><td>Operational complexity</td><td>Higher (JVM + ZAB tuning)</td><td>Lower (Go binary)</td><td>Medium (agents + servers)</td><td>Low</td></tr>
+        <tr><td>Pick when</td><td>Existing ecosystem (Kafka classic, HBase)</td><td>New deploy / k8s</td><td>Multi-DC service discovery</td><td>Legacy Spring Cloud</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy uniform</td><td>Followers serve reads</td><td>Add observers</td><td>Multiple ensembles by domain</td></tr>
+        <tr><td>Write-heavy</td><td>~10k/sec ceiling</td><td>Move metadata out of ZK</td><td>Switch to etcd or other primitive</td></tr>
+        <tr><td>Many watches</td><td>Watch storm</td><td>Filter watches on different znodes</td><td>Replace pattern with pull-based</td></tr>
+        <tr><td>Cross-region</td><td>ZAB hates WAN</td><td>Observers in remote region</td><td>Multiple ensembles + app-side coordination</td></tr>
+        <tr><td>Many small writes</td><td>Tx log churn</td><td>Batch / pre-aggregate</td><td>Off-load from ZK entirely</td></tr>
+        <tr><td>Large values</td><td>1 MB cap</td><td>Store ref to S3</td><td>Pick a different store</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>"ZooKeeper: Wait-free coordination for Internet-scale systems" (USENIX 2010).</li>
+      <li>"ZooKeeper: Distributed Process Coordination" (Junqueira / Reed).</li>
+      <li>Apache Curator (high-level recipes).</li>
+      <li>Production: Kafka pre-KRaft; HBase; Hadoop NameNode HA; Solr Cloud; Pinterest's MySQL HA; Yahoo (origin).</li>
+      <li>Kleppmann on distributed locks &mdash; understand fencing tokens before claiming "we use ZK locks."</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-coordination.html">Coordination comparison</a></li>
+    <li><a href="../leader-election.html">Leader Election (concept)</a></li>
+    <li><a href="../service-discovery.html">Service Discovery (concept)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

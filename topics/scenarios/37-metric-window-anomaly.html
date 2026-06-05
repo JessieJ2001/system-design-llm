@@ -1,0 +1,1453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Designing a Real-Time Anomaly-Window Detector over Metric Streams &mdash; System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    svg text { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    svg .lbl { font-size: 11px; fill: #334155; }
+    svg .box { fill: #f1f5f9; stroke: #2563eb; stroke-width: 1.5; }
+    svg .accent { fill: #fef3c7; stroke: #d97706; stroke-width: 1.5; }
+    svg .danger { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.5; }
+    svg .ok { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+    svg .cool { fill: #e0f2fe; stroke: #0891b2; stroke-width: 1.5; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="../leetcode.md">LeetCode coverage</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Designing a Real-Time Anomaly-Window Detector over Metric Streams</h1>
+      <p class="hero-subtitle">A cloud provider's host-metrics anomaly detector: for every <code>(host, metric)</code> pair, fire when <code>max</code> over the last 5&nbsp;min crosses a static threshold <em>or</em> diverges from the rolling baseline by N&sigma; &mdash; 5&nbsp;M hosts &times; 40 metrics = 200&nbsp;M independent windows, 20&nbsp;M samples/sec, an alert decision within 30&nbsp;s, tolerate at most one missed sample, 30-day retention. We start from one process holding a monotonic deque per series in a giant in-RAM hash-map (the LC #239 "sliding-window maximum" structure, lifted directly) &mdash; which doesn't fit on one node, has no failure story, and GC-thrashes &mdash; and iterate to a sharded warm-standby aggregator fleet with bucketed window-max + t-digest baselines closed on an event-time watermark, fed by a partitioned Kafka log, with backpressure and load-shedding that keeps the decision fresh under a slow sink or a runaway host.</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~50 min read &bull; LC #239 (Sliding Window Maximum)</p>
+    </div>
+  </section>
+
+  <!-- LC kernel banner -->
+  <section class="section dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>LC kernel.</strong> Sliding Window Maximum (LC #239). Textbook structure: a <em>monotonic deque</em> &mdash; a double-ended queue of indices whose values are monotonically decreasing front-to-back. On each new element: pop from the back while the back's value &le; the new value, push the new index; pop from the front while the front's index has fallen out of the window; the window max is always the front. O(1) amortized per element, O(k) space for a window of k elements. <strong>Four properties that break at 200&nbsp;M series:</strong> (1) <em>state size + GC</em> &mdash; one deque per series &times; 200&nbsp;M = hundreds of GB of small heap objects; it doesn't fit one node and the garbage collector thrashes; (2) <em>no failure story</em> &mdash; the deque lives only in RAM, a crash erases it, and rebuilding it requires replaying the last 5&nbsp;min of samples from somewhere durable (minutes); (3) <em>assumes a single in-order stream</em> &mdash; real metric samples arrive out of order (agent retries, clock skew) and you cannot wait for stragglers (30-s decision deadline), so you need an event-time watermark and a structure that tolerates late updates, not a strict monotonic deque; (4) <em>max only</em> &mdash; the "diverges from the median by N&sigma;" half of the spec needs a streaming quantile, which the deque does not provide. The C8 production cousin replaces the deque with a <em>bucketed sliding-window max</em> (a fixed ring of per-sub-window maxes &mdash; checkpointable, late-tolerant, off-heap) paired with a mergeable <em>t-digest</em> baseline, both closed on a <em>watermark</em>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S0. Scenario & Requirements                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s0-scenario">
+    <div class="container">
+      <h2>S0. Scenario &amp; Requirements</h2>
+      <p>A large cloud provider runs ~5&nbsp;M physical and virtual hosts and emits ~40 metrics per host (CPU%, mem%, disk-util%, NIC bytes, dropped packets, request rate, error rate, GC pause, queue depth, &hellip;) &mdash; a sample roughly every 10&nbsp;s per series. An SRE team configures rules of two shapes: a <strong>threshold rule</strong> (&ldquo;page if <code>max(cpu_util, last 5&nbsp;min) &gt; 95%</code>&rdquo;) and an <strong>anomaly rule</strong> (&ldquo;page if <code>max(latency, last 5&nbsp;min)</code> is more than 4&sigma; above its 1-hour rolling baseline&rdquo;). The detector consumes the firehose, maintains a sliding-window max and a rolling baseline per <code>(host, metric)</code>, evaluates the rules, and emits an alert to the on-call bus within 30&nbsp;s of the sample that triggered it. This is the <em>detector</em>, not the metrics store &mdash; long-term sample storage, ad-hoc PromQL, and dashboards belong to a separate time-series database (see #36). The load-bearing tension: 200&nbsp;M windows must <em>never go dark</em>, but the state to maintain them is too big for one node, the firehose is too fast for one consumer, and a crash erases history that takes minutes to rebuild.</p>
+
+      <!-- ─────── System class ─────── -->
+      <div class="full-width">
+        <h3>System class</h3>
+        <p><strong>Class:</strong> automation pipeline (stream-processing) with an algorithmic kernel &mdash; see <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>. It ingests an unbounded stream, maintains per-key derived state, evaluates fixed rules, and emits events; it is <em>not</em> a queryable database (that class would bring an ad-hoc-query FR and a read-latency NFR &mdash; out of scope here). The pipeline framing puts ingest throughput, end-to-end freshness, state size, and recovery time at the centre; the algorithmic-kernel framing brings the C8 deque&rarr;sketch swap.</p>
+      </div>
+
+      <!-- ─────── Functional requirements ─────── -->
+      <div class="full-width">
+        <h3>Functional requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <ul>
+          <li><strong>Ingest samples.</strong> Accept <code>(host_id, metric_name, ts, value)</code> tuples at the firehose rate from host agents; acknowledge fast and fire-and-forget.</li>
+          <li><strong>Maintain a sliding-window max.</strong> For each <code>(host, metric)</code>, expose <code>max(value)</code> over the trailing 5-minute window, updated as samples arrive and as old samples age out.</li>
+          <li><strong>Maintain a rolling baseline.</strong> For each <code>(host, metric)</code>, maintain a robust location and spread estimate (median &plusmn; MAD) over a longer trailing window (1&nbsp;hour) so the anomaly rule has something to compare against.</li>
+          <li><strong>Evaluate rules.</strong> Per series, evaluate the configured threshold rule(s) and anomaly rule(s) on every window update; debounce so a continuously-firing condition produces one alert + periodic re-fires, not one per sample.</li>
+          <li><strong>Emit alerts.</strong> Deliver <code>(series, rule, fired_at, value, baseline)</code> to the on-call alert bus within 30&nbsp;s of the triggering sample; emit a matching <code>resolved</code> event when the condition clears.</li>
+          <li><strong>Manage rules.</strong> SREs create / update / delete rules through a control-plane API; rule changes propagate to the detector within seconds.</li>
+        </ul>
+        <p><strong>Out of scope (named, not silently dropped):</strong> ad-hoc metric queries / PromQL &mdash; that is the TSDB's job (#36), this is a fixed-rule detector; raw-sample dashboards and long-term sample storage &mdash; same; alert routing / escalation / paging-policy logic &mdash; that is the on-call system downstream of our bus; auto-remediation; seasonal / diurnal baselining (&ldquo;median at this time-of-day over the last 7 days&rdquo;) &mdash; the baseline here is a flat 1-hour rolling window, with seasonal baselining flagged as a probe.</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) rules are <em>mostly static</em> &mdash; they change by config push, not per-sample, so a rule lookup is a cached in-RAM read; (2) &ldquo;tolerate at most one missed sample&rdquo; means <em>at-most-once</em> sample delivery is acceptable &mdash; we may drop a sample (and count it) rather than block waiting for it; (3) the 5-minute window is wall-clock-ish &mdash; &plusmn;30&nbsp;s of window-boundary slop is within tolerance for a 5-minute anomaly window; (4) the baseline window is 1 hour and is robust-statistics-based (median/MAD), not mean/stddev, because the outliers we are trying to detect would poison a mean; (5) a single internal tenant (the provider monitoring its own fleet) &mdash; multi-tenant SaaS monitoring is a probe.</p>
+      </div>
+
+      <!-- ─────── Non-functional requirements ─────── -->
+      <div class="full-width">
+        <h3>Non-functional requirements (cite <a href="../canonicals/nfr-checklist.html">nfr-checklist.html</a>)</h3>
+        <p>The general checklist plus the pipeline per-class additions (ingest throughput, end-to-end freshness, backlog bound, exactly-/at-least-/at-most-once semantics, recovery time) were walked; the five that bind are below. The rest are out of scope, named.</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>NFR</th><th>Target</th><th>Where it bites</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Ingest throughput</td><td>20&nbsp;M samples/sec sustained; absorb a 2&times; burst (40&nbsp;M/sec) for minutes</td><td>the ingest tier and the stateful aggregators &mdash; a single consumer cannot fold the firehose</td></tr>
+              <tr><td>Alert latency (freshness)</td><td>p99 &le; 30&nbsp;s from sample-arrival to alert-emitted</td><td>the whole pipeline depth: collector &rarr; Kafka &rarr; aggregator &rarr; rule eval &rarr; alert bus; and GC pauses / backlog inside the aggregator</td></tr>
+              <tr><td>State capacity &amp; durability</td><td>200&nbsp;M series &times; per-series window+baseline state must fit in RAM across the fleet, with a redundant copy, and survive a node loss without a blind spot &gt; 30&nbsp;s for the affected slice</td><td>the stateful aggregator tier; the checkpoint path; the failover path</td></tr>
+              <tr><td>Availability</td><td>99.9% on alert delivery; survive a single-AZ loss and an aggregator-node loss without missing &gt; 1 sample per series</td><td>aggregator failover; Kafka durability; the alert-bus path</td></tr>
+              <tr><td>Correctness</td><td>at-most-once samples (tolerate &le; 1 missed per series); no <em>silent</em> loss &mdash; every dropped / late / shed sample is counted; no false silence &mdash; a stuck node is detected within seconds</td><td>the watermark; node-liveness detection; the shedding paths</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Out-of-scope NFRs (named):</strong> strong consistency &mdash; an approximate window (&plusmn;30&nbsp;s) and an approximate baseline (a sketch) are fine; this is not a ledger. Multi-region &mdash; single region with multi-AZ here; multi-region is a probe. Per-tenant fairness / quotas &mdash; single internal tenant; the SaaS variant is a probe. Read latency on a query API &mdash; there is no query API; the only &ldquo;read&rdquo; is the alert bus consuming alerts.</p>
+      </div>
+
+      <!-- ─────── Constraints table ─────── -->
+      <div class="full-width">
+        <h3>Constraints (numbers we will use)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Constraint</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Series count</td><td>5&nbsp;M hosts &times; 40 metrics = <strong>200&nbsp;M</strong> <code>(host, metric)</code> series</td></tr>
+              <tr><td>Ingest rate</td><td>20&nbsp;M samples/sec peak (&asymp; 1 sample / 10&nbsp;s / series); 2&times; burst headroom</td></tr>
+              <tr><td>Sliding window</td><td>5&nbsp;min &rarr; &le; 30 samples in a series' window</td></tr>
+              <tr><td>Baseline window</td><td>1&nbsp;hour &rarr; &le; 360 samples per series</td></tr>
+              <tr><td>Alert decision SLO</td><td>p99 &le; 30&nbsp;s, sample-arrival &rarr; alert-emitted</td></tr>
+              <tr><td>Loss tolerance</td><td>&le; 1 missed sample per series; at-most-once OK; nothing silent</td></tr>
+              <tr><td>Retention</td><td>alerts: 30 days. Raw samples: only as long as the window + baseline need (minutes&ndash;hours). Long-term raw / rolled-up samples: out of scope (TSDB owns it)</td></tr>
+              <tr><td>Sample wire size</td><td>~24&nbsp;B raw (8&nbsp;B series_id + 8&nbsp;B ts + 8&nbsp;B f64 value); ~12&nbsp;B/sample on the wire in LZ4-compressed Kafka batches</td></tr>
+              <tr><td>Aggregator node</td><td>r6i.4xlarge: 16 vCPU, 128&nbsp;GB RAM, 12.5&nbsp;Gbps NIC &mdash; $1.01/hr (cite <a href="../design-moves/pricing-constants.html#compute">pricing-constants#compute</a>)</td></tr>
+              <tr><td>Big-RAM node</td><td>r6i.16xlarge: 64 vCPU, 512&nbsp;GB RAM &mdash; $4.03/hr (the largest box on our standard menu; still too small for the naive state)</td></tr>
+              <tr><td>Collector node</td><td>c7g.4xlarge (Graviton): 16 vCPU, 32&nbsp;GB &mdash; $0.58/hr</td></tr>
+              <tr><td>Kafka broker</td><td>m6i.4xlarge + gp3 EBS &mdash; $0.77/hr + $0.08/GB-mo; managed alternative: MSK kafka.m5.4xlarge @ $0.83/hr</td></tr>
+              <tr><td>Checkpoint store</td><td>S3 Standard &mdash; $0.023/GB-mo + $0.005/1k PUT (cite <a href="../design-moves/pricing-constants.html#storage">pricing-constants#storage</a>)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ─────── Sister scenarios callout ─────── -->
+      <div class="full-width">
+        <h3>Sister scenarios</h3>
+        <ul>
+          <li><code>20-distributed-rate-limiter.html</code> &mdash; also keeps sliding windows, but for <em>admission</em> (allow-or-block now), not <em>detection</em> (was-this-anomalous). Its windows are tiny, per-key, and ephemeral; ours are per-series, durable, and feed a baseline. Different bottleneck (token-bucket contention vs. stateful-aggregator capacity).</li>
+          <li><code>36-streaming-percentiles.html</code> &mdash; the metrics <em>storage</em> sibling: p50/p95/p99 over windows for dashboards. Shares the t-digest. That page is the store; this page is the detector that runs on top of (a peer of) it.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The fundamental tension:</strong> 200&nbsp;M independent sliding windows must never go dark &mdash; but the state to keep them is too big for one node, the firehose (20&nbsp;M samples/sec) is too fast for one consumer, and a crash erases history that takes minutes to rebuild from the durable log. Every iteration is about making the state <em>fit</em>, <em>survive</em>, and <em>recover fast</em> without ever letting a slow downstream or a runaway host blind a slice of the fleet.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S1. Core Entities                                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s1-entities">
+    <div class="container">
+      <h2>S1. Core Entities (cite <a href="../canonicals/entities-and-data.html">entities-and-data.html</a>)</h2>
+      <p>The nouns the system traffics in. Minimum shape only &mdash; full schemas land at the iteration that introduces each store (C9-bis); S6 has a consolidated reference.</p>
+      <div class="table-responsive full-width">
+        <table>
+          <thead>
+            <tr><th>Entity</th><th>id</th><th>Key fields</th><th>Partition key candidate</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Sample</td><td>(implicit: series_id + ts)</td><td><code>series_id</code>, <code>ts</code>, <code>value</code> (f64). Ephemeral &mdash; folded into window+baseline, then dropped (lives in Kafka only as long as retention)</td><td><code>series_id</code> (hash)</td></tr>
+            <tr><td>Series</td><td><code>series_id = hash64(host_id ‖ metric_name)</code></td><td><code>host_id</code>, <code>metric_name</code>, <code>region</code>. The unit of state and the partition key</td><td><code>series_id</code> (hash)</td></tr>
+            <tr><td>WindowState</td><td>(keyed by <code>series_id</code>)</td><td>the sliding-window-max structure (deque &rarr; bucket ring) + the baseline estimator (1-h sample buffer &rarr; t-digest) + the consumed-offset bookkeeping. Lives in RAM on the owning aggregator; checkpointed</td><td><code>series_id</code></td></tr>
+            <tr><td>Rule</td><td><code>rule_id</code></td><td><code>metric_name</code>, <code>kind</code> (threshold | anomaly), <code>static_threshold</code>, <code>sigma_mult</code>, <code>baseline_window_sec</code>, <code>severity</code>. Small, replicated to every aggregator</td><td>(broadcast &mdash; not partitioned)</td></tr>
+            <tr><td>Alert</td><td><code>alert_id</code> (KSUID)</td><td><code>series_id</code>, <code>rule_id</code>, <code>kind</code>, <code>fired_at</code>, <code>value</code>, <code>baseline_median</code>, <code>baseline_mad</code>, <code>resolved_at</code>. Emitted to the bus; stored 30 days</td><td><code>series_id</code> (and a secondary view by <code>host_id</code>)</td></tr>
+            <tr><td>Checkpoint</td><td><code>s3://&hellip;/{shard_id}/{epoch}.snap</code></td><td>flat-array dump of one shard's WindowStates + the Kafka offsets consumed at snapshot time</td><td><code>shard_id</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>ID scheme</strong> (cite <a href="../canonicals/identifier-schemes.html">identifier-schemes.html</a>): <code>series_id = hash64(host_id ‖ metric_name)</code> &mdash; a 64-bit content hash of the natural key. <strong>Why:</strong> deterministic, so any collector or aggregator derives it (and thus the owning shard) with zero coordination and no lookup table; fixed-size; uniform, so shard balance is automatic; the series universe is huge and churns as hosts come and go, so a monotonic sequence (needs a coordinator) or a UUIDv7 (not derivable from the key) would both force a registry lookup on the hot path. <strong>Rejected:</strong> Snowflake / monotonic-sequence (coordinator + registry on the hot path); UUIDv7 (random &mdash; can't be re-derived from <code>(host, metric)</code>, so routing needs a lookup). For <code>alert_id</code> we use a KSUID &mdash; time-sortable (alerts are listed newest-first) and forgery-resistant; collisions across the fleet are a non-issue.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S2. API / Interface Contracts                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s2-api">
+    <div class="container">
+      <h2>S2. API contracts (cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h2>
+      <p>Three surfaces: the <em>ingest</em> protocol (agents &rarr; collectors, then collectors &rarr; Kafka), the <em>control plane</em> (SREs manage rules), and the <em>output</em> (the alert bus, push). Patterns &mdash; idempotency, errors, versioning, pagination &mdash; cite the canonical; only the scenario-specific shape is inline.</p>
+
+      <div>
+        <h3>Ingest / control / output sketch</h3>
+<pre class="line-numbers"><code class="language-text">// Ingest (agent -> regional collector): batched, compressed, fire-and-forget.
+POST /v1/samples            Content-Encoding: lz4    body: [(series_id, ts, value), ...]
+                            Host-Identity: &lt;mTLS client cert&gt;
+                            -> 202 Accepted   (collector appended the batch to Kafka)
+                            -> 429 / 503      (collector or Kafka degraded; agent DROPS the batch
+                                               + increments produce_failed; NO agent-side retry storm)
+
+// Internally: collector --produce--> Kafka topic "samples", key = series_id, acks=all,
+//             min.insync.replicas=2. The collector enforces a per-host token bucket first.
+
+// Control plane (SRE -> rule service):
+PUT    /v1/rules/{rule_id}  If-Match: &lt;etag&gt;   {metric_name, kind, static_threshold, sigma_mult, ...}
+                            -> 200 | 412      (optimistic concurrency; cite api-design-patterns#concurrency)
+GET    /v1/rules?cursor=... -> 200 {rules, next_cursor}                  (cite #pagination)
+DELETE /v1/rules/{rule_id}  -> 204
+// On any change the rule service bumps a version and broadcasts the new rule set to all aggregators.
+
+// Output (detector -> alert bus): push, not poll.
+ALERT  {alert_id (KSUID), series_id, host_id, metric_name, rule_id, kind, fired_at,
+        value, baseline_median, baseline_mad, severity}            -> on-call bus (PagerDuty Events API / SNS)
+RESOLVE{alert_id, resolved_at}                                     -> on-call bus
+
+Error model:  cite api-design-patterns#errors (problem+json on the control plane; ingest uses bare 2xx/4xx/5xx).
+Versioning:   cite api-design-patterns#versioning (URL prefix /v1/; the Kafka topic schema is versioned separately
+              via a schema registry, so a rolling agent upgrade can add a field without breaking consumers).
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Per-endpoint SLO</h3>
+        <ul>
+          <li><code>POST /v1/samples</code> &mdash; p99 &le; 50&nbsp;ms to <code>202</code> (just &ldquo;appended to the durable log&rdquo;; the agent does not wait for processing).</li>
+          <li>End-to-end <code>sample-arrival &rarr; ALERT-emitted</code> &mdash; <strong>p99 &le; 30&nbsp;s</strong> (the headline SLO; drives the watermark slack and the aggregator headroom).</li>
+          <li><code>PUT /v1/rules/{id}</code> &mdash; p99 &le; 200&nbsp;ms; rule propagated to all aggregators within ~5&nbsp;s (eventual; a rule change does not need to be atomic across the fleet).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Essential Formulas                                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="formulas">
+    <div class="container">
+      <h2>Essential Formulas</h2>
+      <p>Every number on this page derives from these constants and formulas. Unit prices cite <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>; hardware bandwidths cite <a href="../back-of-envelope.html">back-of-envelope.html</a>.</p>
+
+      <div>
+        <h3>Hardware constants</h3>
+<pre class="line-numbers"><code class="language-text">Aggregator (r6i.4xlarge):   16 vCPU, 128 GB RAM, 12.5 Gbps NIC,  $1.01/hr  -> $727/mo
+Big-RAM box (r6i.16xlarge):  64 vCPU, 512 GB RAM,                $4.03/hr  -> $2,902/mo
+Collector (c7g.4xlarge):     16 vCPU, 32 GB RAM,  12.5 Gbps,     $0.58/hr  -> $418/mo
+Kafka broker (m6i.4xlarge):  16 vCPU, 64 GB,      12.5 Gbps,     $0.77/hr  -> $554/mo  (+ gp3 EBS $0.08/GB-mo)
+S3 Standard:                 $0.023/GB-mo ; $0.005 / 1k PUT
+NIC bandwidth:               12.5 Gbps = 1.5625 GB/s
+RAM bandwidth:               ~40 GB/s/node sustained
+Kafka per-broker write:      ~80 MB/s sustained, durable (RF=3, acks=all)  -- conservative; real range 50-150
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Workload constants</h3>
+<pre class="line-numbers"><code class="language-text">N_series          = 200,000,000        (5M hosts x 40 metrics)
+ingest_peak       = 20,000,000 samples/sec     ; burst = 2x = 40M/sec for minutes
+inter_sample_int  = N_series / ingest_peak = 10 s   (avg, per series)
+W_window          = 300 s   -> <= 30 samples in a series' 5-min window
+W_baseline        = 3600 s  -> <= 360 samples in a series' 1-h baseline
+alert_SLO         = 30 s p99 (sample-arrival -> alert-emitted)
+sample_wire       = ~12 B/sample  (LZ4-compressed Kafka batch; ~24 B raw)
+cpu_per_sample    = ~1 us  (DRAM-stall-dominated: hashmap/index probe + window update + digest insert + rule eval)
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Throughput &amp; sizing formulas</h3>
+<pre class="line-numbers"><code class="language-text">samples_per_node     = (16 vCPU x 1 sample/us) x efficiency      ; efficiency ~ 0.3 (GC, Kafka deser, checkpoint) -> ~5 M/s/node planning number
+aggregators_for_cpu  = ceil(ingest_peak / samples_per_node)
+aggregators_for_ram  = ceil(total_state / usable_ram_per_node)   ; usable ~ 50 GB on a 128 GB heap-managed node, ~110 GB if off-heap flat arrays
+aggregators          = max(aggregators_for_cpu, aggregators_for_ram) x (1 + headroom)   ; headroom ~ 0.5
+total_state          = N_series x per_series_state
+kafka_brokers        = ceil(ingest_peak x sample_wire x RF / per_broker_write) x (1 + headroom)
+$/month              = sum_over_tiers( nodes x $/hr x 24 x 30 ) + S3 + managed   (cite pricing-constants.html)
+recovery_warm        = ~seconds                         (standby already caught up)
+recovery_cold        = ckpt_size / NIC + (now - ckpt_age) of Kafka / replay_rate  (download + replay)
+watermark_slack      = 15 s   -> leaves 30 - 15 = 15 s for collector + Kafka + consumer + rule + bus
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S3. Back-of-Envelope                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s3-boe">
+    <div class="container">
+      <h2>S3. Back-of-Envelope &mdash; the ratios that govern every iteration</h2>
+      <p>Two or three numbers shape the whole arc. No optimization technique appears here &mdash; the bucketed window-max, the t-digest, and the watermark are <em>named</em> as future moves but are not used in any calculation below.</p>
+
+      <div>
+        <h3>The firehose</h3>
+<pre class="line-numbers"><code class="language-text">ingest_peak = 20,000,000 samples/sec.
+At ~1 us CPU/sample, that is 20 core-seconds of work per wall-clock second -> needs >= 20 cores busy at all times.
+At ~12 B/sample on the wire, that is 240 MB/s = 1.92 Gbps of compressed sample traffic.
+Conclusion: bandwidth is cheap (one 12.5 Gbps NIC carries it); CPU is the gate; one 16-vCPU node can't do it; you need a fleet.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>The state</h3>
+<pre class="line-numbers"><code class="language-text">Naive per-series state (the LC structures, exact):
+  monotonic deque    <= 30 entries x 16 B (8 B value + 8 B ts)            = 480 B
+  1-h baseline buffer 360 samples x 8 B (value; ts implicit by ring pos)  = 2,880 B
+  hashmap slot + object headers                                          ~ 150 B
+  per series                                                             ~ 3.5 KB
+Total = 200M x 3.5 KB = ~700 GB payload  ;  ~1-1.4 TB resident with hashmap load factor + heap headers.
+Conclusion: doesn't fit the 512 GB box on our menu; you'd reach for a 2 TB x2iedn-class box (~$13-27/hr) -- and a TB-scale
+heap GC-pauses for seconds-to-minutes, which blows the 30-s alert SLO, and one box is one failure domain. Memory-capacity-bound,
+hard wall. (The fix that shrinks ~3.5 KB -> ~1 KB is the C8 sketch swap -- Iteration 2 -- not used in this section.)
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>The clock</h3>
+<pre class="line-numbers"><code class="language-text">alert_SLO = 30 s. inter_sample_int = 10 s. So a series gets ~3 fresh samples inside one decision budget.
+A node loss must not cost more than 30 s of darkness for the affected slice. Re-consuming the last 5 min of one shard's
+Kafka partitions to rebuild a deque from cold = (5 min x per-shard rate) / replay_rate -- on the order of a minute or more,
+which is > 30 s. => cold rebuild alone is not enough; we will need a warm standby (Iteration 1).
+Every iteration's "recovery time" column is checked against this 30-s clock.
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S4. Naive Architecture                                        -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s4-naive">
+    <div class="container">
+      <h2>S4. Naive Architecture &mdash; the simplest thing that meets the FRs</h2>
+      <p>One process. A single Kafka consumer (or a raw TCP listener) reads all 20&nbsp;M samples/sec; a giant in-RAM <code>HashMap&lt;series_id, {monotonic_deque, baseline_buffer}&gt;</code> holds the state &mdash; the LC #239 deque per series, plus a 1-hour ring buffer per series for the median/MAD baseline; on each sample the process updates the deque (pop-back-while-smaller, push, pop-front-while-old), pushes the value into the ring buffer, recomputes the window max and the baseline median/MAD, evaluates the configured rule(s), and on a trigger <code>POST</code>s the alert to a webhook. Rules are loaded once at startup from a config file. One machine. It satisfies every FR &mdash; ingest, window-max, baseline, rule eval, emit. The numbers tell us how far short of the NFRs it falls.</p>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 1180 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Naive: host agents push samples to a single TCP/Kafka listener on one box; the box holds a HashMap of series_id to {monotonic deque, 1-hour baseline ring buffer}; on each sample it updates the deque and buffer, evaluates rules, and POSTs alerts to a webhook. No durable log, no shard, no replica.">
+          <defs>
+            <marker id="arrNs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrNd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="100" width="150" height="90" rx="8"/>
+          <text x="95" y="132" text-anchor="middle" font-weight="bold">Host agents</text>
+          <text x="95" y="152" text-anchor="middle" class="lbl">5M hosts &times; 40 metrics</text>
+          <text x="95" y="170" text-anchor="middle" class="lbl">20M samples/s</text>
+
+          <rect class="danger" x="290" y="40" width="560" height="210" rx="8"/>
+          <text x="570" y="68" text-anchor="middle" font-weight="bold">ONE BOX (r6i.16xlarge &mdash; or bigger; doesn't fit)</text>
+
+          <rect class="box" x="320" y="90" width="200" height="60" rx="6"/>
+          <text x="420" y="115" text-anchor="middle" font-weight="bold">Listener</text>
+          <text x="420" y="133" text-anchor="middle" class="lbl">consumes 20M/s; no durable log</text>
+
+          <rect class="box" x="320" y="170" width="200" height="60" rx="6"/>
+          <text x="420" y="193" text-anchor="middle" font-weight="bold">Rule eval + emit</text>
+          <text x="420" y="211" text-anchor="middle" class="lbl">threshold + N&sigma;; POST webhook</text>
+
+          <rect class="cool" x="560" y="90" width="260" height="140" rx="6"/>
+          <text x="690" y="115" text-anchor="middle" font-weight="bold">HashMap&lt;series_id, state&gt;</text>
+          <text x="690" y="135" text-anchor="middle" class="lbl">200M entries</text>
+          <text x="690" y="153" text-anchor="middle" class="lbl">monotonic deque (5-min max)</text>
+          <text x="690" y="171" text-anchor="middle" class="lbl">1-h ring buffer (median/MAD)</text>
+          <text x="690" y="189" text-anchor="middle" class="lbl">~3.5 KB/series &rarr; ~700 GB</text>
+          <text x="690" y="211" text-anchor="middle" class="lbl">(~1.4 TB resident; lost on crash)</text>
+
+          <rect class="ok" x="970" y="100" width="180" height="90" rx="8"/>
+          <text x="1060" y="132" text-anchor="middle" font-weight="bold">Alert webhook</text>
+          <text x="1060" y="152" text-anchor="middle" class="lbl">on-call</text>
+
+          <line x1="170" y1="145" x2="320" y2="120" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="245" cy="125" r="9" fill="#fff" stroke="#475569"/><text x="245" y="129" text-anchor="middle" font-size="10">1</text>
+
+          <line x1="520" y1="120" x2="560" y2="140" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="540" cy="123" r="9" fill="#fff" stroke="#475569"/><text x="540" y="127" text-anchor="middle" font-size="10">2</text>
+
+          <line x1="560" y1="190" x2="520" y2="200" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrNd)"/>
+          <circle cx="540" cy="187" r="9" fill="#fff" stroke="#94a3b8"/><text x="540" y="191" text-anchor="middle" font-size="10">3</text>
+
+          <line x1="520" y1="200" x2="970" y2="150" stroke="#475569" marker-end="url(#arrNs)"/>
+          <circle cx="745" cy="167" r="9" fill="#fff" stroke="#475569"/><text x="745" y="171" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / lookup; dashed red = hedge / retry (not used here).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Host agents &rarr; Listener</strong> &mdash; agents push <code>(series_id, ts, value)</code> tuples; no batching guarantee, no acknowledgement that matters, no durable log behind it &mdash; if the box is down the samples are gone.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Listener &rarr; HashMap</strong> &mdash; for each sample: <code>hash(series_id)</code>, find the entry, <code>deque.push(value, ts)</code> with the monotonic pop-back/pop-front, <code>ring_buffer.push(value)</code>; recompute <code>window_max</code> (deque front) and <code>baseline = median &plusmn; MAD</code> over the ring buffer.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>HashMap &rarr; Rule eval</strong> &mdash; read <code>window_max</code> and <code>baseline</code> for the touched series; check <code>window_max &gt; static_threshold</code> and <code>window_max &gt; baseline_median + sigma_mult &times; baseline_mad</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Rule eval &rarr; Alert webhook</strong> &mdash; on a trigger (debounced), <code>POST</code> the alert; on clear, <code>POST</code> a resolve.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Numbers (the gap)</h3>
+<pre class="line-numbers"><code class="language-text">State (the hard wall):
+  per_series  = 480 B (deque) + 2,880 B (1-h buffer) + ~150 B (slot+headers) ~= 3.5 KB
+  total       = 200M x 3.5 KB                        = ~700 GB payload  (~1-1.4 TB resident)
+  biggest standard box (r6i.16xlarge) = 512 GB       -> DOESN'T FIT
+  -> you'd buy a 2 TB x2iedn box at ~$13-27/hr ~= $10-20k/mo  -- and it still fails the next two NFRs.
+
+CPU:
+  20M samples/s x 1 us = 20 core-seconds/s          -> needs >= 20 cores busy
+  a 64-vCPU box at ~0.3 efficiency ~= 25M/s effective -> JUST fits; one bad GC pause and it falls behind.
+
+Bandwidth:
+  20M/s x 12 B = 240 MB/s = 1.92 Gbps               -> one 12.5 Gbps NIC carries it easily. NOT the gate.
+
+Alert latency:
+  GC on a TB-scale heap = seconds-to-minutes of stop-the-world; during a pause no alerts are emitted
+  -> p99 alert latency >> 30 s SLO.                  FAILS.
+
+Availability:
+  1 node, 1 AZ.  Its loss = total alerting outage.  Restart = cold = re-consume the last 5 min of samples
+  from... nothing durable behind the listener -> a 5-min FLEET-WIDE blind spot at minimum.   FAILS.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Why it's broken (per failing NFR)</h3>
+        <ul>
+          <li><strong>State capacity &amp; durability &mdash; FAILS, hard.</strong> ~700&nbsp;GB payload / ~1.4&nbsp;TB resident does not fit the largest box on the menu; the only single boxes that hold it (2&nbsp;TB x2iedn) cost ~$10&ndash;20k/mo, are a single failure domain, and have catastrophic GC. This is the <em>shape-determining</em> failure: the only way out is to shard the state across a fleet. Classified <a href="../canonicals/bottlenecks.html#memory-capacity-bound">memory-capacity-bound</a>.</li>
+          <li><strong>Alert latency &mdash; FAILS.</strong> A TB-scale heap (or even a 512&nbsp;GB one) GC-pauses for seconds to minutes; the 30-s end-to-end SLO is blown by a single pause. (And there's no durable buffer to absorb the burst while the process is paused.)</li>
+          <li><strong>Availability &mdash; FAILS.</strong> One node, one AZ. Its loss is a total outage; its restart is cold with nothing durable behind it &rarr; the whole fleet is blind for &ge; 5&nbsp;min. 99.9% on alert delivery from a single node is not achievable.</li>
+          <li><strong>Ingest throughput &mdash; borderline.</strong> A 64-vCPU box <em>just</em> keeps up at ~25&nbsp;M/s effective; no burst headroom; one GC pause and the backlog grows unbounded (nothing durable to spill to).</li>
+          <li><strong>Correctness &mdash; FAILS implicitly.</strong> No durable log &rarr; a crash loses every in-flight sample for every series, not &le; 1; and there's no watermark, so an out-of-order sample either corrupts the deque or is silently dropped.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>Cost of naive &ldquo;at NFR-target load&rdquo;:</strong> ~$10&ndash;20k/mo for a 2&nbsp;TB x2iedn-class box &mdash; and that box <em>still</em> fails availability, alert latency, and correctness. It's not a real option; it's off the menu. Note the contrast with #36, where the naive design was <em>wasteful</em> (it stored raw samples it didn't need) and the arc <em>cut</em> the bill ~14&times;: here the naive design is <em>cheap but fragile</em>, and the arc will <em>spend</em> ~2&times; more to buy availability, freshness, and correctness. A staff designer names which way the bill goes &mdash; and why &mdash; before drawing the first box.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 0                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-0">
+    <div class="container">
+      <h2>Iteration 0 &mdash; Shard the state by <code>series_id</code>; partition the Kafka log; stateless collectors</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1240 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 0: host agents push to a fleet of stateless regional collectors that hash series_id to a Kafka partition and produce to the 'samples' topic (32 partitions, RF=3, 12 brokers, 1h retention); 16 stateful aggregators each own 2 partitions and hold their slice of the HashMap (still the exact deque + 1-h buffer per series); each aggregator evaluates rules and emits to the alert bus; a rule service in the control plane broadcasts rules to all aggregators; alerts are stored 30 days.">
+          <defs>
+            <marker id="arr0s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr0d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="150" width="130" height="80" rx="8"/>
+          <text x="85" y="182" text-anchor="middle" font-weight="bold">Host agents</text>
+          <text x="85" y="200" text-anchor="middle" class="lbl">20M samples/s</text>
+
+          <rect class="accent" x="185" y="150" width="160" height="80" rx="8"/>
+          <text x="265" y="178" text-anchor="middle" font-weight="bold">Collectors (NEW)</text>
+          <text x="265" y="196" text-anchor="middle" class="lbl">stateless; hash(series_id)</text>
+          <text x="265" y="214" text-anchor="middle" class="lbl">~20 nodes c7g.4xl</text>
+
+          <rect class="accent" x="380" y="150" width="180" height="80" rx="8"/>
+          <text x="470" y="174" text-anchor="middle" font-weight="bold">Kafka "samples" (NEW)</text>
+          <text x="470" y="192" text-anchor="middle" class="lbl">32 partitions, RF=3</text>
+          <text x="470" y="210" text-anchor="middle" class="lbl">12 brokers; 1h retention</text>
+
+          <rect class="accent" x="600" y="60" width="300" height="220" rx="8"/>
+          <text x="750" y="86" text-anchor="middle" font-weight="bold">Aggregator fleet (NEW): 16 nodes, sharded</text>
+          <text x="750" y="104" text-anchor="middle" class="lbl">each owns 2 of 32 partitions; r6i.4xlarge</text>
+
+          <rect class="box" x="625" y="120" width="250" height="60" rx="6"/>
+          <text x="750" y="143" text-anchor="middle" font-weight="bold">consumer &rarr; HashMap (shard)</text>
+          <text x="750" y="161" text-anchor="middle" class="lbl">~12.5M series; ~44 GB; deque + 1-h buffer</text>
+
+          <rect class="box" x="625" y="195" width="250" height="60" rx="6"/>
+          <text x="750" y="218" text-anchor="middle" font-weight="bold">rule eval + emit</text>
+          <text x="750" y="236" text-anchor="middle" class="lbl">no redundancy yet &mdash; node loss = ~75 s blind</text>
+
+          <rect class="ok" x="950" y="40" width="170" height="70" rx="8"/>
+          <text x="1035" y="68" text-anchor="middle" font-weight="bold">Rule service</text>
+          <text x="1035" y="86" text-anchor="middle" class="lbl">Postgres; broadcast</text>
+
+          <rect class="cool" x="950" y="150" width="170" height="70" rx="8"/>
+          <text x="1035" y="178" text-anchor="middle" font-weight="bold">Alert bus + store</text>
+          <text x="1035" y="196" text-anchor="middle" class="lbl">push; alerts kept 30d</text>
+
+          <line x1="150" y1="190" x2="185" y2="190" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="167" cy="178" r="9" fill="#fff" stroke="#475569"/><text x="167" y="182" text-anchor="middle" font-size="10">1</text>
+          <line x1="345" y1="190" x2="380" y2="190" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="362" cy="178" r="9" fill="#fff" stroke="#475569"/><text x="362" y="182" text-anchor="middle" font-size="10">2</text>
+          <line x1="560" y1="180" x2="600" y2="160" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="580" cy="160" r="9" fill="#fff" stroke="#475569"/><text x="580" y="164" text-anchor="middle" font-size="10">3</text>
+          <line x1="875" y1="150" x2="875" y2="180" stroke="#475569" marker-end="url(#arr0s)"/>
+          <path d="M 900 210 H 950 V 185" fill="none" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="925" cy="210" r="9" fill="#fff" stroke="#475569"/><text x="925" y="214" text-anchor="middle" font-size="10">4</text>
+          <path d="M 1035 110 V 95 H 905" fill="none" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr0d)"/>
+          <circle cx="970" cy="95" r="9" fill="#fff" stroke="#94a3b8"/><text x="970" y="99" text-anchor="middle" font-size="10">5</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / config broadcast; dashed red = hedge / retry (not used).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Host agents &rarr; Collectors</strong> &mdash; <code>POST /v1/samples</code>, LZ4-batched (~20 samples/batch every ~5&nbsp;s per host); collector authenticates the host's mTLS identity. (The per-host token bucket arrives in Iteration&nbsp;3.)</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Collectors &rarr; Kafka</strong> &mdash; for each sample, <code>partition = hash64(series_id) mod 32</code>; produce to topic <code>samples</code> with <code>acks=all</code>, <code>min.insync.replicas=2</code>. The collector holds no state &mdash; it's a hash-and-relay.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Kafka &rarr; Aggregator fleet</strong> &mdash; 16 aggregators, each statically assigned 2 of the 32 partitions (so a series always lands on the same aggregator). The consumer pulls batches and folds each sample into that shard's <code>HashMap&lt;series_id, {deque, 1-h buffer}&gt;</code> &mdash; still the exact LC structures; the sketch swap is Iteration&nbsp;2.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Aggregator &rarr; Alert bus</strong> &mdash; per touched series, evaluate the rules; on a debounced trigger emit <code>ALERT</code> to the bus, which both fans it to the on-call system and appends it to a 30-day store keyed by <code>(series_id, fired_at)</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Rule service &rarr; Aggregators</strong> &mdash; SREs <code>PUT</code> rules; the service bumps a version and broadcasts the new rule set; each aggregator caches it in RAM and applies it on the next sample. Eventual (~5&nbsp;s), not atomic across the fleet.</li>
+        </ul>
+        <p><strong>Delta vs Naive:</strong> the giant single hash-map is split into 16 disjoint shards by <code>series_id</code>; a durable, partitioned Kafka log now sits in front (so a burst is absorbed and a restarting aggregator can replay its partitions); collectors are a thin stateless tier that turns the agent fan-in into the right Kafka partitions. The per-series structures and the rule logic are unchanged.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>Naive's shape-determining failure is <em>state capacity &amp; durability</em>: ~700&nbsp;GB payload / ~1.4&nbsp;TB resident does not fit any box on the menu, and the only single boxes that hold it are a single failure domain with catastrophic GC. (Ingest throughput is borderline and availability is zero, but both are symptoms of &ldquo;it's one box&rdquo; &mdash; the <em>capacity</em> wall is what forbids a one-box answer at all.) Classified <a href="../canonicals/bottlenecks.html#memory-capacity-bound">memory-capacity-bound</a> &mdash; the signal that picks this entry: a derived state size that exceeds a single node's RAM and grows with the key count, not the request rate. Per <a href="../canonicals/bottleneck-to-decisions.html#memory-capacity">bottleneck-to-decisions#memory-capacity</a>: revisit the <em>partition key</em> (can the state be split across nodes?), the <em>data structure</em> (can a bounded sketch replace the exact structure? &mdash; that's Iteration&nbsp;2), and whether a <em>durable log</em> belongs in front (so a restart isn't a data loss). Iteration&nbsp;0 takes the partition-key lever; the durable log comes along for free because once the state is sharded a restarting shard needs <em>something</em> to replay.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Hash-shard the state by <code>series_id</code> across a fleet, with a partitioned Kafka log in front &mdash; chosen.</strong> The state partitions perfectly (200&nbsp;M independent series, no cross-series queries), <code>series_id</code> is a content hash so routing needs no lookup, and Kafka gives the durable replay-able buffer that makes a shard restart survivable. The natural answer for &ldquo;per-key state too big for one node, stream input.&rdquo;</li>
+          <li><strong>One giant box (2&nbsp;TB x2iedn, off-heap state) &mdash; rejected.</strong> Even with off-heap arrays it's one failure domain (a crash or a rolling deploy = a fleet-wide blind spot), it's ~$10&ndash;20k/mo, and it still has no burst buffer. <em>(Constraint-flip: 🔀 if the fleet were ~20&nbsp;M series instead of 200&nbsp;M and the availability target were 99% not 99.9%, a single big box plus a cold standby would be a defensible MVP.)</em></li>
+          <li><strong>Push the per-series state into an external KV store (Redis Cluster / Cassandra), keep the detector stateless &mdash; rejected.</strong> Every sample becomes a read-modify-write round trip to the store &mdash; 20&nbsp;M RMW/s at ~0.5&nbsp;ms each needs the store to do 20&nbsp;M ops/s <em>and</em> the network round trip eats the latency budget; co-locating state with compute (the &ldquo;stateful stream processor&rdquo; pattern: Flink, Samza, Kafka Streams) is dramatically cheaper for this access shape. We'd only externalize state if the per-key state were huge or rarely touched &mdash; neither holds here.</li>
+          <li><strong>Kinesis instead of Kafka &mdash; rejected.</strong> 1&nbsp;MB/s write per shard &rarr; 240&nbsp;MB/s / 1&nbsp;MB/s = 240 Kinesis shards just for ingest, with per-shard limits and resharding ops dominating; Kafka's ~80&nbsp;MB/s+/broker is ~80&times; the per-unit throughput. Cite <a href="../canonicals/storage-engines.html#heap-append">storage-engines#heap-append</a> (the durable-log engine).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p>Insert a partitioned Kafka topic <code>samples</code> (32 partitions &mdash; comfortably more than we need now, so we can grow aggregators without re-partitioning) keyed by <code>series_id</code>, and run a fleet of stateful aggregators, each statically assigned a contiguous subset of partitions. A series' samples always land on the same partition and therefore the same aggregator, which owns that series' state for life. Collectors become a thin stateless tier: receive agent batches, compute <code>hash64(series_id) mod 32</code> per sample, produce. Sizing: <strong>16 aggregators</strong>, each owning 2 partitions, so each holds <code>200M &times; 2/32 = 12.5M</code> series &asymp; <code>12.5M &times; 3.5 KB = ~44 GB</code> of state (~88&nbsp;GB resident with overhead &mdash; comfortable in 128&nbsp;GB) and folds <code>20M &times; 2/32 = 1.25M</code> samples/sec (well under the ~5&nbsp;M/s/node planning capacity). <strong>12 Kafka brokers</strong>: <code>240 MB/s &times; 3 (RF) = 720 MB/s</code> of cluster write &divide; ~80&nbsp;MB/s/broker &asymp; 9, round up to 12 for headroom; topic retention 1&nbsp;hour (enough for a cold aggregator to rebuild its 5-min deques <em>and</em> warm its 1-h baselines) &rarr; <code>240 MB/s &times; 3600 s &times; 3 (RF) &asymp; 2.6 TB</code> across the cluster &asymp; ~220&nbsp;GB/broker on gp3 &mdash; trivial. <strong>~20 collectors</strong> (c7g.4xlarge): 5&nbsp;M agents pushing a batch every ~5&nbsp;s &asymp; 1&nbsp;M batched-push req/s &divide; ~50&nbsp;k req/s/node &asymp; 20. Cite <a href="../canonicals/sharding-strategies.html#hash">sharding-strategies#hash</a> (uniform hash partition &mdash; the access pattern is <a href="../canonicals/access-patterns.html#write-heavy-uniform">write-heavy-uniform</a> over the key space, no inter-key queries) and <a href="../canonicals/storage-engines.html#heap-append">storage-engines#heap-append</a> (Kafka as the durable buffer).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Naive):
+  total_state          = ~700 GB payload / ~1.4 TB resident   -> NOT BUILDABLE on the 512 GB menu box
+  samples/s per node   = 20M on one (oversized) box, ~25M/s effective ceiling -> no headroom
+  recovery (node loss) = infinite (no node to fail over to; nothing durable behind the listener)
+  alert p99            = seconds-to-minutes (TB-heap GC)      -> FAILS 30 s SLO
+  aggregators          = 1 (a 2 TB x2iedn box that still fails avail + latency)
+  $/month              ~ $10-20k  (off the menu; not a real option)
+
+After (Iter 0 -- shard by series_id; Kafka log; stateless collectors):
+  per_series_state     = 3.5 KB (unchanged -- exact deque + 1-h buffer)
+  state per aggregator = 200M x 3.5 KB x 2/32             = ~44 GB  (~88 GB resident) -> fits 128 GB  (delta: now fits!)
+  samples/s per agg    = 20M x 2/32                       = 1.25M/s  (<< ~5M/s capacity) -> 4x headroom
+  recovery (node loss) = re-consume last 5 min of 2 partitions to rebuild deques
+                       = (5 min x 1.25M/s) / ~5M/s replay = 375M / 5M ~= 75 s blind for that 1/16 of series
+  alert p99            = < 1 s (88 GB heap -> sub-second GC; no TB-heap cliff)         -> PASSES 30 s SLO (with margin)
+  aggregators          = 16 x r6i.4xlarge
+  kafka                = 12 x m6i.4xlarge + ~220 GB gp3/broker
+  collectors           = ~20 x c7g.4xlarge
+  $/month  aggregators = 16 x $1.01 x 720                 = $11,635
+           kafka       = 12 x ($0.77 + ~$0.04 EBS) x 720  = $7,002
+           collectors  = ~20 x $0.58 x 720                = $8,352
+           alert store  ~ small (3-node)                  = ~$500
+           TOTAL                                          ~= $27,000/mo   (~$30k, 1 sig fig)
+</code></pre>
+        <p><strong>NFR check:</strong> state capacity &amp; <em>fit</em> ✅ (44&nbsp;GB/node); ingest throughput ✅ (1.25&nbsp;M/s/node, 4&times; headroom; Kafka absorbs the 2&times; burst); alert latency ✅ (no TB-heap GC; sub-second pauses on an 88&nbsp;GB heap &mdash; still GC-pressured, the bucketing fix is Iteration&nbsp;2). <strong>Still failing:</strong> <em>state durability / availability</em> &mdash; no redundant copy; a node loss blinds 1/16 of series for ~75&nbsp;s (re-consume 5&nbsp;min of Kafka), which is &gt; the 30-s SLO for that slice; a rolling deploy has the same blind spot. The cost also <em>rose</em> ~2&times; vs the (non-viable) naive box &mdash; the price of a fleet + a durable log; it will rise again in Iteration&nbsp;1 (the redundant copy) and come back down in Iteration&nbsp;2 (the sketch swap halves the state, so the redundant fleet halves).</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#black-hole-node">Black-hole / lost aggregator</a>.</strong> Blast radius: 1/16 of series &mdash; their windows and baselines vanish. Detection: the partition's Kafka consumer-group goes idle; lag on those 2 partitions climbs. Recovery: a replacement aggregator joins the group, re-consumes the last 5&nbsp;min of those partitions (~75&nbsp;s), is live again. The ~75-s gap is the open wound that Iteration&nbsp;1 closes.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#bad-deploy">Bad deploy</a>.</strong> Rolling the aggregator binary restarts each node &rarr; each restart is a ~75-s blind spot for its 1/16. Across 16 nodes that's ~20&nbsp;min of cumulative partial blindness per deploy &mdash; unacceptable; Iteration&nbsp;1's warm standby makes a restart a sub-second handoff instead.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#backlog-overflow">Backlog overflow</a>.</strong> If an aggregator slows (GC, a checkpoint, a CPU spike), Kafka lag on its partitions grows; with 1-h retention there's an hour of buffer before <em>data</em> is lost, but the <em>freshness</em> SLO is blown within 30&nbsp;s of falling behind. Iteration&nbsp;3 adds the lag-skip that trades completeness for freshness here.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>Two stores are introduced this iteration (C9-bis &mdash; schemas live where the store is born):</p>
+<pre class="line-numbers"><code class="language-sql">-- Kafka topic (the durable sample buffer)
+TOPIC samples:  partitions = 32, replication.factor = 3, min.insync.replicas = 2,
+                retention.ms = 3,600,000, compression.type = lz4,
+                key = series_id (8-byte big-endian);  value = (ts int64, value float64), schema-registry versioned.
+
+-- Rule store (Postgres -- small, control-plane; broadcast to aggregators on change)
+CREATE TABLE rules (
+  rule_id            text PRIMARY KEY,
+  metric_name        text NOT NULL,
+  kind               text NOT NULL,            -- 'threshold' | 'anomaly'
+  static_threshold   double precision,          -- for kind='threshold'
+  sigma_mult         double precision,          -- for kind='anomaly'
+  baseline_window_sec int NOT NULL DEFAULT 3600,
+  severity           text NOT NULL,
+  version            bigint NOT NULL,           -- bumped on every write; aggregators poll/subscribe on this
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX rules_by_metric ON rules (metric_name);
+
+-- Alert store (LSM engine -- write-heavy, time-ordered, TTL'd; Cassandra/ScyllaDB; cite storage-engines#lsm)
+CREATE TABLE alerts (
+  series_id        bigint,
+  fired_at         timestamptz,
+  alert_id         text,                        -- KSUID
+  rule_id          text, kind text, value double precision,
+  baseline_median  double precision, baseline_mad double precision,
+  resolved_at      timestamptz,
+  PRIMARY KEY ((series_id), fired_at)
+) WITH CLUSTERING ORDER BY (fired_at DESC) AND default_time_to_live = 2592000;   -- 30 days
+-- plus a second table alerts_by_host ((host_id), fired_at) for the "show me this host's alerts" view.
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if the rules were <em>dynamic</em> (per-sample-evaluated expressions, not static config)</span></summary>
+        <p>If rules were arbitrary user-supplied expressions evaluated per sample (a la a streaming-query engine), the rule lookup stops being a cached in-RAM read and becomes a join: each sample must find all rules matching its <code>metric_name</code> (and possibly its host's tags). The aggregator would carry a per-metric rule index, and a rule change would need careful versioning so an in-flight batch sees a consistent rule set. The broadcast in connection &#9316; would become a higher-rate stream, and you'd likely shard rules the same way as series so a hot metric's rules don't all live on one node. The window/baseline machinery is unchanged.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 1                                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-1">
+    <div class="container">
+      <h2>Iteration 1 &mdash; Warm standby per shard + periodic checkpoint to object store</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1240 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 1: each of the 8 logical shards now has a primary aggregator and a warm-standby aggregator in a different AZ; the standby consumes the same Kafka partitions in parallel and maintains a shadow copy of the state; a shard manager backed by etcd holds the primary lease and promotes the standby on primary loss; every 30 s (best-effort, given the heavy structures it's coarser in practice) the primary snapshots its state to S3 so a cold replacement can restore. 32 aggregator nodes total (16 primary + 16 standby).">
+          <defs>
+            <marker id="arr1s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arr1r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="170" width="120" height="70" rx="8"/>
+          <text x="80" y="200" text-anchor="middle" font-weight="bold">Collectors</text>
+          <text x="80" y="218" text-anchor="middle" class="lbl">(unchanged)</text>
+
+          <rect class="box" x="175" y="170" width="150" height="70" rx="8"/>
+          <text x="250" y="198" text-anchor="middle" font-weight="bold">Kafka "samples"</text>
+          <text x="250" y="216" text-anchor="middle" class="lbl">32 part, RF=3</text>
+
+          <rect class="box" x="370" y="90" width="240" height="90" rx="8"/>
+          <text x="490" y="118" text-anchor="middle" font-weight="bold">Primary aggregator</text>
+          <text x="490" y="136" text-anchor="middle" class="lbl">owns shard; holds state; emits</text>
+          <text x="490" y="154" text-anchor="middle" class="lbl">AZ-a</text>
+          <text x="490" y="172" text-anchor="middle" class="lbl">(16 of these)</text>
+
+          <rect class="accent" x="370" y="230" width="240" height="90" rx="8"/>
+          <text x="490" y="258" text-anchor="middle" font-weight="bold">Warm standby (NEW)</text>
+          <text x="490" y="276" text-anchor="middle" class="lbl">consumes SAME partitions in parallel</text>
+          <text x="490" y="294" text-anchor="middle" class="lbl">shadow state; AZ-b; promote in ~s</text>
+          <text x="490" y="312" text-anchor="middle" class="lbl">(16 of these)</text>
+
+          <rect class="accent" x="680" y="40" width="180" height="80" rx="8"/>
+          <text x="770" y="68" text-anchor="middle" font-weight="bold">Shard manager (NEW)</text>
+          <text x="770" y="86" text-anchor="middle" class="lbl">etcd leases; fences promote</text>
+          <text x="770" y="104" text-anchor="middle" class="lbl">primary &harr; standby</text>
+
+          <rect class="accent" x="680" y="250" width="180" height="80" rx="8"/>
+          <text x="770" y="278" text-anchor="middle" font-weight="bold">S3 checkpoints (NEW)</text>
+          <text x="770" y="296" text-anchor="middle" class="lbl">~every 30 s (best-effort)</text>
+          <text x="770" y="314" text-anchor="middle" class="lbl">cold-restore source</text>
+
+          <rect class="cool" x="930" y="170" width="170" height="70" rx="8"/>
+          <text x="1015" y="198" text-anchor="middle" font-weight="bold">Alert bus + store</text>
+          <text x="1015" y="216" text-anchor="middle" class="lbl">(unchanged)</text>
+
+          <line x1="140" y1="205" x2="175" y2="205" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="157" cy="193" r="9" fill="#fff" stroke="#475569"/><text x="157" y="197" text-anchor="middle" font-size="10">1</text>
+          <line x1="325" y1="190" x2="370" y2="135" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="345" cy="160" r="9" fill="#fff" stroke="#475569"/><text x="345" y="164" text-anchor="middle" font-size="10">2</text>
+          <line x1="325" y1="220" x2="370" y2="270" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="345" cy="250" r="9" fill="#fff" stroke="#94a3b8"/><text x="345" y="254" text-anchor="middle" font-size="10">3</text>
+          <line x1="610" y1="100" x2="680" y2="80" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <line x1="610" y1="260" x2="680" y2="90" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="645" cy="90" r="9" fill="#fff" stroke="#94a3b8"/><text x="645" y="94" text-anchor="middle" font-size="10">4</text>
+          <line x1="610" y1="150" x2="680" y2="270" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="645" cy="225" r="9" fill="#fff" stroke="#94a3b8"/><text x="645" y="229" text-anchor="middle" font-size="10">5</text>
+          <line x1="490" y1="230" x2="490" y2="180" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arr1r)"/>
+          <circle cx="505" cy="205" r="9" fill="#fff" stroke="#dc2626"/><text x="505" y="209" text-anchor="middle" font-size="10">6</text>
+          <line x1="610" y1="135" x2="930" y2="195" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="770" cy="165" r="9" fill="#fff" stroke="#475569"/><text x="770" y="169" text-anchor="middle" font-size="10">7</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / checkpoint / control; dashed red = failover promotion.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Collectors &rarr; Kafka</strong> &mdash; unchanged from Iteration&nbsp;0.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Kafka &rarr; Primary</strong> &mdash; the primary aggregator for a shard consumes its 2 partitions, folds samples, evaluates rules, emits alerts (the only emitter).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Kafka &rarr; Warm standby</strong> &mdash; a second aggregator in a different AZ consumes the <em>same</em> 2 partitions in parallel and maintains a shadow copy of the state &mdash; it just doesn't emit. Because it sees every sample the primary sees, it is always caught up; &ldquo;tolerate &le; 1 missed sample&rdquo; holds across a promotion.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Primary / standby &rarr; Shard manager</strong> &mdash; the primary holds a short-TTL lease in etcd; the standby watches it. Lease loss (crash, partition, GC longer than the TTL) is the promote signal.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Primary &rarr; S3 checkpoints</strong> &mdash; every ~30&nbsp;s (best-effort; with the heavy exact structures a full snapshot of ~44&nbsp;GB takes longer than 30&nbsp;s, so in practice the cadence is coarser &mdash; Iteration&nbsp;2 fixes this) the primary writes <code>{shard}/{epoch}.snap</code>: the serialized state plus the Kafka offsets consumed at snapshot time. Cold-restore source.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Promote (failover)</strong> &mdash; on lease loss the shard manager fences the old primary (revokes its right to emit) and promotes the standby: it takes the emit role and (if needed) re-reads a few seconds of Kafka to be certain it's at the head. A <em>new</em> standby is then spun up &mdash; if a warm one isn't available, it cold-restores from S3 + replays.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9318; <strong>Primary &rarr; Alert bus</strong> &mdash; unchanged; only the current primary emits, so an alert is never double-fired by the pair.</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;0:</strong> each shard gains a warm standby (a second consumer of the same partitions, in another AZ, shadowing the state) and a periodic S3 checkpoint; a shard manager (etcd-backed leases) arbitrates which of the pair is the emitting primary and fences the loser to prevent split-brain. The aggregator fleet doubles to 32 nodes.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>Iteration&nbsp;0's open wound: a shard owner's loss blinds 1/16 of series for ~75&nbsp;s while a replacement re-consumes 5&nbsp;min of Kafka &mdash; and a rolling deploy multiplies that across all 16 nodes (~20&nbsp;min of cumulative partial blindness). 75&nbsp;s &gt; the 30-s alert SLO for that slice. This is a <em>recovery-time / availability</em> failure: the design has no warm copy, so every recovery is a cold rebuild. It's adjacent to <a href="../canonicals/bottlenecks.html#cold-start">cold-start</a> (the slice is &ldquo;cold&rdquo; after a loss) and to <a href="../canonicals/failure-modes.html#leader-loss">leader-loss</a> in the failure taxonomy. Per <a href="../canonicals/bottleneck-to-decisions.html#cold-start">bottleneck-to-decisions#cold-start</a>: keep a <em>warm replica</em> so failover is a handoff, not a rebuild; <em>checkpoint</em> the state so even a cold start is bounded; <em>fence</em> the old owner to avoid two emitters. Iteration&nbsp;1 does all three &mdash; one coherent move (&ldquo;make recovery fast&rdquo;): warm standby for the common single-node loss, S3 checkpoints for the rarer double loss / scaling / rebalance, lease-fencing for safety.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Warm standby (parallel consume) + S3 checkpoint + etcd lease-fencing &mdash; chosen.</strong> The standby is always caught up because it reads the same log &mdash; failover is sub-second and loses nothing; the checkpoint bounds the cold path; the lease makes &ldquo;exactly one emitter&rdquo; a single atomic fact. Standard for stateful stream processors that can't afford a rebuild gap.</li>
+          <li><strong>Checkpoint-only (no warm standby) &mdash; rejected (but it's the cost knob).</strong> Half the aggregator fleet (16, not 32) &mdash; ~$5.8k/mo cheaper. But a node loss then means a cold restore (download ~44&nbsp;GB + replay since checkpoint) &asymp; ~1&nbsp;min blind for that 1/16 &mdash; and node losses are <em>frequent</em> (spot reclaims, rolling deploys, hardware). 1&nbsp;min &gt; the 30-s SLO for that slice during a routine event. We keep the standby; in S6 we call this out as the explicit cost-vs-availability trade.</li>
+          <li><strong>Replicate state synchronously between the pair on every sample (chain/quorum) instead of parallel-consume &mdash; rejected.</strong> Doubles the per-sample work with a network hop and couples the pair's latency &mdash; a slow standby slows the primary. Parallel-consume decouples them: the standby falling behind is a detectable, fence-able condition, not a primary-side stall.</li>
+          <li><strong>Lean on Kafka Streams / Flink's built-in changelog + checkpointing instead of rolling our own &mdash; a real option.</strong> Flink's keyed state + RocksDB-backed checkpoints + exactly-once would give much of this for free; we'd trade operational simplicity for less control over the failover latency and the on-heap layout. For a 200&nbsp;M-key, 30-s-SLO workload most teams <em>would</em> reach for a managed stream processor here; we describe the mechanism directly so the trade is visible &mdash; the C8 sketch swap in Iteration&nbsp;2 is the same idea inside whichever framework you pick.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p>For each shard, run a <strong>primary</strong> aggregator (in AZ-a) and a <strong>warm standby</strong> (in AZ-b) that consume the same Kafka partitions in parallel; only the primary holds the emit role. The primary holds a short-TTL lease (a few seconds) in <strong>etcd</strong>; if it loses the lease &mdash; crash, network partition, a GC pause longer than the TTL &mdash; the shard manager <em>fences</em> it (revokes emit, so a paused-then-resumed old primary can't double-fire) and <em>promotes</em> the standby, which already has the state and just re-reads a couple of seconds of Kafka to be sure it's at the head: failover &asymp; <strong>~seconds</strong>, zero data loss. A fresh standby is then started; if a warm one isn't on hand it <em>cold-restores</em> from the latest S3 checkpoint and replays Kafka from the checkpoint's offsets. Checkpoints: every ~30&nbsp;s the primary writes its serialized state + consumed offsets to <code>s3://aggr-checkpoints/{shard}/{epoch}.snap</code>, keeping the last 3 (lifecycle-expire older). With the <em>exact</em> structures a full ~44&nbsp;GB snapshot streams in ~3&ndash;4&nbsp;min at a background ~200&nbsp;MB/s &mdash; longer than the 30-s cadence, so checkpoints are best-effort and the cold-restore RPO is effectively a few minutes of baseline state (the 5-min deque is always rebuilt from Kafka regardless). That's the soft spot Iteration&nbsp;2 closes: fixed-size flat structures make a snapshot a <code>memcpy</code>, and incremental checkpoints make it seconds. AZ placement: primary and standby in different AZs, and the checkpoint bucket is cross-AZ-replicated &mdash; a single-AZ loss takes out at most the primaries (or standbys) in that AZ, and their partners in surviving AZs promote.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 0):
+  per_series_state     = 3.5 KB        ; state per aggregator = ~44 GB ; samples/s/agg = 1.25M
+  recovery (node loss) = ~75 s blind for 1/16 (cold re-consume of 5 min Kafka)
+  aggregators          = 16            ; $/month total ~= $27,000
+
+After (Iter 1 -- warm standby + S3 checkpoint + etcd lease):
+  per_series_state     = 3.5 KB        (unchanged)
+  state per aggregator = ~44 GB        (unchanged) ; samples/s/agg = 1.25M (each pair consumes the same 2 partitions)
+  recovery (single node loss) = ~seconds (warm standby promote; zero data loss; <= 1 missed sample holds)  -- delta: 75 s -> ~s
+  recovery (double loss / no warm standby available)
+                       = ckpt_download (44 GB / 1.5 GB/s ~= 30 s) + replay since ckpt (<= a few min of 1.25M/s ~= tens of s)
+                       ~= ~1-2 min  (rare; the warm path is the common case)
+  rolling deploy       = sub-second handoff per node (promote standby, restart old, it becomes the new standby) -- no blind spot
+  AZ loss              = partners in surviving AZs promote; survived  ✅
+  aggregators          = 32 x r6i.4xlarge
+  checkpoint storage   = 8 shards x ~44 GB x keep 3 = ~1.1 TB S3       = ~$25/mo  (+ a few k PUT/day ~ negligible)
+  $/month  aggregators = 32 x $1.01 x 720             = $23,270  (delta: +$11,635 -- the standby tax)
+           kafka        ~ $7,002 (unchanged)
+           collectors   ~ $8,352 (unchanged)
+           S3 ckpt + alert store ~ $525
+           TOTAL                                       ~= $39,000/mo   (~$40k, 1 sig fig)  -- delta: +~$12k
+</code></pre>
+        <p><strong>NFR check:</strong> availability ✅ (single-node loss &rarr; ~seconds via warm standby; AZ loss survived; &le;&nbsp;1 missed sample holds across a promotion); recovery time ✅ for the common case (cold-restore is ~1&ndash;2&nbsp;min but only on a double loss &mdash; rare). State capacity ✅, ingest ✅, alert latency ✅ (carried). <strong>Still soft:</strong> the cold-restore RPO is a few minutes of baseline state because checkpoints of the heavy exact structures are slow; and the per-node ~88&nbsp;GB heap of ~40&nbsp;M small objects is GC-pressured (sub-second pauses, but pauses) and churns as hosts come/go. Both are symptoms of &ldquo;the data structures are too heavy&rdquo; &mdash; Iteration&nbsp;2's job. Cost is now ~$40k/mo, the peak of the arc; the sketch swap brings it back to ~$30k.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#network-partition">Split-brain on a partition</a>.</strong> Primary and standby can't see each other; both think they should emit. Defence: the etcd lease &mdash; emit is gated on holding it; a partition can't grant two leases; the fenced side drops its alerts (and counts them). Blast radius: bounded to a brief overlap window (&lt; the lease TTL); detection: the shard manager sees the lease change; recovery: automatic on partition heal.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#lease-expiry-storm">Lease-expiry storm under a control-plane blip</a>.</strong> If etcd itself hiccups, many primaries can lose their leases at once &rarr; a wave of promotions. Defence: lease TTLs longer than a typical etcd blip; promotions are cheap (warm standbys) and idempotent (the new primary fences and continues); the shard manager rate-limits concurrent promotions. Blast radius: a transient emit gap on the affected shards; detection: promotion-rate metric spikes.</li>
+          <li><strong>Checkpoint storm.</strong> All 8 shards snapshotting at the same wall-clock instant &rarr; an S3 PUT burst + a synchronized CPU/IO spike across the fleet &rarr; latency wobble. Defence: stagger the checkpoint phase across shards (shard <code>i</code> checkpoints at <code>t mod period == i &times; period/8</code>); cap snapshot bandwidth. Blast radius: none if staggered; detection: checkpoint-duration metric.</li>
+          <li><strong>Standby lag.</strong> The standby's consumer falls behind (its node is slower / busier) &rarr; a promote would yield a stale window. Defence: a standby-lag metric per shard; if lag exceeds a threshold the promote path skips the warm standby and goes straight to cold-restore-from-checkpoint (slower but correct); chronically-lagging standbys are rescheduled. Blast radius: a slower-than-ideal failover for that shard; detection: the lag metric.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>One new store (the checkpoint objects); the in-RAM <code>WindowState</code> layout is unchanged this iteration (still the exact deque + ring buffer &mdash; the layout change is Iteration&nbsp;2).</p>
+<pre class="line-numbers"><code class="language-text">S3 object:  s3://aggr-checkpoints/{region}/{shard_id}/{epoch_ms}.snap
+  header:   shard_id, epoch_ms, kafka_offsets[partition -> offset], series_count, format_version
+  body:     for each series in the shard:  series_id (8 B) | deque (varint len + entries) | ring_buffer (360 x f64)
+  lifecycle: keep newest 3 per shard; expire older.   (Iteration 2 replaces body with fixed-size flat arrays + incremental deltas.)
+
+etcd keys:  /shards/{shard_id}/lease   -> {holder_node_id, expires_at}        (the primary lease; TTL ~3-5 s)
+            /shards/{shard_id}/assign  -> {primary_node, standby_node, partitions:[..]}   (the shard manager's view)
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if the SLO were 99.99% instead of 99.9% and recovery had to be &lt;&nbsp;1&nbsp;s always</span></summary>
+        <p>You'd run <em>two</em> warm standbys per shard across three AZs (so an AZ loss still leaves a warm one), make the lease TTL sub-second (faster fence/promote, at the cost of more spurious promotions under GC &mdash; which pushes you harder toward the Iteration&nbsp;2 off-heap layout to eliminate GC pauses), and keep the standby's consumer pinned to a dedicated core so it can never lag. The aggregator fleet would triple, not double. Conversely, at 99% / minutes-OK you'd drop to checkpoint-only (the rejected alternative above) and save the standby tax.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 2                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-2">
+    <div class="container">
+      <h2>Iteration 2 &mdash; Bucketed window-max + t-digest baseline + watermark close (the C8 swap)</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1240 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 2: the per-series in-RAM structure changes from a variable monotonic deque plus a 1-hour sample buffer to a fixed 10-bucket ring of 30-second sub-window maxes plus two rolling t-digests for the baseline, all closed on a 15-second event-time watermark; the structures are flat off-heap arrays so checkpoints are memcpy/incremental and there is no GC; per-series state drops ~3.5 KB to ~1 KB and total state ~700 GB to ~200 GB, so the redundant fleet shrinks from 32 to 16 nodes (8 primary + 8 standby).">
+          <defs>
+            <marker id="arr2s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr2d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="160" width="130" height="80" rx="8"/>
+          <text x="85" y="192" text-anchor="middle" font-weight="bold">Collectors</text>
+          <text x="85" y="210" text-anchor="middle" class="lbl">+ Kafka (unchanged)</text>
+
+          <rect class="box" x="190" y="160" width="150" height="80" rx="8"/>
+          <text x="265" y="188" text-anchor="middle" font-weight="bold">Watermark</text>
+          <text x="265" y="206" text-anchor="middle" class="lbl">wm = max(ts) &minus; 15 s</text>
+          <text x="265" y="224" text-anchor="middle" class="lbl">per partition</text>
+
+          <rect class="accent" x="380" y="50" width="420" height="300" rx="8"/>
+          <text x="590" y="76" text-anchor="middle" font-weight="bold">Aggregator: per-series state (NEW LAYOUT) &mdash; flat, off-heap</text>
+
+          <rect class="accent" x="405" y="100" width="370" height="90" rx="6"/>
+          <text x="590" y="124" text-anchor="middle" font-weight="bold">Bucketed window-max</text>
+          <text x="590" y="142" text-anchor="middle" class="lbl">ring of 10 &times; 30-s buckets; bucket = max(values in it)</text>
+          <text x="590" y="160" text-anchor="middle" class="lbl">window_max = max over the 10 buckets in [now&minus;300s, now]</text>
+          <text x="590" y="178" text-anchor="middle" class="lbl">~100 B/series; O(1) update; memcpy-able</text>
+
+          <rect class="accent" x="405" y="205" width="370" height="90" rx="6"/>
+          <text x="590" y="229" text-anchor="middle" font-weight="bold">Baseline: 2&times; rolling t-digest</text>
+          <text x="590" y="247" text-anchor="middle" class="lbl">current 30-min half + previous half; query merges them</text>
+          <text x="590" y="265" text-anchor="middle" class="lbl">median &amp; MAD from the merged digest; ~800 B/series</text>
+          <text x="590" y="283" text-anchor="middle" class="lbl">mergeable &rarr; primary &harr; standby agree; survives re-shard</text>
+
+          <rect class="accent" x="405" y="310" width="370" height="30" rx="6"/>
+          <text x="590" y="330" text-anchor="middle" class="lbl">rule eval on bucket-seal (wm passes bucket end) &mdash; debounced &rarr; alert bus</text>
+
+          <rect class="cool" x="850" y="80" width="180" height="80" rx="8"/>
+          <text x="940" y="108" text-anchor="middle" font-weight="bold">S3 checkpoints</text>
+          <text x="940" y="126" text-anchor="middle" class="lbl">incremental; ~3 s/shard</text>
+          <text x="940" y="144" text-anchor="middle" class="lbl">flat-array dump</text>
+
+          <rect class="cool" x="850" y="240" width="180" height="80" rx="8"/>
+          <text x="940" y="268" text-anchor="middle" font-weight="bold">Alert bus + store</text>
+          <text x="940" y="286" text-anchor="middle" class="lbl">+ late_dropped metric</text>
+          <text x="940" y="304" text-anchor="middle" class="lbl">(unchanged path)</text>
+
+          <line x1="150" y1="200" x2="190" y2="200" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="170" cy="188" r="9" fill="#fff" stroke="#475569"/><text x="170" y="192" text-anchor="middle" font-size="10">1</text>
+          <line x1="340" y1="200" x2="405" y2="170" stroke="#475569" marker-end="url(#arr2s)"/>
+          <line x1="340" y1="200" x2="405" y2="250" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="372" cy="200" r="9" fill="#fff" stroke="#475569"/><text x="372" y="204" text-anchor="middle" font-size="10">2</text>
+          <line x1="775" y1="145" x2="850" y2="120" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr2d)"/>
+          <circle cx="812" cy="120" r="9" fill="#fff" stroke="#94a3b8"/><text x="812" y="124" text-anchor="middle" font-size="10">3</text>
+          <line x1="775" y1="325" x2="850" y2="280" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="812" cy="300" r="9" fill="#fff" stroke="#475569"/><text x="812" y="304" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async checkpoint; dashed red = (none this iteration).</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Kafka &rarr; Watermark</strong> &mdash; per partition the consumer tracks <code>wm = max(event_ts seen) &minus; 15&nbsp;s</code>; a sample with <code>ts &lt; wm</code> is too late &mdash; it's dropped and <code>late_dropped{series}</code> increments (this is the &ldquo;tolerate &le; 1 missed sample&rdquo; budget, made explicit and counted).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Sample &rarr; per-series state</strong> &mdash; for a sample at <code>ts</code>, value <code>v</code>: find its 30-s bucket <code>b = floor(ts/30) mod 10</code>; if that bucket is still open (its end &ge; <code>wm</code>) set <code>bucket[b] = max(bucket[b], v)</code>; insert <code>v</code> into the current 30-min t-digest. <code>window_max</code> = max over the 10 buckets whose <code>[start,end]</code> overlaps <code>[now&minus;300s, now]</code>. All O(1) / O(log centroids); no allocation.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Aggregator &rarr; S3 checkpoints</strong> &mdash; the state is now <em>flat off-heap arrays</em> (a dense series-index &rarr; a row of 10 floats + two fixed-size digests). A snapshot is a <code>memcpy</code>; an incremental checkpoint ships only the rows touched since the last one. ~3&nbsp;s for a full shard snapshot; sub-second incrementally. Cold-restore RPO drops from minutes to one checkpoint interval.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Rule eval &rarr; Alert bus</strong> &mdash; rules are evaluated when the watermark <em>seals</em> a bucket (its end &lt; <code>wm</code> &mdash; no more updates possible): the now-final <code>window_max</code> is compared to the static threshold and to <code>baseline_median + sigma_mult &times; baseline_mad</code> (median and MAD read from the merged 2&times;-digest). Debounced &rarr; emit / resolve.</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;1:</strong> the per-series structure changes &mdash; a fixed 10-bucket ring of 30-s sub-window maxes replaces the variable monotonic deque; two rolling t-digests (current + previous 30-min half) replace the 1-hour exact sample buffer; everything is closed on a 15-s event-time watermark; the structures are flat off-heap arrays. State drops ~3.5&nbsp;KB &rarr; ~1&nbsp;KB/series, ~700&nbsp;GB &rarr; ~200&nbsp;GB total, so the redundant fleet shrinks 32 &rarr; 16 nodes. Everything outside the aggregator (collectors, Kafka, alert bus, shard manager) is unchanged.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>Three intertwined symptoms of one root cause &mdash; <em>the exact LC structures are too heavy, too fragile, and too order-sensitive for a 200&nbsp;M-series, 30-s-SLO stateful tier</em>: (1) <strong>slow checkpoints</strong> &mdash; serializing ~44&nbsp;GB of ~12.5&nbsp;M variable-size objects takes minutes, so the cold-restore RPO is minutes of baseline state (Iteration&nbsp;1's soft spot); (2) <strong>GC pressure</strong> &mdash; ~40&nbsp;M live small objects per node, plus churn as hosts come and go, means sub-second-but-real pauses and CPU spent collecting, eating into the latency margin and the per-node throughput; (3) <strong>order-sensitivity</strong> &mdash; the textbook monotonic deque assumes in-order arrival, but real metric streams reorder (agent retries, clock skew), and with a 30-s decision deadline you can't wait for stragglers &mdash; the deque has no answer, so &ldquo;tolerate &le; 1 missed sample, nothing silent&rdquo; isn't actually met. This is the C8 moment: the production cousin of the LC #239 deque. Per <a href="../canonicals/bottleneck-to-decisions.html#memory-capacity">bottleneck-to-decisions#memory-capacity</a>: revisit the <em>data structure</em> &mdash; can a bounded sketch replace the exact structure? Yes, for both halves: a bucketed window-max for the sliding max, a t-digest for the baseline quantiles, both closed on a watermark.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Bucketed window-max (10 &times; 30-s buckets) + 2&times; rolling t-digest baseline + 15-s watermark, all in flat off-heap arrays &mdash; chosen.</strong> Fixed size, O(1) update, <code>memcpy</code> checkpoint, no GC, late-tolerant within the watermark, and the digest is mergeable so primary and standby converge and a re-shard can merge digests. The window is quantized to 30&nbsp;s (the window is &ldquo;the last 270&ndash;300&nbsp;s&rdquo; depending on phase) &mdash; well within the &plusmn;30-s tolerance the FRs flag for a 5-minute anomaly window.</li>
+          <li><strong>Fixed-bucket histogram (64 log-spaced buckets, ~256&nbsp;B) instead of a t-digest &mdash; rejected (but it's the cheaper option).</strong> Smaller, simpler, mergeable, O(1) insert &mdash; at the cost of bucket-resolution quantiles (fine for a coarse N&sigma; test, worse if rules later want a precise p95). We pick the t-digest for robustness to skewed / multimodal metric distributions and because it gives <em>all</em> quantiles cheaply; if RAM ever got tight, the histogram is the drop-in downgrade. Cite <a href="../canonicals/sketches.html#t-digest">sketches#t-digest</a> (and <a href="../canonicals/sketches.html#dd-sketch">#dd-sketch</a> for the relative-error variant).</li>
+          <li><strong>P&sup2; estimator (median only, ~5 markers, ~120&nbsp;B) + EWMA mean/var for &sigma; &mdash; rejected.</strong> Tiny, but not mergeable (so primary and standby can drift) and gives only the one quantile you ask for &mdash; no headroom for richer rules. We note it as the absolute-minimum-state option.</li>
+          <li><strong>Keep the exact deque + buffer but move them off-heap (arenas, manual layout) &mdash; rejected.</strong> Kills the GC pause but not the slow checkpoint (still variable-size, still ~44&nbsp;GB to serialize) and not the order-sensitivity. Half a fix.</li>
+          <li><strong>Bigger buckets (60&nbsp;s &times; 5) &mdash; rejected.</strong> Halves the window state and the digest-touch rate but doubles the window slop to &plusmn;60&nbsp;s &mdash; out of tolerance for a 5-min window. (Smaller buckets &mdash; 15&nbsp;s &times; 20 &mdash; would be tighter but doubles the per-series window state for a precision the FRs don't need.)</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p><strong>Sliding-window max &rarr; bucketed window-max.</strong> Divide time into fixed 30-s buckets; per series keep a ring of 10 buckets covering the last 300&nbsp;s, each holding the max of the values that fell in it (plus the ring's head index and the head bucket's end-timestamp). Update: <code>bucket[floor(ts/30) mod 10] = max(&hellip;, v)</code> if the bucket is still open. Read: <code>window_max</code> = max over the buckets overlapping <code>[now&minus;300s, now]</code>. ~100&nbsp;B/series, O(1) update, O(10) read, and &mdash; the point &mdash; a flat array indexed by a dense series index, so a checkpoint is a <code>memcpy</code> and there are no heap objects to collect. Late sample within 30&nbsp;s of now? It still updates its bucket. Later than the 15-s watermark? Dropped, <code>late_dropped</code>++.</p>
+        <p><strong>1-hour exact buffer &rarr; 2&times; rolling t-digest.</strong> Maintain two t-digests per series &mdash; one for the current 30-minute half-hour, one for the previous &mdash; and rotate (drop the older, start a fresh current) every 30&nbsp;min; a baseline query merges the two and reads the median and the MAD (the latter from a small companion digest of <code>|v &minus; running_median|</code>, or computed from quantiles). At compression ~25 centroids each that's ~2 &times; ~400&nbsp;B &asymp; ~800&nbsp;B/series &mdash; ~3.5&times; smaller than the 2.88&nbsp;KB exact buffer, but the size win is the lesser point: it's that the digest is <strong>mergeable</strong> (primary and standby, both inserting the same samples, stay in agreement; a re-shard merges digests), <strong>bounded regardless of sample rate</strong> (a runaway host emitting 1&nbsp;kHz can't blow the per-series buffer &mdash; the digest caps at 25 centroids), and <strong>all-quantile</strong> (median, MAD, p95, &hellip; all available without sorting a buffer). Cite <a href="../canonicals/sketches.html#t-digest">sketches#t-digest</a>.</p>
+        <p><strong>Watermark close.</strong> Per partition, <code>wm = max(event_ts seen) &minus; 15&nbsp;s</code>; a bucket whose end <code>&lt; wm</code> is <em>sealed</em> &mdash; no more updates &mdash; and the rule is evaluated on the now-final <code>window_max</code>. A sample arriving with <code>ts &lt; wm</code> is too late: dropped + counted, never silently absorbed-or-lost. 15&nbsp;s of watermark slack on a 30-s budget leaves 15&nbsp;s for the collector &rarr; Kafka &rarr; consumer &rarr; rule &rarr; bus path &mdash; comfortable. Re-size the fleet: state is now ~1&nbsp;KB/series &rarr; ~200&nbsp;GB total &rarr; ~4 nodes for RAM (off-heap, ~50&nbsp;GB usable per 128&nbsp;GB node) and ~4 nodes for CPU (20&nbsp;M/s &divide; ~5&nbsp;M/s), so <strong>8 primary + 8 standby = 16 aggregators</strong>, each owning 4 of the 32 partitions (~25&nbsp;GB state, ~2.5&nbsp;M samples/s &mdash; 2&times; CPU headroom). The standby tax halved because the state halved.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 1):
+  per_series_state     = 3.5 KB (deque 480 B + 1-h buffer 2,880 B + ~150 B)  ; total ~700 GB ; ~88 GB resident/node
+  aggregators          = 32 (16 primary + 16 standby) ; ~44 GB state/node ; 1.25M samples/s/node
+  checkpoint           = ~3-4 min full snapshot (heavy variable-size structures) -> cold-restore RPO ~ minutes of baseline
+  alert latency        = < 1 s GC pauses but GC-pressured (~40M live objects/node)
+  $/month total        ~= $39,000
+
+After (Iter 2 -- bucketed window-max + 2x t-digest + 15-s watermark; flat off-heap):
+  per_series_state     = ~100 B (10x30s buckets) + ~800 B (2 x ~25-centroid t-digest) + ~100 B (dense-index slot) ~= 1 KB
+                         (delta: 3.5 KB -> ~1 KB, ~3.5x smaller; and resident ~= payload, no 2x heap overhead)
+  total_state          = 200M x 1 KB = ~200 GB     (delta: 700 GB -> 200 GB)
+  aggregators          = ceil(max(200 GB / 50 GB, 20M / 5M)) x (1+0.5) ~= ceil(max(4, 4)) x 1.5 -> 8 primary + 8 standby = 16
+  state per aggregator = 200M x 1 KB x 4/32 = ~25 GB ; samples/s/node = 20M x 4/32 = 2.5M  (<< 5M -> 2x headroom)
+  checkpoint           = full = 25 GB memcpy-stream / ~1 GB/s ~= ~3 s ; incremental (dirty rows) = sub-second; every 30 s
+  recovery (cold)      = ckpt_download (25 GB / 1.5 GB/s ~= 17 s) + replay since ckpt (<= 30 s of 2.5M/s ~= 15 s) ~= ~30 s
+                         -> finally inside the 30-s SLO even for the rare double-loss; warm standby still the common ~s path
+  GC                   = none (flat off-heap arrays) -> alert-latency margin no longer eroded by collection
+  late handling        = sample older than wm -> dropped + late_dropped++ ; <= 1 missed sample budget now explicit + counted
+  $/month  aggregators = 16 x $1.01 x 720             = $11,635  (delta: -$11,635 -- standby tax halved with the state)
+           kafka        ~ $7,002 (unchanged) ; collectors ~ $8,352 (unchanged) ; S3 ckpt + alert store ~ $525
+           TOTAL                                       ~= $27,000/mo   (~$30k, 1 sig fig)  -- delta: -~$12k, back to the Iter-0 level
+</code></pre>
+        <p><strong>NFR check:</strong> state capacity ✅✅ (~200&nbsp;GB &mdash; tiny relative to fleet RAM; CPU is now the binding dimension); alert latency ✅ (no GC cliff; 15-s watermark + 15-s pipeline &le; 30&nbsp;s end-to-end); recovery time ✅ (warm ~s; cold ~30&nbsp;s &mdash; finally inside the SLO); correctness ✅ (watermark bounds lateness; the &le;&nbsp;1-missed-sample budget is the <code>late_dropped</code> count, never silent; mergeable digests keep the pair in agreement); availability ✅ (carried from Iteration&nbsp;1, now with a fast cold path too). <strong>Still open:</strong> a slow alert sink, or a runaway host whose 40 series cluster on one or two partitions, can still grow a backlog and bleed blast radius &mdash; Iteration&nbsp;3 bounds those.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong><a href="../canonicals/failure-modes.html#clock-skew">Clock skew on host agents</a>.</strong> An agent whose clock is 2&nbsp;min fast stamps samples in the future; <code>max(ts)</code> jumps, the watermark jumps, and buckets seal early &mdash; later (correctly-timed) samples for other series on the same partition now look &ldquo;late.&rdquo; Defence: clamp accepted <code>ts</code> to <code>[now &minus; W_baseline, now + small]</code> at the collector; track per-partition watermark from <em>clamped</em> timestamps; alert on hosts with persistent skew. Blast radius: a partition's watermark wobble; detection: a <code>clock_skew{host}</code> metric.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#poison-message">Poison sample</a>.</strong> A malformed or NaN value, or a metric whose units changed mid-stream, corrupts a bucket-max or a digest. Defence: validate at the collector (finite, in a sane range for the metric); a per-series &ldquo;digest looks degenerate&rdquo; guard that resets that series' baseline and emits a metric rather than firing garbage anomalies. Blast radius: one series; detection: a validation-reject metric.</li>
+          <li><strong>Watermark stall.</strong> A partition stops receiving samples (all its hosts went quiet, or a collector died) &rarr; <code>max(ts)</code> stops advancing &rarr; the watermark freezes &rarr; buckets never seal &rarr; no alerts for that slice &mdash; a <em>false silence</em>. Defence: a wall-clock fallback &mdash; if no sample for &gt; some bound, advance the watermark on processing time and emit a <code>partition_idle</code> metric (an idle partition is itself worth alerting on). Blast radius: 1/32 of series go quiet; detection: the idle metric.</li>
+          <li><strong>Bucket aliasing across a checkpoint restore.</strong> A cold-restored aggregator must reconstruct &ldquo;which bucket is current&rdquo; from the checkpoint's epoch + the replayed samples; an off-by-one would shift the window. Defence: the checkpoint stores the head bucket's absolute end-timestamp, not just an index; restore recomputes the ring position from wall-clock + replayed <code>max(ts)</code>. Tested in the recovery drill.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>No external API change. The in-RAM <code>WindowState</code> layout and the checkpoint body change:</p>
+<pre class="line-numbers"><code class="language-text">// Per-series state (flat, off-heap; indexed by a dense u32 series-index that the aggregator assigns on first sight):
+struct WindowState {            // ~1 KB
+  bucket_max:  [f64; 10]        // ring of 30-s sub-window maxes        80 B
+  head_idx:    u8               // which slot is the current bucket
+  head_end_ms: i64              // absolute end-ts of the current bucket  -> reconstructable after restore
+  digest_cur:  TDigest<25>      // current 30-min half                  ~400 B
+  digest_prev: TDigest<25>      // previous 30-min half                 ~400 B
+  mad_digest:  TDigest<16>      // |v - running_median| for MAD          ~200 B  (or derive MAD from quantiles -> drop this)
+  rotate_at_ms: i64             // when to rotate cur->prev
+}
+// Checkpoint body becomes: kafka_offsets[..] | series_index_map (series_id -> u32) | flat arrays of WindowState rows.
+// Incremental checkpoint: a dirty-bitmap over series-indices + the changed rows since the last full snapshot.
+</code></pre>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>C8 &mdash; LC kernel &rarr; production cousin.</strong> The LC #239 monotonic deque is exact, variable-size, in-RAM-only, and assumes an in-order stream. At 200&nbsp;M series with a 30-s recovery SLO and out-of-order arrivals, every one of those properties is a liability. The cousin: a <em>fixed 10-bucket ring of sub-window maxes</em> (exactness traded for &plusmn;30-s window slop, in exchange for <code>memcpy</code> checkpoints, zero GC, and late-tolerance) plus a <em>mergeable t-digest</em> for the baseline quantiles the deque never provided, both <em>closed on a watermark</em> so the decision is bounded in time. The full property-trade table is in S6.</p>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if rules needed the <em>exact</em> sliding-window max (e.g., a billing or SLA-credit gate, not an alert)</span></summary>
+        <p>You'd keep the monotonic deque (the &plusmn;30-s slop is unacceptable for a contractual number) but still move it off-heap into an arena and pair it with a durable changelog (every deque op appended to a per-shard Kafka changelog topic, compacted) so a restore replays the changelog instead of re-deriving from raw samples &mdash; trading the checkpoint problem for a changelog-replay problem, which is bounded by the deque's small size. The baseline half would still go to a t-digest (no exactness need there). The fleet wouldn't shrink as much (the deque is small but the changelog write is extra IO).</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- ITER 3                                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-3">
+    <div class="container">
+      <h2>Iteration 3 &mdash; Backpressure &amp; load-shedding: bounded alert queue, per-host rate cap, lag-skip</h2>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1240 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 3: the collector gains a per-host token bucket (a runaway host is sampled down 1-in-K and an auto-alert goes to its owner); the aggregator's Kafka consumer watches per-partition lag and fast-forwards to the head when lag exceeds the 30-s budget rather than grinding through stale samples; the outbound alert path has a bounded in-RAM queue that spills to a local disk-backed queue when the sink slows and, beyond a hard cap, coalesces re-fires for an already-firing series while never dropping a first-fire. No fleet-size change.">
+          <defs>
+            <marker id="arr3s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arr3r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="160" width="120" height="80" rx="8"/>
+          <text x="80" y="192" text-anchor="middle" font-weight="bold">Host agents</text>
+          <text x="80" y="210" text-anchor="middle" class="lbl">incl. a runaway host</text>
+
+          <rect class="accent" x="180" y="150" width="170" height="100" rx="8"/>
+          <text x="265" y="176" text-anchor="middle" font-weight="bold">Collector + token bucket (NEW)</text>
+          <text x="265" y="194" text-anchor="middle" class="lbl">per-host budget; over &rarr; 1-in-K sample-down</text>
+          <text x="265" y="212" text-anchor="middle" class="lbl">+ rate_capped{host} metric &amp; auto-alert</text>
+          <text x="265" y="230" text-anchor="middle" class="lbl">+ ts clamp, value validate</text>
+
+          <rect class="box" x="385" y="160" width="130" height="80" rx="8"/>
+          <text x="450" y="192" text-anchor="middle" font-weight="bold">Kafka "samples"</text>
+          <text x="450" y="210" text-anchor="middle" class="lbl">(unchanged)</text>
+
+          <rect class="accent" x="550" y="60" width="370" height="280" rx="8"/>
+          <text x="735" y="86" text-anchor="middle" font-weight="bold">Aggregator (NEW shedding paths)</text>
+
+          <rect class="box" x="575" y="105" width="320" height="60" rx="6"/>
+          <text x="735" y="128" text-anchor="middle" font-weight="bold">consumer + lag-skip</text>
+          <text x="735" y="146" text-anchor="middle" class="lbl">lag &gt; 30 s &rarr; fast-forward to now&minus;W&minus;slack; lag_skip++</text>
+
+          <rect class="box" x="575" y="175" width="320" height="55" rx="6"/>
+          <text x="735" y="197" text-anchor="middle" font-weight="bold">bucketed window-max + t-digest + rule eval</text>
+          <text x="735" y="215" text-anchor="middle" class="lbl">(from Iter 2)</text>
+
+          <rect class="box" x="575" y="240" width="320" height="80" rx="6"/>
+          <text x="735" y="263" text-anchor="middle" font-weight="bold">bounded alert queue (NEW)</text>
+          <text x="735" y="281" text-anchor="middle" class="lbl">RAM cap &rarr; spill to local disk queue &rarr; hard cap</text>
+          <text x="735" y="299" text-anchor="middle" class="lbl">beyond cap: coalesce re-fires; never drop a first-fire</text>
+
+          <rect class="cool" x="965" y="100" width="170" height="70" rx="8"/>
+          <text x="1050" y="128" text-anchor="middle" font-weight="bold">Alert bus / sink</text>
+          <text x="1050" y="146" text-anchor="middle" class="lbl">may slow / 429</text>
+
+          <rect class="ok" x="965" y="240" width="170" height="70" rx="8"/>
+          <text x="1050" y="268" text-anchor="middle" font-weight="bold">Host-owner alert</text>
+          <text x="1050" y="286" text-anchor="middle" class="lbl">"your agent is noisy"</text>
+
+          <line x1="140" y1="200" x2="180" y2="200" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="160" cy="188" r="9" fill="#fff" stroke="#475569"/><text x="160" y="192" text-anchor="middle" font-size="10">1</text>
+          <line x1="350" y1="200" x2="385" y2="200" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="367" cy="188" r="9" fill="#fff" stroke="#475569"/><text x="367" y="192" text-anchor="middle" font-size="10">2</text>
+          <line x1="515" y1="195" x2="575" y2="135" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="545" cy="165" r="9" fill="#fff" stroke="#475569"/><text x="545" y="169" text-anchor="middle" font-size="10">3</text>
+          <line x1="895" y1="275" x2="965" y2="145" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="930" cy="210" r="9" fill="#fff" stroke="#475569"/><text x="930" y="214" text-anchor="middle" font-size="10">4</text>
+          <line x1="965" y1="160" x2="895" y2="290" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arr3r)"/>
+          <circle cx="930" cy="240" r="9" fill="#fff" stroke="#dc2626"/><text x="930" y="244" text-anchor="middle" font-size="10">5</text>
+          <line x1="350" y1="225" x2="965" y2="270" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="657" cy="248" r="9" fill="#fff" stroke="#94a3b8"/><text x="657" y="252" text-anchor="middle" font-size="10">6</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / out-of-band metric; dashed red = backpressure signal (429) / shed.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Host agents &rarr; Collector</strong> &mdash; same protocol; now the collector also clamps <code>ts</code>, validates <code>value</code>, and meters per host.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Collector &rarr; Kafka</strong> &mdash; only the within-budget samples are produced; samples shed by the token bucket increment <code>rate_capped{host}</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Kafka &rarr; consumer (lag-skip)</strong> &mdash; the consumer watches per-partition lag; if the head sample is &gt; ~25&nbsp;s old (i.e., it can't be acted on within the 30-s SLO) it fast-forwards the offset to <code>now &minus; W &minus; slack</code> &mdash; re-reading only the last ~5&nbsp;min, enough to rebuild the window &mdash; and increments <code>lag_skip{partition}</code>. Freshness over completeness, by the SLO's own terms.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Aggregator &rarr; Alert bus</strong> &mdash; alerts go through a bounded in-RAM queue (~100&nbsp;k); on overflow they spill to a local disk-backed queue (durable, replayed when the sink recovers) with a hard cap (~10&nbsp;M); beyond <em>that</em>, for a given <code>(series, rule)</code> only the latest &ldquo;still-firing&rdquo; entry is kept and intermediate re-fires are coalesced &mdash; a first-fire for a series is <em>never</em> dropped.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Alert bus &rarr; aggregator (429 / slow)</strong> &mdash; the sink signalling backpressure (429, rising latency) is what triggers the spill-to-disk; the aggregator never blocks its consumer on a slow sink.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Collector &rarr; Host-owner alert</strong> &mdash; a host that's persistently over its sample budget gets an auto-alert to its owning team (&ldquo;your agent is emitting 100&times; normal &mdash; fix it&rdquo;); the cap protects everyone else's freshness while the human loop fixes the source.</li>
+        </ul>
+        <p><strong>Delta vs Iteration&nbsp;2:</strong> three bounded shedding paths &mdash; a per-host token bucket at the collector, a lag-skip in the aggregator's consumer, and a bounded-then-spilling-then-coalescing alert queue on the way out &mdash; plus collector-side <code>ts</code>/<code>value</code> sanitisation. No new tier, no fleet-size change; +a small local SSD per aggregator for the spill queue.</p>
+      </div>
+
+      <div>
+        <h3>Bottleneck</h3>
+        <p>Three paths to a runaway backlog, all of which currently let one problem bleed into a wider blast radius: (a) the <strong>alert sink slows or 429s</strong> &rarr; alerts queue in the aggregator &rarr; unbounded RAM growth &rarr; OOM or the consumer stalls &rarr; that whole shard goes blind &mdash; a slow downstream takes out the detector; (b) a <strong>misconfigured agent on one host emits 100&times; normal</strong> (a debug build, a metric-cardinality bug) &rarr; that host's 40 series cluster on one or two partitions &rarr; that aggregator's consumer lag grows &rarr; its <em>other</em> series go stale &mdash; one bad host blinds a 1/8 slice; (c) a <strong>transient aggregator slowdown</strong> (a deploy, a checkpoint, a GC&mdash;rare now&mdash;a CPU spike) &rarr; lag spikes &rarr; samples pile up in Kafka &rarr; on recovery it's processing 2-min-old samples it can't act on within the SLO anyway. Classified <a href="../canonicals/bottlenecks.html#backlog-growth">backlog-growth</a> &mdash; the signal: a queue depth (Kafka lag, the alert queue) that grows faster than it drains; the cliff: OOM / consumer stall / a freshness SLO blown the instant you fall behind. Per <a href="../canonicals/bottleneck-to-decisions.html#backlog">bottleneck-to-decisions#backlog</a>: <em>bound every queue</em>; <em>shed at the edge</em> (admission control on the producer); <em>shed by recency</em> (drop or coalesce the stale work, not the fresh work); <em>signal the source</em> (so the human loop can fix it). One coherent move &mdash; &ldquo;shed, don't topple&rdquo; &mdash; applied at all three choke points.</p>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Bounded queues + disk-spill + coalesce-on-overflow (alerts) + per-host token bucket (ingest) + lag-skip (consumer) &mdash; chosen.</strong> Every path that could grow without bound is given a bound and a defined behaviour at that bound that preserves the thing that matters (first-fires, freshness) and sheds the thing that doesn't (re-fires, stale samples), while emitting a metric so the bound being hit is visible. Standard &ldquo;graceful degradation&rdquo; engineering.</li>
+          <li><strong>Just provision for the worst case (size the fleet for a fleet-wide debug-build burst) &mdash; rejected.</strong> The worst case for a misconfigured agent is unbounded (an infinite loop emitting metrics); you can't provision against it &mdash; you can only cap it. And provisioning for it would multiply the bill for an event that should be fixed at the source in minutes.</li>
+          <li><strong>Drop the <em>oldest</em> alerts on overflow (FIFO eviction) instead of coalescing re-fires &mdash; rejected.</strong> The oldest alert might be a series' first-fire &mdash; the one the on-call must see. Coalescing keeps every series' &ldquo;is it firing right now&rdquo; truth and drops only the redundant ticks; first-fires are sacrosanct.</li>
+          <li><strong>Block the consumer on a slow sink (apply backpressure all the way to Kafka) &mdash; rejected.</strong> That trades a bounded alert delay for an <em>unbounded</em> freshness loss on <em>every</em> series in the shard &mdash; far worse. The detector must stay current; alerts that can't be delivered now are spilled and delivered later, but the windows keep updating.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The chosen move</h3>
+        <p><strong>(a) Bounded alert queue &rarr; disk spill &rarr; coalesce.</strong> The aggregator's outbound alert path is a bounded in-RAM ring (~100&nbsp;k entries); when the sink is keeping up this is nearly empty. When the sink slows / 429s, the ring spills to a local disk-backed queue (durable, ordered, replayed when the sink recovers) with a hard cap (~10&nbsp;M entries &asymp; hours of alerts). Beyond that hard cap &mdash; a sink down for hours &mdash; the queue switches to <em>coalesce mode</em> for re-fires: for each <code>(series, rule)</code> it keeps only the latest still-firing entry and drops intermediate re-fires; a <em>first</em> firing for any <code>(series, rule)</code> is never coalesced away. Degradation contract: a slow sink degrades the alert <em>stream</em> to &ldquo;delayed, and re-fire-deduplicated&rdquo; &mdash; never &ldquo;lost a first alert&rdquo; and never &ldquo;aggregator OOM.&rdquo; Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a>.</p>
+        <p><strong>(b) Per-host token bucket at the collector.</strong> Each host gets a sample budget (e.g., ~200 samples/s &mdash; 40 metrics &times; a generous 5/s &mdash; tier-able by host class so a busy DB host with 200 metrics gets a bigger bucket). Over budget &rarr; sample down 1-in-K, increment <code>rate_capped{host}</code>, and (on a sustained breach) auto-alert the host's owning team. This is &ldquo;tolerate &le; 1 missed sample&rdquo; generalised: a pathological producer is <em>throttled</em>, not allowed to starve everyone else's freshness; the human loop fixes the source. (Contrast #20's rate limiter, where the limit is the product; here it's self-defence.)</p>
+        <p><strong>(c) Consumer lag-skip.</strong> The aggregator's Kafka consumer watches per-partition lag; if the head sample is &gt; ~25&nbsp;s old &mdash; it physically cannot be acted on within the 30-s SLO &mdash; the consumer fast-forwards its offset to <code>now &minus; W &minus; slack</code> (~5&nbsp;min back), re-reading only enough to rebuild the window, and increments <code>lag_skip{partition}</code>. An explicit <em>freshness-over-completeness</em> trade that the &ldquo;decision &le; 30&nbsp;s&rdquo; and &ldquo;tolerate &le; 1 missed sample&rdquo; NFRs license &mdash; and a chronically-skipping partition is a capacity alarm (page on the <code>lag_skip</code> rate), not a silent data loss. <strong>No fleet-size change</strong> &mdash; this iteration adds logic and a small local spill volume (~50&nbsp;GB gp3 per aggregator), not capacity. Cost &asymp; unchanged at ~$27k/mo (+~$60/mo for the spill volumes).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Numbers (re-derive the chain)</h3>
+<pre class="line-numbers"><code class="language-text">Before (Iter 2):
+  per_series_state = ~1 KB ; total ~200 GB ; aggregators = 16 (8 primary + 8 standby) ; 2.5M samples/s/node
+  unbounded paths:  alert queue (vs slow sink), consumer lag (vs hot host / transient slowdown)  -> blast radius bleeds
+  $/month total    ~= $27,000
+
+After (Iter 3 -- bounded alert queue + disk spill + coalesce ; per-host token bucket ; lag-skip):
+  per_series_state = ~1 KB (unchanged) ; total ~200 GB (unchanged) ; aggregators = 16 (unchanged) ; 2.5M/s/node (unchanged)
+  alert path        = bounded RAM ring (~100k) -> disk-spill (~10M, hours of alerts) -> coalesce re-fires (first-fires never dropped)
+  ingest path       = per-host token bucket: over budget -> 1-in-K sample-down + rate_capped{host} + owner auto-alert
+  consumer path     = lag > 30 s budget -> fast-forward to now-W-slack ; lag_skip{partition}++ ; page on lag_skip rate
+  loss accounting   = late_dropped (Iter 2) + rate_capped + lag_skip + produce_failed -- these ARE the "<= 1 missed" budget; all counted, none silent
+  spill storage     = 16 x ~50 GB gp3 = ~800 GB                 = ~$64/mo
+  $/month  aggregators ~ $11,635 (unchanged) ; kafka ~ $7,002 ; collectors ~ $8,352 ; S3 ckpt + alert store ~ $525 ; spill ~ $64
+           TOTAL                                                ~= $27,000/mo   (~$30k, 1 sig fig)  -- delta: ~+$60/mo
+</code></pre>
+        <p><strong>NFR check:</strong> availability ✅ (a slow sink or a runaway host can no longer take down a shard &mdash; everything is bounded); alert latency ✅ (lag-skip preserves freshness; the design <em>prefers</em> a fresh-but-incomplete decision to a stale-but-complete one, which is exactly what a 30-s decision SLO asks for); correctness ✅ within the stated tolerance (the &le;&nbsp;1-missed-sample budget is now the sum of four named, counted shed-counters &mdash; <code>late_dropped</code> + <code>rate_capped</code> + <code>lag_skip</code> + <code>produce_failed</code> &mdash; never a silent loss); state/throughput/recovery ✅ (carried). All five NFRs from S0 are now met within budget. <strong>Beyond Core:</strong> multi-region, multi-tenant SaaS, in-shard hot keys, and doing the 30-day retention properly are the probe iterations below.</p>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Spill-queue exhaustion.</strong> The sink down for many hours &rarr; the ~10&nbsp;M-alert disk cap is hit &rarr; coalesce mode &rarr; re-fire granularity is lost (you still learn &ldquo;X is firing,&rdquo; just not every tick) but first-fires survive. Detection: a <code>spill_depth</code> metric; recovery: drain on sink recovery (ordered replay), or, if the on-call console is down too, the alerts are still on disk for forensic replay.</li>
+          <li><strong>Rate-cap false positive.</strong> A legitimately high-cardinality host (a busy hypervisor with 200 metrics) gets throttled because its budget is the default. Defence: per-host-class budgets (tiers), and the auto-alert to the owner doubles as the path to request a higher tier; the cap errs on the side of protecting the fleet. Detection: <code>rate_capped</code> on a host that's known-large.</li>
+          <li><strong>Lag-skip masking a real under-provisioning.</strong> If <code>lag_skip</code> fires constantly, the fleet is too small &mdash; but skipping keeps it from <em>looking</em> broken (it stays current by skipping). Defence: page on the <code>lag_skip</code> <em>rate</em>, not just on lag; lag-skip is a relief valve, not a capacity strategy.</li>
+          <li><strong><a href="../canonicals/failure-modes.html#retry-storm">Agent retry storm</a> (averted).</strong> Worth noting what we <em>don't</em> do: the agent's <code>POST</code> is fire-and-forget &mdash; on a 429/503 it drops the batch and counts it, it does <em>not</em> retry. 5&nbsp;M agents retrying a degraded collector tier would be a self-inflicted DDoS; the &ldquo;tolerate &le; 1 missed sample&rdquo; budget is precisely what buys us the right to not retry. Cite <a href="../canonicals/failure-modes.html#retry-storm">failure-modes#retry-storm</a> for the anti-pattern we're sidestepping.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema / API delta</h3>
+        <p>No external API change (the agent's <code>202 / 429 / 503</code> contract from S2 is exactly the backpressure handshake this iteration leans on). New per-aggregator local store: the disk-backed spill queue (an append-only log file with a head/tail pointer, ~50&nbsp;GB cap, fsync'd on spill). New control-plane config: per-host-class sample budgets in the rule service (or a sibling config table).</p>
+<pre class="line-numbers"><code class="language-sql">CREATE TABLE host_budgets (
+  host_class       text PRIMARY KEY,        -- 'standard' | 'hypervisor' | 'edge' | ...
+  samples_per_sec  int NOT NULL,
+  burst_factor     double precision NOT NULL DEFAULT 2.0,
+  version          bigint NOT NULL
+);
+-- collectors cache this; a host's class comes from its mTLS identity / inventory; default = 'standard'.
+</code></pre>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>🔀 Constraint flip <span style="font-weight:normal;">&mdash; if losing <em>any</em> sample were unacceptable (at-least-once, not at-most-once)</span></summary>
+        <p>The lag-skip is gone (you can't skip), the agent must retry on 429 (with jittered exponential backoff and a client-side bounded buffer so the retry is itself bounded), the collector can't sample-down a runaway host (it must instead push back to that host's agent so the agent buffers), and Kafka retention must be long enough to never drop an un-consumed sample (so the aggregator's lag, not the retention, is the only place a sample can be &ldquo;late&rdquo;). The detector would then have a <em>backlog</em> instead of a <em>blind spot</em> under stress &mdash; trading freshness for completeness &mdash; which is the right trade only if the samples feed something contractual (billing, SLA credits), not an alert.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- PROBES                                                         -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="probes">
+    <div class="container">
+      <h2>Probe iterations <span style="font-weight:normal;font-size:0.7em;">(the interviewer pulls the thread &mdash; beyond the 5-Core budget)</span></h2>
+      <p>Each in a <code>&lt;details&gt;</code> block; same NFR-driven structure, one level deeper.</p>
+
+      <details>
+        <summary>Probe A &mdash; Multi-region (the provider runs hosts in ~20 regions)</summary>
+        <p><strong>Bottleneck.</strong> A single global aggregator fleet would have to ingest samples cross-region: ~240&nbsp;MB/s of inter-region traffic &asymp; <code>240&nbsp;MB/s &times; 86,400 &times; 30 &asymp; 622&nbsp;TB/mo &times; ~$0.02/GB &asymp; ~$12k/mo</code> in egress alone &mdash; and a region-down event would still need the global fleet to keep working, making the home region a single point of failure for everyone's alerting. Classified <a href="../canonicals/bottlenecks.html#cross-region">cross-region</a>.</p>
+        <p><strong>Move.</strong> <em>Per-region aggregator fleets</em> &mdash; a series belongs to one host in one region, so the natural partition is region-then-<code>series_id</code>; there are no cross-region series. A thin <em>global alert aggregator</em> simply unions the per-region alert streams (alerts are tiny &mdash; KB/s, not MB/s) so the on-call sees one feed. DR: a region's checkpoints replicate to a bucket in a designated buddy region (~200&nbsp;GB &times; cross-region-storage ~$0.02/GB-mo &asymp; trivial), so a whole-region loss is reconstituted elsewhere in minutes (acceptable for a region-down). Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a> and <a href="../canonicals/cross-cutting.html#cells">#cells</a> (region = cell). Constraint that drives it: the 622&nbsp;TB/mo egress + the SPOF-region risk; both vanish under per-region fleets.</p>
+      </details>
+
+      <details>
+        <summary>Probe B &mdash; Multi-tenant SaaS monitoring (Datadog-style, external customers)</summary>
+        <p><strong>Bottleneck.</strong> Now the hosts belong to external customers, not the provider &mdash; so one customer's 50&nbsp;k hosts must not starve another's 50, a runaway tenant must not blind the fleet, and each tenant brings their own rules. The per-class NFR additions for a multi-tenant pipeline (per-tenant fairness, per-tenant quotas, noisy-tenant isolation) become load-bearing.</p>
+        <p><strong>Move.</strong> (1) Per-tenant token buckets at the collector (the Iteration&nbsp;3 mechanism, keyed by tenant rather than host) plus weighted-fair consumer scheduling so a big tenant gets proportional, not unbounded, share. (2) Per-tenant quotas (max series, max ingest rate &mdash; billed; over-quota &rarr; reject + a billing event). (3) <em>Cells</em>: shard the aggregator fleet by tenant-group so a runaway tenant takes down one cell, not all; route a tenant to its cell by a stable hash of <code>tenant_id</code>. (4) The rule store becomes per-tenant; the broadcast becomes a per-tenant subscription. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>. This is genuinely a different product (its FR list gains tenant onboarding, billing, per-tenant dashboards) &mdash; mostly out of scope here, but the cell + per-tenant-quota shape is the part that transfers.</p>
+      </details>
+
+      <details>
+        <summary>Probe C &mdash; Hot host / hot series within a shard</summary>
+        <p><strong>Bottleneck.</strong> A single host with 10&nbsp;k custom metrics, or one metric sampled at 1&nbsp;kHz, makes that host's series cluster on one or two Kafka partitions &rarr; that aggregator runs hot (CPU on t-digest inserts; state for the extra series). Classified <a href="../canonicals/bottlenecks.html#hot-key">hot-key</a> (a partition-key value, or a small set of them, that draws disproportionate load).</p>
+        <p><strong>Move.</strong> Detect a hot partition (<code>samples/s/partition</code> &gt;&gt; the mean), then <em>spread</em> &mdash; re-hash that host's series across a wider key (<code>hash64(host_id ‖ metric_name ‖ sub_bucket)</code> where <code>sub_bucket = hash(metric_name) mod M</code>), distributing them over <code>M</code> partitions instead of one; or pin the hot host to a dedicated mini-shard. Note: the Iteration&nbsp;3 per-host rate cap already absorbs most of this &mdash; a 1&nbsp;kHz metric is exactly what the token bucket is for; this probe is the residual case of a host that's <em>legitimately</em> high-cardinality (a big hypervisor) and so gets a big budget. Cite <a href="../canonicals/bottleneck-to-decisions.html#hot-key">bottleneck-to-decisions#hot-key</a>.</p>
+      </details>
+
+      <details>
+        <summary>Probe D &mdash; Doing &ldquo;30-day retention&rdquo; properly</summary>
+        <p><strong>What we keep 30 days.</strong> The <em>alerts</em> &mdash; <code>(series_id, fired_at, kind, value, baseline, resolved_at)</code> &mdash; are tiny: even 1&nbsp;M alerts/day &times; ~200&nbsp;B &times; 30 &asymp; ~6&nbsp;GB in the LSM alert store, TTL-expired automatically. Optionally a <em>daily rolled-up baseline</em> per series (the day's median/MAD) for post-hoc &ldquo;was this normal a week ago?&rdquo; investigations &mdash; 200&nbsp;M series &times; ~16&nbsp;B/day &times; 30 &asymp; ~96&nbsp;GB to S3 &asymp; ~$2/mo.</p>
+        <p><strong>What we do <em>not</em> keep.</strong> The raw 20&nbsp;M/s sample stream &mdash; <code>240&nbsp;MB/s &times; 30 days &asymp; ~620&nbsp;TB</code> &mdash; is a TSDB's job; the metrics-storage system (#36) owns long-term raw and rolled-up samples. This detector only needs minutes-to-hours of samples (the window + the baseline + a Kafka replay buffer). Cite <a href="../design-moves/cost-shapes.html#telemetry">cost-shapes#telemetry</a> (the &ldquo;keep alerts + rollups, not raw&rdquo; pattern) and cross-link <a href="36-streaming-percentiles.html">#36</a> for where the raw samples actually live.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S6. Final Design                                              -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s6-final">
+    <div class="container">
+      <h2>S6. Final Design</h2>
+
+      <div class="full-width">
+        <h3>Architecture</h3>
+        <svg viewBox="0 0 1280 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Final: host agents push LZ4 batches to ~20 stateless regional collectors (per-host token bucket, ts clamp, value validate, hash series_id to one of 32 Kafka partitions); a 12-broker Kafka 'samples' topic (RF=3, 1h retention) buffers durably; 8 primary aggregators (each owning 4 partitions, with an 8-strong warm-standby set in other AZs) consume with lag-skip, maintain per-series 10x30s bucketed window-max plus 2x rolling t-digest baselines closed on a 15s watermark, evaluate threshold and Nσ rules, and emit through a bounded-then-spilling alert queue to the alert bus and a 30-day LSM alert store; primaries checkpoint incrementally to S3 every 30s; an etcd-backed shard manager holds primary leases and fences/promotes; a Postgres rule service broadcasts rules to all aggregators.">
+          <defs>
+            <marker id="arrFs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrFd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arrFr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="box" x="20" y="190" width="120" height="80" rx="8"/>
+          <text x="80" y="222" text-anchor="middle" font-weight="bold">Host agents</text>
+          <text x="80" y="240" text-anchor="middle" class="lbl">5M&times;40; 20M/s</text>
+          <text x="80" y="256" text-anchor="middle" class="lbl">fire-and-forget</text>
+
+          <rect class="box" x="175" y="180" width="160" height="100" rx="8"/>
+          <text x="255" y="206" text-anchor="middle" font-weight="bold">Collectors &times;~20</text>
+          <text x="255" y="224" text-anchor="middle" class="lbl">stateless; c7g.4xl</text>
+          <text x="255" y="242" text-anchor="middle" class="lbl">per-host token bucket</text>
+          <text x="255" y="260" text-anchor="middle" class="lbl">ts clamp; hash&rarr;part</text>
+
+          <rect class="cool" x="370" y="190" width="150" height="80" rx="8"/>
+          <text x="445" y="216" text-anchor="middle" font-weight="bold">Kafka "samples"</text>
+          <text x="445" y="234" text-anchor="middle" class="lbl">32 part, RF=3</text>
+          <text x="445" y="252" text-anchor="middle" class="lbl">12 brokers; 1h ret.</text>
+
+          <rect class="box" x="560" y="70" width="320" height="160" rx="8"/>
+          <text x="720" y="96" text-anchor="middle" font-weight="bold">Primary aggregators &times;8 (4 part. each)</text>
+          <text x="720" y="115" text-anchor="middle" class="lbl">consumer + lag-skip</text>
+          <text x="720" y="133" text-anchor="middle" class="lbl">per series: 10&times;30s bucket-max + 2&times; t-digest</text>
+          <text x="720" y="151" text-anchor="middle" class="lbl">15-s watermark; rule eval (threshold + N&sigma;)</text>
+          <text x="720" y="169" text-anchor="middle" class="lbl">bounded alert queue &rarr; disk-spill &rarr; coalesce</text>
+          <text x="720" y="187" text-anchor="middle" class="lbl">~25 GB state/node; 2.5M samples/s/node; r6i.4xl</text>
+          <text x="720" y="210" text-anchor="middle" class="lbl">flat off-heap arrays &mdash; no GC</text>
+
+          <rect class="accent" x="560" y="250" width="320" height="80" rx="8"/>
+          <text x="720" y="276" text-anchor="middle" font-weight="bold">Warm standbys &times;8 (other AZs)</text>
+          <text x="720" y="294" text-anchor="middle" class="lbl">consume SAME partitions; shadow state</text>
+          <text x="720" y="312" text-anchor="middle" class="lbl">promote in ~s on lease loss</text>
+
+          <rect class="ok" x="920" y="40" width="170" height="70" rx="8"/>
+          <text x="1005" y="68" text-anchor="middle" font-weight="bold">Shard mgr (etcd)</text>
+          <text x="1005" y="86" text-anchor="middle" class="lbl">leases; fence/promote</text>
+
+          <rect class="ok" x="920" y="130" width="170" height="70" rx="8"/>
+          <text x="1005" y="158" text-anchor="middle" font-weight="bold">Rule service</text>
+          <text x="1005" y="176" text-anchor="middle" class="lbl">Postgres; broadcast</text>
+
+          <rect class="cool" x="920" y="220" width="170" height="70" rx="8"/>
+          <text x="1005" y="248" text-anchor="middle" font-weight="bold">S3 checkpoints</text>
+          <text x="1005" y="266" text-anchor="middle" class="lbl">incremental, 30 s</text>
+
+          <rect class="cool" x="920" y="310" width="170" height="80" rx="8"/>
+          <text x="1005" y="336" text-anchor="middle" font-weight="bold">Alert bus + store</text>
+          <text x="1005" y="354" text-anchor="middle" class="lbl">push; 30-day LSM</text>
+          <text x="1005" y="372" text-anchor="middle" class="lbl">PagerDuty / SNS</text>
+
+          <line x1="140" y1="230" x2="175" y2="230" stroke="#475569" marker-end="url(#arrFs)"/>
+          <circle cx="157" cy="218" r="9" fill="#fff" stroke="#475569"/><text x="157" y="222" text-anchor="middle" font-size="10">1</text>
+          <line x1="335" y1="230" x2="370" y2="230" stroke="#475569" marker-end="url(#arrFs)"/>
+          <circle cx="352" cy="218" r="9" fill="#fff" stroke="#475569"/><text x="352" y="222" text-anchor="middle" font-size="10">2</text>
+          <line x1="520" y1="220" x2="560" y2="160" stroke="#475569" marker-end="url(#arrFs)"/>
+          <line x1="520" y1="240" x2="560" y2="285" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="540" cy="220" r="9" fill="#fff" stroke="#475569"/><text x="540" y="224" text-anchor="middle" font-size="10">3</text>
+          <line x1="880" y1="290" x2="880" y2="225" stroke="#dc2626" stroke-dasharray="5,3" marker-end="url(#arrFr)"/>
+          <circle cx="895" cy="258" r="9" fill="#fff" stroke="#dc2626"/><text x="895" y="262" text-anchor="middle" font-size="10">4</text>
+          <line x1="880" y1="120" x2="920" y2="80" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="900" cy="95" r="9" fill="#fff" stroke="#94a3b8"/><text x="900" y="99" text-anchor="middle" font-size="10">5</text>
+          <path d="M 1005 130 V 110 H 882" fill="none" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="940" cy="110" r="9" fill="#fff" stroke="#94a3b8"/><text x="940" y="114" text-anchor="middle" font-size="10">6</text>
+          <line x1="880" y1="170" x2="920" y2="250" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrFd)"/>
+          <circle cx="900" cy="210" r="9" fill="#fff" stroke="#94a3b8"/><text x="900" y="214" text-anchor="middle" font-size="10">7</text>
+          <line x1="880" y1="190" x2="920" y2="335" stroke="#475569" marker-end="url(#arrFs)"/>
+          <circle cx="900" cy="262" r="9" fill="#fff" stroke="#475569"/><text x="900" y="266" text-anchor="middle" font-size="10">8</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered above) and line-style legend.</strong> <em>Solid slate = sync hot path; dashed gray = async / checkpoint / control / shadow-consume; dashed red = failover promotion.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Agents &rarr; Collectors</strong> &mdash; LZ4-batched <code>POST /v1/samples</code>; per-host token bucket; <code>ts</code> clamp + <code>value</code> validate; <code>202</code> fast, fire-and-forget.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Collectors &rarr; Kafka</strong> &mdash; <code>partition = hash64(series_id) mod 32</code>; <code>acks=all</code>, <code>min.insync.replicas=2</code>.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Kafka &rarr; Primary (and Standby)</strong> &mdash; the primary for a shard consumes its 4 partitions (lag-skip if &gt; 30&nbsp;s behind), folds samples into the bucketed-max + t-digest, evaluates rules on bucket-seal, emits; the standby consumes the same 4 partitions in parallel and shadows the state without emitting.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Promote</strong> &mdash; on lease loss the shard manager fences the old primary and promotes the standby (~s); a new standby is started (warm if available, else cold-restore from S3 + replay).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Primary &harr; Shard manager</strong> &mdash; the primary holds a short-TTL etcd lease; the manager arbitrates primary&harr;standby and rate-limits concurrent promotions.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Rule service &rarr; Aggregators</strong> &mdash; SRE rule edits bump a version; the new rule set is broadcast; aggregators cache it and apply on the next sample (~5&nbsp;s, eventual).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9318; <strong>Primary &rarr; S3 checkpoints</strong> &mdash; every 30&nbsp;s, incremental (dirty rows) over the flat-array state + consumed offsets; keep last 3; cross-AZ-replicated bucket.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9319; <strong>Primary &rarr; Alert bus + store</strong> &mdash; through the bounded&rarr;disk-spill&rarr;coalesce queue; the bus fans alerts to on-call and appends to the 30-day LSM store keyed by <code>(series_id, fired_at)</code> (and a by-host view).</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Optimization stack (per-iteration delta)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Stage</th><th>Move</th><th>Bottleneck addressed</th><th>per-series state</th><th>samples/s/agg</th><th>single-node-loss recovery</th><th>aggregators</th><th>$/mo (1 sig fig)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Naive</td><td>one in-RAM node, exact deque + 1-h buffer per series</td><td>&mdash;</td><td>3.5 KB</td><td>20M (1 node, ~25M ceiling)</td><td>&infin; (no node to fail to; nothing durable)</td><td>1 (2&nbsp;TB box; <em>fails</em> avail + latency)</td><td>~$10&ndash;20k*</td></tr>
+              <tr><td>+ Iter 0</td><td>shard state by <code>series_id</code>; partitioned Kafka log; stateless collectors</td><td>memory-capacity-bound</td><td>3.5 KB</td><td>1.25M (&times;16)</td><td>~75&nbsp;s (re-consume 5&nbsp;min Kafka)</td><td>16</td><td>~$30k</td></tr>
+              <tr><td>+ Iter 1</td><td>warm standby per shard + S3 checkpoint + etcd lease-fencing</td><td>recovery-time / availability</td><td>3.5 KB</td><td>1.25M</td><td>~s (warm standby); ~1&ndash;2&nbsp;min (cold, double loss)</td><td>32</td><td>~$40k</td></tr>
+              <tr><td>+ Iter 2</td><td>bucketed window-max + 2&times; rolling t-digest + 15-s watermark; flat off-heap</td><td>heavy / fragile / order-sensitive structures (C8 swap)</td><td>~1 KB</td><td>2.5M (&times;8)</td><td>~s (warm); ~30&nbsp;s (cold)</td><td>16</td><td>~$30k</td></tr>
+              <tr><td>+ Iter 3</td><td>bounded alert queue + disk-spill + coalesce; per-host token bucket; lag-skip</td><td>backlog-growth</td><td>~1 KB</td><td>2.5M</td><td>~s</td><td>16</td><td>~$30k</td></tr>
+              <tr><td><strong>Final</strong></td><td>&mdash;</td><td>&mdash;</td><td><strong>~1 KB</strong></td><td><strong>2.5M</strong> (2&times; headroom)</td><td><strong>~s (warm) / ~30&nbsp;s (cold)</strong></td><td><strong>16</strong> (8 primary + 8 standby)</td><td><strong>~$30k</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>*Naive's &ldquo;~$10&ndash;20k&rdquo; is the cost of a 2&nbsp;TB x2iedn-class box that <em>still</em> fails availability, alert latency, and correctness &mdash; it's off the menu, not a real option. <strong>Total improvement:</strong> from an unbuildable single box to a 16-node fleet that meets all five NFRs &mdash; and note the cost arc <em>rose</em> ~2&ndash;3&times; (the price of availability + a durable log) then the C8 sketch swap clawed it back; this is the inverse of #36, where the arc <em>cut</em> the bill ~14&times; because #36's naive design was wasteful and this one was merely fragile.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel &rarr; production cousin (property trade)</h3>
+        <p>The artifact that distinguishes &ldquo;memorised the swap&rdquo; from &ldquo;understood what bottleneck forces it.&rdquo; Five properties of the LC #239 monotonic deque that <em>actually</em> changed:</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Property</th><th>Textbook (LC #239 monotonic deque)</th><th>Production cousin</th><th>Why the swap</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Per-series memory</td><td>O(k) exact, variable (&le; 30 entries &times; 16&nbsp;B = 480&nbsp;B)</td><td>O(buckets) = 10 &times; 8&nbsp;B fixed = 80&nbsp;B</td><td>200&nbsp;M series &rarr; needs a checkpointable flat array, no GC, off-heap; fixed size makes a snapshot a <code>memcpy</code></td></tr>
+              <tr><td>Window resolution</td><td>exact (per-sample boundary)</td><td>quantized to bucket size (&plusmn;30&nbsp;s of window-edge slop)</td><td>a 5-min anomaly window with a 30-s decision SLO doesn't need second-precision boundaries; the slop is within the flagged tolerance</td></tr>
+              <tr><td>Restart / serialize</td><td>none (RAM-only; lost on crash)</td><td><code>memcpy</code> / incremental snapshot, O(rows touched)</td><td>a shard owner's loss must recover within the 30-s SLO; the heavy variable structure took minutes to serialize</td></tr>
+              <tr><td>Arrival order</td><td>assumes a single in-order stream</td><td>bucket-update within a 15-s event-time watermark; later &rarr; <code>late_dropped</code> (counted)</td><td>real metric streams reorder (agent retries, clock skew); &ldquo;tolerate &le; 1 missed sample, nothing silent&rdquo; needs an explicit late-handling rule</td></tr>
+              <tr><td>Baseline distribution</td><td>deque gives <code>max</code> only &mdash; no median / spread</td><td>2&times; rolling t-digest (mergeable) over the 1-h baseline window</td><td>the &ldquo;diverges from the median by N&sigma;&rdquo; rule needs a streaming quantile; mergeability keeps primary &harr; standby in agreement and survives a re-shard</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; consolidated schema reference</h3>
+        <p>Each schema was introduced at the iteration that created the store (Iter&nbsp;0: Kafka <code>samples</code> topic, <code>rules</code>, <code>alerts</code>; Iter&nbsp;1: S3 checkpoint objects + etcd lease/assign keys; Iter&nbsp;2: the flat off-heap <code>WindowState</code> layout + the new checkpoint body; Iter&nbsp;3: <code>host_budgets</code> + the local disk spill log). Consolidated here for reference &mdash; this is <em>not</em> the only place they live.</p>
+<pre class="line-numbers"><code class="language-sql">-- Kafka:  TOPIC samples  (partitions=32, RF=3, min.insync.replicas=2, retention.ms=3,600,000, compression=lz4,
+--                          key=series_id big-endian i64, value=(ts i64, value f64) schema-registry versioned)
+-- No series registry:  series_id = hash64(host_id ‖ metric_name) -- deterministic, derived everywhere, never looked up.
+
+CREATE TABLE rules (        -- Postgres (control plane); broadcast to aggregators on every write (version-bumped)
+  rule_id text PRIMARY KEY, metric_name text NOT NULL, kind text NOT NULL,         -- 'threshold' | 'anomaly'
+  static_threshold double precision, sigma_mult double precision,
+  baseline_window_sec int NOT NULL DEFAULT 3600, severity text NOT NULL,
+  version bigint NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX rules_by_metric ON rules (metric_name);
+
+CREATE TABLE host_budgets ( -- Postgres; collectors cache; host's class from its mTLS identity / inventory
+  host_class text PRIMARY KEY, samples_per_sec int NOT NULL, burst_factor double precision NOT NULL DEFAULT 2.0,
+  version bigint NOT NULL);
+
+CREATE TABLE alerts (       -- LSM engine (Cassandra/ScyllaDB) -- write-heavy, time-ordered, TTL'd (cite storage-engines#lsm)
+  series_id bigint, fired_at timestamptz, alert_id text,                            -- KSUID
+  rule_id text, kind text, value double precision, baseline_median double precision, baseline_mad double precision,
+  resolved_at timestamptz,
+  PRIMARY KEY ((series_id), fired_at)) WITH CLUSTERING ORDER BY (fired_at DESC) AND default_time_to_live = 2592000;
+-- + alerts_by_host ((host_id), fired_at) for the "this host's alerts" view.
+
+-- In-RAM per-series state (flat, off-heap; dense u32 series-index):  ~1 KB
+--   bucket_max:[f64;10] | head_idx:u8 | head_end_ms:i64 | digest_cur:TDigest<25> | digest_prev:TDigest<25>
+--   | mad_digest:TDigest<16> | rotate_at_ms:i64
+-- S3 checkpoint object:  s3://aggr-checkpoints/{region}/{shard_id}/{epoch_ms}.snap
+--   header: shard_id, epoch_ms, kafka_offsets[part->offset], series_count, format_version
+--   body:   series_index_map | flat WindowState arrays   (incremental ckpt = dirty-bitmap + changed rows)
+-- etcd:  /shards/{id}/lease -> {holder, expires_at}   ;   /shards/{id}/assign -> {primary, standby, partitions:[..]}
+-- Local on each aggregator:  spill.log  (append-only, ~50 GB cap, fsync on spill, head/tail offsets)
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>#</th><th>Concern</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>mTLS agents&harr;collectors; the collector authenticates the host's identity cert (which also yields its <code>host_class</code>); rule + budget writes are RBAC'd and audit-logged; checkpoints in S3 with SSE and a tight bucket policy; etcd access scoped to the shard manager. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>Metric <em>values</em> are host telemetry (CPU%, mem, disk, request/error counts) &mdash; low PII; if a customer-defined metric <em>name</em> or <em>tag</em> could carry PII, the collector scrubs against an allowlist. Alerts retained 30 days then TTL-expired; no raw samples retained. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>Checkpoints written cross-AZ (and cross-region in Probe&nbsp;A); RPO &asymp; one checkpoint interval (~30&nbsp;s of baseline state &mdash; the 5-min window is rebuilt from Kafka's 1-h retention regardless); RTO &asymp; ~s (warm standby) / ~30&nbsp;s (cold restore) / ~minutes (whole-region). Quarterly recovery drill exercising the bucket-aliasing path. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>Autoscale aggregators on Kafka consumer lag + per-shard CPU; +50% headroom on the aggregator fleet (2&times; ingest burst + rolling deploy + one AZ down); cold-start = restore from the latest S3 checkpoint then replay; the <code>lag_skip</code> rate is the &ldquo;you're under-provisioned&rdquo; alarm. Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>Collectors talk to a subset of Kafka brokers (the ones leading their target partitions), not all 12; aggregators connect only to the brokers for their assigned partitions. Cite <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>Single region here = 1 cell; multi-region (Probe&nbsp;A) = 1 cell/region; multi-tenant SaaS (Probe&nbsp;B) = cells by tenant-group. Within a region the shard <em>is</em> the failure-isolation unit (a shard's blast radius is its 1/8 of series). Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>The alert bus is push (PagerDuty Events API / SNS / SSE to a console) &mdash; no client polling for alerts. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>N/A &mdash; this is internal fleet telemetry; the regional collectors are the closest thing to an edge tier (they terminate agent connections regionally and relay to Kafka), but there are no CDN POPs and no user-facing edge.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p>When the <strong>alert sink is down</strong> &rarr; alerts spill to local disk, replayed on recovery; if the spill hard cap is hit, re-fires for an already-firing series are coalesced (you still learn &ldquo;X is firing&rdquo; &mdash; just not every tick) &mdash; a first-fire is never dropped. When a <strong>primary aggregator dies</strong> &rarr; its warm standby promotes in ~s; if the standby is also gone &rarr; cold-restore from the latest S3 checkpoint + Kafka replay (~30&nbsp;s blind for that 1/8 of series). When <strong>Kafka is degraded</strong> (below <code>min.insync.replicas</code>) &rarr; producers get errors &rarr; collectors drop the batch + emit <code>produce_failed</code> (no agent retry storm); on recovery, normal flow resumes &mdash; the dropped samples are the &ldquo;&le; 1 missed&rdquo; budget. When a <strong>shard's consumer falls &gt; 30&nbsp;s behind</strong> &rarr; lag-skip to the head (freshness over completeness). When a <strong>host runs away</strong> &rarr; its samples are 1-in-K'd and its owner is auto-alerted. The system <em>never</em> silently loses an alert, <em>never</em> exceeds the 30-s decision SLO by waiting on stale data, and <em>never</em> lets one slow downstream or one bad host blind a slice of the fleet &mdash; it sheds, counts, and stays fresh. Cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a> + <a href="../canonicals/failure-modes.html#backlog-overflow">#backlog-overflow</a>.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> Per-partition Kafka consumer lag (&rarr; alert-latency); samples/s/aggregator and per-series-op p99 &mdash; bucket update + digest insert (&rarr; throughput, latency); <strong>end-to-end alert latency p99</strong>, sample-ts &rarr; alert-emitted (&rarr; the headline SLO); <code>late_dropped</code>/s, <code>rate_capped</code> host count, <code>lag_skip</code>/s, <code>produce_failed</code>/s, alert-spill depth (&rarr; the &ldquo;&le; 1 missed sample&rdquo; budget &mdash; these <em>are</em> the budget; watch them); checkpoint duration + age (&rarr; recovery-time); standby-lag per shard + promotion count + <code>partition_idle</code> count (&rarr; availability + false-silence).</li>
+          <li><strong>Rollout.</strong> Canary one aggregator carrying a <em>shadow</em> copy of 1&ndash;2 partitions &mdash; it consumes, computes, and evaluates rules, but its alerts go to a <code>/dev/null</code> sink that is diffed against the live aggregator's stream for 24&nbsp;h; then promote partition-by-partition (the shard manager reassigns; the new binary becomes the standby first, then is promoted, so a bad binary is a sub-second rollback away). Rollback trigger: alert-stream divergence, a regression in end-to-end latency p99, or any rise in the shed-counters.</li>
+          <li><strong>Migration (naive &rarr; sharded).</strong> Stand up the new fleet consuming the same Kafka topic in shadow; diff the alert streams for 24&nbsp;h; cut the alert bus over; keep the old monster box running as a fallback for a week, then decommission. The Kafka topic is created first (collectors dual-write to it and to the old listener during the transition).</li>
+          <li><strong>Headroom.</strong> +50% on the aggregator fleet: 8 primaries could absorb ~12 partitions' worth if several standbys are promoted during a deploy + an AZ loss; CPU at 2.5&nbsp;M/s/node has 2&times; headroom to ~5&nbsp;M/s; RAM is ~25&nbsp;GB of 128&nbsp;GB. Kafka and collectors carry their own ~50% over their steady-state need (the 2&times; ingest burst). Reason: routine spot reclaims + rolling deploys + a single-AZ loss happening together is a Tuesday, not a black-swan.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text">Aggregators:   16 x r6i.4xlarge x $1.01/hr x 720          = $11,635/mo   (8 primary + 8 warm standby)
+Kafka:         12 x m6i.4xlarge x $0.77/hr x 720          = $ 6,653/mo
+               + ~2.6 TB gp3 EBS x $0.08/GB-mo            = $   213/mo
+Collectors:    ~20 x c7g.4xlarge x $0.58/hr x 720         = $ 8,352/mo
+Checkpoints:   ~600 GB S3 (last 3 of 8 x ~25 GB) x $0.023 = $    14/mo
+               + ~few k PUT/day x $0.005/1k               = ~$    5/mo
+Alert store:   ~6 GB on a small 3-node Cassandra/Scylla   ~= $   500/mo
+Spill volumes: 16 x ~50 GB gp3 x $0.08/GB-mo              = $    64/mo
+Alert bus:     PagerDuty Events API / SNS                 ~= $   100/mo
+-----------------------------------------------------------------------
+TOTAL                                                     ~= $27,500/mo   ->  ~$30k/mo (1 sig fig)
+
+Dominant cost:  the stateful aggregator fleet (~42% of the bill, and ~half of THAT is the warm-standby replica),
+                followed by the collectors and Kafka -- all of it "the price of ingesting 20M samples/s durably and
+                folding them with a redundant, recoverable in-RAM state." This is a stream-processing cost shape
+                (cite cost-shapes#stream-processing / #telemetry): compute-heavy (the stateful tier + the ingest tier),
+                modest storage (Kafka retention + tiny checkpoints/alerts), negligible egress (single region).
+
+Cost-vs-latency knob:  the warm standby doubles the aggregator line ($5.8k -> $11.6k) to turn single-node-loss recovery
+                from ~75 s (Iter-0 cold re-consume) into ~seconds. Run checkpoint-only (no standby) for ~$5.8k/mo less and
+                accept ~30 s blind on 1/8 of series per node-loss event -- but node losses (spot reclaims, deploys, hardware)
+                are frequent and 30 s violates the alert SLO for that slice during a routine event, so we keep the standby.
+                A second knob -- 60-s buckets (5 of them) -- halves the window state and the digest-touch rate but doubles
+                the window slop to +/-60 s, which is out of tolerance for a 5-min window, so we don't turn it.
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Real-system comparison</h3>
+        <p>The closest production cousins are <strong>Uber's M3</strong> metrics platform (M3DB + M3 Aggregator: a tier of stateful aggregators that fold a metric firehose into rolled-up windows, sharded by series, with a coordinator handing out shard assignments &mdash; the same &ldquo;co-locate state with compute, shard by series, replicate for failover&rdquo; shape we derived) and <strong>Netflix's RAD</strong> outlier-detection work (robust streaming statistics &mdash; median/MAD-style baselines &mdash; over high-cardinality metric streams, which is exactly the t-digest-baseline half here). Both confirm the load-bearing choices: a durable partitioned log in front, per-series sharding, replicas for failover, and sketch-based (not exact-buffer) baselines. Where a real team would diverge from this page: most reach for a managed stream processor (Flink / Kafka Streams) rather than rolling the failover and checkpointing themselves &mdash; we derived the mechanism directly so the trade is visible, but in practice you'd carry less of it. And a real fleet's metric cardinality is messier than &ldquo;5&nbsp;M &times; 40&rdquo; &mdash; tag explosions and custom metrics make the per-host rate cap (Iteration&nbsp;3) and the in-shard hot-key split (Probe&nbsp;C) load-bearing from day one, not afterthoughts. Sources: see <a href="../../cribs/_sources.md">cribs/_sources.md</a> for this scenario (Uber M3, Netflix RAD, Cloudflare per-host metrics).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p>Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal. If a question can't be answered in 3&ndash;6 sentences from the text above, the page is missing a probe.</p>
+
+      <div>
+        <h3>What if the fleet were 10&times; tomorrow &mdash; 50&nbsp;M hosts, 2&nbsp;B series, 200&nbsp;M samples/s? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>State is fine &mdash; 2&nbsp;B &times; ~1&nbsp;KB = ~2&nbsp;TB, ~40 aggregators for RAM. CPU is the gate: 200&nbsp;M/s &divide; ~5&nbsp;M/s/node &asymp; ~40 nodes for compute, +50% headroom &rarr; ~64 primaries + 64 standbys. Kafka grows to ~120 brokers (2.4&nbsp;GB/s &times; RF=3 &divide; ~80&nbsp;MB/s); 32 partitions is too few &mdash; you'd re-partition to 256 (the reason we picked 32, not 8, at the start: cheap headroom for exactly this). The new bottleneck shifts from &ldquo;state&rdquo; (Iter&nbsp;0&ndash;2) to <a href="../canonicals/bottlenecks.html#network-bandwidth-bound">network-bandwidth</a> at the Kafka brokers and the collector tier (2.4&nbsp;GB/s is ~19&nbsp;Gbps &mdash; past one NIC, so collectors and brokers both need to be more numerous or fatter). The +50% headroom buys roughly a year of organic host growth before re-provisioning is load-bearing.</p>
+      </div>
+
+      <div>
+        <h3>Why not just use Flink / Kafka Streams / a managed stream processor and skip the bespoke failover? <span style="font-weight:normal;font-size:0.85em;">(alt-engine)</span></h3>
+        <p>You probably would, and the page says so (Iter&nbsp;1, last alternative). Flink's keyed state + RocksDB-backed incremental checkpoints + exactly-once would give you the sharding, the checkpointing, and the failover for free; the bucketed-window-max and the t-digest become a user-defined keyed-state function inside it. The trade: less control over the failover <em>latency</em> (Flink's checkpoint-and-restore is barriered &mdash; a restore re-reads from the last barrier, which at this volume can be tens of seconds, vs. our warm-standby ~seconds) and over the on-heap layout (Flink's RocksDB state is on local disk, not flat off-heap RAM &mdash; great for huge state, an unnecessary serialization tax for our ~1&nbsp;KB/series). At 200&nbsp;M keys with a 30-s SLO, a team that owns its operational story end-to-end might keep the warm-standby; a team that doesn't would absolutely take Flink. The <em>derivation</em> &mdash; shard by series, durable log in front, replica for failover, sketch not buffer &mdash; is identical either way; cite <a href="../canonicals/storage-engines.html#kv-engine">storage-engines#kv-engine</a> for the RocksDB-state-backend trade.</p>
+      </div>
+
+      <div>
+        <h3>What changes if this is a regulated environment &mdash; the metrics include something HIPAA/PCI-scoped? <span style="font-weight:normal;font-size:0.85em;">(regulatory)</span></h3>
+        <p>Most of it doesn't change &mdash; metric values are numbers, and the design already scrubs PII-bearing metric names/tags at the collector (X2). What gains: (1) an audit log of rule changes and alert deliveries (who saw which alert when) &mdash; cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>; (2) encryption-at-rest on the Kafka topic, the checkpoints, and the alert store (SSE + KMS, key rotation policy) &mdash; mostly already there; (3) data-residency: the multi-region probe's per-region fleets become a <em>requirement</em>, not an optimization, and the buddy-region for DR must be in-jurisdiction; (4) retention controls: the 30-day alert TTL becomes a policy-enforced minimum-and-maximum, with legal-hold exceptions. Naming what stays the same matters: the window/baseline math, the sharding, the failover, and the shedding logic are untouched &mdash; regulation adds governance around the data, not new bottlenecks.</p>
+      </div>
+
+      <div>
+        <h3>An entire AZ goes dark right now &mdash; what's the blast radius and the recovery sequence? <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Primaries and standbys are placed in different AZs, so an AZ loss takes out roughly half the primaries (and half the standbys) but never both halves of a shard. Sequence: the shard manager sees those primaries' etcd leases expire (~3&ndash;5&nbsp;s); it fences them and promotes their (surviving-AZ) standbys &mdash; ~seconds, zero data loss, because each standby was reading the same Kafka partitions. Now those shards have no standby; the manager schedules fresh standbys on surviving-AZ capacity, which cold-restore from S3 + replay (~30&nbsp;s each to <em>warm</em>, but the shard is already serving via its new primary throughout). Kafka (RF=3 across AZs) keeps quorum on 2 AZs. The on-call sees a brief promotion-storm metric spike and a temporary &ldquo;no standby&rdquo; window for half the shards. Cite <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a> + <a href="../canonicals/failure-modes.html#lease-expiry-storm">#lease-expiry-storm</a>.</p>
+      </div>
+
+      <div>
+        <h3>Where does the ~$30k/mo bill actually come from, and which knob moves it most? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>~42% is the aggregator fleet (16 r6i.4xlarge), and ~half of <em>that</em> &mdash; ~$5.8k/mo &mdash; is the warm-standby replica; ~30% is the collector tier, ~24% Kafka, the rest (S3, alert store, spill, bus) is rounding error. So the single biggest knob is the standby: dropping it to checkpoint-only saves ~$5.8k/mo (~21% of the bill) at the cost of turning single-node-loss recovery from ~seconds into ~30&nbsp;s of partial blindness &mdash; which violates the SLO for that 1/8 slice during a routine spot reclaim, so we don't. The second-biggest is the collector count, which is driven by the agent push <em>cadence</em> &mdash; if agents pushed every 15&nbsp;s instead of 5&nbsp;s you'd cut collectors ~3&times; (~$5.6k/mo), at the cost of ~10&nbsp;s more ingestion latency, which eats hard into the 30-s budget &mdash; also a no. Cite <a href="../design-moves/cost-shapes.html#stream-processing">cost-shapes#stream-processing</a>.</p>
+      </div>
+
+      <div>
+        <h3>How do you cut over from the existing single-box detector without a blind spot? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Phase 1: create the Kafka <code>samples</code> topic; have the collectors (or a shim in front of the old box) <em>dual-write</em> &mdash; samples go both to the old listener and to Kafka. Phase 2: stand up the new sharded + standby aggregator fleet consuming Kafka in <em>shadow</em> &mdash; it computes windows, baselines, and rule evals, but emits to a <code>/dev/null</code> sink that's diffed against the old box's alert stream; run this for 24&nbsp;h and chase down every divergence (usually a tie-break in debouncing or a window-edge case). Phase 3: cut the alert bus over to the new fleet; keep the old box running (now ignored) for a week as an instant rollback; then decommission and stop the dual-write. Rollback trigger at any phase: alert-stream divergence beyond a tiny tolerance, or any regression in end-to-end alert latency p99. The risk is entirely in Phase 2's diff &mdash; if the shadow stream matches for a day, the cutover is boring.</p>
+      </div>
+
+      <div>
+        <h3>The on-call says &ldquo;we stopped getting alerts for a chunk of hosts&rdquo; &mdash; where do you look first? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>The SLI dashboard, in order: (1) <code>partition_idle</code> count and per-partition Kafka <em>produce</em> rate &mdash; if a partition's producer rate cratered, the problem is upstream (a collector died, or a whole rack of agents went quiet) &rarr; this is real silence, page the upstream owner; (2) per-partition <em>consumer</em> lag and <code>lag_skip</code> rate &mdash; if lag is high, an aggregator is behind (under-provisioned, GC&mdash;rare now&mdash;or a hot host) &rarr; check <code>rate_capped</code> for a runaway host on that partition; (3) promotion-count and standby-lag for the shards covering those hosts &mdash; a recent promotion + a lagging new standby explains a transient gap; (4) end-to-end alert latency p99 broken down by shard &mdash; localizes which 1/8 is affected; (5) the alert-spill depth and <code>produce_failed</code> rate &mdash; if alerts are <em>being generated</em> but not <em>delivered</em>, the sink is the problem, not the detector. Each signal maps to a specific failure mode from the What-Breaks blocks and a runbook entry; the design's whole &ldquo;count everything you shed&rdquo; discipline exists so this triage is a dashboard read, not a guess.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S7. Key Takeaways & Related Topics                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s7-takeaways">
+    <div class="container">
+      <h2>S7. Key Takeaways</h2>
+      <ul>
+        <li><strong>Per-key state too big for one node &rarr; shard the state, put a durable log in front.</strong> The naive single-box detector fails on <em>capacity</em> first (200&nbsp;M &times; ~3.5&nbsp;KB &asymp; 700&nbsp;GB &gt; any sane box), and that's the failure that <em>forbids</em> a one-box answer at all; the rest (no failover, GC, no burst buffer) are symptoms. The fix is structural: hash-shard by <code>series_id</code>, partitioned Kafka behind it so a restart isn't a data loss.</li>
+        <li><strong>&ldquo;Survives a node loss&rdquo; isn't free &mdash; you pay for it in a warm replica.</strong> A cold rebuild (re-consume 5&nbsp;min of Kafka) is ~75&nbsp;s &mdash; over the 30-s SLO. A warm standby (parallel-consume the same partitions, shadow the state, promote on a fenced lease) makes failover ~seconds, and it costs a 2&times; aggregator fleet. Name the cheaper option (checkpoint-only, ~1&nbsp;min recovery) and why you didn't take it.</li>
+        <li><strong>The LC #239 deque is a teaching structure, not a production one.</strong> At 200&nbsp;M series it's too heavy (GC, slow to checkpoint), too fragile (RAM-only), and too order-sensitive (assumes in-order). The cousin: a fixed bucket-ring of sub-window maxes (exactness traded for &plusmn;30-s slop, in exchange for <code>memcpy</code> checkpoints and zero GC) + a mergeable t-digest for the baseline quantiles the deque never gave you + a watermark to bound the decision in time.</li>
+        <li><strong>A 30-s decision SLO is a license, not just a constraint.</strong> It licenses lag-skip (a sample &gt; 25&nbsp;s old can't be acted on in time, so skip it), the 15-s watermark (don't wait for stragglers), and &plusmn;30-s window slop &mdash; all of which make the design <em>cheaper and simpler</em>. Read your latency NFR for what it permits, not just what it forbids.</li>
+        <li><strong>Bound every queue; shed by recency; signal the source; count everything.</strong> A slow alert sink &rarr; bounded queue &rarr; disk spill &rarr; coalesce re-fires (never first-fires). A runaway host &rarr; per-host token bucket + auto-alert its owner. An aggregator behind &rarr; lag-skip + a <code>lag_skip</code>-rate alarm. The &ldquo;&le; 1 missed sample&rdquo; budget is the <em>sum of named, counted shed-counters</em> &mdash; never a silent loss.</li>
+        <li><strong>Not every NALSD arc cuts the bill.</strong> #36's arc cut cost ~14&times; because its naive design was <em>wasteful</em> (kept raw samples it didn't need). This arc <em>spent</em> ~2&ndash;3&times; more because its naive design was <em>cheap but fragile</em> &mdash; the delta is the price of availability + a durable log; the C8 sketch swap then clawed half of it back. A staff designer says which way the bill goes, and why, before drawing the first box.</li>
+        <li><strong>Co-locate state with compute unless the state is huge or rarely touched.</strong> Externalizing per-series state to Redis/Cassandra would turn every sample into a network RMW &mdash; 20&nbsp;M RMW/s plus a round trip in the latency budget. The stateful-stream-processor pattern (state in the aggregator's RAM, durable log for recovery) is dramatically cheaper for a hot, small-per-key access shape; reach for an external store only when that stops being true.</li>
+      </ul>
+
+      <h2>Related topics</h2>
+      <div class="card-grid full-width">
+        <a href="../canonicals/bottlenecks.html#memory-capacity-bound" class="card topic-card">
+          <h3>Bottleneck: memory-capacity-bound</h3>
+          <p>The shape-determining failure here: derived state that exceeds one node's RAM and grows with the key count, not the request rate. First move: shard the state.</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#backlog-growth" class="card topic-card">
+          <h3>Bottleneck: backlog-growth</h3>
+          <p>Iteration 3's target: a queue that grows faster than it drains (Kafka lag, the alert queue). First move: bound it, shed by recency, signal the source.</p>
+        </a>
+        <a href="../canonicals/sketches.html#t-digest" class="card topic-card">
+          <h3>Sketch: t-digest</h3>
+          <p>The mergeable streaming-quantile sketch behind the rolling baseline &mdash; median, MAD, any quantile, bounded per series regardless of sample rate. Shared with #36.</p>
+        </a>
+        <a href="../canonicals/failure-modes.html#slow-dependency" class="card topic-card">
+          <h3>Failure mode: slow dependency</h3>
+          <p>The slow-alert-sink case; the degradation contract pattern (bounded queue &rarr; spill &rarr; coalesce) that keeps a slow downstream from toppling the detector.</p>
+        </a>
+        <a href="36-streaming-percentiles.html" class="card topic-card">
+          <h3>#36 Streaming percentiles</h3>
+          <p>The metrics <em>storage</em> sibling &mdash; p50/p95/p99 over windows for dashboards. Shares t-digest; owns the long-term raw samples this detector doesn't keep.</p>
+        </a>
+        <a href="20-distributed-rate-limiter.html" class="card topic-card">
+          <h3>#20 Distributed rate limiter</h3>
+          <p>Sliding windows for <em>admission</em>, not <em>detection</em> &mdash; the contrast that sharpens what this page's windows are for, and the source of Iteration 3's token-bucket mechanism.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

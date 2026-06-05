@@ -1,0 +1,2656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Networking Fundamentals &mdash; System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- ===== Navigation ===== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="os-concepts.html">OS Concepts</a></li>
+        <li><a href="dns.html">DNS</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===== 1. Hero Section ===== -->
+  <section class="section">
+    <div class="container topic-hero">
+      <h1>Networking Fundamentals</h1>
+      <p class="hero-subtitle">Every system design decision &mdash; latency budgets, failure modes, scaling strategies &mdash; ultimately rests on how data moves across the network. Understanding networking is not optional; it is the foundation.</p>
+      <span class="hero-meta">30 min read</span>
+    </div>
+  </section>
+
+  <!-- ===== 2. What Is It? ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Is It?</h2>
+      <p>
+        Networking fundamentals are the core concepts governing how data travels between machines &mdash; from one process on your laptop to a server across the planet. For system designers, two protocols dominate: <strong>TCP</strong> (Transmission Control Protocol) and <strong>UDP</strong> (User Datagram Protocol). TCP provides reliable, ordered byte streams with built-in flow control and congestion control. UDP is a bare-bones, fire-and-forget protocol: it sends datagrams with no guarantees of delivery, ordering, or duplicate prevention. Nearly every system you will design uses TCP (HTTP, gRPC, database connections), but knowing when UDP is the right choice &mdash; and how QUIC merges the best of both &mdash; separates good system designers from great ones.
+      </p>
+      <p>
+        The <strong>TCP/IP model</strong> (the practical simplification of the 7-layer OSI model) is what matters for system design. The layers you will reason about are: the <strong>link layer</strong> (Ethernet, ARP), the <strong>network layer</strong> (IP addressing, routing), the <strong>transport layer</strong> (TCP, UDP, QUIC), and the <strong>application layer</strong> (HTTP, gRPC, DNS, TLS). When you draw a system architecture diagram, every arrow between boxes is a network call, and each network call carries the weight of these layers: DNS resolution, TCP handshake, TLS negotiation, serialization, transmission, and deserialization. Each step adds latency and each step can fail.
+      </p>
+      <p>
+        Why does this matter for system design? Because <strong>latency budgets</strong> are dominated by network time. A database query might take 2ms to execute, but the network round trip to reach the database could add 0.5ms within the same datacenter &mdash; or 70ms if it crosses the Atlantic. <strong>Connection management</strong> determines whether your service can handle 10 concurrent requests or 10,000. And <strong>failure modes</strong> in distributed systems are overwhelmingly network failures: packet loss, connection resets, DNS resolution failures, TLS certificate expiry, and the dreaded network partition. Understanding networking gives you the vocabulary and mental models to reason about all of these.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Animated Diagram: TCP Sliding Window ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Animated Diagram: TCP Sliding Window Protocol</h2>
+      <div class="animation-container" id="tcp-window-container">
+        <canvas id="tcp-window-canvas"></canvas>
+        <div class="animation-controls">
+          <button data-action="play" class="active">Pause</button>
+          <button data-action="reset">Reset</button>
+        </div>
+      </div>
+      <p class="animation-description">
+        Sender on the left transmits numbered packets (segments). Receiver on the right sends ACKs. The <strong>window</strong> (bracket) slides forward as ACKs arrive.
+        <strong style="color:#16a34a;">Green</strong> = sent + acknowledged,
+        <strong style="color:#2563eb;">blue</strong> = sent, awaiting ACK,
+        <strong style="color:#94a3b8;">gray</strong> = not yet sent.
+        Watch the window expand during slow start and shrink when congestion (packet loss) is detected.
+      </p>
+    </div>
+  </section>
+
+
+  <!-- ===== 3d. Deep Dive: Sliding Window Algorithm ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Deep Dive: Sliding Window Algorithm</h2>
+      <p>The sliding window is TCP's core mechanism for achieving high throughput without overwhelming the receiver. Here's exactly how it works, step by step.</p>
+
+      <h3>The Algorithm</h3>
+      <ol>
+        <li><strong>Sender maintains a window</strong> of size <code>W</code> (the minimum of <code>cwnd</code> and <code>rwnd</code>). It can send packets with sequence numbers from <code>base</code> to <code>base + W - 1</code> without waiting for ACKs.</li>
+        <li><strong>As each packet is sent</strong>, it enters the "in-flight" state. A retransmission timer starts for each unacknowledged packet.</li>
+        <li><strong>When the receiver gets a packet</strong>, it sends a cumulative ACK for the highest in-order sequence number received. If packet 3 arrives but packet 2 is missing, the receiver ACKs up to 1 (duplicate ACK).</li>
+        <li><strong>When the sender receives an ACK</strong>, it slides the window forward: <code>base = ACK number</code>. This frees up slots at the right edge of the window, allowing new packets to be sent.</li>
+        <li><strong>If a timeout occurs</strong> (no ACK for the oldest in-flight packet), the sender retransmits that packet and may shrink the window.</li>
+      </ol>
+
+      <h3>Visualizing the Window States</h3>
+      <div class="animation-container" id="sliding-window-detail-container">
+        <canvas id="sliding-window-detail-canvas"></canvas>
+        <div class="animation-controls"></div>
+      </div>
+      <p class="animation-description">
+        Each packet occupies one of four states: <strong style="color:#16a34a;">Acknowledged</strong> (delivered and confirmed),
+        <strong style="color:#2563eb;">In-flight</strong> (sent, awaiting ACK),
+        <strong style="color:#f59e0b;">Sendable</strong> (within window but not yet sent),
+        <strong style="color:#94a3b8;">Blocked</strong> (outside window, must wait).
+        Watch as ACKs arrive and the window slides right, allowing new packets to enter the sendable zone.
+      </p>
+
+      <h3>Python Implementation</h3>
+      <p>This code implements the exact sliding window algorithm shown in the diagram above. Each variable maps directly to what you see in the animation.</p>
+<pre class="line-numbers"><code class="language-python">"""
+TCP Sliding Window Protocol — Sender Side
+
+The window has 4 zones (left to right):
+  [ACKed] [In-flight] [Sendable] [Blocked]
+  ←─────── window ──────→
+
+- base: left edge of window (oldest unACKed packet)
+- next_seq: boundary between in-flight and sendable
+- base + window_size: right edge (boundary of sendable/blocked)
+
+Key insight: the sender can keep sending as long as
+next_seq < base + window_size, without waiting for ACKs.
+"""
+import time
+import random
+from collections import defaultdict
+
+class SlidingWindowSender:
+    def __init__(self, total_packets, window_size):
+        self.total = total_packets
+        self.window_size = window_size  # min(cwnd, rwnd)
+
+        # --- The three pointers that define the window ---
+        self.base = 0          # oldest unACKed packet (left edge)
+        self.next_seq = 0      # next packet to send
+        # right edge = base + window_size
+
+        self.acked = set()              # received ACKs
+        self.send_times = {}            # seq -> send timestamp
+        self.timeout = 1.0              # retransmit timeout (RTO)
+
+    @property
+    def right_edge(self):
+        """Right boundary of the window."""
+        return min(self.base + self.window_size, self.total)
+
+    def can_send(self):
+        """Is there room in the window for more packets?"""
+        return self.next_seq < self.right_edge
+
+    def send_next(self):
+        """Send the next packet within the window.
+
+        In the diagram: moves a packet from 'Sendable' to 'In-flight'.
+        """
+        if not self.can_send():
+            return None
+        seq = self.next_seq
+        self.send_times[seq] = time.time()
+        self.next_seq += 1
+        print(f"  SEND packet {seq}  "
+              f"[base={self.base} next={self.next_seq} "
+              f"right_edge={self.right_edge}]")
+        return seq
+
+    def receive_ack(self, ack_num):
+        """Process a cumulative ACK.
+
+        ACK(n) means: 'I have received everything up to n-1,
+        send me packet n next.'
+
+        This SLIDES the window: base moves right, opening space
+        at the right edge for new packets.
+        """
+        # Mark all packets up to ack_num as acknowledged
+        for seq in range(self.base, ack_num):
+            self.acked.add(seq)
+            self.send_times.pop(seq, None)
+
+        # Slide the window forward
+        old_base = self.base
+        self.base = ack_num
+        slid = self.base - old_base
+
+        if slid > 0:
+            print(f"  ACK {ack_num} → window slid {slid} slots "
+                  f"[base={self.base} right_edge={self.right_edge}]")
+
+    def check_timeout(self):
+        """Check for timed-out packets and retransmit."""
+        now = time.time()
+        for seq in range(self.base, self.next_seq):
+            if seq not in self.acked and seq in self.send_times:
+                if now - self.send_times[seq] > self.timeout:
+                    print(f"  TIMEOUT packet {seq} → retransmit")
+                    self.send_times[seq] = now
+                    return seq  # retransmit this packet
+        return None
+
+    def is_complete(self):
+        return self.base >= self.total
+
+
+class SlidingWindowReceiver:
+    def __init__(self):
+        self.expected = 0       # next expected in-order seq
+        self.buffer = set()     # out-of-order packets buffered
+
+    def receive(self, seq, lost=False):
+        """Receive a packet and return cumulative ACK.
+
+        The receiver only ACKs the highest in-order sequence.
+        Out-of-order packets are buffered but NOT acknowledged
+        (triggering duplicate ACKs at the sender).
+        """
+        if lost:
+            print(f"  ✗ Packet {seq} LOST in transit")
+            return None
+
+        if seq == self.expected:
+            # In order — advance and check buffer
+            self.expected += 1
+            while self.expected in self.buffer:
+                self.buffer.remove(self.expected)
+                self.expected += 1
+            print(f"  ✓ Received {seq} → ACK {self.expected}")
+            return self.expected
+        elif seq > self.expected:
+            # Out of order — buffer it, send duplicate ACK
+            self.buffer.add(seq)
+            print(f"  ⚠ Out-of-order {seq} (expected {self.expected})"
+                  f" → duplicate ACK {self.expected}")
+            return self.expected  # duplicate ACK
+        return None  # already received
+
+
+# --- Run simulation ---
+print("=== Sliding Window Simulation ===")
+print("Window size = 4, Total packets = 10\n")
+
+sender = SlidingWindowSender(total_packets=10, window_size=4)
+receiver = SlidingWindowReceiver()
+loss_probability = 0.15  # 15% packet loss
+round_num = 0
+
+while not sender.is_complete():
+    round_num += 1
+    print(f"\n--- Round {round_num} ---")
+
+    # Send all packets within the window
+    sent_this_round = []
+    while sender.can_send():
+        seq = sender.send_next()
+        if seq is not None:
+            sent_this_round.append(seq)
+
+    # Simulate network: each packet may be lost
+    for seq in sent_this_round:
+        lost = random.random() < loss_probability
+        ack = receiver.receive(seq, lost=lost)
+        if ack is not None:
+            sender.receive_ack(ack)
+
+    # Check for timeouts on unACKed packets
+    timed_out = sender.check_timeout()
+    if timed_out is not None:
+        ack = receiver.receive(timed_out)
+        if ack:
+            sender.receive_ack(ack)
+
+print(f"\n✓ All {sender.total} packets delivered "
+      f"in {round_num} rounds.")</code></pre>
+
+      <p><strong>What the code shows:</strong> The <code>base</code>, <code>next_seq</code>, and <code>right_edge</code> pointers directly correspond to the window boundaries in the diagram. When <code>receive_ack()</code> slides <code>base</code> forward, the <code>right_edge</code> automatically moves too, opening slots for new packets. This is the "sliding" in sliding window.</p>
+    </div>
+  </section>
+
+  <!-- ===== 3e. Deep Dive: Congestion Control Algorithm ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Deep Dive: Congestion Control (AIMD)</h2>
+      <p>While the sliding window prevents overwhelming the <em>receiver</em>, congestion control prevents overwhelming the <em>network</em>. TCP uses <strong>AIMD</strong> (Additive Increase, Multiplicative Decrease) — the classic sawtooth pattern you see in every networking textbook.</p>
+
+      <h3>The Three Phases</h3>
+      <div class="animation-container" id="congestion-control-container">
+        <canvas id="congestion-control-canvas"></canvas>
+        <div class="animation-controls"></div>
+      </div>
+      <p class="animation-description">
+        <strong style="color:#f59e0b;">Slow Start</strong>: cwnd doubles every RTT (exponential growth) until hitting ssthresh.
+        <strong style="color:#2563eb;">Congestion Avoidance</strong>: cwnd grows by 1 MSS per RTT (linear/additive increase).
+        <strong style="color:#dc2626;">Loss Event</strong>: cwnd is halved (multiplicative decrease), creating the characteristic sawtooth.
+        The top chart shows cwnd over time; the bottom shows packets in flight with ACK flow.
+      </p>
+
+      <h3>Python Implementation</h3>
+      <p>This simulation models TCP Reno's congestion control. The cwnd sawtooth pattern in the diagram above is produced by exactly this logic.</p>
+<pre class="line-numbers"><code class="language-python">"""
+TCP Congestion Control — Reno Algorithm
+
+Three phases:
+  1. Slow Start:          cwnd doubles each RTT (exponential)
+  2. Congestion Avoidance: cwnd += 1 MSS per RTT (linear)
+  3. Fast Recovery:        cwnd halved on 3 dup ACKs
+
+The effective sending window = min(cwnd, rwnd).
+cwnd is measured in MSS (Maximum Segment Size = 1460 bytes).
+
+The "sawtooth" pattern:
+  - cwnd grows linearly in congestion avoidance
+  - cwnd is halved on loss → sharp drop
+  - then grows linearly again → gradual rise
+  - repeat → sawtooth shape
+"""
+
+class TCPRenoCongestionControl:
+    def __init__(self, initial_cwnd=1, initial_ssthresh=64):
+        # --- Core state ---
+        self.cwnd = initial_cwnd      # congestion window (in MSS)
+        self.ssthresh = initial_ssthresh  # slow start threshold
+        self.phase = "slow_start"
+
+        # --- Tracking ---
+        self.ack_count = 0            # ACKs received in current RTT
+        self.dup_ack_count = 0        # consecutive duplicate ACKs
+        self.last_ack = -1
+
+        # --- History for plotting ---
+        self.history = []
+        self.rtt_num = 0
+
+    def on_ack(self, ack_num):
+        """Called when a new ACK arrives.
+
+        Slow Start: each ACK increases cwnd by 1 MSS.
+          Since ~cwnd ACKs arrive per RTT, cwnd doubles per RTT.
+          This is EXPONENTIAL growth (1→2→4→8→16...).
+
+        Congestion Avoidance: each ACK increases cwnd by 1/cwnd.
+          Since ~cwnd ACKs per RTT, total increase = cwnd * (1/cwnd) = 1.
+          cwnd grows by 1 MSS per RTT. This is LINEAR growth.
+        """
+        if ack_num == self.last_ack:
+            # Duplicate ACK
+            self.dup_ack_count += 1
+            if self.dup_ack_count == 3:
+                # 3 dup ACKs → packet loss detected (fast retransmit)
+                self._on_triple_dup_ack()
+            return
+
+        # New ACK
+        self.dup_ack_count = 0
+        self.last_ack = ack_num
+        self.ack_count += 1
+
+        if self.phase == "slow_start":
+            # Exponential growth: +1 MSS per ACK
+            self.cwnd += 1
+            if self.cwnd >= self.ssthresh:
+                self.phase = "congestion_avoidance"
+                print(f"  → Entering Congestion Avoidance "
+                      f"(cwnd={self.cwnd}, ssthresh={self.ssthresh})")
+
+        elif self.phase == "congestion_avoidance":
+            # Linear growth: +1/cwnd per ACK → +1 MSS per RTT
+            self.cwnd += 1.0 / self.cwnd
+
+        elif self.phase == "fast_recovery":
+            # Exit fast recovery on new ACK
+            self.cwnd = self.ssthresh
+            self.phase = "congestion_avoidance"
+            print(f"  → Exiting Fast Recovery "
+                  f"(cwnd={self.cwnd:.1f})")
+
+    def _on_triple_dup_ack(self):
+        """Three duplicate ACKs: a single packet was lost.
+
+        MULTIPLICATIVE DECREASE: halve the window.
+        This is gentler than a timeout (which resets to 1).
+
+        Why halve? The 3 dup ACKs prove the network is still
+        delivering packets (just not one specific one). So the
+        network isn't totally congested — halving is enough.
+        """
+        print(f"  ✗ 3 dup ACKs! Fast retransmit. "
+              f"cwnd {self.cwnd:.1f} → {self.cwnd/2:.1f}")
+        self.ssthresh = max(int(self.cwnd / 2), 2)
+        self.cwnd = self.ssthresh + 3  # inflate for 3 dup ACKs
+        self.phase = "fast_recovery"
+
+    def on_timeout(self):
+        """Retransmission timeout: the worst case.
+
+        No ACKs at all → network might be totally congested.
+        Reset cwnd to 1 and restart slow start.
+        This is MORE aggressive than triple dup ACK because
+        a timeout means even the dup ACKs aren't getting through.
+        """
+        print(f"  ✗✗ TIMEOUT! cwnd {self.cwnd:.1f} → 1, "
+              f"ssthresh → {max(int(self.cwnd/2), 2)}")
+        self.ssthresh = max(int(self.cwnd / 2), 2)
+        self.cwnd = 1
+        self.phase = "slow_start"
+
+    def record(self):
+        """Record current state for plotting."""
+        self.rtt_num += 1
+        self.history.append({
+            'rtt': self.rtt_num,
+            'cwnd': round(self.cwnd, 2),
+            'ssthresh': self.ssthresh,
+            'phase': self.phase
+        })
+
+
+# --- Simulation: 30 RTTs with loss events ---
+print("=== TCP Reno Congestion Control Simulation ===\n")
+cc = TCPRenoCongestionControl(initial_cwnd=1, initial_ssthresh=32)
+
+for rtt in range(40):
+    # Simulate one RTT: ~cwnd ACKs arrive
+    num_acks = int(cc.cwnd)
+
+    # Inject loss at specific points to show the sawtooth
+    loss_at_rtt = {15, 28, 36}  # loss events
+
+    if rtt in loss_at_rtt:
+        # Simulate 3 duplicate ACKs (fast retransmit)
+        print(f"\nRTT {rtt}: Loss detected!")
+        cc.on_ack(rtt)  # dup
+        cc.on_ack(rtt)  # dup
+        cc.on_ack(rtt)  # 3rd dup → triggers fast retransmit
+    else:
+        for _ in range(num_acks):
+            cc.on_ack(rtt + 1)  # new ACK
+
+    cc.record()
+    phase_symbol = {"slow_start": "⟋⟋",  # exponential
+                    "congestion_avoidance": "⟋",  # linear
+                    "fast_recovery": "↓"}  # drop
+    print(f"RTT {rtt:2d}: cwnd={cc.cwnd:6.1f}  "
+          f"ssthresh={cc.ssthresh:3d}  "
+          f"{phase_symbol.get(cc.phase, '?')} {cc.phase}")
+
+# Print the sawtooth pattern as ASCII art
+print("\n=== cwnd Over Time (Sawtooth Pattern) ===\n")
+max_cwnd = max(h['cwnd'] for h in cc.history)
+chart_width = 50
+for h in cc.history:
+    bar_len = int(h['cwnd'] / max_cwnd * chart_width)
+    phase_char = {'slow_start': 'S',
+                  'congestion_avoidance': 'A',
+                  'fast_recovery': 'R'}[h['phase']]
+    bar = '█' * bar_len
+    print(f"RTT {h['rtt']:2d} [{phase_char}] {bar} {h['cwnd']}")</code></pre>
+
+      <p><strong>What the code shows:</strong> In slow start, <code>cwnd += 1</code> per ACK gives exponential growth (cwnd ACKs per RTT → cwnd doubles). In congestion avoidance, <code>cwnd += 1/cwnd</code> per ACK gives linear growth (+1 per RTT). On triple duplicate ACK, cwnd is halved (multiplicative decrease). The ASCII chart at the bottom produces the same sawtooth pattern as the animated diagram above.</p>
+
+      <h3>AIMD: Why It Works</h3>
+      <div class="callout callout-info">
+        <h4>The Math Behind the Sawtooth</h4>
+        <p>AIMD converges to fairness. If two flows share a bottleneck link of capacity <code>C</code>:</p>
+        <ul>
+          <li><strong>Additive Increase:</strong> Both flows increase by the same amount (+1 MSS/RTT). This moves their combined rate along a 45° line toward the capacity boundary.</li>
+          <li><strong>Multiplicative Decrease:</strong> Both flows halve their rate. This moves them toward the fairness line (where both flows get equal share) because halving preserves the ratio while reducing the total.</li>
+          <li>Over repeated cycles of AI+MD, flows converge to <code>C/2</code> each — regardless of where they started. This is why TCP achieves approximate fairness without any central coordinator.</li>
+        </ul>
+        <p><strong>Throughput formula:</strong> In steady state, TCP Reno achieves <code>throughput ≈ (MSS / RTT) × (1.22 / √p)</code> where <code>p</code> is the loss rate. This is the Mathis formula — it shows that throughput degrades as the square root of loss rate and is inversely proportional to RTT.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. How It Works ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How It Works</h2>
+
+      <h3>TCP Three-Way Handshake</h3>
+      <div class="animation-container" id="tcp-handshake-container" style="float:right; width:420px; margin:0 0 1rem 1.5rem;">
+        <canvas id="tcp-handshake-canvas"></canvas>
+        <div class="animation-controls"></div>
+        <p class="animation-description">
+          The client sends <strong>SYN</strong>, the server responds with <strong>SYN-ACK</strong>,
+          the client completes with <strong>ACK</strong>. <strong>1 RTT</strong> before data flows.
+        </p>
+      </div>
+      <p>Before any data flows, TCP establishes a connection with a three-step ritual:</p>
+      <ol>
+        <li><strong>SYN</strong> &mdash; The client sends a SYN (synchronize) segment with its initial sequence number (ISN). Think of it as "I want to talk, and I will start counting bytes at number X."</li>
+        <li><strong>SYN-ACK</strong> &mdash; The server responds with its own SYN and an ACK of the client's ISN+1. "I hear you, here is my starting number Y, and I am ready for your byte X+1."</li>
+        <li><strong>ACK</strong> &mdash; The client acknowledges the server's ISN. The connection is now established. This takes <strong>one full round-trip time (RTT)</strong> before any data can flow.</li>
+      </ol>
+      <p>
+        <strong>System design parallel:</strong> Every new TCP connection costs 1 RTT. In a microservices architecture with 10 hops per request, those handshakes add up. This is why <strong>connection pooling</strong> and <strong>HTTP/2 multiplexing</strong> are so critical &mdash; they amortize that setup cost across many requests.
+      </p>
+
+      <div style="clear:both;"></div>
+      <h3>Sliding Window Flow Control</h3>
+      <p>TCP does not send data one byte at a time and wait for an ACK. Instead, it uses a <strong>sliding window</strong>: the sender can have multiple segments "in flight" (sent but not yet acknowledged) up to the window size. As ACKs come back, the window slides forward, allowing new data to be sent.</p>
+      <p>The receiver advertises a <strong>receive window</strong> (rwnd) &mdash; how much buffer space it has available. The sender never exceeds this. This prevents a fast sender from overwhelming a slow receiver. In system design terms, this is <strong>backpressure</strong>: the same concept you see in message queues (consumer lag) and API rate limiting (throttling the producer).</p>
+
+      <h3>Congestion Control</h3>
+      <p>Flow control protects the receiver; <strong>congestion control</strong> protects the network. TCP maintains a <strong>congestion window</strong> (cwnd) that limits how much data is in flight, independent of the receiver's window. The effective window is <code>min(cwnd, rwnd)</code>.</p>
+      <ol>
+        <li><strong>Slow start</strong> &mdash; The cwnd starts small (typically 10 segments, or ~14KB). For every ACK received, cwnd increases by 1 segment, causing exponential growth. The window doubles every RTT until it hits the <strong>slow start threshold</strong> (ssthresh) or a loss occurs.</li>
+        <li><strong>Congestion avoidance</strong> &mdash; Once cwnd reaches ssthresh, growth becomes linear: cwnd increases by 1 segment per RTT (additive increase). This probes for available bandwidth cautiously.</li>
+        <li><strong>Fast retransmit &amp; fast recovery</strong> &mdash; If the sender receives 3 duplicate ACKs (indicating a single packet was lost but later packets arrived), it retransmits the lost segment immediately without waiting for a timeout. cwnd is halved (multiplicative decrease), and the sender enters congestion avoidance. This AIMD (Additive Increase, Multiplicative Decrease) pattern is the heartbeat of classic TCP.</li>
+      </ol>
+      <p>
+        <strong>System design parallel:</strong> TCP slow start means a fresh connection cannot immediately use full bandwidth. The first request on a new connection to a CDN edge is penalized. This is why persistent connections matter, why HTTP/2 multiplexes streams over a single connection, and why QUIC supports 0-RTT resumption.
+      </p>
+
+      <h3>UDP: When You Do Not Need Reliability</h3>
+      <p>UDP adds only a port number and a checksum on top of raw IP. No handshake, no sequence numbers, no retransmissions. A UDP datagram either arrives or it does not. This makes UDP ideal for:</p>
+      <ul>
+        <li><strong>Real-time applications</strong> &mdash; Video streaming, VoIP, online gaming. A late packet is worse than a lost packet; retransmission is pointless if the moment has passed.</li>
+        <li><strong>DNS queries</strong> &mdash; A single request-response pair. Opening a TCP connection for one question is wasteful (although DNS-over-TCP and DNS-over-HTTPS are increasingly common for security).</li>
+        <li><strong>Application-level reliability</strong> &mdash; When you want control over retransmission logic (e.g., QUIC builds its own reliability on top of UDP).</li>
+      </ul>
+
+      <h4>UDP in Practice: Online Multiplayer Game Example</h4>
+      <p>Consider an online multiplayer game sending player position updates 60 times per second via UDP.</p>
+      <p>Packet #42 (player at position x=100, y=200) is lost in transit. What happens?</p>
+      <ul>
+        <li>The game does <strong>NOT</strong> retransmit packet #42 (UDP has no retransmission).</li>
+        <li>Packet #43 arrives: player at x=102, y=201.</li>
+        <li>The client renders a small "jump" &mdash; the player teleports 2 pixels instead of moving smoothly by 1 pixel.</li>
+        <li>This is acceptable! The game prefers a tiny visual glitch over a 100ms delay while waiting for retransmission.</li>
+      </ul>
+      <p><strong>If this were TCP:</strong> packet #42 lost &rarr; TCP retransmits &rarr; packets #43&ndash;#45 are queued waiting for #42 &rarr; 100ms+ freeze &rarr; then all packets delivered at once &rarr; player "warps" forward. Much worse user experience.</p>
+      <pre>
+UDP (what actually happens):
+  t=0ms   Packet #41 arrives  → render player at (99, 199)   ✓
+  t=16ms  Packet #42 LOST     → nothing to render             (skip)
+  t=33ms  Packet #43 arrives  → render player at (102, 201)   ✓ (small jump)
+  t=50ms  Packet #44 arrives  → render player at (103, 202)   ✓
+
+TCP (hypothetical — what would happen):
+  t=0ms   Packet #41 arrives  → render player at (99, 199)   ✓
+  t=16ms  Packet #42 LOST     → TCP detects loss...
+  t=33ms  Packet #43 arrives  → HELD IN BUFFER (waiting for #42)
+  t=50ms  Packet #44 arrives  → HELD IN BUFFER (waiting for #42)
+  t=116ms Packet #42 retransmitted → arrives
+          → deliver #42, #43, #44 all at once
+          → player "warps" from (99,199) to (103,202) — 100ms freeze + teleport
+      </pre>
+
+      <h3>DNS Resolution: How a Domain Name Becomes an IP Address</h3>
+      <p>When you type <code>www.example.com</code> in your browser, your computer does not know the IP address of that server. Before any TCP handshake or TLS negotiation can begin, the domain name must be resolved to an IP address. This is DNS (Domain Name System) &mdash; the internet's phone book.</p>
+
+      <p>Here is the full resolution chain for an <strong>uncached</strong> lookup of <code>www.example.com</code>:</p>
+
+      <div class="table-responsive"><table>
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th>Who</th>
+            <th>Action</th>
+            <th>Response</th>
+            <th>Cached?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>Browser</td>
+            <td>Checks browser DNS cache</td>
+            <td>Not found</td>
+            <td>&mdash;</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>Operating System</td>
+            <td>Checks OS DNS cache (<code>/etc/hosts</code>, system resolver)</td>
+            <td>Not found</td>
+            <td>&mdash;</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>OS &rarr; Recursive Resolver (ISP or 8.8.8.8)</td>
+            <td>"What is the IP for www.example.com?"</td>
+            <td>"I don't know yet, let me find out"</td>
+            <td>&mdash;</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>Resolver &rarr; Root Nameserver (one of 13 clusters)</td>
+            <td>"Who handles <code>.com</code>?"</td>
+            <td>"Try the .com TLD server at 192.5.6.30"</td>
+            <td>Cached for 48h</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td>Resolver &rarr; TLD Nameserver (<code>.com</code>)</td>
+            <td>"Who handles <code>example.com</code>?"</td>
+            <td>"Try the authoritative server at 93.184.216.34"</td>
+            <td>Cached for TTL</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td>Resolver &rarr; Authoritative Nameserver (<code>example.com</code>)</td>
+            <td>"What is the IP for <code>www.example.com</code>?"</td>
+            <td>"93.184.216.34, TTL=3600"</td>
+            <td>Cached for 1 hour</td>
+          </tr>
+          <tr>
+            <td>7</td>
+            <td>Resolver &rarr; OS &rarr; Browser</td>
+            <td>"93.184.216.34"</td>
+            <td>&mdash;</td>
+            <td>All levels cache</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <p><strong>Total latency for an uncached lookup:</strong> ~100&ndash;200ms (4 network round trips: to root, to TLD, to authoritative, and back to the client). <strong>For a cached lookup</strong> (the recursive resolver already knows the answer from step 3): ~1&ndash;5ms.</p>
+
+      <h4>Caching at Every Level</h4>
+      <p>Each DNS response includes a <strong>TTL (Time To Live)</strong> &mdash; the number of seconds the answer may be cached before it must be re-queried. Caching happens at multiple layers:</p>
+      <ul>
+        <li><strong>Browser cache</strong> &mdash; Chrome caches DNS results for up to 60 seconds (configurable). Fastest layer: no network call at all.</li>
+        <li><strong>OS resolver cache</strong> &mdash; The operating system's stub resolver (e.g., <code>systemd-resolved</code> on Linux, the DNS Client service on Windows) caches responses according to their TTL.</li>
+        <li><strong>Recursive resolver cache</strong> &mdash; Your ISP's resolver or a public resolver like Google (8.8.8.8) or Cloudflare (1.1.1.1) caches aggressively. This is the most impactful cache &mdash; it serves millions of users, so popular domains are almost always cached here.</li>
+        <li><strong>Root hints and TLD delegation</strong> &mdash; The addresses of root servers and TLD servers change very rarely. Resolvers cache root hints for ~48 hours and TLD referrals for similarly long periods.</li>
+      </ul>
+
+      <p>Common TTL values and their tradeoffs:</p>
+      <div class="table-responsive"><table>
+        <thead>
+          <tr>
+            <th>TTL</th>
+            <th>Use Case</th>
+            <th>Tradeoff</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>60 seconds</td>
+            <td>Services behind a load balancer with frequent IP changes, failover scenarios</td>
+            <td>High DNS query volume, but fast failover</td>
+          </tr>
+          <tr>
+            <td>300 seconds (5 min)</td>
+            <td>Most web applications &mdash; a good default</td>
+            <td>Balance between freshness and query volume</td>
+          </tr>
+          <tr>
+            <td>3600 seconds (1 hour)</td>
+            <td>Stable services with infrequent IP changes</td>
+            <td>Low DNS traffic, but slow failover (up to 1 hour of stale data)</td>
+          </tr>
+          <tr>
+            <td>86400 seconds (24 hours)</td>
+            <td>MX records, TXT records for email authentication (SPF, DKIM)</td>
+            <td>Minimal DNS traffic, but changes take a full day to propagate</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <p><strong>System design implication:</strong> Before a planned migration (e.g., moving to a new CDN or cloud provider), lower the TTL to 60 seconds <em>well in advance</em> (at least 24&ndash;48 hours before). This ensures that when you change the DNS record, old cached values expire quickly. After the migration stabilizes, raise the TTL back up to reduce DNS query load.</p>
+
+      <h4>Why DNS Uses UDP (Usually)</h4>
+      <p>Standard DNS queries use UDP on port 53. A typical DNS query is ~40 bytes and the response is ~100&ndash;500 bytes &mdash; both fit in a single UDP datagram. Using TCP would require a 3-way handshake (1 RTT) before the query is even sent, tripling the latency for a single lookup. However, DNS falls back to TCP when:</p>
+      <ul>
+        <li>The response exceeds 512 bytes (the original UDP limit) or 4096 bytes (with EDNS0 extensions)</li>
+        <li>Zone transfers (AXFR/IXFR) between DNS servers, which transfer large amounts of data</li>
+        <li>DNS-over-TLS (DoT, port 853) and DNS-over-HTTPS (DoH, port 443) for privacy &mdash; these always use TCP because TLS requires a connection</li>
+      </ul>
+
+      <h3>TLS Handshake Overhead</h3>
+      <div class="animation-container" id="tls-handshake-container" style="float:right; width:480px; margin:0 0 1rem 1.5rem;">
+        <canvas id="tls-handshake-canvas"></canvas>
+        <div class="animation-controls"></div>
+        <p class="animation-description">
+          <strong>TLS 1.2</strong> (left): <strong>2 RTTs</strong> &mdash; ClientHello/ServerHello + certificate, then key exchange + Finished.
+          <strong>TLS 1.3</strong> (right): <strong>1 RTT</strong> &mdash; key share sent in ClientHello, completed in one flight.
+        </p>
+      </div>
+      <p>TLS 1.2 adds <strong>2 additional RTTs</strong> on top of the TCP handshake before encrypted data can flow. TLS 1.3 reduced this to <strong>1 RTT</strong> (and supports 0-RTT for resumed sessions, at the cost of replay attack risk). For a new HTTPS connection: TCP handshake (1 RTT) + TLS 1.3 (1 RTT) = 2 RTTs minimum before the first byte of application data. On a 100ms cross-continent link, that is 200ms of pure setup latency.</p>
+
+      <h4>TLS 1.2 &mdash; Step by Step (2 RTTs)</h4>
+      <p>The TLS 1.2 handshake is a sequential negotiation split across two full round trips:</p>
+      <ol>
+        <li><strong>RTT 1 &mdash; Negotiate cipher and exchange certificates</strong>
+          <ul>
+            <li><strong>ClientHello</strong> (Client &rarr; Server) &mdash; The client sends its supported cipher suites (e.g., <code>TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256</code>), a client random (32 bytes of nonce), and the maximum TLS version it supports. This is the client saying: "Here are all the encryption methods I know. Pick one."</li>
+            <li><strong>ServerHello</strong> (Server &rarr; Client) &mdash; The server selects one cipher suite from the client's list and sends back its own server random nonce. "I picked this cipher. Here is my random number."</li>
+            <li><strong>Certificate</strong> (Server &rarr; Client) &mdash; The server sends its X.509 certificate chain so the client can verify the server's identity. The client checks the certificate against trusted CAs.</li>
+            <li><strong>ServerKeyExchange</strong> (Server &rarr; Client) &mdash; For DHE/ECDHE ciphers, the server sends its Diffie-Hellman public parameters. (Skipped for RSA key exchange, which is now deprecated.)</li>
+            <li><strong>ServerHelloDone</strong> (Server &rarr; Client) &mdash; "I am done sending my handshake messages. Your turn."</li>
+          </ul>
+        </li>
+        <li><strong>RTT 2 &mdash; Complete key exchange and verify</strong>
+          <ul>
+            <li><strong>ClientKeyExchange</strong> (Client &rarr; Server) &mdash; The client sends its half of the key material: either its DH/ECDHE public key, or an RSA-encrypted pre-master secret. Both sides can now independently compute the same master secret from: client random + server random + pre-master secret.</li>
+            <li><strong>ChangeCipherSpec</strong> (Client &rarr; Server) &mdash; "Everything I send from now on will be encrypted with the negotiated cipher." This is a signal, not a negotiation.</li>
+            <li><strong>Finished</strong> (Client &rarr; Server) &mdash; A hash of the entire handshake transcript, encrypted with the new session key. This proves the handshake was not tampered with.</li>
+            <li><strong>ChangeCipherSpec</strong> (Server &rarr; Client) &mdash; Server also switches to encrypted communication.</li>
+            <li><strong>Finished</strong> (Server &rarr; Client) &mdash; Server's own encrypted verify hash. Both sides confirm they derived the same key.</li>
+          </ul>
+        </li>
+      </ol>
+      <p><strong>Why 2 RTTs?</strong> The cipher negotiation and key exchange are <em>separate phases</em>. The client must wait to learn which cipher and key exchange method the server chose (RTT 1) before it can compute and send its own key material (RTT 2). TLS 1.2 supported many legacy ciphers (RSA, DHE, ECDHE), each requiring different client behavior, so the client could not act until the server decided.</p>
+
+      <h4>TLS 1.3 &mdash; Step by Step (1 RTT)</h4>
+      <p>TLS 1.3 collapses the handshake into a single round trip by making two key design changes:</p>
+      <ol>
+        <li><strong>Removed legacy ciphers.</strong> TLS 1.3 only allows a handful of modern key exchange methods (all Diffie-Hellman based: X25519, P-256, P-384). Since there are so few options, the client can <strong>guess</strong> which one the server will pick and speculatively send its key share upfront.</li>
+        <li><strong>Merged negotiation and key exchange into a single flight.</strong> No separate <code>ChangeCipherSpec</code> message. No <code>ServerKeyExchange</code>. Everything happens in one round trip.</li>
+      </ol>
+      <p>The flow:</p>
+      <ol>
+        <li><strong>ClientHello + KeyShare</strong> (Client &rarr; Server) &mdash; The client sends supported ciphers <em>and</em> pre-computes key shares for the most likely DH groups (e.g., X25519 and P-256). "Here are my cipher preferences, and here is my key material for the ones I think you will pick."</li>
+        <li><strong>ServerHello + KeyShare + EncryptedExtensions + Certificate + Finished</strong> (Server &rarr; Client) &mdash; The server picks a cipher, sends its DH key share, its certificate, and its Finished hash &mdash; <em>all in one flight</em>. Everything after ServerHello is already encrypted using the derived handshake key.</li>
+        <li><strong>Finished</strong> (Client &rarr; Server) &mdash; The client verifies the server's certificate and Finished hash, then sends its own Finished. Application data can now flow.</li>
+      </ol>
+      <p><strong>Why only 1 RTT?</strong> By restricting to modern DH-based ciphers, the client does not need to wait for the server's choice &mdash; it sends key shares for all likely options in its very first message. If the server picks one the client already provided, no extra round trip is needed. (In the rare case of a mismatch, the server sends a <code>HelloRetryRequest</code> and it falls back to 2 RTTs.)</p>
+
+      <h4>TLS 1.3 0-RTT Resumption</h4>
+      <p>If the client has connected to this server before, it can send encrypted application data <em>in the very first message</em> using a pre-shared key (PSK) from the previous session. This is called <strong>0-RTT</strong>: the first HTTP request arrives at the server before the handshake is even complete. The tradeoff is that 0-RTT data is vulnerable to <strong>replay attacks</strong> &mdash; an attacker who captures the ClientHello can re-send it. For this reason, 0-RTT should only be used for idempotent requests (GET, not POST).</p>
+
+      <div style="clear:both;"></div>
+      <h4>TCP vs. TLS &mdash; When to Use Which</h4>
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>Use Plain TCP When</h4>
+          <ul>
+            <li><strong>Internal service-to-service in a trusted network</strong> &mdash; Within a VPC with network-level isolation (security groups, private subnets). The network boundary provides the security layer.</li>
+            <li><strong>Ultra-low-latency requirements</strong> &mdash; When the handshake cost matters and the channel is already secured at another layer (IPsec, WireGuard VPN).</li>
+            <li><strong>Non-sensitive protocols</strong> &mdash; Health checks, Prometheus metrics scraping, cluster-internal heartbeats where data is not confidential.</li>
+            <li><strong>Legacy systems</strong> &mdash; Systems that cannot support TLS, provided there are compensating controls (network segmentation, mTLS sidecar proxies).</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>Use TLS When</h4>
+          <ul>
+            <li><strong>Any data crosses the public internet</strong> &mdash; HTTPS for web traffic, WSS for WebSockets, TLS-wrapped database connections from external clients. No exceptions.</li>
+            <li><strong>Sensitive data in transit</strong> &mdash; Credentials, PII, financial data, health records &mdash; even within a private network if you follow defense-in-depth.</li>
+            <li><strong>User-facing traffic</strong> &mdash; All HTTP traffic should be HTTPS. Browsers now flag plain HTTP as "Not Secure."</li>
+            <li><strong>Compliance requirements</strong> &mdash; PCI-DSS, HIPAA, SOC2, and GDPR all mandate or strongly recommend encryption in transit.</li>
+            <li><strong>Zero-trust architectures</strong> &mdash; In a zero-trust model, the network is never trusted. Every hop uses mTLS (mutual TLS) regardless of whether it is "internal."</li>
+          </ul>
+        </div>
+      </div>
+      <p><strong>Rule of thumb:</strong> Default to TLS. Only drop to plain TCP when you have a concrete reason <em>and</em> a compensating security control. The performance cost of TLS 1.3 (1 extra RTT on first connection, 0 on resumption) is negligible for almost all use cases.</p>
+
+      <p>
+        <strong>System design parallel:</strong> This is why internal service-to-service communication within a datacenter often skips TLS (or uses mTLS with connection pooling to amortize the cost). It is also why QUIC is compelling: it combines the transport handshake and TLS handshake into a single RTT.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 5. When to Use / When NOT to Use ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>When to Use / When NOT to Use</h2>
+
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>TCP &mdash; Use When</h4>
+          <ul>
+            <li><strong>Reliable delivery required</strong> &mdash; HTTP/HTTPS, REST APIs, gRPC, database connections, file transfers.</li>
+            <li><strong>Ordered data matters</strong> &mdash; Streaming a web page, transferring a database dump, any protocol where out-of-order data is nonsensical.</li>
+            <li><strong>Long-lived connections</strong> &mdash; WebSockets, database connection pools, gRPC streaming. TCP's overhead is amortized over many messages.</li>
+            <li><strong>Congestion sensitivity</strong> &mdash; You want the network to self-regulate. TCP backs off under congestion; UDP does not.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>TCP &mdash; Avoid When</h4>
+          <ul>
+            <li><strong>Latency trumps reliability</strong> &mdash; Real-time voice/video where a lost frame is better than a delayed one.</li>
+            <li><strong>One-shot requests</strong> &mdash; Tiny request/response pairs where the 1-RTT handshake is a proportionally large overhead (DNS, NTP).</li>
+            <li><strong>Multicast/broadcast</strong> &mdash; TCP is point-to-point only. Use UDP for multicast scenarios (service discovery, cluster heartbeats).</li>
+            <li><strong>Custom reliability logic</strong> &mdash; When your application needs different retransmission semantics than TCP provides (e.g., selective retransmission for specific game state).</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="decision-grid">
+        <div class="decision-use">
+          <h4>UDP &mdash; Use When</h4>
+          <ul>
+            <li><strong>Real-time streaming</strong> &mdash; Video conferencing (WebRTC), VoIP, live game state updates.</li>
+            <li><strong>DNS queries</strong> &mdash; Standard DNS uses UDP on port 53 for speed. Falls back to TCP for large responses (&gt;512 bytes).</li>
+            <li><strong>Speed over reliability</strong> &mdash; Metrics collection (StatsD), logging pipelines where occasional loss is acceptable.</li>
+            <li><strong>Building custom protocols</strong> &mdash; QUIC (HTTP/3) is built on UDP, implementing its own reliability, flow control, and encryption.</li>
+          </ul>
+        </div>
+        <div class="decision-avoid">
+          <h4>UDP &mdash; Avoid When</h4>
+          <ul>
+            <li><strong>Data integrity is critical</strong> &mdash; Financial transactions, database writes, file transfers. Lost packets mean lost data.</li>
+            <li><strong>Firewall compatibility matters</strong> &mdash; Many corporate firewalls block or throttle UDP traffic. TCP on port 443 is universally allowed.</li>
+            <li><strong>You do not want to implement reliability yourself</strong> &mdash; Building reliable delivery, flow control, and congestion control is hard. Use TCP unless you have a compelling reason.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>QUIC (HTTP/3): The Best of Both</h3>
+      <p>To understand why QUIC exists, you need to understand the evolution from HTTP/1.1 to HTTP/2, and the fundamental problem HTTP/2 could not solve.</p>
+
+      <h4>HTTP/2 Stream Multiplexing</h4>
+      <p><strong>HTTP/1.1 problem:</strong> One request at a time per TCP connection. To load a web page with 6 resources (CSS, JS, images), you either need 6 separate TCP connections (each with its own handshake overhead) or you wait for each request to finish before sending the next. This is <strong>head-of-line (HOL) blocking</strong> at the HTTP level &mdash; a slow response for <code>/style.css</code> blocks the browser from even asking for <code>/app.js</code>.</p>
+
+      <p><strong>HTTP/2 solution:</strong> Multiple <strong>streams</strong> (logical request/response pairs) share a single TCP connection. Each stream has a numeric ID. Frames from different streams are interleaved on the wire:</p>
+
+      <pre>
+Single TCP connection carrying 3 HTTP/2 streams:
+
+  Frame: [Stream 1, HEADERS, GET /style.css   ]
+  Frame: [Stream 2, HEADERS, GET /app.js       ]
+  Frame: [Stream 3, HEADERS, GET /logo.png     ]
+  Frame: [Stream 1, DATA, bytes 0-16383 of style.css    ]
+  Frame: [Stream 2, DATA, bytes 0-16383 of app.js       ]
+  Frame: [Stream 1, DATA, bytes 16384-32767 of style.css ]
+  Frame: [Stream 3, DATA, bytes 0-8191 of logo.png      ]
+  ...
+
+All 3 resources download in parallel over ONE connection.
+No head-of-line blocking at the HTTP level.
+      </pre>
+
+      <p><strong>BUT:</strong> HTTP/2 still has head-of-line blocking at the <strong>TCP level</strong>. TCP sees all these interleaved frames as a single, ordered byte stream. If TCP packet #5 (carrying a frame for Stream 1) is lost, TCP must retransmit it before delivering packets #6, #7, #8 &mdash; even if those packets belong to Streams 2 and 3. Stream 3's data is delayed by Stream 1's lost packet. On lossy networks (mobile, Wi-Fi), this can make HTTP/2 <em>slower</em> than HTTP/1.1 (which used separate TCP connections that failed independently).</p>
+
+      <h4>HTTP/3: QUIC Solves TCP's Head-of-Line Blocking</h4>
+      <p>QUIC runs on <strong>UDP</strong> instead of TCP and implements its own reliability layer. The key innovation: each QUIC stream is <strong>independently flow-controlled and independently reliable</strong>. If a packet belonging to Stream 1 is lost, only Stream 1 stalls:</p>
+
+      <pre>
+QUIC connection (over UDP):
+  Stream 1: packet lost! Retransmitting...     ⏸ (only this stream waits)
+  Stream 2: ✓ continues receiving data, unaffected
+  Stream 3: ✓ continues receiving data, unaffected
+      </pre>
+
+      <p>Compare to HTTP/2 over TCP:</p>
+
+      <pre>
+TCP connection:
+  Packet lost! ALL streams blocked until retransmit completes.
+  Stream 1: ⏸ waiting
+  Stream 2: ⏸ waiting (even though its data arrived fine!)
+  Stream 3: ⏸ waiting
+      </pre>
+
+      <h4>QUIC's Other Advantages</h4>
+      <p>QUIC is not just about fixing head-of-line blocking. It also includes:</p>
+      <ul>
+        <li><strong>Built-in TLS 1.3</strong> &mdash; Encryption is not optional and is integrated into the connection handshake. A new QUIC connection takes <strong>1 RTT</strong> (transport + crypto combined) vs. TCP's 1 RTT + TLS 1.3's 1 RTT = <strong>2 RTTs</strong>. For resumed connections, QUIC supports <strong>0-RTT</strong>: application data in the very first packet.</li>
+        <li><strong>Connection migration</strong> &mdash; TCP identifies connections by the tuple (source IP, source port, dest IP, dest port). If your phone switches from Wi-Fi to cellular, the source IP changes and the TCP connection dies. QUIC identifies connections by a <strong>connection ID</strong>, so the connection survives network changes seamlessly.</li>
+        <li><strong>User-space implementation</strong> &mdash; QUIC runs in the application (not the kernel), so protocol improvements ship as library updates rather than OS kernel upgrades. This enables much faster iteration.</li>
+      </ul>
+
+      <pre>
+Connection setup comparison:
+
+  TCP + TLS 1.3 (HTTP/2):
+    Client ──SYN──────────────→ Server       ┐
+    Client ←─SYN-ACK──────────  Server       │ 1 RTT (TCP handshake)
+    Client ──ACK + ClientHello→ Server       ┘
+    Client ←─ServerHello───────  Server       ┐ 1 RTT (TLS handshake)
+    Client ──Finished──────────→ Server       ┘
+    Client ──HTTP Request──────→ Server       ← data flows (after 2 RTTs)
+
+  QUIC (HTTP/3):
+    Client ──Initial (crypto + data)──→ Server  ┐
+    Client ←─Handshake─────────────────  Server  │ 1 RTT (combined!)
+    Client ──HTTP Request──────────────→ Server  ┘ ← data flows (after 1 RTT)
+
+  QUIC 0-RTT (resumed connection):
+    Client ──Initial + 0-RTT data──────→ Server  ← data flows immediately!
+    Client ←─Handshake─────────────────  Server  (0 RTTs before first data)
+      </pre>
+
+      <p><strong>System design implication:</strong> On a 100ms cross-continent link, the difference between 2 RTTs (HTTP/2) and 1 RTT (QUIC) is 100ms of saved latency on every new connection. For 0-RTT, you save 200ms. For mobile users who frequently switch networks, QUIC's connection migration eliminates the reconnection penalty entirely.</p>
+    </div>
+  </section>
+
+  <!-- ===== 6. Classic vs. Modern Approaches ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Classic vs. Modern Approaches</h2>
+
+      <h3>Classic: TCP Reno &amp; Tahoe Congestion Control</h3>
+      <p>TCP Tahoe (1988) and Reno (1990) use <strong>loss-based</strong> congestion control: they interpret packet loss as a signal of congestion and cut the window. This works well on wired networks where loss almost always means congestion. But on wireless networks or high-bandwidth-delay-product links, it performs poorly &mdash; random packet loss triggers unnecessary backoff, and the AIMD probing is too slow to fill fat pipes.</p>
+
+      <h3>Modern: BBR (Google, 2016)</h3>
+      <p>BBR (Bottleneck Bandwidth and Round-trip propagation time) takes a fundamentally different approach. Instead of reacting to loss, it <strong>models the network path</strong> by continuously measuring two signals: the maximum bandwidth (delivery rate) and the minimum RTT. It aims to operate at the optimal point where throughput is maximized and queuing delay is minimized &mdash; the Kleinrock operating point.</p>
+      <p>Google reported a <strong>14% throughput improvement</strong> on YouTube after deploying BBR, and up to 2700x improvement in throughput on lossy links (where loss-based algorithms collapse). BBR is now the default congestion control algorithm for Google's internal traffic and is available in Linux 4.9+.</p>
+      <p><strong>System design implication:</strong> If you are serving video or large file downloads, switching to BBR at the OS level (a single <code>sysctl</code> command) can yield significant throughput gains with no application changes.</p>
+
+      <h3>Modern: QUIC &amp; HTTP/3</h3>
+      <p>QUIC moves the transport layer from the kernel into user space, built on top of UDP. This means protocol improvements can be deployed as library updates rather than OS kernel upgrades &mdash; a huge advantage for iteration speed. Major CDNs (Cloudflare, Akamai, Fastly) and browsers (Chrome, Firefox, Safari) now support HTTP/3 over QUIC.</p>
+
+      <h3>Modern: MPTCP (Multi-Path TCP)</h3>
+      <p>MPTCP allows a single TCP connection to use multiple network paths simultaneously (e.g., Wi-Fi + cellular). This improves reliability (failover if one path drops) and throughput (aggregate bandwidth). Apple uses MPTCP for Siri and Maps on iOS. In datacenter networks, MPTCP can exploit multiple paths through a fat-tree topology.</p>
+
+      <h3>Modern: Kernel Bypass &amp; io_uring</h3>
+      <p>For ultra-low-latency systems (high-frequency trading, real-time ad bidding), the kernel's network stack is too slow. <strong>DPDK</strong> (Data Plane Development Kit) bypasses the kernel entirely, allowing user-space applications to process packets directly from the NIC. <strong>io_uring</strong> (Linux 5.1+) provides asynchronous I/O with minimal syscall overhead, achieving near-kernel-bypass performance while remaining easier to use. <strong>TCP Fast Open</strong> (TFO) allows data in the SYN packet itself, saving 1 RTT on connections to servers you have visited before.</p>
+    </div>
+  </section>
+
+  <!-- ===== 7. Assumptions & Model ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Assumptions &amp; Model</h2>
+      <div class="callout-assumptions">
+        <h4>Key Assumptions in TCP's Congestion Control Model</h4>
+        <ul>
+          <li><strong>Packet loss = congestion</strong> &mdash; TCP Reno/Tahoe assume that any packet loss is caused by router buffer overflow (congestion). This breaks on wireless networks where packet loss is often due to signal interference, not congestion. BBR addresses this by not relying on loss as a signal.</li>
+          <li><strong>RTT is measurable and stable</strong> &mdash; TCP timestamps packets to measure RTT and uses smoothed RTT (SRTT) for retransmission timers. On jittery mobile networks or through overloaded middleboxes, RTT measurement becomes noisy, leading to premature retransmissions or excessive timeouts.</li>
+          <li><strong>Endpoints are cooperative</strong> &mdash; TCP assumes both sides obey congestion control. A malicious sender could ignore cwnd and flood the network. In practice, cloud providers enforce fairness at the hypervisor level.</li>
+          <li><strong>Bandwidth-delay product (BDP) determines optimal window size</strong> &mdash; The ideal cwnd equals the BDP: <code>BDP = bandwidth &times; RTT</code>. On a 1 Gbps link with 10ms RTT, BDP = 1.25 MB. If your TCP buffers are smaller than this, you can never fully utilize the link. If they are much larger, you risk bufferbloat.</li>
+          <li><strong>Congestion window growth is appropriate</strong> &mdash; Slow start's exponential growth assumes the network can absorb doubling traffic every RTT. On very high-bandwidth links, this wastes time; on already-congested links, it causes overshoot. Modern algorithms like CUBIC (Linux default) use a cubic function for more aggressive but smoother probing.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 8. Sizing & Tradeoffs ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Sizing &amp; Tradeoffs</h2>
+
+      <p>Good networking decisions start from SLOs, not from defaults. Each example below begins with a concrete SLO and derives the networking configuration required to meet it.</p>
+
+      <!-- SLO Example 1: Video Conferencing -->
+      <h3>SLO Example 1: Video Conferencing</h3>
+      <div class="callout callout-info">
+        <h4>SLO: p99 RTT &lt; 150ms, 1,000 Concurrent Calls</h4>
+        <p><strong>Scenario:</strong> A video conferencing platform must deliver two-way audio/video with p99 round-trip latency under 150ms for 1,000 simultaneous calls.</p>
+        <p><strong>Bandwidth derivation:</strong> Each call uses two media streams (send + receive). With VP8 at 720p the typical bitrate is ~1.5 Mbps per direction, so each call consumes ~3 Mbps. 1,000 calls &times; 3 Mbps = <strong>3 Gbps aggregate media bandwidth</strong>. Provision at least 5 Gbps to absorb bursts and retransmissions.</p>
+        <p><strong>Codec selection:</strong> At 150ms RTT budget, ~50ms is consumed by encode/decode. This leaves ~100ms for network transit. Opus audio (20ms frames) fits comfortably. For video, H.264 Baseline Profile with 100ms keyframe intervals keeps decode latency low. AV1 has better compression but its encode latency (~200ms at real-time preset) would blow the budget &mdash; reject it.</p>
+        <p><strong>Protocol choice:</strong> UDP with SRTP, not TCP. A single lost TCP segment stalls the entire stream (head-of-line blocking), which destroys real-time guarantees. With UDP, lost frames are concealed by the codec (Opus PLC, video freeze-frame) rather than blocking subsequent frames.</p>
+        <p><strong>Server placement:</strong> With a 100ms network budget, servers must be within ~50ms one-way of clients. Use latency-based DNS routing to direct users to the nearest media relay. For global coverage, deploy in at least 5 regions (US-East, US-West, EU-West, APAC-South, APAC-East).</p>
+      </div>
+
+      <!-- SLO Example 2: Real-Time Gaming -->
+      <h3>SLO Example 2: Real-Time Gaming</h3>
+      <div class="callout callout-info">
+        <h4>SLO: p99 RTT &lt; 50ms, 100K Concurrent Players</h4>
+        <p><strong>Scenario:</strong> A real-time multiplayer game requires p99 RTT under 50ms for 100,000 concurrent players across North America.</p>
+        <p><strong>Server placement:</strong> 50ms RTT means ~25ms one-way. Light in fiber travels at ~200 km/ms, giving a radius of ~5,000 km at the physical limit, but real-world routing adds 1.5-3x overhead. Practically, you need servers within ~2,000 km of every player. For NA coverage: deploy in US-East (Virginia), US-Central (Dallas), US-West (Oregon), and Canada-Central (Montreal) &mdash; 4 regions.</p>
+        <p><strong>TCP vs UDP:</strong> At 50ms budget, TCP retransmission timeout (~200ms minimum) is 4x the entire budget. A single lost packet causes a catastrophic latency spike. Use UDP with application-level reliability: send game state at 60 Hz (every 16.7ms), make each packet self-contained (no dependency on previous packets), and use client-side prediction to mask jitter.</p>
+        <p><strong>Packet size optimization:</strong> Each game state update is ~200 bytes. Keep packets under the typical Internet MTU of 1,400 bytes to avoid fragmentation. Fragmented UDP packets are reassembled at the destination &mdash; if any fragment is lost, the entire datagram is dropped. Bundle up to 6 player updates per packet (6 &times; 200 = 1,200 bytes payload + 28 bytes UDP/IP header = 1,228 bytes, safely under MTU).</p>
+        <p><strong>Capacity math:</strong> 100K players &times; 60 packets/sec &times; 1,228 bytes = ~7.4 Gbps inbound. Each game server handles ~100 players, so you need 1,000 game server instances plus headroom.</p>
+      </div>
+
+      <!-- SLO Example 3: File Sync -->
+      <h3>SLO Example 3: File Sync Service</h3>
+      <div class="callout callout-info">
+        <h4>SLO: 100 MB File Sync in &lt; 10s on a 100 Mbps Link</h4>
+        <p><strong>Scenario:</strong> A file synchronization service (like Dropbox) must sync a 100 MB file in under 10 seconds when the user has a 100 Mbps connection.</p>
+        <p><strong>Theoretical check:</strong> 100 MB = 800 Mb. At 100 Mbps, the minimum transfer time is 8 seconds. This leaves only 2 seconds of budget for overhead &mdash; extremely tight.</p>
+        <p><strong>TCP window sizing:</strong> Assume 40ms RTT to the nearest storage edge. BDP = 100 Mbps &times; 0.04s = 4 Mb = <strong>500 KB</strong>. TCP receive window must be at least 500 KB to saturate the link. Default Linux <code>tcp_rmem</code> max of 6 MB is sufficient, but ensure the initial window is large enough &mdash; set <code>initcwnd</code> to 32 segments (48 KB) to accelerate slow start.</p>
+        <p><strong>Chunking strategy:</strong> Do not send the file as a single stream. Split into 4 MB chunks and upload via 4 parallel TCP connections. Each connection only needs 125 KB window to reach its 25 Mbps share. Parallel connections also provide resilience &mdash; if one connection hits packet loss and enters congestion avoidance, the others continue at full speed. Total throughput degrades gracefully.</p>
+        <p><strong>Slow-start penalty:</strong> TCP slow start from <code>initcwnd=10</code> takes ~5 RTTs (200ms) to reach the BDP of 500 KB. With 4 connections, this is 200ms &times; 4 = 200ms total (connections start in parallel). Acceptable within the 2s overhead budget. Use persistent connections (HTTP/2 or long-lived TCP) for subsequent syncs to skip slow start entirely.</p>
+        <p><strong>Deduplication layer:</strong> Before any transfer, hash each 4 MB chunk (SHA-256). Send only chunks the server does not already have. For a file with 90% unchanged content, actual transfer drops from 100 MB to 10 MB, completing in ~1 second.</p>
+      </div>
+
+      <!-- SLO Example 4: Microservices East-West Traffic -->
+      <h3>SLO Example 4: Microservices East-West Traffic</h3>
+      <div class="callout callout-info">
+        <h4>SLO: p99 &lt; 5ms Intra-DC Latency, 1M RPS</h4>
+        <p><strong>Scenario:</strong> A microservices mesh within a single datacenter must handle 1 million requests per second with p99 latency under 5ms between any two services.</p>
+        <p><strong>MTU optimization:</strong> Default Ethernet MTU is 1,500 bytes. Intra-DC, enable jumbo frames (MTU 9,000 bytes). A typical gRPC response of 4 KB requires 3 packets at MTU 1,500 but only 1 packet at MTU 9,000. Fewer packets mean fewer interrupts, less CPU overhead, and lower latency. Verify all switches in the path support jumbo frames &mdash; a single 1,500-byte link causes fragmentation and performance collapse.</p>
+        <p><strong>Connection pooling:</strong> At 1M RPS across 200 services, each service averages 5,000 RPS. Using Little's Law with 2ms average latency: <code>pool_size = 5,000 &times; 0.002 = 10 connections</code> per upstream service. Add 2x headroom for p99 variance: <strong>20 connections per upstream</strong>. With 200 services, each instance holds ~4,000 connections total. Use HTTP/2 to multiplex requests over fewer TCP connections &mdash; a single HTTP/2 connection can handle 100+ concurrent streams.</p>
+        <p><strong>Kernel tuning for sub-5ms:</strong></p>
+        <ul>
+          <li><code>net.ipv4.tcp_nodelay = 1</code> &mdash; Disable Nagle's algorithm. Nagle buffers small writes for up to 200ms to coalesce them, which is fatal for a 5ms budget.</li>
+          <li><code>net.ipv4.tcp_low_latency = 1</code> &mdash; Prefer latency over throughput in TCP processing.</li>
+          <li><code>net.core.busy_poll = 50</code> &mdash; Busy-poll the NIC for 50&mu;s before sleeping. Eliminates interrupt-to-userspace wakeup latency (~10-50&mu;s) at the cost of CPU.</li>
+          <li><code>SO_REUSEPORT</code> on all listeners &mdash; Distribute incoming connections across CPU cores, avoiding single-core bottleneck on the accept queue.</li>
+        </ul>
+        <p><strong>Capacity math:</strong> 1M RPS &times; 2 KB average request/response = 2 GB/s = 16 Gbps. A 25 GbE NIC handles this comfortably. At 10 GbE, you need two NICs with RSS (Receive Side Scaling) to distribute across cores.</p>
+      </div>
+
+      <!-- Interactive Canvas: Throughput vs RTT & Packet Loss -->
+      <h3>Interactive: Effective Throughput vs Network Conditions</h3>
+      <p>This graph shows how effective TCP throughput degrades as RTT increases and packet loss rises. Hover over any point to see exact values. The Mathis formula models this: <code>throughput &approx; (MSS / RTT) &times; (1 / &radic;loss)</code>.</p>
+      <div style="position:relative; margin:1.5rem 0;">
+        <canvas id="throughputCanvas" width="760" height="420" style="width:100%;max-width:760px;border:1px solid var(--border, #333);border-radius:8px;cursor:crosshair;"></canvas>
+        <div id="canvasTooltip" style="display:none;position:absolute;pointer-events:none;background:rgba(0,0,0,0.88);color:#f0f0f0;padding:8px 12px;border-radius:6px;font-size:0.85rem;line-height:1.4;font-family:'JetBrains Mono',monospace;white-space:nowrap;z-index:10;"></div>
+      </div>
+      <p style="font-size:0.85rem;opacity:0.7;">Assumptions: MSS = 1,460 bytes, TCP Reno-like behavior. Curves show throughput ceiling for a single TCP connection at each loss rate.</p>
+
+      <script>
+      (function() {
+        const canvas = document.getElementById('throughputCanvas');
+        const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('canvasTooltip');
+
+        const W = canvas.width, H = canvas.height;
+        const pad = { top: 40, right: 30, bottom: 60, left: 80 };
+        const plotW = W - pad.left - pad.right;
+        const plotH = H - pad.top - pad.bottom;
+
+        const MSS = 1460; // bytes
+        const lossRates = [
+          { rate: 0.0001, color: '#22c55e', label: '0.01% loss' },
+          { rate: 0.001,  color: '#3b82f6', label: '0.1% loss' },
+          { rate: 0.01,   color: '#f59e0b', label: '1% loss' },
+          { rate: 0.05,   color: '#ef4444', label: '5% loss' }
+        ];
+
+        const rttMin = 1, rttMax = 300; // ms
+        const tputMax = 800; // Mbps
+
+        function rttToX(rtt) { return pad.left + (rtt - rttMin) / (rttMax - rttMin) * plotW; }
+        function tputToY(t)  { return pad.top + plotH - (t / tputMax) * plotH; }
+        function xToRtt(x)   { return rttMin + (x - pad.left) / plotW * (rttMax - rttMin); }
+
+        function mathisThroughput(rttMs, loss) {
+          // Mathis formula: throughput = (MSS / RTT) * (C / sqrt(loss))
+          // C ~ 1.22 for TCP Reno
+          var rttSec = rttMs / 1000;
+          var tputBps = (MSS * 8 / rttSec) * (1.22 / Math.sqrt(loss));
+          return tputBps / 1e6; // Mbps
+        }
+
+        function drawGrid() {
+          ctx.fillStyle = '#181818';
+          ctx.fillRect(0, 0, W, H);
+
+          // Grid lines
+          ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+          ctx.lineWidth = 1;
+          for (var t = 0; t <= tputMax; t += 100) {
+            var y = tputToY(t);
+            ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+          }
+          for (var r = 0; r <= rttMax; r += 50) {
+            var x = rttToX(r);
+            ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+          }
+
+          // Axes
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + plotH); ctx.lineTo(W - pad.right, pad.top + plotH); ctx.stroke();
+
+          // Labels
+          ctx.fillStyle = 'rgba(255,255,255,0.7)';
+          ctx.font = '12px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          for (var r = 0; r <= rttMax; r += 50) {
+            ctx.fillText(r + 'ms', rttToX(r), pad.top + plotH + 20);
+          }
+          ctx.fillText('Round-Trip Time (RTT)', W / 2, H - 10);
+
+          ctx.textAlign = 'right';
+          for (var t = 0; t <= tputMax; t += 100) {
+            ctx.fillText(t + ' Mbps', pad.left - 8, tputToY(t) + 4);
+          }
+
+          ctx.save();
+          ctx.translate(16, pad.top + plotH / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.fillText('Effective Throughput', 0, 0);
+          ctx.restore();
+
+          // Title
+          ctx.fillStyle = 'rgba(255,255,255,0.9)';
+          ctx.font = 'bold 14px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('TCP Throughput vs RTT (Mathis Model)', W / 2, 22);
+        }
+
+        function drawCurves() {
+          lossRates.forEach(function(lr) {
+            ctx.strokeStyle = lr.color;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            var started = false;
+            for (var r = rttMin; r <= rttMax; r += 1) {
+              var t = Math.min(mathisThroughput(r, lr.rate), tputMax);
+              var x = rttToX(r), y = tputToY(t);
+              if (!started) { ctx.moveTo(x, y); started = true; }
+              else { ctx.lineTo(x, y); }
+            }
+            ctx.stroke();
+          });
+        }
+
+        function drawLegend() {
+          var lx = pad.left + 16, ly = pad.top + 14;
+          lossRates.forEach(function(lr, i) {
+            var yy = ly + i * 22;
+            ctx.fillStyle = lr.color;
+            ctx.fillRect(lx, yy - 6, 18, 4);
+            ctx.fillStyle = 'rgba(255,255,255,0.8)';
+            ctx.font = '11px "JetBrains Mono", monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(lr.label, lx + 24, yy);
+          });
+        }
+
+        function render() {
+          drawGrid();
+          drawCurves();
+          drawLegend();
+        }
+        render();
+
+        // Hover interaction
+        canvas.addEventListener('mousemove', function(e) {
+          var rect = canvas.getBoundingClientRect();
+          var scaleX = W / rect.width;
+          var mx = (e.clientX - rect.left) * scaleX;
+          var my = (e.clientY - rect.top) * (H / rect.height);
+
+          if (mx < pad.left || mx > W - pad.right || my < pad.top || my > pad.top + plotH) {
+            tooltip.style.display = 'none';
+            render();
+            return;
+          }
+
+          var rtt = xToRtt(mx);
+          rtt = Math.max(rttMin, Math.min(rttMax, rtt));
+
+          // Redraw with crosshair
+          render();
+          ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath(); ctx.moveTo(mx, pad.top); ctx.lineTo(mx, pad.top + plotH); ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Draw dots on curves
+          var lines = [];
+          lines.push('RTT: ' + rtt.toFixed(1) + ' ms');
+          lines.push('---');
+          lossRates.forEach(function(lr) {
+            var t = Math.min(mathisThroughput(rtt, lr.rate), tputMax);
+            var y = tputToY(t);
+            ctx.fillStyle = lr.color;
+            ctx.beginPath(); ctx.arc(rttToX(rtt), y, 5, 0, Math.PI * 2); ctx.fill();
+            lines.push(lr.label + ': ' + t.toFixed(1) + ' Mbps');
+          });
+
+          // BDP
+          var bdpKB = (100 * rtt / 8).toFixed(0); // assuming 100 Mbps link
+          lines.push('---');
+          lines.push('BDP (100Mbps): ' + bdpKB + ' KB');
+
+          tooltip.innerHTML = lines.map(function(l) { return l === '---' ? '<hr style="border:none;border-top:1px solid rgba(255,255,255,0.2);margin:4px 0;">' : l; }).join('<br>');
+          tooltip.style.display = 'block';
+
+          var tipX = e.clientX - rect.left + 16;
+          var tipY = e.clientY - rect.top - 10;
+          if (tipX + 220 > rect.width) tipX = e.clientX - rect.left - 230;
+          if (tipY < 0) tipY = 10;
+          tooltip.style.left = tipX + 'px';
+          tooltip.style.top = tipY + 'px';
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+          tooltip.style.display = 'none';
+          render();
+        });
+      })();
+      </script>
+
+      <!-- SLO-Driven Capacity Planning -->
+      <h3>SLO-Driven Capacity Planning</h3>
+      <p>Capacity planning that starts from SLOs avoids both over-provisioning (wasted cost) and under-provisioning (breached SLOs). Follow this framework:</p>
+
+      <h4>Step 1: Define the Latency Budget</h4>
+      <p>Break the end-to-end SLO into per-hop budgets. For a p99 &lt; 200ms API response:</p>
+      <ul>
+        <li><strong>Client &rarr; Edge:</strong> 30ms (governed by geography and DNS routing)</li>
+        <li><strong>Edge &rarr; Origin DC:</strong> 40ms (governed by backbone RTT)</li>
+        <li><strong>Load balancer + TLS:</strong> 2ms (L7 processing + TLS termination)</li>
+        <li><strong>Service processing:</strong> 100ms (application logic + DB)</li>
+        <li><strong>Response return path:</strong> 28ms (asymmetric routing possible)</li>
+      </ul>
+      <p>Total: 200ms. Each component team owns their slice and monitors against it.</p>
+
+      <h4>Step 2: Derive Bandwidth from Throughput SLO</h4>
+      <p>Convert request rate SLOs to bandwidth requirements:</p>
+      <p><code>bandwidth = RPS &times; avg_response_size &times; overhead_factor</code></p>
+      <p>Where <code>overhead_factor</code> accounts for TCP/IP headers (~3% for large responses, ~40% for small responses), TLS record framing (~1%), and retransmissions (~1-2% on typical links). For 50K RPS with 5 KB average responses:</p>
+      <p><code>50,000 &times; 5 KB &times; 1.05 = 262.5 MB/s = <strong>2.1 Gbps</strong></code></p>
+      <p>Provision 2x headroom for burst absorption: <strong>5 Gbps</strong> NIC capacity.</p>
+
+      <h4>Step 3: Size Buffers and Pools from the Tail</h4>
+      <p>Always size for the p99, not the average. Connection pools, TCP buffers, and queue depths should accommodate tail latency:</p>
+      <ul>
+        <li><strong>Connection pool:</strong> <code>pool = RPS &times; p99_latency &times; safety_margin</code>. If p99 is 4x the average, your pool must be 4x the Little's Law minimum.</li>
+        <li><strong>TCP buffers:</strong> Size to BDP at the p99 RTT (which may be 2-3x the median RTT due to retransmissions and queueing).</li>
+        <li><strong>Queue depth:</strong> If your service can absorb bursts for 2 seconds at p99 processing time, queue depth = <code>burst_RPS &times; 2s &times; p99_processing_time</code>.</li>
+      </ul>
+
+      <h4>Step 4: Validate with Load Testing at the Tail</h4>
+      <p>Synthetic benchmarks at average load tell you nothing about SLO compliance. Test at p99 conditions:</p>
+      <ul>
+        <li>Inject 1% packet loss (using <code>tc netem</code>) to simulate real-world network conditions.</li>
+        <li>Run at 80% of provisioned capacity for 1 hour, not 5 minutes &mdash; buffer bloat and GC pauses surface over time.</li>
+        <li>Measure p99.9, not just p99 &mdash; many SLO breaches hide in the last 0.1%.</li>
+        <li>Test with realistic payload size distributions, not uniform sizes.</li>
+      </ul>
+
+      <h3>Key Tradeoff: Connection Count</h3>
+      <ul>
+        <li><strong>Too few connections</strong> &mdash; Serialization delay. Requests queue behind the pool, adding latency spikes at p99.</li>
+        <li><strong>Too many connections</strong> &mdash; Memory waste (per-connection buffers), server CPU overhead (context switching between connections), and risk of exhausting server-side limits (file descriptors, <code>max_connections</code>).</li>
+        <li><strong>Sweet spot</strong> &mdash; Use the Little's Law formula as a baseline, add 50-100% headroom, and monitor queue wait time. If requests spend more than 5ms waiting for a pooled connection, the pool is too small.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 9. Scaling Journey ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Scaling Journey</h2>
+      <div class="scaling-stages">
+        <div class="scaling-stage">
+          <span class="stage-users">0 &ndash; 1K Users</span>
+          <h4>Single Connection Per Request</h4>
+          <p>Each incoming HTTP request opens a fresh TCP connection to the database, makes its query, and closes the connection. Simple, no pooling libraries needed. At low traffic, the 1ms handshake overhead is invisible.</p>
+          <p><strong>Migration signal:</strong> p99 latency rises as handshake overhead becomes a measurable fraction of request time. Database logs show frequent connection churn.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">1K &ndash; 100K Users</span>
+          <h4>Connection Pooling</h4>
+          <p>Introduce a connection pool (PgBouncer, HikariCP, or language-native pools). Connections are reused across requests, eliminating handshake overhead. HTTP/1.1 Keep-Alive keeps upstream connections open.</p>
+          <p><strong>Migration signal:</strong> With HTTP/1.1, each in-flight request needs its own connection. At high concurrency, you open hundreds of TCP connections to the same upstream. Head-of-line blocking limits throughput.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">100K &ndash; 10M Users</span>
+          <h4>HTTP/2 Multiplexing</h4>
+          <p>HTTP/2 multiplexes many logical streams over a single TCP connection. This dramatically reduces connection count to upstreams (load balancers, APIs, CDN origins). gRPC uses HTTP/2 natively, making it ideal for inter-service communication.</p>
+          <p><strong>Migration signal:</strong> TCP head-of-line blocking becomes visible. A single lost packet stalls all multiplexed streams on that connection. Tail latency (p99.9) increases under packet loss.</p>
+        </div>
+        <div class="scaling-stage">
+          <span class="stage-users">10M+ Users</span>
+          <h4>QUIC/HTTP/3 &amp; Kernel Bypass</h4>
+          <p>QUIC eliminates TCP head-of-line blocking (each stream is independently reliable). 0-RTT resumption slashes connection setup for returning users. For ultra-low-latency paths (ad bidding, HFT), kernel bypass (DPDK, io_uring) eliminates syscall overhead entirely.</p>
+          <p><strong>Migration signal:</strong> When you need sub-millisecond latency guarantees or when mobile users on lossy networks suffer from TCP performance issues.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10. What Can Go Wrong ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>What Can Go Wrong</h2>
+
+      <h3>TCP Head-of-Line Blocking</h3>
+      <p><strong>What happened:</strong> A major web application migrated from HTTP/1.1 (multiple connections) to HTTP/2 (single multiplexed connection). Under normal conditions, latency improved. But on lossy mobile networks, p99 latency doubled. A single lost TCP segment blocked all HTTP/2 streams on that connection until the segment was retransmitted.</p>
+      <p><strong>Root cause:</strong> TCP treats its byte stream as strictly ordered. HTTP/2 multiplexes independent request/response streams over that single ordered stream. One lost packet stalls everything &mdash; even streams whose data arrived fine.</p>
+      <p><strong>Mitigation:</strong> Used multiple HTTP/2 connections (partially defeating the purpose), or migrated to QUIC/HTTP/3 where each stream has independent loss recovery. Some CDNs now automatically fall back from HTTP/2 to HTTP/1.1 on high-loss connections.</p>
+
+      <h3>Connection Exhaustion (TIME_WAIT Accumulation)</h3>
+      <p><strong>What happened:</strong> A microservice under heavy load started returning connection errors intermittently. Monitoring showed 28,000 sockets in TIME_WAIT state, approaching the ephemeral port range limit (typically 28,232 ports on Linux, from 32768-60999).</p>
+      <p><strong>Root cause:</strong> The service was opening and closing short-lived TCP connections to a downstream API at high frequency. TCP's TIME_WAIT state (2 &times; MSL = 60s by default) exists to prevent old packets from a closed connection from being misinterpreted by a new connection on the same port. But at high churn rates, you run out of (source IP, source port, dest IP, dest port) tuples.</p>
+      <p><strong>Mitigation:</strong> Enabled <code>tcp_tw_reuse</code> (allows reusing TIME_WAIT sockets for new outbound connections), switched to connection pooling (HTTP Keep-Alive), and widened the ephemeral port range (<code>net.ipv4.ip_local_port_range</code>). Long-term fix: moved to HTTP/2 with persistent connections.</p>
+
+      <h3>Bufferbloat Adding Hidden Latency</h3>
+      <p><strong>What happened:</strong> A video streaming service reported that interactive API calls (play/pause, seek) became sluggish during peak streaming hours, even though bandwidth utilization was only 40%. Ping times to the API went from 5ms to 300ms.</p>
+      <p><strong>Root cause:</strong> Network switches and home routers had oversized buffers. During streaming, TCP filled these buffers (because TCP thinks buffered packets = delivered packets). The buffers added hundreds of milliseconds of queuing delay that TCP's congestion control could not detect because no packets were being dropped &mdash; they were just sitting in a very deep queue.</p>
+      <p><strong>Mitigation:</strong> Deployed Active Queue Management (AQM) with CoDel or PIE algorithms on network equipment. Switched congestion control to BBR (which measures RTT rather than waiting for loss). Reduced TCP buffer sizes to prevent excessive queuing.</p>
+    </div>
+  </section>
+
+  <!-- ===== 11. Operating in Production ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Operating in Production</h2>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>What It Tells You</th>
+            <th>Alert Threshold</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>tcp_connections_active</code></td>
+            <td>Number of open TCP connections. Spikes mean connection leaks or traffic surges.</td>
+            <td>Alert if &gt; 80% of <code>max_connections</code> or file descriptor limit</td>
+          </tr>
+          <tr>
+            <td><code>tcp_time_wait_count</code></td>
+            <td>Sockets stuck in TIME_WAIT. High counts indicate connection churn without pooling.</td>
+            <td>Alert if &gt; 15,000 (approaching ephemeral port exhaustion)</td>
+          </tr>
+          <tr>
+            <td><code>tcp_retransmission_rate</code></td>
+            <td>Percentage of segments retransmitted. Indicates packet loss or network congestion.</td>
+            <td>Alert if &gt; 1%. Page if &gt; 5%.</td>
+          </tr>
+          <tr>
+            <td><code>tcp_rtt_ms</code> (p50/p99)</td>
+            <td>Round-trip time to peers. Increasing RTT may indicate congestion, bufferbloat, or routing changes.</td>
+            <td>Alert if p99 RTT &gt; 2x baseline for same-region peers</td>
+          </tr>
+          <tr>
+            <td><code>network_bandwidth_utilization</code></td>
+            <td>Percentage of link capacity used. Saturation causes queuing delay.</td>
+            <td>Alert if sustained &gt; 70% on any link</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Debug Playbook</h3>
+      <div class="debug-flow">
+        <p><strong>Is latency high?</strong></p>
+        <p>&rarr; Check RTT to the peer &rarr; If RTT is normal, the issue is server-side (application, DB). If RTT is elevated:</p>
+        <p>&nbsp;&nbsp;&rarr; Check retransmission rate &rarr; If retransmissions are high, there is packet loss on the path. Check NIC errors, switch port errors, intermediate router health.</p>
+        <p>&nbsp;&nbsp;&rarr; If retransmissions are low but RTT is high, suspect <strong>bufferbloat</strong>. Check queue depth on switches/routers. Consider enabling BBR or AQM.</p>
+        <p><strong>Are connections failing?</strong></p>
+        <p>&rarr; Check TIME_WAIT count &rarr; If high, enable <code>tcp_tw_reuse</code> and implement connection pooling.</p>
+        <p>&rarr; Check SYN backlog &rarr; If <code>ListenOverflows</code> counter is incrementing, increase <code>tcp_max_syn_backlog</code> and <code>somaxconn</code>.</p>
+        <p>&rarr; Check file descriptor limits &rarr; Each socket consumes one fd. Increase <code>ulimit -n</code> and <code>fs.file-max</code>.</p>
+      </div>
+
+      <h3>Configuration That Matters</h3>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>What It Does</th>
+            <th>Recommended Production Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>net.core.somaxconn</code></td>
+            <td>Maximum queue length for pending connections. Limits how many connections wait in the accept queue.</td>
+            <td><code>65535</code> (default 4096 in modern kernels)</td>
+          </tr>
+          <tr>
+            <td><code>net.ipv4.tcp_max_syn_backlog</code></td>
+            <td>Maximum number of half-open connections (SYN received, waiting for final ACK). Prevents SYN flood exhaustion.</td>
+            <td><code>65535</code></td>
+          </tr>
+          <tr>
+            <td><code>net.ipv4.tcp_keepalive_time</code></td>
+            <td>Seconds before TCP sends a keepalive probe on an idle connection. Detects dead peers.</td>
+            <td><code>60</code> (default 7200 is too slow for most services)</td>
+          </tr>
+          <tr>
+            <td><code>net.ipv4.tcp_tw_reuse</code></td>
+            <td>Allows reusing TIME_WAIT sockets for new outgoing connections (safe with timestamps).</td>
+            <td><code>1</code> (enabled)</td>
+          </tr>
+          <tr>
+            <td><code>net.core.netdev_max_backlog</code></td>
+            <td>Maximum number of packets queued on the input side when the interface receives packets faster than the kernel can process them.</td>
+            <td><code>65535</code> (default 1000)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Bonus:</strong> <code>SO_REUSEPORT</code> (set per-socket, not sysctl) allows multiple processes to bind to the same port. The kernel distributes incoming connections across all listeners, improving multi-core scalability for servers like Nginx. This is how high-performance proxies achieve millions of connections per second.</p>
+    </div>
+  </section>
+
+  <!-- ===== 12. Interactions & Pitfalls ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Interactions &amp; Pitfalls</h2>
+
+      <h3>Networking + Load Balancing</h3>
+      <p><strong>L4 load balancers</strong> (TCP level) route based on IP/port tuples. They see TCP connections but not HTTP requests. A single HTTP/2 connection carrying 100 multiplexed streams looks like one connection to an L4 LB, causing uneven load distribution. <strong>L7 load balancers</strong> (HTTP level) can see individual requests and distribute them evenly, but they terminate TCP connections (adding latency) and must manage their own connection pools to backends.</p>
+      <p><strong>Pitfall:</strong> If you use an L4 LB with HTTP/2 clients, you may see one backend drowning while others idle. Solution: use L7 load balancing for HTTP/2, or configure clients to open multiple HTTP/2 connections.</p>
+
+      <h3>Networking + CDN</h3>
+      <p>CDN edge servers are geographically close to users (low RTT), but the <strong>first request to an edge</strong> suffers TCP slow start &mdash; the connection starts with a small congestion window and must ramp up. For small assets (a 10KB JavaScript file), the entire transfer might complete before slow start finishes ramping up, so you never reach full throughput.</p>
+      <p><strong>Pitfall:</strong> CDN providers tune <code>initcwnd</code> (initial congestion window) to 10 segments (~14KB) or higher. Google found that increasing initcwnd from 3 to 10 reduced page load time by 10%. If you control your origin server, tune this too.</p>
+
+      <h3>Networking + Microservices</h3>
+      <p>Each hop in a microservice call chain adds at least 1 RTT (more if connections are not pooled). A request that traverses 5 services adds 5 RTTs of network latency. Within a datacenter (0.5ms RTT), this is 2.5ms. Across availability zones (1-2ms RTT), it is 5-10ms. If any hop crosses regions (50-100ms RTT), latency explodes.</p>
+      <p><strong>Pitfall:</strong> "The network is fast" is a common assumption that breaks when you have deep call chains. Always budget for network latency at each hop. Use persistent connections (gRPC with HTTP/2) and co-locate tightly-coupled services in the same availability zone.</p>
+
+      <h3>Networking + Database</h3>
+      <p>Database connections are expensive to establish (TCP + TLS + authentication + session setup). A PostgreSQL connection setup can take 5-20ms. Without pooling, a service making 1000 QPS would need 1000 connection setups per second &mdash; 5-20 seconds of cumulative overhead per second, which is obviously impossible.</p>
+      <p><strong>Pitfall:</strong> Connection poolers like PgBouncer in transaction mode can multiplex many application connections over fewer database connections. But in transaction mode, prepared statements and session-level settings (SET search_path) do not work across requests. Test your ORM compatibility.</p>
+    </div>
+  </section>
+
+  <!-- ===== 13. Cost Considerations ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Cost Considerations</h2>
+      <div class="callout-cost">
+        <h4>Network Cost Breakdown</h4>
+        <ul>
+          <li><strong>Egress is the dominant cost.</strong> Cloud providers charge $0.05-$0.09/GB for data leaving their network (egress). Ingress is free. For a service sending 100 TB/month, that is $5,000-$9,000/month in egress alone.</li>
+          <li><strong>Cross-AZ transfer:</strong> AWS charges $0.01/GB per direction for cross-AZ traffic. A microservice architecture with chatty cross-AZ calls can accumulate thousands of dollars monthly in transfer costs that are invisible until you check the bill.</li>
+          <li><strong>NAT Gateway costs:</strong> AWS NAT Gateways charge $0.045/GB processed, plus $0.045/hour. A service sending 10 TB/month through NAT costs $495/month just for the NAT Gateway. Use VPC endpoints for AWS services and consider NAT instances for cost-sensitive workloads.</li>
+          <li><strong>Compression saves 3-5x.</strong> Enabling gzip/Brotli on HTTP responses and using protocol buffers instead of JSON can reduce payload sizes by 60-80%, directly cutting egress costs. A 5 KB JSON payload compressed to 1.2 KB saves $0.00000038 per response &mdash; at 1 billion requests/month, that is $380/month saved.</li>
+          <li><strong>The cost of NOT optimizing networking:</strong> Without connection pooling, you pay in CPU overhead (connection setup/teardown). Without compression, you pay in bandwidth costs. Without proper TCP tuning, you pay in underutilized expensive links. Without a CDN, you pay in origin bandwidth and higher latency losing users.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 14. Real-World Examples ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Real-World Examples</h2>
+
+      <h3>Google BBR Deployment</h3>
+      <p>In 2016, Google deployed BBR across its entire infrastructure, including YouTube, Google Cloud, and internal services. Results: <strong>14% throughput improvement</strong> globally for YouTube, with improvements up to <strong>2,700x on lossy links</strong> (e.g., developing countries with congested last-mile networks). BBR achieved this by refusing to interpret random packet loss as congestion &mdash; instead measuring actual bottleneck bandwidth and RTT. The lesson for system design: your congestion control algorithm choice (a simple kernel config change) can have a larger impact than weeks of application optimization.</p>
+
+      <h3>QUIC Adoption at Google and Cloudflare</h3>
+      <p>Google has been using QUIC for Chrome-to-Google-server traffic since 2013, carrying over 30% of all Google traffic. Cloudflare rolled out QUIC/HTTP/3 support in 2019 and reported that QUIC reduced time-to-first-byte by <strong>12.4%</strong> on average compared to HTTP/2, with larger gains on high-latency and lossy connections. The 0-RTT handshake is particularly impactful for mobile users who switch networks frequently (Wi-Fi to cellular) &mdash; QUIC's connection migration means no re-handshake is needed.</p>
+
+      <h3>Netflix TCP Optimization for Video Streaming</h3>
+      <p>Netflix operates its own CDN (Open Connect) with appliances deployed directly in ISP networks. They customized the TCP stack on their FreeBSD-based Open Connect servers: increasing the initial congestion window, tuning TCP buffer sizes for video streaming workloads, and using sendfile() for zero-copy data transfer from disk to NIC. These OS-level networking optimizations allow a single Netflix appliance to serve <strong>90 Gbps of video traffic</strong> from commodity hardware. The system design takeaway: for data-intensive applications, networking optimization at the OS level can be more impactful than application-level changes.</p>
+    </div>
+  </section>
+
+  <!-- ===== 15. Code Example ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Code Example: TCP Sliding Window Simulation</h2>
+      <p>A simplified Python simulation of TCP's sliding window protocol with sender and receiver. This illustrates window management, ACK-based advancement, and congestion response &mdash; the same concepts that govern connection throughput in any system you design.</p>
+<pre class="line-numbers"><code class="language-python">import random
+
+class SlidingWindowSender:
+    def __init__(self, total_packets=20, init_cwnd=4):
+        self.total = total_packets
+        self.cwnd = init_cwnd          # congestion window
+        self.base = 0                  # oldest unacked packet
+        self.next_seq = 0              # next packet to send
+        self.acked = [False] * total_packets
+        self.ssthresh = 16             # slow start threshold
+
+    def send_window(self):
+        """Send all packets within the current window."""
+        sent = []
+        while self.next_seq < self.total and \
+              self.next_seq < self.base + self.cwnd:
+            sent.append(self.next_seq)
+            self.next_seq += 1
+        return sent
+
+    def receive_ack(self, ack_num):
+        """Process an ACK — slide window forward."""
+        self.acked[ack_num] = True
+        while self.base < self.total and self.acked[self.base]:
+            self.base += 1
+        # Grow window: slow start or congestion avoidance
+        if self.cwnd < self.ssthresh:
+            self.cwnd += 1              # slow start: exponential
+        else:
+            self.cwnd += 1 / self.cwnd  # congestion avoidance: linear
+
+    def handle_loss(self):
+        """Packet loss detected — shrink window (multiplicative decrease)."""
+        self.ssthresh = max(self.cwnd // 2, 2)
+        self.cwnd = self.ssthresh
+        self.next_seq = self.base      # retransmit from base
+
+# --- Simulation ---
+sender = SlidingWindowSender(total_packets=20, init_cwnd=2)
+loss_prob = 0.1  # 10% packet loss — like a congested network
+
+while sender.base < sender.total:
+    sent = sender.send_window()
+    print(f"Sent: {sent}  cwnd={sender.cwnd:.1f}  base={sender.base}")
+    for seq in sent:
+        if random.random() > loss_prob:
+            sender.receive_ack(seq)
+        else:
+            print(f"  !! Packet {seq} lost")
+            sender.handle_loss()
+            break
+print(f"All {sender.total} packets delivered.")</code></pre>
+    </div>
+  </section>
+
+  <!-- ===== 16. How to Validate Your Design ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>How to Validate Your Design</h2>
+
+      <h3>Bandwidth &amp; Throughput Testing</h3>
+      <p>Use <strong>iperf3</strong> to measure raw network throughput between two points. Run <code>iperf3 -s</code> on the server and <code>iperf3 -c &lt;server-ip&gt; -t 30</code> on the client for a 30-second test. Compare results to your expected BDP. If throughput is significantly below link capacity, TCP tuning (buffer sizes, congestion control algorithm) is likely the bottleneck.</p>
+      <p>For HTTP-level benchmarking, use <strong>wrk</strong> or <strong>k6</strong> to measure requests/second and latency distribution under load. Pay attention to p99, not just p50 &mdash; networking tail latency is where the problems hide.</p>
+
+      <h3>Packet Analysis</h3>
+      <p><strong>tcpdump</strong> and <strong>Wireshark</strong> let you inspect individual packets on the wire. Key things to look for:</p>
+      <ul>
+        <li>TCP retransmissions (filter: <code>tcp.analysis.retransmission</code> in Wireshark) &mdash; any retransmission &gt; 0.1% deserves investigation.</li>
+        <li>Window size negotiation &mdash; is the receive window shrinking to zero (receiver overwhelmed)?</li>
+        <li>TLS handshake duration &mdash; is it 1 RTT (TLS 1.3) or 2 (TLS 1.2)?</li>
+        <li>RST (reset) packets &mdash; unexpected connection terminations by a firewall or overloaded server.</li>
+      </ul>
+
+      <h3>Fault Injection</h3>
+      <p><strong>toxiproxy</strong> is a TCP proxy that lets you inject network faults between your service and its dependencies:</p>
+      <ul>
+        <li><strong>Latency</strong> &mdash; Add 200ms delay to simulate cross-region calls. Verify your timeouts are set correctly.</li>
+        <li><strong>Packet loss</strong> &mdash; Drop 5% of packets. Does your service degrade gracefully or crash?</li>
+        <li><strong>Bandwidth limiting</strong> &mdash; Throttle to 1 Mbps. Does your service handle slow clients without holding connections forever?</li>
+        <li><strong>Connection reset</strong> &mdash; Randomly RST connections. Does your connection pool recover and retry?</li>
+      </ul>
+      <p>Run fault injection tests in staging as part of your CI/CD pipeline. Netflix's Chaos Monkey philosophy applies to networking: if you have not tested it failing, assume it will fail in the worst way at the worst time.</p>
+    </div>
+  </section>
+
+  <!-- ===== 17. Interview Questions ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Interview Questions</h2>
+
+      <details class="interview-q">
+        <summary>Why does TCP have a three-way handshake?</summary>
+        <div class="answer">
+          <p>
+            The three-way handshake (SYN, SYN-ACK, ACK) serves a fundamental purpose: it allows both sides to agree on initial sequence numbers and confirm that the communication channel works in both directions. Without the third step (the client's ACK), the server would have no proof that the client received its sequence number &mdash; it would be committing resources (allocating a socket, buffer memory) based on a one-way message.
+          </p>
+          <p>
+            The three-way handshake also prevents <strong>stale connection requests</strong> from causing phantom connections. Imagine a SYN packet delayed by the network for 30 seconds. Without the final ACK, the server might accept this stale SYN and allocate resources for a connection the client no longer wants. The three-way handshake ensures both sides are alive and intentional right now.
+          </p>
+          <p>
+            <strong>System design connection:</strong> This 1-RTT cost is why connection pooling exists. In a microservices architecture, a request traversing 5 services would pay 5 RTTs just for TCP setup (plus 5 more for TLS). Connection pools amortize this cost by keeping connections open across requests. HTTP/2 multiplexing reduces it further by sending many requests over a single connection. QUIC eliminates it for returning clients with 0-RTT.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What is a SYN flood attack and how does SYN cookies defend against it? (SYN floods exhaust the server's SYN backlog with half-open connections. SYN cookies encode connection state in the sequence number, so the server does not allocate memory until the handshake completes.) How does TCP Fast Open avoid the handshake overhead? (TFO sends data in the SYN packet using a cached cookie, saving 1 RTT on repeat connections.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How does sliding window flow control work, and how does it relate to rate limiting in system design?</summary>
+        <div class="answer">
+          <p>
+            TCP's sliding window is a form of <strong>credit-based flow control</strong>. The receiver advertises how many bytes it can buffer (the receive window, rwnd). The sender can transmit up to that many bytes without waiting for an ACK. As the receiver processes data and frees buffer space, it advertises a larger window. If the receiver is overwhelmed, it advertises a smaller window &mdash; potentially zero, which pauses the sender entirely.
+          </p>
+          <p>
+            This is exactly the <strong>backpressure</strong> pattern in system design. A message queue with a bounded buffer applies the same principle: producers slow down when consumers cannot keep up. Rate limiting is the application-layer equivalent: the server advertises how many requests a client can make per second (the "window"), and the client must not exceed that rate. Token bucket algorithms are conceptually similar to TCP's window &mdash; tokens accumulate over time (like the window opening) and are consumed by requests (like sending data).
+          </p>
+          <p>
+            The congestion window (cwnd) adds a second dimension: even if the receiver has capacity, the sender also considers network capacity. This dual-window model is analogous to having both per-client rate limits (receiver flow control) and global rate limits (network congestion control) in an API gateway.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What happens when rwnd reaches zero? (TCP enters "persist mode" and sends small probe segments to detect when the window reopens. Without this, a deadlock would occur &mdash; the receiver waits for data, the sender waits for a window update.) How is this different from TCP's Nagle algorithm? (Nagle's algorithm batches small writes into larger segments for efficiency, reducing overhead from tiny packets. It can interact badly with delayed ACKs, causing 200ms latency &mdash; disable it with TCP_NODELAY for latency-sensitive applications.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>TCP vs. UDP &mdash; give examples of when to use each in system design.</summary>
+        <div class="answer">
+          <p>
+            <strong>TCP</strong> is the default choice for system design. Use it for HTTP/HTTPS (web APIs, REST, GraphQL), gRPC (microservice communication), database connections (PostgreSQL, MySQL, MongoDB), message queue protocols (Kafka uses TCP, AMQP uses TCP), and any scenario where every byte matters (file transfers, financial transactions). TCP's reliability, ordering, and congestion control are exactly what you want when data integrity is critical.
+          </p>
+          <p>
+            <strong>UDP</strong> is the right choice when latency matters more than reliability, or when you want to implement custom reliability semantics. Real-world examples: <strong>DNS</strong> (standard queries on port 53 &mdash; a single round trip, no need for connection setup), <strong>video streaming</strong> (WebRTC uses UDP because a dropped video frame is better than a delayed one; the player just shows the next frame), <strong>gaming</strong> (game state updates sent 30-60 times per second; old state is irrelevant by the time it is retransmitted), <strong>metrics/logging</strong> (StatsD sends metrics over UDP because dropping a few data points is acceptable and the simplicity/performance gain is worth it).
+          </p>
+          <p>
+            The modern answer also includes <strong>QUIC</strong>: it is technically UDP at the network layer but provides TCP-like reliability at the application layer. Use QUIC/HTTP/3 when you want reliable delivery without TCP's head-of-line blocking problem &mdash; especially for mobile users on lossy networks or for multiplexed API calls.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Why do some DNS implementations fall back to TCP? (When the DNS response exceeds 512 bytes &mdash; common with DNSSEC &mdash; UDP cannot carry it in a single datagram. DNS over HTTPS/TLS also uses TCP for privacy.) Can you build a reliable protocol on UDP? (Yes, QUIC does exactly this. You get to choose which reliability features you need and skip the ones you do not &mdash; at the cost of complexity.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>What is head-of-line blocking and how do HTTP/2 and QUIC address it?</summary>
+        <div class="answer">
+          <p>
+            <strong>Head-of-line (HOL) blocking</strong> occurs when a single slow or lost element blocks everything behind it. In TCP, it manifests because TCP guarantees in-order byte delivery. If segment #5 is lost, segments #6, #7, and #8 (which arrived fine) cannot be delivered to the application until #5 is retransmitted and received. The entire stream stalls.
+          </p>
+          <p>
+            <strong>HTTP/1.1</strong> suffers from HOL blocking at the application layer: each connection handles one request at a time, so a slow response blocks subsequent requests on that connection. Browsers work around this by opening 6 parallel connections per origin &mdash; an inefficient hack.
+          </p>
+          <p>
+            <strong>HTTP/2</strong> solves the application-layer HOL blocking by multiplexing many streams over a single TCP connection. Different requests and responses can be interleaved. But it inherits <strong>TCP-layer HOL blocking</strong>: if one TCP segment is lost, all streams stall because TCP's ordered byte stream sees them as one sequence. Under packet loss, HTTP/2 can actually perform worse than HTTP/1.1 (which had 6 independent TCP connections).
+          </p>
+          <p>
+            <strong>QUIC (HTTP/3)</strong> solves both layers. Each QUIC stream has independent reliability: a lost packet for stream A does not stall stream B. QUIC implements its own packet numbering and loss recovery per stream, built on top of UDP (which has no ordering guarantees). This is the fundamental reason HTTP/3 exists.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> Does QUIC completely eliminate HOL blocking? (It eliminates inter-stream HOL blocking but intra-stream HOL blocking remains &mdash; within a single request, packets must still be ordered. The improvement is that other requests are unaffected.) How does HOL blocking relate to message queues? (A single poison message blocking a partition in Kafka is conceptually similar &mdash; one stuck consumer blocks all messages behind it on that partition.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>How would you size a connection pool?</summary>
+        <div class="answer">
+          <p>
+            Start with <strong>Little's Law</strong>: <code>L = &lambda; &times; W</code>, where L is the average number of items in the system (connections in use), &lambda; is the arrival rate (requests per second), and W is the average time each request holds a connection. So: <code>pool_size &ge; RPS &times; avg_latency</code>.
+          </p>
+          <p>
+            <strong>Example:</strong> 200 RPS to a database, average query latency 25ms. Minimum pool: 200 &times; 0.025 = 5 connections. But this assumes perfectly uniform arrival and constant latency. In practice, traffic is bursty and latency varies. Add 2-3x headroom: 10-15 connections. PostgreSQL's own guidance suggests <code>(2 &times; CPU_cores) + disk_spindles</code> as a per-server maximum, which for a 4-core server is about 9 connections.
+          </p>
+          <p>
+            <strong>The over-provisioning trap:</strong> More connections is not always better. Each database connection consumes ~10MB of memory on the server. A pool of 100 connections to PostgreSQL wastes 1 GB of server RAM on connection overhead. Worse, the server spends CPU time context-switching between connections. HikariCP (the popular Java connection pool) recommends a pool size of <code>2 &times; CPU_cores + 1</code> for OLTP workloads, noting that larger pools consistently underperform in benchmarks.
+          </p>
+          <p>
+            <strong>Connection pool hierarchy:</strong> With microservices, you need pooling at every layer. If you have 20 application instances each with 15 connections, that is 300 database connections &mdash; more than most databases can efficiently handle. Use a <strong>connection multiplexer</strong> (PgBouncer, ProxySQL) between your application pools and the database to reduce the fan-in.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What happens when the pool is exhausted? (Requests wait in a queue for a connection. This adds latency and can cascade: if wait times exceed downstream timeouts, you get timeout storms. Set a pool acquisition timeout and shed load early.) How do you size pools differently for read replicas vs. the primary? (Read replicas handle read-only traffic, which is typically the bulk. Allocate 80% of your total pool capacity to replica connections and 20% to the primary.)</p>
+        </div>
+      </details>
+
+      <details class="interview-q">
+        <summary>Explain BBR and why it is better than traditional congestion control.</summary>
+        <div class="answer">
+          <p>
+            Traditional TCP congestion control (Reno, CUBIC) is <strong>loss-based</strong>: it increases the sending rate until a packet is dropped, then halves the rate. The implicit model is "loss = congestion." This worked well on wired networks in the 1990s, but it has two fundamental problems: (1) it requires filling router buffers to the point of overflow to detect congestion (causing <strong>bufferbloat</strong>), and (2) on lossy wireless links, random packet loss (from interference, not congestion) causes unnecessary rate reduction.
+          </p>
+          <p>
+            <strong>BBR</strong> (Bottleneck Bandwidth and Round-trip propagation time) takes a model-based approach. It continuously measures two signals: the maximum delivery rate (bottleneck bandwidth) and the minimum RTT (propagation delay). It then sets the sending rate to match the measured bottleneck bandwidth while keeping the amount of in-flight data equal to the BDP. This means BBR does not need packet loss to find the optimal rate &mdash; it discovers it through measurement.
+          </p>
+          <p>
+            <strong>Results:</strong> Google reported 14% throughput improvement on YouTube globally, with the largest gains on congested and lossy paths (developing countries, mobile networks). BBR avoids bufferbloat by design: it does not fill queues because it targets the propagation delay, not the delay including queuing. It also coexists better with other flows on the network (though BBRv1 had fairness issues with loss-based algorithms; BBRv2 addresses this).
+          </p>
+          <p>
+            <strong>System design implication:</strong> Switching to BBR is a single command (<code>sysctl net.ipv4.tcp_congestion_control=bbr</code>) and requires no application changes. For any service that transfers large amounts of data (video, file downloads, database replication over WAN), BBR is a near-free performance improvement.
+          </p>
+          <p class="follow-up"><strong>Follow-ups:</strong> What are BBRv2's improvements over BBRv1? (BBRv2 adds explicit loss tolerance parameters and fairer bandwidth sharing with CUBIC flows. BBRv1 could starve loss-based flows by being too aggressive.) When should you NOT use BBR? (In controlled datacenter environments where CUBIC performs well and the link is lossless. BBR's probing behavior can cause minor throughput oscillations that CUBIC avoids on stable links.)</p>
+        </div>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- ===== 18. Key Takeaways ===== -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+      <ul>
+        <li><strong>TCP's three-way handshake costs 1 RTT</strong> &mdash; and this is why connection pooling and HTTP/2 multiplexing exist. Every system design arrow between boxes is a network call; amortize setup costs.</li>
+        <li><strong>The sliding window is backpressure at the transport layer</strong> &mdash; the same concept appears in message queues (consumer lag), rate limiters (token bucket), and stream processing (bounded buffers).</li>
+        <li><strong>Congestion control determines throughput</strong> &mdash; BBR (bandwidth-based) outperforms Reno/CUBIC (loss-based) on lossy and high-BDP links. Switching is a single sysctl command.</li>
+        <li><strong>UDP is for speed; TCP is for reliability; QUIC is for both</strong> &mdash; QUIC eliminates head-of-line blocking, combines transport + TLS handshakes into 1 RTT, and supports connection migration for mobile users.</li>
+        <li><strong>Connection pool sizing follows Little's Law</strong> &mdash; <code>pool_size = RPS &times; latency</code>, plus headroom for variance. More connections is not always better; context switching and memory overhead dominate past the sweet spot.</li>
+        <li><strong>Head-of-line blocking is the recurring villain</strong> &mdash; it appears in TCP (lost segment stalls everything), HTTP/1.1 (one request per connection), message queues (poison message), and databases (long transaction blocking WAL replay). Recognizing the pattern lets you apply the same solutions: parallelism, independent streams, and isolation.</li>
+        <li><strong>Network costs are dominated by egress</strong> &mdash; cloud egress is $0.05-$0.09/GB. Compression, protocol optimization (protobuf over JSON), and CDNs are your primary cost levers.</li>
+        <li><strong>Tune your kernel, not just your application</strong> &mdash; <code>tcp_keepalive_time</code>, <code>tcp_tw_reuse</code>, <code>somaxconn</code>, buffer sizes, and congestion control algorithm are the networking knobs that production systems need adjusted from their defaults.</li>
+        <li><strong>Every microservice hop adds network latency</strong> &mdash; budget for it. Co-locate tightly coupled services, use persistent connections, and measure RTT between every pair of communicating services.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== 19. Further Reading ===== -->
+  <section class="section">
+    <div class="container">
+      <h2>Further Reading</h2>
+      <p>Continue exploring related system design topics:</p>
+      <ul>
+        <li><a href="os-concepts.html">OS Concepts</a> &mdash; Processes, threads, and I/O models that determine how your application interacts with the network stack. Understand epoll, io_uring, and why "the C10K problem" was a networking challenge as much as an OS one.</li>
+        <li><a href="dns.html">DNS</a> &mdash; The first network call in every request. DNS resolution adds latency, can fail, and is often the first domino in cascading outages. Understand TTLs, caching, and failover.</li>
+        <li><a href="load-balancing.html">Load Balancing</a> &mdash; L4 vs. L7 load balancers operate at different layers of the network stack. Understanding TCP and HTTP is essential for choosing the right type and configuring it correctly.</li>
+        <li><a href="proxies.html">Proxies</a> &mdash; Forward and reverse proxies terminate TCP connections and create new ones. Understanding connection management, keep-alive, and TLS termination is critical for proxy configuration.</li>
+        <li><a href="websockets.html">WebSockets</a> &mdash; WebSockets upgrade an HTTP connection to a persistent, full-duplex TCP channel. Understanding TCP keepalive, connection limits, and buffering is essential for scaling WebSocket-based systems.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===== Prev/Next Navigation ===== -->
+  <div class="container">
+    <nav class="page-nav">
+      <a href="os-concepts.html" class="prev">OS Concepts</a>
+      <a href="dns.html" class="next">DNS</a>
+    </nav>
+  </div>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <p>System Design Learning &mdash; Built for engineers preparing for system design interviews.</p>
+    </div>
+  </footer>
+
+  <!-- ===== Scripts ===== -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <script src="../js/animations.js"></script>
+  <script src="../js/diagrams.js"></script>
+  <script src="../js/sidebar.js"></script>
+
+  <script>
+    // ===== TCP Sliding Window Animation =====
+    (function () {
+      const canvas = document.getElementById('tcp-window-canvas');
+      const container = document.getElementById('tcp-window-container');
+
+      const TOTAL_PACKETS = 16;
+      const CYCLE = 18; // seconds per full animation cycle
+
+      // Animation state
+      let packets = [];
+      let windowBase = 0;
+      let windowSize = 2;
+      let acks = [];       // { seq, progress, done }
+      let sends = [];      // { seq, progress, done }
+      let phase = 'slow-start'; // 'slow-start', 'congestion-avoidance', 'loss', 'recovery'
+      let lastStepTime = 0;
+      let stepIndex = 0;
+      let congestionEvent = false;
+
+      // Pre-compute the step sequence for a deterministic animation
+      const steps = [];
+      (function buildSteps() {
+        let base = 0, cwnd = 2, ssthresh = 8;
+        let pState = new Array(TOTAL_PACKETS).fill('unsent');
+        let step = 0;
+
+        while (base < TOTAL_PACKETS && step < 40) {
+          const effectiveWin = Math.min(Math.floor(cwnd), TOTAL_PACKETS - base);
+          const toSend = [];
+          for (let i = base; i < base + effectiveWin && i < TOTAL_PACKETS; i++) {
+            if (pState[i] === 'unsent') {
+              pState[i] = 'sent';
+              toSend.push(i);
+            }
+          }
+
+          // Simulate loss at packet 8 (first time)
+          let lostSeq = -1;
+          if (step === 5 && pState[7] === 'sent') {
+            lostSeq = 7;
+          }
+
+          const toAck = [];
+          for (let i = base; i < base + effectiveWin && i < TOTAL_PACKETS; i++) {
+            if (pState[i] === 'sent' && i !== lostSeq) {
+              pState[i] = 'acked';
+              toAck.push(i);
+            }
+          }
+
+          // Advance base
+          while (base < TOTAL_PACKETS && pState[base] === 'acked') base++;
+
+          let phaseName = cwnd < ssthresh ? 'slow-start' : 'congestion-avoidance';
+
+          if (lostSeq >= 0) {
+            phaseName = 'loss';
+            ssthresh = Math.max(Math.floor(cwnd / 2), 2);
+            cwnd = ssthresh;
+            pState[lostSeq] = 'unsent'; // will be resent
+          } else {
+            if (cwnd < ssthresh) {
+              cwnd = Math.min(cwnd + toAck.length, ssthresh);
+            } else {
+              cwnd += toAck.length / cwnd;
+            }
+          }
+
+          steps.push({
+            send: toSend,
+            ack: toAck,
+            lost: lostSeq,
+            base: base,
+            cwnd: Math.floor(cwnd),
+            phase: phaseName,
+            ssthresh: ssthresh
+          });
+          step++;
+        }
+      })();
+
+      function drawTCPWindow(ctx, time, w, h) {
+        const cycleTime = time % CYCLE;
+        const stepDuration = CYCLE / (steps.length + 2);
+        const currentStep = Math.min(Math.floor(cycleTime / stepDuration), steps.length - 1);
+
+        // Derive state from steps up to currentStep
+        const pState = new Array(TOTAL_PACKETS).fill('unsent');
+        let curBase = 0, curCwnd = 2, curPhase = 'slow-start', curLost = -1;
+
+        for (let s = 0; s <= currentStep; s++) {
+          const st = steps[s];
+          st.send.forEach(seq => { if (pState[seq] === 'unsent') pState[seq] = 'sent'; });
+          if (st.lost >= 0) {
+            pState[st.lost] = 'lost';
+            curLost = st.lost;
+          }
+          st.ack.forEach(seq => { pState[seq] = 'acked'; });
+          curBase = st.base;
+          curCwnd = st.cwnd;
+          curPhase = st.phase;
+        }
+
+        // If the lost packet was retransmitted in a later step, mark it
+        if (curLost >= 0 && pState[curLost] === 'acked') curLost = -1;
+
+        // Progress within current step for animations
+        const stepProgress = (cycleTime % stepDuration) / stepDuration;
+
+        // ---- Layout ----
+        const senderX = 90;
+        const receiverX = w - 90;
+        const topY = 65;
+        const packetAreaY = topY + 30;
+        const packetH = 28;
+        const packetW = Math.min(38, (w - 240) / TOTAL_PACKETS - 2);
+        const packetGap = 2;
+        const packetStartX = senderX - 20;
+
+        // Title
+        drawLabel(ctx, w / 2, 15, 'TCP Sliding Window Protocol', {
+          fontSize: 15, bold: true, color: '#1e293b', baseline: 'top'
+        });
+
+        // Phase badge
+        const phaseLabels = {
+          'slow-start': 'SLOW START',
+          'congestion-avoidance': 'CONGESTION AVOIDANCE',
+          'loss': 'PACKET LOSS DETECTED',
+          'recovery': 'FAST RECOVERY'
+        };
+        const phaseTypes = {
+          'slow-start': 'info',
+          'congestion-avoidance': 'success',
+          'loss': 'danger',
+          'recovery': 'warning'
+        };
+        drawStatusBadge(ctx, w / 2, 40, phaseLabels[curPhase] || curPhase, phaseTypes[curPhase] || 'info');
+
+        // Sender box
+        drawBox(ctx, 15, topY + 40, 120, 50, {
+          color: '#2563eb', fill: '#eff6ff', text: 'Sender', fontSize: 14
+        });
+
+        // Receiver box
+        drawBox(ctx, w - 135, topY + 40, 120, 50, {
+          color: '#0891b2', fill: '#ecfeff', text: 'Receiver', fontSize: 14
+        });
+
+        // cwnd label
+        drawLabel(ctx, 75, topY + 100, `cwnd = ${curCwnd}`, {
+          fontSize: 12, bold: true, color: '#2563eb', baseline: 'top'
+        });
+
+        // Packet visualization area
+        const pktY = topY + 135;
+        drawLabel(ctx, w / 2, pktY - 18, 'Packet Buffer', {
+          fontSize: 11, color: '#64748b', bold: true, baseline: 'top'
+        });
+
+        // Draw packets
+        const totalPktWidth = TOTAL_PACKETS * (packetW + packetGap) - packetGap;
+        const pktBaseX = (w - totalPktWidth) / 2;
+
+        for (let i = 0; i < TOTAL_PACKETS; i++) {
+          const px = pktBaseX + i * (packetW + packetGap);
+          const py = pktY;
+          let fillColor, borderColor;
+
+          switch (pState[i]) {
+            case 'acked':
+              fillColor = '#dcfce7'; borderColor = '#16a34a'; break;
+            case 'sent':
+              fillColor = '#dbeafe'; borderColor = '#2563eb'; break;
+            case 'lost':
+              fillColor = '#fef2f2'; borderColor = '#dc2626'; break;
+            default:
+              fillColor = '#f1f5f9'; borderColor = '#94a3b8'; break;
+          }
+
+          drawBox(ctx, px, py, packetW, packetH, {
+            color: borderColor, fill: fillColor, text: String(i + 1), fontSize: 10, radius: 4
+          });
+        }
+
+        // Draw window bracket
+        const winStart = pktBaseX + curBase * (packetW + packetGap) - 2;
+        const winEnd = pktBaseX + Math.min(curBase + curCwnd, TOTAL_PACKETS) * (packetW + packetGap) - packetGap + 2;
+        const bracketY = pktY + packetH + 6;
+
+        ctx.save();
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(winStart, bracketY);
+        ctx.lineTo(winStart, bracketY + 10);
+        ctx.lineTo(winEnd, bracketY + 10);
+        ctx.lineTo(winEnd, bracketY);
+        ctx.stroke();
+        ctx.restore();
+
+        drawLabel(ctx, (winStart + winEnd) / 2, bracketY + 14, 'window', {
+          fontSize: 10, color: '#2563eb', bold: true, baseline: 'top'
+        });
+
+        // Draw in-flight packets and ACKs (animated dots between sender and receiver)
+        const dotY = topY + 65;
+        const step = steps[currentStep];
+        if (step && stepProgress < 0.9) {
+          // Show sends (left to right) in first half of step
+          if (stepProgress < 0.45) {
+            const sendProg = ease.inOut(stepProgress / 0.45);
+            step.send.forEach((seq, idx) => {
+              const yOff = (idx - step.send.length / 2) * 12;
+              drawMovingDot(ctx, senderX + 60, dotY + yOff, receiverX - 60, dotY + yOff, sendProg, {
+                color: step.lost === seq ? '#dc2626' : '#2563eb', radius: 5
+              });
+              // Packet number label following the dot
+              const dotX = (senderX + 60) + (receiverX - 60 - senderX - 60) * sendProg;
+              drawLabel(ctx, dotX, dotY + yOff - 12, `#${seq + 1}`, {
+                fontSize: 9, bold: true, color: step.lost === seq ? '#dc2626' : '#2563eb', baseline: 'middle'
+              });
+            });
+
+            // Show lost packet X
+            if (step.lost >= 0 && sendProg > 0.4 && sendProg < 0.8) {
+              const lx = (senderX + 60) + (receiverX - 60 - senderX - 60) * 0.55;
+              const ly = dotY;
+              ctx.save();
+              ctx.strokeStyle = '#dc2626';
+              ctx.lineWidth = 3;
+              ctx.beginPath();
+              ctx.moveTo(lx - 8, ly - 8);
+              ctx.lineTo(lx + 8, ly + 8);
+              ctx.moveTo(lx + 8, ly - 8);
+              ctx.lineTo(lx - 8, ly + 8);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+
+          // Show ACKs (right to left) in second half of step
+          if (stepProgress > 0.45 && step.ack.length > 0) {
+            const ackProg = ease.inOut((stepProgress - 0.45) / 0.45);
+            const cumAck = Math.max(...step.ack) + 1;
+            drawMovingDot(ctx, receiverX - 60, dotY, senderX + 60, dotY, ackProg, {
+              color: '#0891b2', radius: 4
+            });
+            const ackDotX = (receiverX - 60) + (senderX + 60 - receiverX + 60) * ackProg;
+            drawLabel(ctx, ackDotX, dotY - 14, `ACK ${cumAck}`, {
+              fontSize: 9, bold: true, color: '#0891b2', baseline: 'middle'
+            });
+          }
+        }
+
+        // Legend
+        const legendY = h - 35;
+        const legendItems = [
+          { label: 'Acked', fill: '#dcfce7', border: '#16a34a' },
+          { label: 'In-flight', fill: '#dbeafe', border: '#2563eb' },
+          { label: 'Unsent', fill: '#f1f5f9', border: '#94a3b8' },
+          { label: 'Lost', fill: '#fef2f2', border: '#dc2626' }
+        ];
+        const legendStartX = w / 2 - (legendItems.length * 80) / 2;
+        legendItems.forEach((item, i) => {
+          const lx = legendStartX + i * 85;
+          drawBox(ctx, lx, legendY, 14, 14, {
+            color: item.border, fill: item.fill, radius: 3
+          });
+          drawLabel(ctx, lx + 20, legendY + 7, item.label, {
+            fontSize: 10, color: '#64748b', align: 'left', baseline: 'middle'
+          });
+        });
+      }
+
+      const animation = createAnimation(canvas, drawTCPWindow, { height: 340 });
+      setupControls(container, animation);
+    })();
+
+    // ===== TCP Three-Way Handshake Animation =====
+    (function () {
+      const canvas = document.getElementById('tcp-handshake-canvas');
+      const container = document.getElementById('tcp-handshake-container');
+
+      function drawHandshake(ctx, time, w, h) {
+        const CYCLE = 8;
+        const t = time % CYCLE;
+        const clientX = 120;
+        const serverX = w - 120;
+        const midX = w / 2;
+        const timelineTop = 60;
+        const timelineH = h - 100;
+
+        // Title
+        drawLabel(ctx, midX, 12, 'TCP Three-Way Handshake', {
+          fontSize: 15, bold: true, color: '#1e293b', baseline: 'top'
+        });
+
+        // Client & Server columns
+        drawBox(ctx, clientX - 50, 35, 100, 36, {
+          color: '#2563eb', fill: '#eff6ff', text: 'Client', fontSize: 13
+        });
+        drawBox(ctx, serverX - 50, 35, 100, 36, {
+          color: '#0891b2', fill: '#ecfeff', text: 'Server', fontSize: 13
+        });
+
+        // Vertical timelines
+        ctx.save();
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(clientX, 75); ctx.lineTo(clientX, h - 30);
+        ctx.moveTo(serverX, 75); ctx.lineTo(serverX, h - 30);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // Phase timings
+        const steps = [
+          { start: 0.5, end: 2.0, label: 'SYN', sublabel: 'seq=x', color: '#2563eb', fromX: clientX, toX: serverX, y1: 95, y2: 135 },
+          { start: 2.5, end: 4.0, label: 'SYN-ACK', sublabel: 'seq=y, ack=x+1', color: '#0891b2', fromX: serverX, toX: clientX, y1: 155, y2: 195 },
+          { start: 4.5, end: 6.0, label: 'ACK', sublabel: 'ack=y+1', color: '#16a34a', fromX: clientX, toX: serverX, y1: 215, y2: 255 },
+        ];
+
+        // State annotations
+        const clientStates = [
+          { y: 85, text: 'CLOSED', tStart: 0 },
+          { y: 110, text: 'SYN_SENT', tStart: 0.5 },
+          { y: 210, text: 'ESTABLISHED', tStart: 4.5 },
+        ];
+        const serverStates = [
+          { y: 85, text: 'LISTEN', tStart: 0 },
+          { y: 150, text: 'SYN_RCVD', tStart: 2.0 },
+          { y: 260, text: 'ESTABLISHED', tStart: 6.0 },
+        ];
+
+        // Draw state labels
+        clientStates.forEach(s => {
+          if (t >= s.tStart) {
+            const alpha = Math.min(1, (t - s.tStart) / 0.3);
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            drawLabel(ctx, clientX - 65, s.y, s.text, {
+              fontSize: 9, color: '#64748b', bold: true, align: 'right', baseline: 'middle'
+            });
+            ctx.restore();
+          }
+        });
+        serverStates.forEach(s => {
+          if (t >= s.tStart) {
+            const alpha = Math.min(1, (t - s.tStart) / 0.3);
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            drawLabel(ctx, serverX + 65, s.y, s.text, {
+              fontSize: 9, color: '#64748b', bold: true, align: 'left', baseline: 'middle'
+            });
+            ctx.restore();
+          }
+        });
+
+        // Draw arrows and moving packets
+        steps.forEach(step => {
+          if (t < step.start) return;
+          const progress = Math.min(1, (t - step.start) / (step.end - step.start));
+
+          // Draw the arrow line (full)
+          if (progress >= 1) {
+            drawArrow(ctx, step.fromX, step.y1, step.toX, step.y2, { color: step.color, width: 2 });
+            // Label on arrow
+            drawLabel(ctx, midX, (step.y1 + step.y2) / 2 - 14, step.label, {
+              fontSize: 12, bold: true, color: step.color, baseline: 'middle'
+            });
+            drawLabel(ctx, midX, (step.y1 + step.y2) / 2 + 4, step.sublabel, {
+              fontSize: 9, color: '#64748b', baseline: 'middle'
+            });
+          } else {
+            // Partial arrow + moving dot
+            const curX = step.fromX + (step.toX - step.fromX) * ease.inOut(progress);
+            const curY = step.y1 + (step.y2 - step.y1) * ease.inOut(progress);
+
+            ctx.save();
+            ctx.strokeStyle = step.color;
+            ctx.lineWidth = 2;
+            ctx.globalAlpha = 0.3;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            ctx.moveTo(step.fromX, step.y1);
+            ctx.lineTo(step.toX, step.y2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+
+            drawMovingDot(ctx, step.fromX, step.y1, step.toX, step.y2, ease.inOut(progress), {
+              color: step.color, radius: 7
+            });
+
+            drawLabel(ctx, curX, curY - 16, step.label, {
+              fontSize: 11, bold: true, color: step.color, baseline: 'middle'
+            });
+          }
+        });
+
+        // RTT bracket
+        if (t >= 0.5) {
+          const bracketX = w - 45;
+          const rttTop = 95;
+          const rttBot = 255;
+          const rttProgress = Math.min(1, (t - 0.5) / 5.5);
+          const rttCurBot = rttTop + (rttBot - rttTop) * rttProgress;
+
+          ctx.save();
+          ctx.strokeStyle = '#dc2626';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(bracketX - 8, rttTop);
+          ctx.lineTo(bracketX, rttTop);
+          ctx.lineTo(bracketX, rttCurBot);
+          ctx.lineTo(bracketX - 8, rttCurBot);
+          ctx.stroke();
+          ctx.restore();
+
+          if (rttProgress > 0.5) {
+            drawLabel(ctx, bracketX + 5, (rttTop + rttCurBot) / 2, '1 RTT', {
+              fontSize: 10, bold: true, color: '#dc2626', align: 'left', baseline: 'middle'
+            });
+          }
+        }
+
+        // "Data can flow" label after handshake
+        if (t >= 6.5) {
+          const alpha = Math.min(1, (t - 6.5) / 0.5);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          drawBox(ctx, midX - 70, 275, 140, 28, {
+            color: '#16a34a', fill: '#dcfce7', text: '✓ Data can flow!', fontSize: 11, radius: 14
+          });
+          ctx.restore();
+        }
+      }
+
+      const anim = createAnimation(canvas, drawHandshake, { height: 320, numSteps: 16, totalDuration: 8 });
+      setupControls(container, anim);
+    })();
+
+    // ===== TLS 1.2 vs 1.3 Handshake Animation =====
+    (function () {
+      const canvas = document.getElementById('tls-handshake-canvas');
+      const container = document.getElementById('tls-handshake-container');
+
+      function drawTLSHandshake(ctx, time, w, h) {
+        const CYCLE = 12;
+        const t = time % CYCLE;
+        const halfW = w / 2 - 10;
+
+        // Title
+        drawLabel(ctx, w / 2, 10, 'TLS 1.2 vs TLS 1.3 Handshake', {
+          fontSize: 15, bold: true, color: '#1e293b', baseline: 'top'
+        });
+
+        // Divider
+        ctx.save();
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(w / 2, 35); ctx.lineTo(w / 2, h - 10);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // Draw one side
+        function drawSide(offsetX, isTLS13) {
+          const label = isTLS13 ? 'TLS 1.3 (1 RTT)' : 'TLS 1.2 (2 RTTs)';
+          const clientX = offsetX + 80;
+          const serverX = offsetX + halfW - 80;
+          const midSideX = (clientX + serverX) / 2;
+
+          drawLabel(ctx, midSideX, 32, label, {
+            fontSize: 12, bold: true, color: isTLS13 ? '#16a34a' : '#f59e0b', baseline: 'top'
+          });
+
+          // Column headers
+          drawBox(ctx, clientX - 30, 50, 60, 26, {
+            color: '#2563eb', fill: '#eff6ff', text: 'Client', fontSize: 10
+          });
+          drawBox(ctx, serverX - 30, 50, 60, 26, {
+            color: '#0891b2', fill: '#ecfeff', text: 'Server', fontSize: 10
+          });
+
+          // Timelines
+          ctx.save();
+          ctx.strokeStyle = '#e2e8f0';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(clientX, 80); ctx.lineTo(clientX, h - 25);
+          ctx.moveTo(serverX, 80); ctx.lineTo(serverX, h - 25);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+
+          if (isTLS13) {
+            // TLS 1.3: single RTT
+            const msgs = [
+              { start: 0.5, end: 2.5, label: 'ClientHello', sub: '+ key_share', color: '#2563eb', from: clientX, to: serverX, y1: 95, y2: 125 },
+              { start: 3.0, end: 5.0, label: 'ServerHello', sub: '+ key_share + cert + Finished', color: '#0891b2', from: serverX, to: clientX, y1: 140, y2: 170 },
+              { start: 5.5, end: 7.5, label: 'Finished', sub: '+ application data', color: '#16a34a', from: clientX, to: serverX, y1: 185, y2: 215 },
+            ];
+
+            msgs.forEach(msg => {
+              if (t < msg.start) return;
+              const prog = Math.min(1, (t - msg.start) / (msg.end - msg.start));
+              if (prog >= 1) {
+                drawArrow(ctx, msg.from, msg.y1, msg.to, msg.y2, { color: msg.color, width: 1.5 });
+              } else {
+                ctx.save();
+                ctx.globalAlpha = 0.2;
+                ctx.strokeStyle = msg.color;
+                ctx.lineWidth = 1;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.moveTo(msg.from, msg.y1);
+                ctx.lineTo(msg.to, msg.y2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.restore();
+                drawMovingDot(ctx, msg.from, msg.y1, msg.to, msg.y2, ease.inOut(prog), { color: msg.color, radius: 5 });
+              }
+              const labelAlpha = Math.min(1, prog * 2);
+              ctx.save();
+              ctx.globalAlpha = labelAlpha;
+              drawLabel(ctx, midSideX, (msg.y1 + msg.y2) / 2 - 8, msg.label, {
+                fontSize: 9, bold: true, color: msg.color, baseline: 'middle'
+              });
+              drawLabel(ctx, midSideX, (msg.y1 + msg.y2) / 2 + 4, msg.sub, {
+                fontSize: 7, color: '#64748b', baseline: 'middle'
+              });
+              ctx.restore();
+            });
+
+            // 1 RTT bracket
+            if (t > 1) {
+              const bracketX = serverX + 20;
+              ctx.save();
+              ctx.strokeStyle = '#16a34a';
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              ctx.moveTo(bracketX - 5, 95);
+              ctx.lineTo(bracketX, 95);
+              ctx.lineTo(bracketX, 215);
+              ctx.lineTo(bracketX - 5, 215);
+              ctx.stroke();
+              ctx.restore();
+              drawLabel(ctx, bracketX + 3, 155, '1 RTT', {
+                fontSize: 8, bold: true, color: '#16a34a', align: 'left', baseline: 'middle'
+              });
+            }
+
+            // Encrypted data
+            if (t >= 8) {
+              const alpha = Math.min(1, (t - 8) / 0.5);
+              ctx.save();
+              ctx.globalAlpha = alpha;
+              drawBox(ctx, midSideX - 55, 230, 110, 22, {
+                color: '#16a34a', fill: '#dcfce7', text: '🔒 Encrypted data', fontSize: 9, radius: 11
+              });
+              ctx.restore();
+            }
+          } else {
+            // TLS 1.2: two RTTs
+            const msgs = [
+              { start: 0.5, end: 2.0, label: 'ClientHello', sub: 'cipher suites, random', color: '#2563eb', from: clientX, to: serverX, y1: 90, y2: 108 },
+              { start: 2.2, end: 3.7, label: 'ServerHello', sub: '+ cert + ServerHelloDone', color: '#0891b2', from: serverX, to: clientX, y1: 115, y2: 133 },
+              { start: 4.0, end: 5.5, label: 'ClientKeyExchange', sub: '+ ChangeCipherSpec + Finished', color: '#2563eb', from: clientX, to: serverX, y1: 150, y2: 168 },
+              { start: 5.7, end: 7.2, label: 'ChangeCipherSpec', sub: '+ Finished', color: '#0891b2', from: serverX, to: clientX, y1: 175, y2: 193 },
+              { start: 7.5, end: 9.0, label: 'Application Data', sub: 'encrypted', color: '#16a34a', from: clientX, to: serverX, y1: 210, y2: 228 },
+            ];
+
+            msgs.forEach(msg => {
+              if (t < msg.start) return;
+              const prog = Math.min(1, (t - msg.start) / (msg.end - msg.start));
+              if (prog >= 1) {
+                drawArrow(ctx, msg.from, msg.y1, msg.to, msg.y2, { color: msg.color, width: 1.5 });
+              } else {
+                ctx.save();
+                ctx.globalAlpha = 0.2;
+                ctx.strokeStyle = msg.color;
+                ctx.lineWidth = 1;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.moveTo(msg.from, msg.y1);
+                ctx.lineTo(msg.to, msg.y2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.restore();
+                drawMovingDot(ctx, msg.from, msg.y1, msg.to, msg.y2, ease.inOut(prog), { color: msg.color, radius: 5 });
+              }
+              const labelAlpha = Math.min(1, prog * 2);
+              ctx.save();
+              ctx.globalAlpha = labelAlpha;
+              drawLabel(ctx, midSideX, (msg.y1 + msg.y2) / 2 - 8, msg.label, {
+                fontSize: 9, bold: true, color: msg.color, baseline: 'middle'
+              });
+              drawLabel(ctx, midSideX, (msg.y1 + msg.y2) / 2 + 4, msg.sub, {
+                fontSize: 7, color: '#64748b', baseline: 'middle'
+              });
+              ctx.restore();
+            });
+
+            // 2 RTT brackets
+            if (t > 1) {
+              const bracketX = serverX + 18;
+              ctx.save();
+              ctx.strokeStyle = '#f59e0b';
+              ctx.lineWidth = 1.5;
+              // RTT 1
+              ctx.beginPath();
+              ctx.moveTo(bracketX - 5, 90);
+              ctx.lineTo(bracketX, 90);
+              ctx.lineTo(bracketX, 133);
+              ctx.lineTo(bracketX - 5, 133);
+              ctx.stroke();
+              drawLabel(ctx, bracketX + 2, 112, 'RTT 1', {
+                fontSize: 7, bold: true, color: '#f59e0b', align: 'left', baseline: 'middle'
+              });
+              // RTT 2
+              if (t > 4) {
+                ctx.beginPath();
+                ctx.moveTo(bracketX - 5, 150);
+                ctx.lineTo(bracketX, 150);
+                ctx.lineTo(bracketX, 193);
+                ctx.lineTo(bracketX - 5, 193);
+                ctx.stroke();
+                drawLabel(ctx, bracketX + 2, 172, 'RTT 2', {
+                  fontSize: 7, bold: true, color: '#f59e0b', align: 'left', baseline: 'middle'
+                });
+              }
+              ctx.restore();
+            }
+          }
+        }
+
+        drawSide(0, false);        // Left: TLS 1.2
+        drawSide(w / 2 + 10, true); // Right: TLS 1.3
+      }
+
+      const anim = createAnimation(canvas, drawTLSHandshake, { height: 300, numSteps: 24, totalDuration: 12 });
+      setupControls(container, anim);
+    })();
+
+    // ===== Sliding Window Detail Animation =====
+    (function () {
+      const canvas = document.getElementById('sliding-window-detail-canvas');
+      const container = document.getElementById('sliding-window-detail-container');
+
+      const TOTAL = 16;
+      const CYCLE = 14;
+
+      function drawSlidingWindowDetail(ctx, time, w, h) {
+        const t = time % CYCLE;
+
+        drawLabel(ctx, w / 2, 10, 'Sliding Window — Packet States Over Time', {
+          fontSize: 14, bold: true, color: '#1e293b', baseline: 'top'
+        });
+
+        // Compute window state at this time
+        // Simulate: window starts at base=0, size=4, slides as time passes
+        const stepsData = [];
+        let base = 0, nextSeq = 0, wSize = 4;
+        for (let i = 0; i < 10; i++) {
+          stepsData.push({ base, nextSeq, wSize, sent: Math.min(nextSeq + wSize, TOTAL) });
+          // Simulate sending & receiving ACKs
+          nextSeq = Math.min(base + wSize, TOTAL);
+          base = Math.min(base + 2, TOTAL); // ACK 2 packets per step
+          if (i === 4) wSize = 6; // window grows
+          if (i === 7) wSize = 3; // window shrinks (loss)
+        }
+
+        const stepIdx = Math.min(Math.floor(t / (CYCLE / stepsData.length)), stepsData.length - 1);
+        const stepProgress = (t - stepIdx * (CYCLE / stepsData.length)) / (CYCLE / stepsData.length);
+        const state = stepsData[stepIdx];
+
+        // Draw packets
+        const pktW = Math.min(48, (w - 60) / TOTAL - 3);
+        const pktGap = 3;
+        const totalW = TOTAL * (pktW + pktGap) - pktGap;
+        const startX = (w - totalW) / 2;
+        const pktY = 70;
+        const pktH = 40;
+
+        for (let i = 0; i < TOTAL; i++) {
+          const px = startX + i * (pktW + pktGap);
+          let fillColor, borderColor, stateLabel;
+
+          if (i < state.base) {
+            fillColor = '#dcfce7'; borderColor = '#16a34a'; stateLabel = 'ACK';
+          } else if (i < state.nextSeq) {
+            fillColor = '#dbeafe'; borderColor = '#2563eb'; stateLabel = 'Fly';
+          } else if (i < state.base + state.wSize) {
+            fillColor = '#fef3c7'; borderColor = '#f59e0b'; stateLabel = 'Send';
+          } else {
+            fillColor = '#f1f5f9'; borderColor = '#94a3b8'; stateLabel = 'Wait';
+          }
+
+          drawBox(ctx, px, pktY, pktW, pktH, {
+            color: borderColor, fill: fillColor, text: String(i), fontSize: 12, radius: 4
+          });
+          drawLabel(ctx, px + pktW / 2, pktY + pktH + 4, stateLabel, {
+            fontSize: 8, color: borderColor, bold: true, baseline: 'top'
+          });
+        }
+
+        // Window bracket
+        const winLeft = startX + state.base * (pktW + pktGap) - 3;
+        const winRight = startX + Math.min(state.base + state.wSize, TOTAL) * (pktW + pktGap) - pktGap + 3;
+        const bracketY = pktY - 10;
+
+        ctx.save();
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(winLeft, bracketY + 8);
+        ctx.lineTo(winLeft, bracketY);
+        ctx.lineTo(winRight, bracketY);
+        ctx.lineTo(winRight, bracketY + 8);
+        ctx.stroke();
+        ctx.restore();
+
+        drawLabel(ctx, (winLeft + winRight) / 2, bracketY - 14, `window (size=${state.wSize})`, {
+          fontSize: 11, bold: true, color: '#2563eb', baseline: 'top'
+        });
+
+        // Pointer labels
+        const baseX = startX + state.base * (pktW + pktGap) + pktW / 2;
+        const nextX = startX + Math.min(state.nextSeq, TOTAL - 1) * (pktW + pktGap) + pktW / 2;
+        const rightX = startX + Math.min(state.base + state.wSize, TOTAL) * (pktW + pktGap) - pktGap / 2;
+
+        const pointerY = pktY + pktH + 22;
+        drawLabel(ctx, baseX, pointerY, '↑ base', {
+          fontSize: 9, bold: true, color: '#16a34a', baseline: 'top'
+        });
+        if (state.nextSeq > state.base && state.nextSeq < TOTAL) {
+          drawLabel(ctx, nextX, pointerY + 12, '↑ next_seq', {
+            fontSize: 9, bold: true, color: '#2563eb', baseline: 'top'
+          });
+        }
+
+        // Legend at bottom
+        const legendY = h - 40;
+        const legendItems = [
+          { label: 'Acknowledged', fill: '#dcfce7', border: '#16a34a' },
+          { label: 'In-flight', fill: '#dbeafe', border: '#2563eb' },
+          { label: 'Sendable', fill: '#fef3c7', border: '#f59e0b' },
+          { label: 'Blocked', fill: '#f1f5f9', border: '#94a3b8' }
+        ];
+        const lStartX = w / 2 - (legendItems.length * 100) / 2;
+        legendItems.forEach((item, i) => {
+          const lx = lStartX + i * 105;
+          drawBox(ctx, lx, legendY, 14, 14, {
+            color: item.border, fill: item.fill, radius: 3
+          });
+          drawLabel(ctx, lx + 20, legendY + 7, item.label, {
+            fontSize: 10, color: '#64748b', align: 'left', baseline: 'middle'
+          });
+        });
+
+        // Step indicator
+        drawLabel(ctx, w / 2, h - 12, `Step ${stepIdx + 1} / ${stepsData.length}  —  base=${state.base}  next_seq=${state.nextSeq}  window=${state.wSize}`, {
+          fontSize: 10, color: '#94a3b8', baseline: 'top'
+        });
+      }
+
+      const anim = createAnimation(canvas, drawSlidingWindowDetail, { height: 220, numSteps: 10, totalDuration: 14 });
+      setupControls(container, anim);
+    })();
+
+    // ===== Congestion Control (AIMD Sawtooth) Animation =====
+    (function () {
+      const canvas = document.getElementById('congestion-control-canvas');
+      const container = document.getElementById('congestion-control-container');
+
+      // Pre-compute cwnd history (Reno-like)
+      const cwndHistory = [];
+      (function () {
+        let cwnd = 1, ssthresh = 32;
+        for (let rtt = 0; rtt < 60; rtt++) {
+          let phase;
+          // Inject loss at certain points
+          if (rtt === 20 || rtt === 38 || rtt === 52) {
+            phase = 'loss';
+            ssthresh = Math.max(Math.floor(cwnd / 2), 2);
+            cwnd = ssthresh;
+          } else if (cwnd < ssthresh) {
+            phase = 'slow_start';
+            cwnd = Math.min(cwnd * 2, ssthresh);
+          } else {
+            phase = 'congestion_avoidance';
+            cwnd += 1;
+          }
+          cwndHistory.push({ rtt, cwnd, ssthresh, phase });
+        }
+      })();
+
+      const maxCwnd = Math.max(...cwndHistory.map(h => h.cwnd));
+      const CYCLE = 15;
+
+      function drawCongestionControl(ctx, time, w, h) {
+        const t = time % CYCLE;
+        const visibleRTTs = Math.min(cwndHistory.length, Math.floor(t / CYCLE * cwndHistory.length) + 1);
+
+        // Title
+        drawLabel(ctx, w / 2, 8, 'TCP Congestion Control — AIMD Sawtooth', {
+          fontSize: 14, bold: true, color: '#1e293b', baseline: 'top'
+        });
+
+        // Chart area
+        const pad = { top: 45, right: 30, bottom: 55, left: 65 };
+        const plotW = w - pad.left - pad.right;
+        const plotH = h - pad.top - pad.bottom;
+
+        // Axes
+        ctx.save();
+        ctx.strokeStyle = '#94a3b8';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, pad.top);
+        ctx.lineTo(pad.left, pad.top + plotH);
+        ctx.lineTo(pad.left + plotW, pad.top + plotH);
+        ctx.stroke();
+        ctx.restore();
+
+        // Y axis labels
+        for (let v = 0; v <= maxCwnd; v += 8) {
+          const y = pad.top + plotH - (v / maxCwnd) * plotH;
+          drawLabel(ctx, pad.left - 8, y, String(v), {
+            fontSize: 9, color: '#64748b', align: 'right', baseline: 'middle'
+          });
+          ctx.save();
+          ctx.strokeStyle = '#f1f5f9';
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(pad.left + plotW, y);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        drawLabel(ctx, 14, pad.top + plotH / 2, 'cwnd (MSS)', {
+          fontSize: 10, bold: true, color: '#475569', baseline: 'middle'
+        });
+
+        // X axis
+        for (let r = 0; r < cwndHistory.length; r += 10) {
+          const x = pad.left + (r / cwndHistory.length) * plotW;
+          drawLabel(ctx, x, pad.top + plotH + 10, String(r), {
+            fontSize: 9, color: '#64748b', baseline: 'top'
+          });
+        }
+        drawLabel(ctx, pad.left + plotW / 2, h - 10, 'RTT (round-trip times)', {
+          fontSize: 10, bold: true, color: '#475569', baseline: 'top'
+        });
+
+        // Draw ssthresh line
+        if (visibleRTTs > 0) {
+          const lastVisible = cwndHistory[visibleRTTs - 1];
+          const ssY = pad.top + plotH - (lastVisible.ssthresh / maxCwnd) * plotH;
+          ctx.save();
+          ctx.strokeStyle = '#dc2626';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, ssY);
+          ctx.lineTo(pad.left + plotW, ssY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+          drawLabel(ctx, pad.left + plotW + 2, ssY, 'ssthresh', {
+            fontSize: 8, color: '#dc2626', align: 'left', baseline: 'middle'
+          });
+        }
+
+        // Draw cwnd line
+        ctx.save();
+        ctx.lineWidth = 2.5;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        let started = false;
+
+        for (let i = 0; i < visibleRTTs; i++) {
+          const d = cwndHistory[i];
+          const x = pad.left + (d.rtt / cwndHistory.length) * plotW;
+          const y = pad.top + plotH - (d.cwnd / maxCwnd) * plotH;
+
+          // Color by phase
+          if (i > 0) {
+            ctx.stroke(); // stroke previous segment
+            ctx.beginPath();
+            ctx.moveTo(
+              pad.left + (cwndHistory[i-1].rtt / cwndHistory.length) * plotW,
+              pad.top + plotH - (cwndHistory[i-1].cwnd / maxCwnd) * plotH
+            );
+          }
+
+          const phaseColors = {
+            slow_start: '#f59e0b',
+            congestion_avoidance: '#2563eb',
+            loss: '#dc2626'
+          };
+          ctx.strokeStyle = phaseColors[d.phase] || '#2563eb';
+
+          if (!started) { ctx.moveTo(x, y); started = true; }
+          else { ctx.lineTo(x, y); }
+
+          // Mark loss events with X
+          if (d.phase === 'loss') {
+            ctx.stroke();
+            ctx.beginPath();
+
+            ctx.save();
+            ctx.strokeStyle = '#dc2626';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6);
+            ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6);
+            ctx.stroke();
+            ctx.restore();
+
+            drawLabel(ctx, x, y - 14, 'Loss!', {
+              fontSize: 8, bold: true, color: '#dc2626', baseline: 'middle'
+            });
+
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+          }
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        // Current point dot
+        if (visibleRTTs > 0) {
+          const last = cwndHistory[visibleRTTs - 1];
+          const lx = pad.left + (last.rtt / cwndHistory.length) * plotW;
+          const ly = pad.top + plotH - (last.cwnd / maxCwnd) * plotH;
+          ctx.save();
+          ctx.fillStyle = '#2563eb';
+          ctx.beginPath();
+          ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 0.3;
+          ctx.beginPath();
+          ctx.arc(lx, ly, 8, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Legend
+        const legendY = pad.top + 5;
+        const legendX = pad.left + 10;
+        const items = [
+          { label: 'Slow Start (exponential)', color: '#f59e0b' },
+          { label: 'Congestion Avoidance (linear)', color: '#2563eb' },
+          { label: 'Loss → Multiplicative Decrease', color: '#dc2626' },
+        ];
+        items.forEach((item, i) => {
+          const ly = legendY + i * 16;
+          ctx.save();
+          ctx.fillStyle = item.color;
+          ctx.fillRect(legendX, ly - 2, 14, 4);
+          ctx.restore();
+          drawLabel(ctx, legendX + 20, ly, item.label, {
+            fontSize: 9, color: '#475569', align: 'left', baseline: 'middle'
+          });
+        });
+      }
+
+      const anim = createAnimation(canvas, drawCongestionControl, { height: 320, numSteps: 20, totalDuration: 15 });
+      setupControls(container, anim);
+    })();
+  </script>
+
+</body>
+</html>

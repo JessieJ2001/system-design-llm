@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K4 — Continuous Batching &amp; Scheduling — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <link rel="stylesheet" href="../../css/diagrams.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* ---- skeleton-only styling (removed when prose lands) ---- */
+    .stub { background:#fff7ed; border-left:3px dashed #ea580c; border-radius:4px;
+      padding:.45rem .8rem; margin:.4rem 0; font-size:.92rem; color:#7c2d12; }
+    .stub b { color:#9a3412; }
+    .stub .ps { color:#166534; font-weight:700; }
+    .stub .meta { display:block; margin-top:.3rem; font-size:.82rem; color:#78716c;
+      font-family:'JetBrains Mono',monospace; }
+    .svgph { background:#f1f5f9; border:2px dashed #64748b; border-radius:8px;
+      padding:1.1rem; margin:.7rem 0; text-align:center; color:#334155; font-size:.9rem; }
+    .svgph strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#0f172a; }
+    .skel-banner { background:#0f172a; color:#fff; border-radius:8px; padding:.8rem 1.1rem;
+      margin:.8rem 0 1.4rem; font-size:.95rem; }
+    .skel-banner code { background:#1e293b; color:#fde68a; padding:.05rem .35rem; border-radius:3px; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../index.html">LLM Serving</a></li>
+        <li><a href="../../topics/design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>K4 &mdash; Continuous Batching &amp; Scheduling</h1>
+      <p class="hero-subtitle"><strong>How do you build a scalable, large-scale single-pool scheduler?</strong> Keep one GPU&rsquo;s compute saturated while <em>every</em> request still meets its own TTFT/TPOT SLO &mdash; when requests arrive continuously, vary wildly in length, and finish at different steps. This is the <strong>single-pool scheduler</strong>: what one engine does with the requests it already holds. Fleet-level scaling is <a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>; the prefill/decode <em>pool</em> split is <a href="K5_disaggregated-serving.html">K5</a>.</p>
+      <p class="hero-meta">GPU-serving SoT &bull; cites <a href="K0_transformer-forward-pass-and-dimensions.html">K0</a> / <a href="K1_serving-fundamentals.html">K1</a> / <a href="K2_kv-cache.html">K2</a> &bull; dedicated scenario: <strong>L3</strong> &bull; ~20 min</p>
+    </div>
+  </section>
+
+  <!-- SKELETON BANNER (delete when prose lands) -->
+  <section class="section">
+    <div class="container">
+      <div class="skel-banner">
+        <strong>SKELETON FOR REVIEW &mdash; arc &amp; structure only, no prose yet.</strong><br>
+        Every <span style="color:#fdba74;">amber dashed box</span> is a one-line <span class="ps" style="color:#86efac;">Problem&rarr;Solution</span> stub with its planned worked-number and citations in the <code>meta</code> line. Detail SVGs/tables are <span style="color:#cbd5e1;">grey placeholders</span> describing what they will draw &mdash; deferred until this arc is approved. The <strong>decision-tree spine SVG below is real</strong> (it <em>is</em> the scheduling spine). Approve / redirect the arc, the Problem&rarr;Solution decomposition, deep-dive placement (D1/D2/D3/D11/D13/D18/D20/D21/D22/D33/D34 + the ragged-batch dive + <span style="color:#fdba74;">5 ADDED stubs from the realism review: KV-aware admission, per-rank schedule consistency, sequence fan-out / reclaim-latency, adapter-aware batch composition, constrained-decoding host tax</span>), and the number/citation plan; then prose + detail SVGs are filled section by section.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLI header (Authoring rule 8) -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>SLIs This Page Reduces</h2>
+      <div class="ref-box">
+        <strong>SLIs this page reduces</strong> (the reverse index of <a href="K1_serving-fundamentals.html#slis">K1 &sect;3.12</a>):
+        <ul style="margin:.4rem 0 0;">
+          <li><strong>Throughput &amp; MFU / batch-occupancy</strong> &mdash; by refilling freed slots every iteration (continuous batching) so effective batch stays near B<sub>max</sub> instead of decaying to 1 (the convoy).</li>
+          <li><strong>TPOT / ITL</strong> &mdash; by chunking long prefills and bounding per-iteration work so a 100k-token prompt never head-of-lines in-flight decodes.</li>
+          <li><strong>Goodput</strong> (the real objective) &mdash; by tuning chunk size, the prefill&harr;decode split, multi-step <em>k</em>, and admission against <em>requests-meeting-SLO</em>, not raw tokens/s.</li>
+          <li><strong>Queue-depth</strong> &mdash; by an admission + degradation contract that sheds in a stated order before the backlog grows unbounded.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scope -->
+  <section class="section">
+    <div class="container">
+      <h2>What This Page Is (and Is Not)</h2>
+      <p><strong>TL;DR.</strong> One engine, one GPU (or one TP/PP group acting as one engine): which requests&rsquo; tokens enter each GPU forward step, and what gives when the engine is over capacity.</p>
+      <ul>
+        <li><strong>Is:</strong> the single-pool scheduler &mdash; why batch and why <em>continuous</em> (derived), the iteration loop, the ragged batch, chunked prefill, preemption, priority/fairness over GPU tokens, the admission + degradation contract, and the two hidden taxes (CPU-stall, CUDA-graph shape) it must out-run, all tuned for goodput.</li>
+        <li><strong>Is not:</strong> fleet-level autoscaling &amp; keep-warm economics (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>); the prefill/decode <em>pool</em> disaggregation &amp; KV handoff (<a href="K5_disaggregated-serving.html">K5</a>); per-token billing, per-tenant API rate-limiting, the streaming gateway (API-product layer). All <em>named and linked</em> in &sect;7, not covered.</li>
+      </ul>
+      <div class="warn-box"><strong>Dedup rule.</strong> Self-contained on scheduling only: the roofline / B* / step-time constants are <a href="K1_serving-fundamentals.html#roofline">K1</a>&rsquo;s; the block table that makes swap/recompute/cancel-reclaim work is <a href="K2_kv-cache.html#d4">K2 (D4)</a>&rsquo;s; the <code>O(seq&sup2;)</code> attention shape that forces tiling is <a href="K0_transformer-forward-pass-and-dimensions.html#sdpa">K0</a>&rsquo;s; the attention/CUDA-graph kernel internals are <a href="attention-kernels-and-cuda-graphs.html">K17</a>&rsquo;s. This page <em>cites</em> them and never re-derives them. Preemption-by-swap <em>is</em> <a href="K2_kv-cache.html#tier">K2&rsquo;s tier offload</a> &mdash; same transfer, different trigger.</div>
+    </div>
+  </section>
+
+  <!-- The scheduling spine -->
+  <section class="section section-alt" id="spine">
+    <div class="container">
+      <h2>The Scheduling Spine (the page&rsquo;s spine)</h2>
+      <p>Every section is one link in a naive&rarr;problem&rarr;fix chain; the decision-tree SVG below <em>is</em> this chain.</p>
+      <ul>
+        <li><strong>Static batch &rarr; idle-slot waste.</strong> Fix a batch, run it to completion. <em>Problem:</em> requests finish at different steps; a finished slot sits idle until the slowest sequence drains (the <strong>convoy effect</strong>) &rarr; utilization collapses.</li>
+        <li><strong>Continuous (iteration-level) batching &rarr; long-prefill head-of-line.</strong> Re-decide the batch <em>every iteration</em>, admit a waiting request the instant a slot frees (Orca). <em>Problem:</em> a freshly admitted 100k-token prefill is one uninterruptible kernel that blocks every in-flight decode &rarr; TPOT spikes.</li>
+        <li><strong>Chunked prefill &rarr; KV exhaustion.</strong> Split the prefill into fixed token-budget chunks so decodes interleave between them. <em>Problem:</em> more concurrent sequences &rArr; aggregate KV outgrows HBM, and KV grows <em>every step</em> so a request admitted when HBM looked fine OOMs the pool thousands of steps later (cite K2).</li>
+        <li><strong>KV-aware admission &rarr; the projection can be wrong.</strong> Gate admission on free KV blocks, reserve minimum decode headroom, and project aggregate in-flight growth before admitting (proactive). <em>Problem:</em> output length is unknown, so the growth projection is an estimate that can still breach the watermark.</li>
+        <li><strong>Preemption &rarr; which victim, recompute or swap.</strong> Evict a sequence&rsquo;s KV at a watermark when the proactive estimate was wrong (the reactive fallback). <em>Problem:</em> victim choice and eviction mechanism are themselves a policy with a cost crossover.</li>
+        <li><strong>Many SLO classes &amp; tenants contend &rarr; priority + fairness.</strong> <em>Problem:</em> priority starves low-priority/long requests; fairness must compose with priority <em>over GPU tokens, not requests</em>.</li>
+        <li><strong>Still over capacity &rarr; admission, load-shed, a degradation contract.</strong> <em>Problem:</em> what degrades, in what order, must be a <em>stated contract</em>, not an accident.</li>
+        <li><strong>All of it must out-run two hidden taxes:</strong> the CPU scheduler stalling the GPU between steps, and the CUDA-graph static-shape constraint &mdash; and be tuned for <strong>goodput</strong> (requests meeting SLO), not raw tokens/s.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 0. Decision tree (REAL — this is the arc)             -->
+  <!-- ===================================================== -->
+  <section class="section" id="tree">
+    <div class="container">
+      <h2>The Page as One Decision Tree</h2>
+      <p>One chain: <em>static batch wastes freed slots (convoy) &rarr; continuous batching refills them &rarr; a long prefill now head-of-lines decodes &rarr; chunk it &rarr; more concurrent seqs &amp; per-step KV growth exhaust HBM &rarr; KV-aware admission gate + decode-headroom reservation (proactive) &rarr; preempt only when that growth estimate was wrong (reactive) &rarr; victim/contention is a policy &rarr; priority + fairness over tokens &rarr; still over capacity &rarr; admission + a stated degradation contract</em> &mdash; all of it racing two hidden taxes, tuned for goodput. Each box is a section below; the body elaborates them in this order.</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1200 1024" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .b  { fill:#fff; stroke:#334155; }
+          .bp { fill:#eff6ff; stroke:#2563eb; }
+          .bd { fill:#fef3c7; stroke:#d97706; }
+          .bc { fill:#ecfdf5; stroke:#059669; }
+          .bs { fill:#faf5ff; stroke:#7c3aed; }
+          .t  { font-size:13px; font-weight:700; fill:#1e293b; }
+          .s  { font-size:11px; fill:#475569; }
+          .l  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          line, path.e { stroke:#1e293b; stroke-width:1.5; fill:none; marker-end:url(#a); }
+        </style>
+
+        <!-- root -->
+        <rect class="b" x="380" y="16" width="440" height="58" rx="8"/>
+        <text class="t" x="600" y="40" text-anchor="middle">Keep 1 GPU saturated; each request meets its SLO</text>
+        <text class="s" x="600" y="58" text-anchor="middle">continuous arrivals &middot; varying length &middot; finish at different steps &middot; §1</text>
+
+        <line x1="600" y1="74" x2="600" y2="100"/>
+        <text class="l" x="690" y="92">naive (Iron Rule #5)</text>
+
+        <!-- naive -->
+        <rect class="b" x="370" y="100" width="460" height="46" rx="8"/>
+        <text class="t" x="600" y="120" text-anchor="middle">NAIVE: static batch &mdash; fix B, run to completion</text>
+        <text class="s" x="600" y="137" text-anchor="middle">no continuous batching, no chunking, no preemption</text>
+
+        <line x1="600" y1="146" x2="600" y2="174"/>
+
+        <!-- P1 -->
+        <rect class="bd" x="370" y="174" width="460" height="48" rx="8"/>
+        <text class="t" x="600" y="194" text-anchor="middle">PROBLEM: seqs finish at different steps</text>
+        <text class="s" x="600" y="211" text-anchor="middle">freed slot idle until slowest drains (convoy) &rarr; util collapses</text>
+
+        <line x1="600" y1="222" x2="600" y2="250"/>
+        <text class="l" x="690" y="240">fix</text>
+
+        <!-- F1 -->
+        <rect class="bc" x="370" y="250" width="460" height="50" rx="8"/>
+        <text class="t" x="600" y="270" text-anchor="middle">Continuous (iteration-level) batching</text>
+        <text class="s" x="600" y="288" text-anchor="middle">refill a freed slot the instant a seq EOSs (Orca) &middot; §2</text>
+
+        <line x1="600" y1="300" x2="600" y2="328"/>
+        <text class="l" x="690" y="318">new problem</text>
+
+        <!-- P2 -->
+        <rect class="bd" x="370" y="328" width="460" height="48" rx="8"/>
+        <text class="t" x="600" y="348" text-anchor="middle">PROBLEM: a 100k-token prefill = 1 uninterruptible kernel</text>
+        <text class="s" x="600" y="365" text-anchor="middle">blocks every in-flight decode &rarr; TPOT spike (head-of-line)</text>
+
+        <line x1="600" y1="376" x2="600" y2="404"/>
+        <text class="l" x="690" y="394">fix</text>
+
+        <!-- F2 -->
+        <rect class="bc" x="370" y="404" width="460" height="50" rx="8"/>
+        <text class="t" x="600" y="424" text-anchor="middle">Chunked prefill &mdash; split into token-budget chunks</text>
+        <text class="s" x="600" y="442" text-anchor="middle">decodes interleave between chunks &mdash; D1 &middot; §3</text>
+
+        <line x1="600" y1="454" x2="600" y2="482"/>
+        <text class="l" x="690" y="472">new problem</text>
+
+        <!-- P3 -->
+        <rect class="bd" x="370" y="482" width="460" height="48" rx="8"/>
+        <text class="t" x="600" y="502" text-anchor="middle">PROBLEM: more concurrent seqs &rArr; KV outgrows HBM</text>
+        <text class="s" x="600" y="519" text-anchor="middle">+ KV grows every step &mdash; an admitted-fine seq OOMs later (cite K2)</text>
+
+        <line x1="600" y1="530" x2="600" y2="558"/>
+        <text class="l" x="690" y="548">fix</text>
+
+        <!-- F3 -->
+        <rect class="bc" x="370" y="558" width="460" height="50" rx="8"/>
+        <text class="t" x="600" y="578" text-anchor="middle">KV-aware admission gate, then preemption fallback</text>
+        <text class="s" x="600" y="596" text-anchor="middle">reserve headroom + project growth (proactive, ADDED) &middot; recompute/swap (reactive, D3) &middot; §3</text>
+
+        <line x1="600" y1="608" x2="600" y2="636"/>
+        <text class="l" x="690" y="626">new problem</text>
+
+        <!-- P4 -->
+        <rect class="bd" x="370" y="636" width="460" height="48" rx="8"/>
+        <text class="t" x="600" y="656" text-anchor="middle">PROBLEM: growth estimate wrong &rarr; which victim?</text>
+        <text class="s" x="600" y="673" text-anchor="middle">recompute or swap &mdash; a policy with a cost crossover &middot; many SLO classes contend</text>
+
+        <line x1="600" y1="684" x2="600" y2="712"/>
+        <text class="l" x="690" y="702">fix</text>
+
+        <!-- F4 -->
+        <rect class="bc" x="370" y="712" width="460" height="50" rx="8"/>
+        <text class="t" x="600" y="732" text-anchor="middle">Priority + fairness over GPU tokens</text>
+        <text class="s" x="600" y="750" text-anchor="middle">WFQ over tokens, not requests &mdash; D2 / D18 &middot; §3</text>
+
+        <line x1="600" y1="762" x2="600" y2="790"/>
+        <text class="l" x="690" y="780">new problem</text>
+
+        <!-- P5 -->
+        <rect class="bd" x="370" y="790" width="460" height="48" rx="8"/>
+        <text class="t" x="600" y="810" text-anchor="middle">PROBLEM: priority starves long/low-pri; still over capacity</text>
+        <text class="s" x="600" y="827" text-anchor="middle">what degrades, in what order?</text>
+
+        <line x1="600" y1="838" x2="600" y2="866"/>
+        <text class="l" x="690" y="856">fix</text>
+
+        <!-- F5 -->
+        <rect class="bc" x="370" y="866" width="460" height="50" rx="8"/>
+        <text class="t" x="600" y="886" text-anchor="middle">Admission + load-shed + a stated degradation contract</text>
+        <text class="s" x="600" y="904" text-anchor="middle">rule-11 spectrum + symptom&rarr;action table &mdash; D13 &middot; §3</text>
+
+        <line x1="600" y1="916" x2="600" y2="944"/>
+
+        <!-- footer band: the two hidden taxes + goodput -->
+        <rect class="bs" x="300" y="944" width="600" height="64" rx="8"/>
+        <text class="t" x="600" y="968" text-anchor="middle">Underneath all of it &mdash; two hidden taxes + the real objective</text>
+        <text class="s" x="600" y="986" text-anchor="middle">CPU-scheduler stall (D33) &middot; CUDA-graph static shape (D22 &rarr; K17)</text>
+        <text class="s" x="600" y="1002" text-anchor="middle">tune every knob for GOODPUT, not tokens/s (D20)</text>
+
+        <!-- side note: the foundation -->
+        <text class="s" x="1000" y="266" text-anchor="middle" font-style="italic" fill="#7c3aed">why batch at all,</text>
+        <text class="s" x="1000" y="282" text-anchor="middle" font-style="italic" fill="#7c3aed">why continuous &mdash;</text>
+        <text class="s" x="1000" y="298" text-anchor="middle" font-style="italic" fill="#7c3aed">derived in §2</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Root &rarr; Naive &rarr; P1</strong> &mdash; static batch; seqs finish at different steps &rarr; freed slot idle until slowest drains (convoy) &rarr; util collapses.</li>
+        <li><span class="b">&#9313;</span> <strong>F1</strong> &mdash; continuous (iteration-level) batching: refill on EOS (Orca). <em>This is the reason the scheduler exists</em>; everything below manages the costs it creates.</li>
+        <li><span class="b">&#9314;</span> <strong>P2 &rarr; F2</strong> &mdash; a long prefill head-of-lines decodes &rarr; chunked prefill (D1).</li>
+        <li><span class="b">&#9315;</span> <strong>P3 &rarr; F3</strong> &mdash; concurrent seqs <em>and per-step KV growth</em> outgrow HBM &rarr; KV-aware admission gate + decode-headroom reservation + projected-growth gate (proactive, <span style="color:#ea580c;">ADDED</span>) &rarr; preemption (D3) is the reactive fallback only when that growth estimate was wrong.</li>
+        <li><span class="b">&#9316;</span> <strong>P4 &rarr; F4 &rarr; P5 &rarr; F5</strong> &mdash; victim/contention is a policy &rarr; priority + fairness over tokens (D2/D18); over capacity &rarr; admission + a stated degradation contract (D13).</li>
+        <li><span class="b">&#9317;</span> <strong>Footer</strong> &mdash; two hidden taxes (CPU-stall D33, CUDA-graph shape D22&rarr;K17); the objective is <em>goodput</em> (D20), not tokens/s.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 1. Problem -->
+  <!-- ===================================================== -->
+  <section class="section" id="problem">
+    <div class="container">
+      <h2>1. The Problem It Solves</h2>
+      <h3>The bottleneck shape</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> one GPU&rsquo;s decode step is memory-bandwidth-bound and only pays for itself when many sequences share the one weight-load &mdash; but requests arrive continuously, vary wildly in length, and finish at different steps, so a fixed batch decays toward occupancy 1 (the convoy) and a long prefill stalls every decode. <b>Solution (what the page builds):</b> a per-iteration scheduler that keeps effective batch near B<sub>max</sub>, chunks long prefills, preempts under pressure, and sheds in a stated order &mdash; all tuned for goodput.<span class="meta">number: effective-occupancy decay of a static batch vs continuous on the trace &mdash; cites K1 §3.5 (#decode), §3.4 (#roofline) &middot; canonical: llm/canonicals/llm-bottlenecks.html#convoy</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 2. Mechanism — the tokenized-prompt walkthrough (hard req 6) -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="mechanism">
+    <div class="container">
+      <h2>2. The Mechanism &mdash; the Tokenized-Prompt Walkthrough</h2>
+
+      <h3 id="where">Where the scheduler lives &mdash; the host-side control loop <em>around</em> the GPU forward step, not a model layer</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (architecture placement, hard req 6).</span> <b>Problem:</b> the model (K0 forward pass) computes one step over whatever tokens it is handed &mdash; it has no notion of &ldquo;requests&rdquo;, queues, or SLOs; nothing inside the transformer decides <em>which</em> requests&rsquo; tokens go into the next step. <b>Solution:</b> the scheduler is a CPU-side loop that wraps every GPU forward step &mdash; it admits/evicts requests, packs their tokens into the ragged batch, launches the step, harvests outputs, and repeats. It sits <em>around</em> the K0 forward pass, not inside it; this is also <em>why</em> it can become the bottleneck (the D33 CPU-stall tax) and why CUDA graphs constrain it (D22).<span class="meta">cites K0 (the forward step it wraps) &middot; no number (placement fact) &middot; diagram: scheduler loop as a ring around the K0 forward-pass block</span></p>
+
+      <h3 id="rank-consistency" style="background:#fff7ed;border-left:4px solid #ea580c;padding:.4rem .7rem;">The scheduler in a multi-GPU engine &mdash; every rank must make the <em>identical</em> decision <span style="font-weight:400;font-size:.8em;color:#ea580c;">[ADDED &mdash; not in plan]</span></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (a correctness fact, not a perf knob &mdash; placement-level, hard req 6 sibling).</span> <b>Problem:</b> &ldquo;one GPU step&rdquo; is a simplification &mdash; when the engine is a TP/PP group the forward step is a <em>collective-synchronized barrier</em> (per-layer all-reduce, K7/K20). The scheduler loop is <em>replicated on every rank</em>; if rank&nbsp;0 admits request X this step and rank&nbsp;1 does not, their batched tensors have different shapes &rarr; the all-reduce mismatches &rarr; the engine <strong>hangs</strong> (a deadlock, not a slowdown &mdash; the worst failure class). <b>Solution:</b> the schedule must be <em>bit-identical across ranks</em> &mdash; a <em>driver rank runs the scheduler and broadcasts the decision</em> (batch membership, <code>cu_seqlens</code>, block tables) to all workers before the step (vLLM), <em>or</em> every rank runs a deterministic scheduler over byte-identical replicated state (no rank-local RNG / wall-clock / hash-order in the admission decision). State the placement: the scheduler sits <em>around</em> the K0 forward pass and <em>above</em> the K20 collective &mdash; it is a single logical decision physically replicated, not N independent schedulers.<span class="meta">no number (correctness placement fact) &middot; failure: rank-schedule divergence &rarr; collective deadlock (&sect;5) &middot; cites K7/K20 (the collective the decision must stay consistent with), K22 (group blast radius on the resulting hang) &middot; real: vLLM driver-worker broadcast, TRT-LLM orchestrator</span></p>
+
+      <h3 id="walkthrough">The walkthrough on <code>&quot;I like cat, why?&quot;</code> &mdash; static batch vs continuous, prefill vs decode</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (hard requirement 6 &mdash; reader&rsquo;s first contact).</span> Canonical trace: user A sends T1 = <code>&quot;I like cat, why?&quot;</code> (6 tokens) and is mid-answer (decoding token 47 of its response); user B then submits a long prompt. <b>Static batch:</b> A&rsquo;s batch was fixed at admission &rarr; B waits for the <em>entire</em> batch to drain before it can start (convoy); each step still mixes A&rsquo;s <em>prefill</em> (all 6 tokens, one parallel <code>Q&middot;K&#7488;</code> with a causal mask, KV <em>written</em>) then A&rsquo;s <em>decode</em> (1 new token, cached K,V <em>read</em>). <b>Continuous batching:</b> the iteration loop admits B&rsquo;s prefill into the slot A frees the instant A emits EOS &mdash; effective batch stays full. Show the static-vs-continuous occupancy contrast explicitly on this two-user trace.<span class="meta">numbers: symbolic until §2.3 / D1 use it to compare static vs continuous and chunk-size (numbers-only-at-decisions) &middot; diagram: per-iteration ragged batch (A decode + B prefill-chunk) on a timeline, static vs continuous occupancy</span></p>
+
+      <h3 id="why-continuous">Why batch at all, and why <em>continuous</em> &mdash; derived</h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the page&rsquo;s opening derivation, builds on the walkthrough).</span> Sub-bulleted chain: (a) decode at batch 1 is memory-bandwidth-bound &mdash; one token&rsquo;s compute must read <em>all</em> model weights from HBM, arithmetic intensity &asymp; 1, MBU tiny (cite K1 #decode/#roofline); (b) batching B amortizes the one weight-load across B tokens &mdash; throughput &prop; B until decode crosses the roofline ridge at B* (cite K1; B*&asymp;295 on the trace), so below B* more batch is <em>free</em> throughput; (c) static batching forfeits this &mdash; the batch only shrinks, never refills mid-flight, so effective B decays from B<sub>max</sub> toward 1 (the convoy: one 512-token generation among 31&times;32-token ones runs most of its life at near-1 occupancy); (d) continuous batching = iteration-level admission &mdash; refill a freed slot the instant a sequence EOSs &rarr; effective B stays near B<sub>max</sub>. <em>This is the entire reason the scheduler exists; everything below manages the costs it creates.</em><span class="meta">numbers: occupancy decay (512 among 31&times;32) &amp; throughput &prop; B up to B*&asymp;295, cited from K1 #decode #roofline &middot; cites K1 only</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 3. System-design view -->
+  <!-- ===================================================== -->
+  <section class="section" id="design">
+    <div class="container">
+      <h2>3. The System-Design View</h2>
+
+      <h3 style="border-top:3px solid #059669;padding-top:.6rem;">The scheduler itself</h3>
+
+      <h3 id="loop">The iteration loop &amp; <code>max_num_batched_tokens</code></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub.</span> <b>Problem:</b> &ldquo;continuous batching&rdquo; is not a step &mdash; it is a question (when do you admit? how much work per step? where do finished sequences&rsquo; resources go?). <b>Solution:</b> the loop &mdash; collect finished &rarr; free their KV blocks (K2 D4) &rarr; admit from the waiting queue under the token budget &rarr; build the ragged batch &rarr; one GPU step &rarr; repeat; <code>max_num_batched_tokens</code> is the per-iteration work cap that makes step time predictable; a bounded waiting queue + backpressure is what happens when admission can&rsquo;t keep up.<span class="meta">number: step time vs token budget on the trace &mdash; cites K1 #decode (step cost), K2 D4 (block free/alloc) &middot; SLIs: batch-occupancy, queue-depth (K1 #slis)</span></p>
+
+      <h3 id="ragged" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive &mdash; the ragged batch: how one GPU runs variable lengths in parallel</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the reader&rsquo;s &ldquo;how is this physically possible?&rdquo; question, owed in place &mdash; rule 11).</span> <b>Problem:</b> an iteration mixes a few prefills (different prompt lengths) with many decodes (1 token each, different KV lengths); static batching&rsquo;s only answer is to pad every request to <code>max_seq_len</code> and run a rectangular tensor &mdash; compute/HBM wasted &prop; padding (a batch of one 8k-token req + 31&times;128-token reqs does &asymp;32&times; the needed attention work). <b>Solution (three parts):</b> (1) non-attention layers are length-agnostic &mdash; QKV/MLP are per-token GEMMs, so all tokens of all requests pack into one flat <code>[total_tokens, d_model]</code> matrix with <code>cu_seqlens</code> (prefix-sum) marking each request&rsquo;s slice; (2) attention is the length-sensitive part &mdash; the kernel tiles into <em>(query-block &times; KV-block)</em> tiles, each an independent CTA, KV-side non-contiguity handled by the K2 block table (kernel internals = K17); (3) the GPU&rsquo;s grid scheduler greedily hands each CTA to any free SM &mdash; variable length becomes &ldquo;variable tile count&rdquo;, not padding. <b>The cliff K4 owns:</b> the grid runs in <em>waves</em> of <code>ceil(num_CTAs/num_SMs)</code>; one very long request &rarr; a lopsided tile count &rarr; a partial final wave with idle SMs = the <strong>wave / tile-quantization tail</strong> &rarr; MFU collapses though the GPU looks busy. This is <em>precisely why</em> <code>max_num_batched_tokens</code> + chunked prefill exist &mdash; they cap and regularize per-iteration tile count.<span class="meta">number: padded-vs-packed work for {1&times;8k + 31&times;128} on the trace; wave-tail MFU loss &middot; cites K0 #sdpa (O(seq&sup2;) shape), K2 D4 (non-contiguous KV), K17 (tiling/online-softmax kernel internals &mdash; rule of two) &middot; K4 owns batch-composition + wave-balance</span></p>
+
+      <h3 id="d1" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D1 &mdash; chunked prefill: what it is and the four things it improves</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>What it is:</b> instead of prefilling a prompt in one giant kernel over all its tokens, split it into fixed <code>max_num_batched_tokens</code>-sized chunks processed across successive scheduler iterations. Four improvements, each Problem&rarr;Solution with a concrete prompt:</p>
+      <ul>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(1) Interleaving prefill with decode &rarr; no head-of-line TPOT spike.</b> <em>Problem:</em> unchunked, a long prefill is one uninterruptible kernel; every in-flight decode stalls for its whole duration. <em>Concrete:</em> user A is decoding token 47 of the answer to <code>&quot;I like cat, why?&quot;</code>; user B submits a 120 000-token contract-review prompt &mdash; unchunked, A&rsquo;s next token waits the full ~120k-token prefill (seconds). <em>Solution:</em> chunk B at C=2 048 &rarr; ~59 chunk-iterations; A&rsquo;s decode is scheduled <em>between</em> chunks &rarr; A&rsquo;s TPOT stays &asymp; its normal ~21 ms.<span class="meta">number: A&rsquo;s TPOT unchunked (seconds) vs chunked (~21 ms) on the trace &mdash; cites K1 #decode #prefill</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(2) Bounds prefill activation/residual-stream memory &mdash; the long-context OOM that hits <em>before</em> KV does.</b> <em>Problem:</em> prefill over N tokens materializes the residual stream + attention intermediates &asymp; <code>[N, d_model]</code> per layer; at N=200k this activation working set OOMs the GPU before the KV cache does (the hidden OOM). <em>Concrete:</em> a 200 000-token codebase prompt (<code>&quot;here is my repo, find the bug: &lt;200k tokens&gt;&quot;</code>) OOMs even though weights+KV fit. <em>Solution:</em> chunk at C=4 096 &rarr; peak prefill activation is O(<code>C&middot;d_model</code>), independent of N &rarr; 49 chunks, flat bounded footprint.<span class="meta">number: activation footprint 200k vs C=4096 on the trace &mdash; cites K0/K18 (residual-stream shape), rule of two: K18/D46 owns the crossover</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(3) CUDA-graph reuse via regular kernel shapes.</b> <em>Problem:</em> unbounded variable-length prefill is a different tensor shape per request &rarr; a captured CUDA graph (fixed shapes) can&rsquo;t be replayed &rarr; thousands of kernel launches/iteration, launch overhead dominates at small batch. <em>Concrete:</em> prompts of 6, 4 000, 128 000 tokens would need three prefill shapes; chunked at C=2 048 they all become a stream of identical 2 048-token chunk iterations &rarr; one captured graph serves every prompt length. <em>Solution:</em> chunk size = a fixed graph bucket the scheduler snaps to. <em>Rule of two:</em> K4 owns the scheduler-snaps-to-bucket; the capture machinery is K17 (D22).<span class="meta">number: kernel launches/iter unchunked vs one-graph chunked &mdash; cites K17 D22 (capture machinery, rule of two)</span></li>
+        <li class="stub" style="border-left-color:#7c3aed;"><b>(4) Bounded, uniform per-iteration work &rarr; predictable TPOT/goodput.</b> <em>Problem:</em> variable per-step work (a fat prefill step vs a thin decode step) &rarr; TPOT jitter, p99 &gg; p50, wave-tail MFU collapse. <em>Solution:</em> <code>max_num_batched_tokens</code> caps every iteration&rsquo;s work &rarr; step time &asymp; constant &rarr; TPOT p99 &asymp; p50. This is also <em>how</em> the in-pool prefill&harr;decode split (D34) is physically enforced and what goodput (D20) is tuned against.<span class="meta">number: TPOT p99/p50 with vs without the cap on the trace &mdash; cites K1 #slis, forward-links D34/D20</span></li>
+      </ul>
+      <p class="stub"><span class="ps">Sub-stub &mdash; the chunk-size knob = the TTFT&harr;TPOT dial (the crossover, with the number).</span> For prompt <code>s_in</code>, chunk <code>C</code>: prefill takes <code>&lceil;s_in/C&rceil;</code> iterations &rarr; <code>TTFT &asymp; &lceil;s_in/C&rceil; &middot; step_time</code> (bigger C &rarr; fewer iters &rarr; lower TTFT) but each chunk-bearing step adds &asymp; <code>prefill_compute(C)</code> to concurrent decodes&rsquo; TPOT (bigger C &rarr; worse TPOT). Optimal C is where marginal TTFT-gain = marginal TPOT-loss in SLO-violation terms. Preemption/resume happens at chunk boundaries &mdash; chunked prefill <em>is</em> the preemption primitive.<span class="meta">number: TTFT &amp; TPOT vs C swept on the trace; the crossover C* &mdash; cites K1 #prefill #decode, derive both directions &middot; real: vLLM chunked prefill</span></p>
+
+      <h3 id="kv-admission" style="background:#fff7ed;border-left:4px solid #ea580c;padding:.4rem .7rem;">KV-aware admission &amp; headroom reservation &mdash; the proactive twin of preemption <span style="font-weight:400;font-size:.8em;color:#ea580c;">[ADDED &mdash; not in plan]</span></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (the proactive sibling D3 reacts to; spine node before preemption).</span> <b>Problem:</b> the iteration loop admits &ldquo;under the token budget&rdquo; &mdash; but <code>max_num_batched_tokens</code> is a <em>compute</em> cap; it says nothing about HBM. KV is allocated per admitted sequence <em>and grows every decode step</em>, so two distinct failures follow: (i) admitting a request with no free blocks for its prompt guarantees an <em>immediate</em> preempt; (ii) a set of requests that all fit at admission can collectively breach the free-block watermark thousands of steps later because every one keeps growing &mdash; the preempt storm D3 then has to clean up. <b>Solution &mdash; a second admission gate + reservation + projection:</b> (a) gate admission on <em>free KV blocks for the prompt</em>, not just the token budget; (b) <em>reserve</em> a minimum decode-headroom of blocks per admitted sequence so it can make forward progress before competing for growth; (c) <em>project</em> aggregate in-flight growth (&Sigma; over running seqs of expected remaining tokens &times; block rate) and stop admitting while the projection would cross the watermark within the horizon. D3 (recompute-vs-swap) is the <em>reactive fallback for when this estimate was wrong</em> (output length is unknown &mdash; cite K19/D47 for the length prior, K4 owns the headroom/projection gate). <b>The knob:</b> the reserved-headroom fraction &mdash; too small &rarr; preempt storms (gate was useless); too large &rarr; under-admission, batch occupancy &amp; goodput drop.<span class="meta">number: preempt-rate &amp; goodput vs reserved-headroom fraction on the trace; the watermark + horizon that minimize preempts without starving admission &mdash; cites K1 #decode (block growth rate), K2 D4 (block alloc) / #tier, K19 D47 (length prior) &middot; real: vLLM watermark + <code>can_allocate</code> / GPU-blocks budget, TGI <code>waiting_served_ratio</code> &middot; canonical: llm-bottlenecks.html#kv-exhaustion</span></p>
+
+      <h3 id="d3" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D3 &mdash; preemption: the two strategies and the crossover</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (K4 owns the policy; the transfer mechanism is K2&rsquo;s).</span> <b>Problem:</b> at a free-block watermark a victim&rsquo;s KV must go &mdash; but dropping it wastes its prefill, keeping it costs HBM. <b>Solution &mdash; two strategies + the crossover:</b> (a) <em>recompute</em> &mdash; drop the victim&rsquo;s KV, re-run prefill on resume; O(1) extra memory, O(prompt) compute; wins for short prompts. (b) <em>swap/offload</em> &mdash; copy KV blocks HBM&rarr;pinned host RAM via the K2 block table (block-granular scatter DMA, <em>not</em> a contiguous memcpy), restore on resume; O(prompt) PCIe bytes + host RAM; wins for long prompts. Pick the cheaper: <code>recompute = prompt_FLOPs/throughput</code> vs <code>swap = KV_bytes/PCIe_BW</code> (both directions). <b>State the equivalence explicitly:</b> preemption-by-swap <em>is</em> the K2 warm-tier offload &mdash; same HBM&rarr;pinned-host DMA over the same block table; preemption is just the whole-sequence, scheduler-triggered, restore-on-resume <em>policy</em> over that mechanism, vs K2&rsquo;s per-block hotness policy. Link <a href="K2_kv-cache.html#tier">K2_kv-cache.html#tier</a> &mdash; &ldquo;same transfer, different trigger.&rdquo;<span class="meta">number: recompute vs swap cost crossover by prompt length on the trace &mdash; cites K1 #prefill, K2 D4 (block-granular scatter DMA) / #tier (the equivalence) &middot; canonical: llm-bottlenecks.html#kv-exhaustion</span></p>
+
+      <h3 id="d34" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D34 &mdash; the in-pool prefill&harr;decode token-budget split</h3>
+      <p class="stub"><span class="ps">Deep-dive stub + selection-knob sweep (rule 11) &mdash; the single-pool analog of K5&rsquo;s pool ratio.</span> <b>Problem:</b> each iteration&rsquo;s <code>max_num_batched_tokens</code> is divided between prefill-chunk tokens and decode tokens; all-prefill iterations starve decodes (TPOT spike), all-decode starves prefills (TTFT spike) &mdash; the same tension K5 solves with <em>separate pools</em>, here resolved <em>within one pool</em>. <b>Solution &mdash; the sweep:</b> (a) decode-first (serve all running decodes, fill remainder with prefill chunks) &mdash; protects TPOT, risks TTFT under prefill backlog; (b) prefill-first &mdash; protects TTFT, spikes TPOT; (c) fixed ratio &mdash; predictable, ignores live SLO slack; (d) SLO-feedback ratio (SoTA) &mdash; raise prefill budget as TTFT-slack tightens, lower as TPOT-slack tightens. Crossover: the split where marginal TTFT-gain = marginal TPOT-loss in SLO-violation terms.<span class="meta">number: TTFT/TPOT vs split ratio on the trace; the SLO-feedback crossover &mdash; cites K1 #prefill #decode &middot; real: vLLM chunked-prefill long_prefill_token_threshold, SGLang &middot; cross-link K5 (the cross-pool sibling)</span></p>
+
+      <h3 id="d11" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D11 (K4 co-host half) &mdash; speculative decoding breaks the uniform-step assumption <span style="font-weight:400;font-size:.78rem;color:#6b21a8;">&middot; co-host with <a href="K13_speculative-decoding.html#d11">K13&nbsp;&sect;D11</a> (the speculation-mechanism half: the losslessness proof + the <code>B_spec</code> on/off crossover)</span></h3>
+      <p class="stub"><span class="ps">Deep-dive stub (rule of two: <a href="K13_speculative-decoding.html#d11">K13/D11</a> owns <em>when speculation wins/loses</em> &mdash; the &alpha;-speedup &amp; the <code>B_spec</code> compute-bound cliff; <strong>K4/D11 (here)</strong> owns how the scheduler accommodates variable-width steps).</span> <b>Problem:</b> the &ldquo;bounded, uniform per-iteration work&rdquo; guarantee (D1.4) silently rests on <em>each decode step emits exactly 1 token/sequence</em> &mdash; so a slot frees on a predictable cadence and the token budget is exact. Speculative decoding emits <em>1..K+1 accepted tokens per sequence per step, variable across sequences and across steps</em> (acceptance is data-dependent). Three scheduler invariants break: (i) the per-iteration <em>token budget</em> is no longer <code>num_seqs</code> &mdash; a step verifies <code>num_seqs&times;(K+1)</code> tokens, so <code>max_num_batched_tokens</code> accounting must reserve the draft+verify width; (ii) <em>KV-append count is variable per sequence</em> (only accepted tokens commit; rejected draft KV must be rolled back &mdash; cite K2 D4); (iii) <em>slot-free timing is variable</em> (a high-acceptance seq finishes in fewer steps), perturbing the convoy/refill cadence. <b>Solution K4 owns:</b> budget on the <em>speculative width</em> (<code>num_seqs&times;(K+1)</code>, not <code>num_seqs</code>); make KV-append/rollback part of the per-step harvest; treat the accepted-token count as the slot-reclaim signal. The on/off-by-batch decision (the <code>B_spec</code> crossover) is <a href="K13_speculative-decoding.html#d11">K13/D11</a> &mdash; cite, do not re-derive.<span class="meta">number: token-budget inflation factor (K+1) and its effect on safe batch size on the trace &mdash; cites K1 #decode, K2 D4 (KV append/rollback), K13 D11 (when speculation helps/hurts &mdash; rule of two) &middot; real: vLLM spec-decode scheduler, TensorRT-LLM</span></p>
+
+      <h3 id="d33" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D33 &mdash; the scheduler is on the critical path: the CPU-stall tax</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (a top production cause of &ldquo;GPU-util 60% but throughput low&rdquo;).</span> <b>Problem:</b> the scheduler runs on the CPU <em>between</em> GPU steps (collect EOS, free blocks, admission/eviction, build <code>cu_seqlens</code> + block tables, launch); at high QPS with many small requests the decode kernel is ~5&ndash;15 ms but the host scheduling work can rival it &rarr; the GPU idles between steps, achieved throughput &ll; roofline even at &ldquo;high&rdquo; GPU-util. <b>Solution + the knob:</b> overlap host scheduling with GPU compute &mdash; <em>async scheduling</em> (build step n+1 while step n runs) and <em>multi-step scheduling</em> (run k decode steps per schedule, amortizing host cost k&times;). Crossover: multi-step trades scheduling latency for <em>staleness</em> (a finished request unnoticed for up to k steps &rarr; wasted compute + TPOT jitter) &rarr; pick the largest k with <code>host_sched_time/k &le; &epsilon;&middot;step_time</code> and <code>k&middot;step_time &le; TPOT_slack</code>.<span class="meta">number: host_sched_time vs decode step on the trace; the k that satisfies both bounds &mdash; cites K1 #decode (step time) &middot; real: vLLM multi-step / async scheduler, TGI batching loop</span></p>
+
+      <h3 id="host-tax" style="background:#fff7ed;border-left:4px solid #ea580c;padding:.4rem .7rem;">Constrained-decoding &amp; detokenizer host tax <span style="font-weight:400;font-size:.8em;color:#ea580c;">[ADDED &mdash; not in plan]</span></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (a real-world surface of the D33 host tax the plan didn&rsquo;t name).</span> <b>Problem:</b> two per-token host operations silently inflate the D33 tax and can break CUDA graphs in production: (i) <em>guided/structured decoding</em> &mdash; JSON-schema / grammar-constrained output computes a token-validity mask on the CPU every step from an FSM/pushdown automaton (large-vocab mask build is non-trivial and serializes with the GPU step); (ii) <em>detokenization + stop-string matching</em> &mdash; incremental detokenize and multi-stop-sequence scan run on the host per token. At high batch both rival the decode step and partially defeat graph capture (the mask is dynamic). <b>Solution:</b> mask precompute / FSM-state caching &amp; jump-ahead (XGrammar/Outlines-style), async/overlapped detokenization, batched mask kernels, and accounting these into the D33 budget &mdash; they are part of <code>host_sched_time</code>, not free.<span class="meta">number: per-token mask-build + detok cost vs decode step at high batch on the trace &middot; real: vLLM structured output, XGrammar, Outlines, SGLang &middot; cites D33 (same tax surface), D22 (graph breakage)</span></p>
+
+      <h3 id="d22" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D22 &mdash; the CUDA-graph static-shape constraint the scheduler must respect</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (K4 owns the snap, K17 owns the capture &mdash; rule of two).</span> <b>Problem:</b> continuous batching changes batch composition every iteration, but a captured CUDA graph requires <em>fixed</em> shapes; re-capturing per iteration is impossible. <b>Solution K4 owns:</b> the scheduler <em>snaps</em> each iteration&rsquo;s batch to the nearest captured bucket (pad up to the next batch-size / block-count tier), trading bucket-pad waste for the launch overhead the graph removes &mdash; state the crossover. The capture machinery, the bucket set, and piecewise graphs are <strong>K17&rsquo;s (D22)</strong> &mdash; cite, do not re-derive.<span class="meta">number: bucket-pad waste vs launch-overhead saved on the trace (the crossover) &mdash; cites K17 D22 (capture/bucketing internals, rule of two), K1 #decode</span></p>
+
+      <h3 id="d21" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D21 &mdash; request cancellation &amp; client disconnect</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> a client closes the tab mid-generation (huge on long reasoning answers); with no action the GPU keeps decoding a 30k-token answer nobody will read &mdash; pure wasted GPU-hours, the single biggest reasoning-fleet money leak. <b>Solution:</b> propagate cancellation into the scheduler loop &rarr; next iteration drop the sequence, free its KV blocks immediately (K2 D4), reclaim the slot. Cover the detection path (HTTP disconnect &rarr; scheduler signal), the worst case (cancellation mid-prefill-chunk vs between iterations), and the number (GPU-seconds saved per cancelled long generation).<span class="meta">number: GPU-s saved per cancelled 30k-token generation on the trace &mdash; cites K1 #decode, K2 D4 (immediate block free) &middot; real: vLLM abort, TGI stop &middot; cross-link K19 (reasoning length)</span></p>
+
+      <h3 id="fanout" style="background:#fff7ed;border-left:4px solid #ea580c;padding:.4rem .7rem;">Sequence fan-out &amp; termination-detection latency &mdash; the slot accounting continuous batching depends on <span style="font-weight:400;font-size:.8em;color:#ea580c;">[ADDED &mdash; not in plan]</span></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (two coupled gaps in &ldquo;1 request = 1 slot, refill the instant it EOSs&rdquo;; rule of two: K2 owns the CoW, K4 owns slot/budget/reclaim accounting).</span> <b>Problem A &mdash; fan-out:</b> one admitted request is <em>not</em> one decode sequence &mdash; <code>n&gt;1</code> / beam / best-of-<em>n</em> <em>fan out after prefill</em> into <em>n</em> concurrently-decoding sequences (best-of-8 = 1 prefill &rarr; 8 decode slots + 8&times; the decode KV). An admission gate that reserves the <em>prompt&rsquo;s</em> footprint under-reserves by <code>n&times;</code> and triggers an immediate post-prefill preempt. <b>Problem B &mdash; reclaim latency:</b> continuous batching&rsquo;s entire premise is &ldquo;refill the slot the instant the sequence ends&rdquo; &mdash; but <em>when</em> is the end detected? <code>max_tokens</code> and the EOS token are exact (free this step); a <em>stop-string</em> is only decidable <em>after incremental detokenization</em> (the host tax above) and can span tokens &rarr; the slot is freed <em>one or more steps late</em>, so effective occupancy &lt; nominal. <b>Solution:</b> (a) admission and the token budget reserve the <em>post-fan-out</em> sequence count and KV (the K2 CoW shares the common prefix, but K4 must <em>count</em> the <em>n</em> divergent slots); (b) model reclaim-latency explicitly &mdash; EOS-token / <code>max_tokens</code> free in-step, stop-strings free at detok-confirm; size the refill cadence on the <em>confirmed</em>-free signal, not the optimistic one.<span class="meta">number: under-reservation factor for best-of-n; occupancy loss from k-step stop-string reclaim latency on the trace &mdash; cites K2 D4 (CoW + block free), the detok host-tax stub (stop-string lookback) &middot; real: vLLM <code>n</code>/best_of + stop-string handling, SGLang</span></p>
+
+      <h3 id="d2" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D2 &mdash; request priority &amp; how it maps to scheduling decisions</h3>
+      <p class="stub"><span class="ps">Deep-dive stub.</span> <b>Problem:</b> &ldquo;priority&rdquo; is named but un-actionable until it maps to concrete per-step choices, and naive priority starves long/low-priority requests. <b>Solution:</b> priority classes resolve three choices each scheduler step &mdash; who gets the next free batch slot, who is preempted first when blocks run out, deadline/SLO-aware ordering; plus priority inversion + <em>aging</em> so low-priority or very long requests don&rsquo;t starve, and per-tenant weighted-fair-queueing layered <em>over GPU tokens</em> (not requests) so priority and fairness compose. Disambiguate the three senses of &ldquo;priority&rdquo;: a static <em>class</em>, the per-step <em>scheduling order</em>, and the <em>admission</em> decision.<span class="meta">number: starvation time without aging vs with, on a low-pri long request &mdash; cites K1 #slis &middot; composes with D18 (WFQ over tokens)</span></p>
+
+      <h3 id="d18" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D18 &mdash; multi-tenant isolation on the shared GPU</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (K4 owns the on-GPU slice; fleet placement is K15).</span> <b>Problem:</b> one tenant&rsquo;s burst of long requests evicts everyone&rsquo;s KV and monopolizes batch slots &mdash; noisy-neighbor on a shared engine. <b>Solution:</b> weighted-fair-queueing <em>over GPU tokens, not requests</em> (a tenant&rsquo;s share = tokens/iteration, so a few long requests don&rsquo;t beat many short ones), per-tenant KV-block quota, and priority composing <em>on top of</em> fairness (priority orders within a tenant&rsquo;s fair share, not across it). Crossover: quota too tight wastes capacity, too loose loses isolation &mdash; the value that bounds tail-latency blast radius.<span class="meta">number: a tenant&rsquo;s p99 with vs without the token-WFQ + quota on the trace &mdash; cites K1 #slis &middot; cross-link K15 (fleet-level multi-tenancy) &middot; canonical: llm-bottlenecks.html#hot-tenant</span></p>
+
+      <h3 id="adapter-batch" style="background:#fff7ed;border-left:4px solid #ea580c;padding:.4rem .7rem;">Adapter-aware batch composition (multi-LoRA per step) &mdash; the scheduling slice <span style="font-weight:400;font-size:.8em;color:#ea580c;">[ADDED &mdash; not in plan; rule-of-two boundary]</span></h3>
+      <p class="stub"><span class="ps">Problem&rarr;Solution stub (rule of two stated in place &mdash; K15/L4 owns fleet adapter economics &amp; scale-to-zero; K17 owns the SGMV/grouped-GEMM kernel; <strong>K4 owns only the per-batch composition constraint</strong>).</span> <b>Problem:</b> a shared-base engine batches requests for <em>different LoRA adapters</em> in the same step. The base GEMM is shared, but each request also needs its adapter&rsquo;s <code>B&middot;A</code> delta &mdash; so a batch spanning <em>m</em> distinct adapters needs <em>m</em> adapter weight-sets resident and a grouped/segmented gather. The scheduler picking batch membership <em>blind to adapter identity</em> maximizes adapter diversity per step &rarr; more resident adapter weight (HBM) + less efficient grouped-GEMM &rarr; throughput collapses, exactly the noisy-neighbor shape of D18 but along the <em>adapter</em> axis. <b>Solution:</b> adapter-aware composition &mdash; cap distinct adapters per batch (<code>max_loras</code>), prefer co-batching requests sharing an adapter, and amortize adapter HBM-residency / activation across the steps it stays hot. <b>The knob &amp; its two-sided cliff:</b> adapters-per-batch too low &rarr; head-of-line wait for same-adapter peers (latency, like over-strict affinity); too high &rarr; the grouped-GEMM + adapter-residency cost (throughput). The crossover is K4&rsquo;s; the SGMV kernel cost it trades against is K17&rsquo;s, the cold-adapter swap is K15/K21&rsquo;s &mdash; cite, do not re-derive.<span class="meta">number: throughput vs adapters-per-batch on the trace; the <code>max_loras</code> crossover &mdash; cites K1 #decode, K17 (SGMV grouped-GEMM cost, rule of two), K15/L4 (fleet adapter economics, rule of two) &middot; real: S-LoRA / Punica, vLLM <code>max_loras</code> &middot; cross-link D18 (same noisy-neighbor shape, tenant axis)</span></p>
+
+      <h3 id="d13">Overload behavior: admission as a rule-11 spectrum + the degradation contract (D13)</h3>
+      <p class="stub"><span class="ps">Selection-knob sweep (rule 11) + required artifact &mdash; owed in place.</span> When offered load exceeds capacity the question is not <em>if</em> but <em>what degrades, in what order</em> &mdash; a stated contract, not an accident. <b>The admission/scheduling-policy spectrum</b> (weakest&rarr;strongest, each with its two-sided cliff + a named system): (0) FCFS &mdash; simplest; one long request head-of-lines the queue. (1) priority classes &mdash; SLO tiers first; starves low priority without aging. (2) deadline/SLO-aware (EDF-like) &mdash; orders by time-to-SLO-breach; mispredicts on unknown output length. (3) predicted-length-aware (shortest-remaining-first) &mdash; short jumps long; needs a length predictor, mis-prediction inverts it. (4) goodput-maximizing (SoTA) &mdash; admit the set maximizing SLO-meeting req/s; needs a cost model. Disambiguate the three senses of &ldquo;priority&rdquo; (static class / per-step order / admit-at-all).<span class="meta">number: the crossover that flips each policy &mdash; cites K1 #slis, K19 (length prior) &middot; real: vLLM, SGLang, EDF schedulers</span></p>
+      <div class="svgph"><strong>SVG PLACEHOLDER &mdash; admission policy spectrum</strong>horizontal weak&rarr;strong axis (0)&ndash;(4); each node tagged with what it orders on + its two-sided cliff + the named system; SoTA (4) highlighted. Drawn after arc approval.</div>
+      <p class="stub"><span class="ps">Required artifact stub &mdash; the degradation contract (symptom &rarr; action table).</span> Rows, each: trigger signal &middot; action &middot; SLO protected &middot; SLO sacrificed &mdash; queue-time SLO exceeded &rarr; shed lowest-priority first; KV watermark hit &rarr; preempt longest / least-progress (D3); sustained overload &rarr; drop <code>reasoning_effort</code> (cross-link K19) or fall back to a smaller model; hard ceiling &rarr; reject with backpressure (429) rather than accept-and-miss.<span class="meta">artifact: real HTML table (not prose) &mdash; placeholder until arc approved &middot; cross-link K19 (reasoning-effort lever)</span></p>
+      <div class="svgph"><strong>TABLE PLACEHOLDER &mdash; symptom &rarr; action degradation contract</strong>4&ndash;5 rows: trigger &middot; action &middot; SLO protected &middot; SLO sacrificed. Filled after arc approval.</div>
+      <p class="stub"><span class="ps">Sub-stub &mdash; preempt&harr;resume livelock.</span> <b>Problem:</b> under sustained overload a victim swapped out, resumed, immediately re-preempted makes no forward progress. <b>Solution:</b> the aging / anti-livelock rule that guarantees progress (a resumed sequence is preemption-immune for a minimum quantum).<span class="meta">number: progress guarantee vs quantum on the trace &middot; canonical: llm-bottlenecks.html#preempt-livelock</span></p>
+
+      <h3 id="d20" style="background:#faf5ff;border-left:4px solid #7c3aed;padding:.4rem .7rem;">Deep dive D20 &mdash; goodput, not throughput, is the objective</h3>
+      <p class="stub"><span class="ps">Deep-dive stub (the optimization target the whole page serves).</span> <b>Problem:</b> raising batch / <code>max_num_batched_tokens</code> raises tokens/s but can push more requests past their SLO &mdash; throughput up, <em>useful</em> output down. <b>Solution:</b> define <strong>goodput</strong> = req/s meeting <em>both</em> TTFT and TPOT SLOs, and tune chunk size (D1), the prefill&harr;decode split (D34), the multi-step k (D33), batch cap, and admission against <em>that</em>. This is the shared objective with K5&rsquo;s disaggregation ratio.<span class="meta">number: a worked case where +20% tokens/s is &minus;15% goodput on the trace &mdash; cites K1 #slis &middot; shared with K5 (D35), canonical: gpu-inference-cost-shapes.html</span></p>
+
+      <h3 id="knobs">Knobs &amp; their cliffs (consolidated)</h3>
+      <p class="stub"><span class="ps">Consolidated stub.</span> Each knob &mdash; <code>max_num_batched_tokens</code>, chunk size C, the prefill&harr;decode split, multi-step k, the free-block watermark, <b>the reserved decode-headroom fraction + projection horizon</b> (ADDED KV-aware admission), priority classes &amp; aging quantum, per-tenant token-WFQ weight &amp; KV quota, <b>max distinct adapters per batch</b> (<code>max_loras</code>), <b>the spec-decode width factor K under batching</b>, the CUDA-graph bucket set, admission policy &mdash; stated with its chosen value, the reason, and the cliff on <em>each</em> side.<span class="meta">numbers: the crossover per knob (composes with D1/D13/D34 + the ADDED KV-admission/fan-out/adapter/spec sweeps above) &middot; no new citations</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 4. Alternatives -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="alternatives">
+    <div class="container">
+      <h2>4. Alternatives &amp; When Each Wins</h2>
+      <p class="stub"><span class="ps">Stub (&ge;2, disqualifying constraint per alt).</span> (a) <b>Static / request-level batching</b> &mdash; disq: effective B decays to ~1 (convoy), throughput collapses under mixed lengths; wins only at uniform length + offline (&rarr; K16). (b) <b>No chunked prefill</b> &mdash; disq: one long prefill head-of-lines every decode + activation OOM; wins only when all prompts are short. (c) <b>Separate prefill/decode pools instead of the in-pool split (D34)</b> &mdash; disq: pool-quantization waste + KV-transfer hop at small scale; wins at hyperscale/tight-SLO (the K5 / D35 crossover &mdash; cross-link, don&rsquo;t re-derive). (d) <b>Recompute-only preemption (never swap)</b> &mdash; disq: O(prompt) recompute dominates for long prompts. Each: when it actually wins.<span class="meta">number: the constraint value that disqualifies each &mdash; cites K1 #decode (B*), K5 D35 (pool crossover), K16 (offline)</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 5. Failure modes -->
+  <!-- ===================================================== -->
+  <section class="section" id="failure">
+    <div class="container">
+      <h2>5. Failure Modes</h2>
+      <p class="stub"><span class="ps">Stub (cite, never inline-redefine).</span> Convoy / effective-batch decay; prefill head-of-line (long prompt stalls all decodes); KV-exhaustion &rarr; preempt storm; <b>admission-projection miss</b> (in-flight growth outran reserved headroom &rarr; preempt storm the proactive gate was meant to avoid); <b>fan-out under-reservation</b> (best-of-<em>n</em> reserved as 1 &rarr; immediate post-prefill preempt); <b>preempt&harr;resume livelock</b> (no forward progress under sustained overload); <b>rank-schedule divergence &rarr; collective deadlock</b> (replicated schedulers disagree &rarr; the engine <em>hangs</em>, not slows &mdash; the worst class); <b>CPU-stall</b> (GPU-util high, throughput low &mdash; the D33 tax, incl. grammar-mask/detok); <b>spec-decode budget mis-estimate</b> (budgeted at <code>num_seqs</code> not <code>num_seqs&times;(K+1)</code> &rarr; OOM/preempt); <b>adapter-diversity throughput collapse</b> (too many distinct LoRAs per batch); CUDA-graph bucket thrash (batch shape oscillates across a bucket edge); <b>cancellation leak</b> (disconnected client still burning GPU on a 30k-token answer); <b>batch-composition nondeterminism</b> (continuous batching changes a request&rsquo;s batch-mates every step &rarr; non-associative FP reduction order shifts &rarr; output varies with batch &mdash; the <em>root cause</em> D10 addresses; rule of two: K17/D10 owns the fix, K4 owns that continuous batching <em>is</em> the cause); backlog-growth (unbounded queue when admission can&rsquo;t shed). GPU-specific blast radius each.<span class="meta">cites llm/canonicals/llm-bottlenecks.html (convoy, prefill-HoL, preempt-livelock, mbw-bound-decode) + gpu-failure-modes.html (overload, rank-schedule deadlock) + K17/D10 (batch-invariance, cross-link) &middot; <b>ACTION: seed/extend these canonical entries in this same change (G0.2 / living-canonical discipline)</b></span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 6. Real systems -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="real-systems">
+    <div class="container">
+      <h2>6. Real Systems</h2>
+      <p class="stub"><span class="ps">Stub (named products + production-post URLs, C10).</span> Orca (iteration-level batching, the origin), vLLM (continuous batching + chunked prefill + multi-step/async scheduler + APC), SGLang (RadixAttention scheduler, long_prefill_token_threshold), TensorRT-LLM (in-flight batching), TGI (continuous batching loop, stop/abort). Each: what it implements from this page + URL, justified vs 2&ndash;3 competitors.<span class="meta">URLs added with prose &middot; concrete-tech rule (C10)</span></p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- 7. Used by & cross-references -->
+  <!-- ===================================================== -->
+  <section class="section" id="cross-refs">
+    <div class="container">
+      <h2>7. Used By &amp; Cross-References</h2>
+      <p class="stub"><span class="ps">Stub.</span> <b>Used by:</b> <a href="../scenarios/L3-long-context-serving.html">L3</a> (chunked-prefill + short/long head-of-line is its spine); <a href="../scenarios/L4-multi-tenant-lora-platform.html">L4</a> (multi-tenant isolation D18); <a href="../scenarios/L5-spot-gpu-autoscaling-fleet.html">L5</a> (admission/shed under spot churn); <a href="../scenarios/L7-model-version-canary-rollout.html">L7</a> (drain-on-deploy = the <em>planned</em> twin of preemption); <a href="../scenarios/L8-reasoning-model-serving.html">L8</a> (bimodal reasoning length &rarr; length-aware scheduling + D34); <a href="../scenarios/L9-cache-aware-reuse-serving.html">L9</a> (scheduling around partial cache hits). <em>Filled as scenarios land.</em><span class="meta">orphan-check + Used-by back-fill happen in each consuming scenario&rsquo;s PR</span></p>
+      <ul>
+        <li><a href="K1_serving-fundamentals.html#decode">K1 &sect;3.5</a> / <a href="K1_serving-fundamentals.html#roofline">&sect;3.4</a> / <a href="K1_serving-fundamentals.html#prefill">&sect;3.3</a> / <a href="K1_serving-fundamentals.html#slis">&sect;3.12</a> &mdash; the batch-amortization derivation + B*, step-time, prefill cost, the SLI list the scheduler reports.</li>
+        <li><a href="K2_kv-cache.html#d4">K2 D4</a> &mdash; the block table makes swap / recompute / cancellation-free reclaim work and a tile&rsquo;s KV non-contiguous-safe; <a href="K2_kv-cache.html#tier">K2 &sect;tier</a> &mdash; preemption-by-swap is the <em>same transfer, different trigger</em>.</li>
+        <li><a href="K0_transformer-forward-pass-and-dimensions.html#sdpa">K0 &sect;sdpa</a> &mdash; the <code>O(seq&sup2;)</code> attention shape that forces the ragged-batch tiling.</li>
+        <li><a href="attention-kernels-and-cuda-graphs.html">K17</a> &mdash; the attention tiling/gather kernel + the CUDA-graph capture/bucketing (internals K4 cites via D22, not re-derives).</li>
+        <li><a href="K5_disaggregated-serving.html">K5</a> &mdash; disaggregation is the <em>cross-pool</em> sibling of the in-pool D34 split; shared goodput objective (D20).</li>
+        <li><a href="K13_speculative-decoding.html#d11">K13</a> &mdash; <strong>D11 co-host (rule of two):</strong> speculation changes the per-step accepted-token count &rarr; the batch token budget must adapt. <strong>K4/D11 owns the scheduler / variable-width-step accommodation; K13/D11 owns the losslessness proof + the <code>B_spec</code> on/off crossover.</strong></li>
+        <li><a href="reasoning-model-serving.html">K19</a> &mdash; reasoning-length sets the degradation-contract knob (drop <code>reasoning_effort</code>).</li>
+        <li><strong>Out of scope (named, not covered):</strong> fleet-level autoscaling &amp; keep-warm economics (<a href="gpu-fleet-autoscaling-multitenancy.html">K15</a>); the prefill/decode <em>pool</em> disaggregation &amp; KV handoff (<a href="K5_disaggregated-serving.html">K5</a>); per-token billing, per-tenant API rate-limiting, the streaming gateway (API-product layer).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../js/sidebar.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+
+</body>
+</html>

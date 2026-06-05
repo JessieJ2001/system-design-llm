@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MongoDB — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style> table.styled-table { font-size: 0.85rem; } </style>
+</head>
+<body class="has-sidebar">
+  <nav class="nav"><div class="nav-inner"><a href="../../index.html" class="nav-brand">System Design</a><ul class="nav-links"><li><a href="../../index.html">Home</a></li><li><a href="../technologies.html">Technologies</a></li><li><a href="comparison-datastores.html">Datastores Comparison</a></li></ul></div></nav>
+
+  <section class="section"><div class="container topic-hero">
+    <h1>MongoDB</h1>
+    <p class="hero-subtitle">Document database storing BSON (binary JSON) in B-tree indexes via WiredTiger storage engine. Replica sets for HA; sharded clusters for horizontal scale; oplog for replication and CDC. Schemaless from day one with optional schema validators since 4.0.</p>
+    <p class="hero-meta">document &bull; replica set &bull; sharded cluster &bull; oplog tailing</p>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>2. Underlying mechanism</h2>
+    <ul>
+      <li><strong>BSON document:</strong> the row, with rich types (ObjectId, dates, arrays, nested objects). Up to 16 MB per doc.</li>
+      <li><strong>WiredTiger storage engine:</strong> B-tree index over collections; copy-on-write blocks; LRU cache of B-tree pages; per-document MVCC via timestamps.</li>
+      <li><strong>Oplog:</strong> capped collection on primary recording every write; replicas tail it. Same log used for change streams (CDC), Atlas Stream Processing, etc.</li>
+      <li><strong>Replica set:</strong> 3+ nodes; primary takes writes; others are secondaries running automatic failover via Raft-like election.</li>
+      <li><strong>Sharded cluster:</strong> mongos router + config servers (replica set storing metadata) + N shards (each itself a replica set). Shard key chosen at table creation.</li>
+    </ul>
+  </div></section>
+
+  <section class="section dense-columns"><div class="container">
+    <h2>3. Read &amp; write path</h2>
+    <div>
+      <h3>Write (insert / update)</h3>
+      <pre class="line-numbers"><code class="language-text">1. Client &rarr; mongos (or directly primary in single-rs)
+2. mongos hashes shard key &rarr; shard
+3. Primary of shard:
+   - Take collection lock (intent-shared)
+   - Write to journal (WAL)
+   - Update WiredTiger B-tree page (CoW)
+   - Append to oplog
+4. With w:majority, wait for majority of replica acks
+5. Indexes updated atomically with the doc</code></pre>
+    </div>
+    <div>
+      <h3>Read (find)</h3>
+      <pre class="line-numbers"><code class="language-text">1. Client &rarr; mongos
+2. mongos plans:
+   - Targeted: shard key in filter &rarr; one shard
+   - Scatter-gather: no shard key &rarr; all shards
+3. Each shard runs query on its data
+4. mongos merges + returns
+
+Read concerns: local / available / majority / linearizable</code></pre>
+    </div>
+    <div>
+      <h3>Replication</h3>
+      <pre class="line-numbers"><code class="language-text">Each replica tails primary's oplog
+Applies operations idempotently
+Election when primary unreachable (~10s)
+Pre-image / post-image for change streams</code></pre>
+    </div>
+    <div>
+      <h3>Sharding rebalance</h3>
+      <pre class="line-numbers"><code class="language-text">Balancer moves chunks between shards (background)
+Goal: even chunk count per shard
+Online but expensive
+4.4+: live re-sharding (change shard key)</code></pre>
+    </div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>4. Replication &amp; consistency</h2>
+    <ul>
+      <li>Replica set: 1 primary + N secondaries; auto-failover via Raft-like protocol; arbiters allowed but discouraged.</li>
+      <li>Write concern: <code>w:1</code> (default), <code>w:majority</code> (durable), <code>w:N</code>, <code>j:true</code> (force journal sync).</li>
+      <li>Read concern: <code>local</code> (latest), <code>majority</code> (durable), <code>linearizable</code> (read after majority, strongest), <code>snapshot</code> (txn-bound).</li>
+      <li>Read preference: <code>primary</code> (default), <code>secondary</code>, <code>nearest</code>, <code>secondaryPreferred</code>.</li>
+      <li>Multi-doc transactions (4.0+): single replica set; <code>4.2+</code> across shards via 2PC; perf hit at high QPS.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>5. Partitioning (sharding)</h2>
+    <ul>
+      <li>Shard key chosen at collection creation; hash or range.</li>
+      <li>Hash sharding: even distribution; loses ordered range queries.</li>
+      <li>Range sharding: ordered queries fast; hot range possible.</li>
+      <li>Compound shard keys help cardinality.</li>
+      <li>Pre-split with hash sharding for write-heavy from-scratch tables.</li>
+      <li>Zone sharding: pin chunk ranges to specific shards (e.g., geo zones).</li>
+      <li>4.4+ live re-sharding: change shard key online.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>6. Time complexity</h2>
+    <ul>
+      <li>Indexed find: O(log N).</li>
+      <li>Insert: O(log N) per affected index.</li>
+      <li>Update: O(log N); single-doc atomic.</li>
+      <li>Aggregation: depends on stages; pipeline optimizer pushes filters down.</li>
+      <li>Cross-shard scatter-gather: O(shards &times; per-shard work).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>7. Per-node capacity envelope</h2>
+    <ul>
+      <li>Throughput: ~5&ndash;20k ops/sec/node tuned.</li>
+      <li>P99 latency: 1&ndash;5 ms with majority writes.</li>
+      <li>Doc size: 16 MB cap.</li>
+      <li>Per-shard storage: ~1 TB practical before balancer churn.</li>
+      <li>Connections: thousands; mongos handles fan-out.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt dense-columns"><div class="container">
+    <h2>8. When to use / not to</h2>
+    <div>
+      <h3>Use Mongo when&hellip;</h3>
+      <ul>
+        <li>Schema is genuinely flexible; documents vary per row.</li>
+        <li>Need fast development iteration without schema migrations.</li>
+        <li>Embedded doc structure matches your query patterns.</li>
+        <li>Atlas managed cluster fits the budget.</li>
+        <li>Need full-text + geo + change streams in one product.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Don't use Mongo when&hellip;</h3>
+      <ul>
+        <li>Data is naturally relational with joins. Use Postgres.</li>
+        <li>Heavy multi-document transactions at high QPS.</li>
+        <li>Mature relational tooling expected.</li>
+        <li>Strict consistency without <code>majority</code> overhead.</li>
+        <li>JSON-light needs &mdash; Postgres JSONB is often enough.</li>
+      </ul>
+    </div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>9. Common gotchas</h2>
+    <ul>
+      <li>Bad shard-key choice = re-sharding pain (eased in 4.4+, still expensive).</li>
+      <li>Unbounded array fields explode doc size.</li>
+      <li>Case-insensitive queries without proper index = collection scan.</li>
+      <li>Cross-shard transactions add coordination overhead; keep transactions to one shard if possible.</li>
+      <li>Stale reads from secondary with default <code>readPreference: primary</code>.</li>
+      <li>Index over wide doc paths can balloon.</li>
+      <li>Aggregation pipeline order matters for performance.</li>
+      <li>Connection pool exhaustion on mongos.</li>
+      <li>Oplog window too small &rarr; replica resync from full snapshot.</li>
+      <li>Time-series collections (5.0+) have specific best practices.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>10. Cloud equivalents</h2>
+    <ul>
+      <li>MongoDB Atlas (multi-cloud).</li>
+      <li>AWS DocumentDB (Mongo-API-compat, partial; not the same engine).</li>
+      <li>Azure Cosmos DB Mongo API (compat).</li>
+      <li>Self-host or community edition (SSPL license &mdash; restrictions for SaaS providers).</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>11. Deployment topologies</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Topology</th><th>What it gives</th><th>How</th><th>Cost / failure</th></tr></thead>
+      <tbody>
+        <tr><td>Standalone</td><td>Dev only</td><td>Single node</td><td>No HA</td></tr>
+        <tr><td>Replica set (3 voting nodes)</td><td>HA + read scale</td><td>1 primary + 2 secondaries; election on primary loss</td><td>~10s failover; w:majority for durability</td></tr>
+        <tr><td>5-node replica set</td><td>Higher availability</td><td>Survives 2 simultaneous losses with quorum</td><td>More replication traffic</td></tr>
+        <tr><td>Sharded cluster</td><td>Horizontal scale</td><td>mongos + config servers + N shards</td><td>Cross-shard txns slow; balancer churn</td></tr>
+        <tr><td>Multi-region replica set</td><td>Geo redundancy</td><td>Members in different regions</td><td>Cross-region election latency</td></tr>
+        <tr><td>Atlas Global Cluster</td><td>Multi-region zone-sharded</td><td>Pin chunks to regions by key</td><td>Atlas-only feature</td></tr>
+        <tr><td>Atlas Search / Vector Search</td><td>Lucene + vectors integrated</td><td>Search nodes alongside data nodes</td><td>Atlas-only</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>12. Usage patterns</h2>
+    <ul>
+      <li>Document store for entities with flexible schema.</li>
+      <li>Embed-related data (user with embedded addresses) for one-shot queries.</li>
+      <li>Catalog / inventory.</li>
+      <li>Time-series collections (5.0+).</li>
+      <li>Change streams for real-time event triggers.</li>
+      <li>Geospatial (2dsphere index) for location apps.</li>
+      <li>Atlas Search for full-text + faceted search in-product.</li>
+      <li>Vector search via Atlas Search.</li>
+      <li>NOT primary store for relational data with joins.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>13. Operational knobs</h2>
+    <ul>
+      <li>WiredTiger cache size (default 50% of RAM minus 1 GB).</li>
+      <li>Write concern + read concern defaults.</li>
+      <li>Oplog size (24 hr typical replication window).</li>
+      <li>Compression: snappy (default) / zlib / zstd.</li>
+      <li>Index types: single, compound, multikey, text, 2dsphere, hashed, partial, sparse, TTL, wildcard.</li>
+      <li>Profiler levels for slow query capture.</li>
+      <li>Sharding chunk size (default 128 MB).</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>14. Capacity planning</h2>
+    <ul>
+      <li>RAM &asymp; working set; index hot paths must fit.</li>
+      <li>Storage: 30% headroom; compression cuts ~3&times; for typical JSON.</li>
+      <li>Connections: pool per app; 1k+ feasible with mongos.</li>
+      <li>Sharding: pre-split for write-heavy or expect balancer pain.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>15. Failure modes</h2>
+    <ul>
+      <li>Primary loss: replica election &asymp; 10s; lose un-replicated writes (w:1).</li>
+      <li>Network partition: minority side rejects writes.</li>
+      <li>Disk full: writes blocked; clear oplog or extend.</li>
+      <li>Balancer storm: chunk moves block writes; throttle balancer window.</li>
+      <li>Long-running query: holds collection lock briefly; then snapshot.</li>
+      <li>Oplog roll-over: replica can't catch up &rarr; full resync.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>16. Backup &amp; DR</h2>
+    <ul>
+      <li>Atlas Cloud Backup: continuous + snapshots.</li>
+      <li><code>mongodump</code> / <code>mongorestore</code>: logical, slow.</li>
+      <li>File-system snapshot of data path (with fsync lock).</li>
+      <li>Ops Manager (Enterprise): full PITR.</li>
+      <li>RPO: oplog tail.</li>
+      <li>RTO: restore + replay oplog.</li>
+      <li>Multi-region replica set = built-in DR.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>17. Upgrade &amp; migration</h2>
+    <ul>
+      <li>Rolling upgrade: secondary first, step-down primary, upgrade last.</li>
+      <li>Bump <code>featureCompatibilityVersion</code> after.</li>
+      <li>Migrate from another DB: typically dual-write + backfill.</li>
+      <li>Atlas Live Migration tool.</li>
+      <li>Sharding migration (re-sharding): 4.4+ live; expensive but no-downtime.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>18. Security</h2>
+    <ul>
+      <li>SCRAM auth; x509 cert; LDAP / Kerberos (Enterprise); IAM (Atlas).</li>
+      <li>RBAC roles; database / collection / action level.</li>
+      <li>TLS for client + cluster.</li>
+      <li>Encryption at rest (Enterprise / Atlas).</li>
+      <li>Field-level encryption (CSFLE) &mdash; transparent client-side encryption.</li>
+      <li>Network: VPC peering / private endpoint in Atlas.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>19. Multi-tenancy</h2>
+    <ul>
+      <li>Database per tenant (clean isolation, doesn't scale to thousands).</li>
+      <li>Collection per tenant.</li>
+      <li>Shared collection + tenant_id field + indexed (most common).</li>
+      <li>No native rate limiting per tenant.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>20. Observability</h2>
+    <ul>
+      <li>Operations per second (insert/query/update/delete).</li>
+      <li>Replication lag (<code>rs.printSlaveReplicationInfo()</code> / <code>rs.status()</code>).</li>
+      <li>WiredTiger cache eviction.</li>
+      <li>Page-fault rate.</li>
+      <li>Slow query log (profiler).</li>
+      <li>Connection count.</li>
+      <li>Index hit rate.</li>
+      <li>Balancer activity (sharded).</li>
+      <li>Oplog window remaining.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>21. Anti-patterns</h2>
+    <ul>
+      <li>Unbounded arrays inside documents.</li>
+      <li>Heavy joins via <code>$lookup</code> at high QPS.</li>
+      <li>Transactions across many docs at high QPS (use single-doc atomic ops).</li>
+      <li>Bad shard key (low cardinality, monotonic).</li>
+      <li>Ad-hoc queries on un-indexed fields.</li>
+      <li>Reading from primary by default when secondary would do.</li>
+      <li>Storing large blobs &mdash; use S3.</li>
+      <li>Skipping schema validators &rarr; data drift.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>22. Cost model</h2>
+    <ul>
+      <li>Atlas: cluster tier (RAM-based).</li>
+      <li>Backup storage extra.</li>
+      <li>Data transfer (egress / cross-region).</li>
+      <li>Sharded clusters multiply.</li>
+      <li>Search nodes / vector search nodes separate.</li>
+    </ul>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>23. Sibling comparison</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Dim</th><th>Mongo</th><th>Postgres JSONB</th><th>DocumentDB</th><th>Cosmos DB Mongo API</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td>Document, schemaless</td><td>Mostly relational + JSONB column</td><td>Mongo-compat (different engine)</td><td>Mongo-compat (different engine)</td></tr>
+        <tr><td>Joins</td><td><code>$lookup</code> (slow)</td><td>Full SQL JOIN</td><td>Same as Mongo</td><td>Same</td></tr>
+        <tr><td>Indexes</td><td>Many doc-aware</td><td>GIN on JSONB; rich SQL indexes</td><td>Subset</td><td>Subset</td></tr>
+        <tr><td>Transactions</td><td>Multi-doc; 4.0+</td><td>Full ACID</td><td>Limited</td><td>Limited</td></tr>
+        <tr><td>Pick when</td><td>Schemaless from day 1</td><td>Have relational + some JSON</td><td>AWS Mongo compat</td><td>Azure Mongo compat</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section section-alt"><div class="container">
+    <h2>24. Scaling for access patterns</h2>
+    <div class="table-responsive"><table class="styled-table">
+      <thead><tr><th>Pattern</th><th>Native</th><th>First lever</th><th>Last resort</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy</td><td>Secondary read pref</td><td>Index tuning; cache layer</td><td>Sharding for read fan-out</td></tr>
+        <tr><td>Write-heavy</td><td>Sharded by key</td><td>Pre-split chunks; hash key</td><td>Bigger shards</td></tr>
+        <tr><td>Hot doc / hot chunk</td><td>Single primary owns it</td><td>Re-shard or split chunk</td><td>Add bucket to shard key</td></tr>
+        <tr><td>Bursty writes</td><td>Auto-scale tiers</td><td>Atlas auto-scale; pre-warm</td><td>Sharding</td></tr>
+        <tr><td>Aggregations</td><td>Pipeline operators</td><td>Indexes on filter stages</td><td>CDC into warehouse</td></tr>
+        <tr><td>Vector / search</td><td>Atlas Search / Vector</td><td>Use it</td><td>Move to dedicated</td></tr>
+        <tr><td>High-cardinality query</td><td>Secondary index</td><td>Compound + partial</td><td>Move to ES</td></tr>
+        <tr><td>Strict ordering</td><td>Per-shard</td><td>Single-shard ops only</td><td>Use single replica set</td></tr>
+      </tbody>
+    </table></div>
+  </div></section>
+
+  <section class="section"><div class="container">
+    <h2>25. References</h2>
+    <ul>
+      <li>"MongoDB: The Definitive Guide" (Bradshaw et al.).</li>
+      <li>MongoDB University courses (free).</li>
+      <li>WiredTiger internals docs.</li>
+      <li>Production: eBay, Adobe, Coinbase, Forbes; many SaaS-side data platforms.</li>
+      <li>Atlas blog &mdash; new features and patterns.</li>
+    </ul>
+  </div></section>
+
+  <section class="section section-alt"><div class="container"><h2>Related</h2><ul>
+    <li><a href="comparison-datastores.html">Datastores comparison</a></li>
+    <li><a href="postgresql.html">Postgres (with JSONB)</a></li>
+    <li><a href="../technologies.html">All Technologies</a></li>
+  </ul></div></section>
+
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>

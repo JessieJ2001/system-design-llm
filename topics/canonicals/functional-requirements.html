@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Functional Requirements — System Design</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Functional Requirements</h1>
+      <p class="hero-subtitle">How to seek and structure functional requirements (the "users / clients should be able to…" statements) before drawing any boxes. This is the source-of-truth page; scenario S0 sections cite this for the FR clarification protocol.</p>
+      <p class="hero-meta">~6 min reference</p>
+    </div>
+  </section>
+
+  <!-- What FRs are -->
+  <section class="section">
+    <div class="container">
+      <h2>What Functional Requirements Are</h2>
+
+      <p>Functional requirements describe what the system <strong>does</strong> — the behavior its callers can rely on. They are the <em>contract</em> the system commits to, expressed in caller-visible terms, not in implementation terms.</p>
+
+      <p>FRs are the first thing you discuss in S0 (Scenario &amp; Requirements). Before drawing a single box, before any BOE math, before any architecture, you settle which behaviors the system must support. Everything later — non-functional requirements, bottleneck analysis, design choices — is judged against this list.</p>
+
+      <h3>FR vs NFR</h3>
+      <ul>
+        <li><strong>FR:</strong> what the system <em>does</em>. <em>"User can post a tweet."</em> / <em>"Cache supports GET, SET, CAS, LEASE_GET."</em> / <em>"Crawler fetches URL, follows redirects, respects robots.txt."</em></li>
+        <li><strong>NFR:</strong> how well it does it. <em>"p95 timeline read ≤ 200 ms."</em> (See <a href="nfr-checklist.html">NFR checklist</a>.)</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- System class -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Step 1: Identify the System Class</h2>
+
+      <p>"Design X" interview prompts come in four distinct shapes. Each has a different FR vocabulary. Ask yourself (or the interviewer) <em>which kind of thing am I being asked to design</em> before listing capabilities — the wrong vocabulary produces the wrong S0.</p>
+
+      <h3 id="class-product">A. Product-shaped (user-facing application)</h3>
+      <ul>
+        <li><strong>Examples.</strong> Twitter, Calendar, Yelp, ride-sharing, e-commerce.</li>
+        <li><strong>Caller.</strong> End users via web / mobile / SDK.</li>
+        <li><strong>FR vocabulary.</strong> "User can &lt;verb&gt; &lt;noun&gt;" — capabilities at the user level.</li>
+      </ul>
+
+      <h3 id="class-infra">B. Infrastructure primitive</h3>
+      <ul>
+        <li><strong>Examples.</strong> Distributed cache, message queue, file system, distributed lock, ID generator, rate limiter, leader-election service, KV store.</li>
+        <li><strong>Caller.</strong> Other services (not human end-users).</li>
+        <li><strong>FR vocabulary.</strong> "API exposes &lt;operation&gt; with &lt;semantics&gt;" — operations and their guarantees. Often: <em>"GET key returns the most-recently-written value"</em> / <em>"SUBSCRIBE delivers each message at-least-once."</em></li>
+        <li><strong>Trap.</strong> Forgetting to specify <em>semantics</em> (exactly-once vs at-least-once vs at-most-once; linearizable vs sequential vs eventual; serializable vs read-committed). Half the design choices flow from these.</li>
+      </ul>
+
+      <h3 id="class-pipeline">C. Automation / pipeline</h3>
+      <ul>
+        <li><strong>Examples.</strong> Web crawler, ETL job, search-index builder, backup job, log-shipping pipeline, video-transcode pipeline, ML feature pipeline.</li>
+        <li><strong>Caller.</strong> No interactive caller; runs on a schedule or trigger.</li>
+        <li><strong>FR vocabulary.</strong> "Given &lt;input source&gt;, produce &lt;output&gt; subject to &lt;policy&gt;" — input → output transformation plus the policy that drives it (frequency, completeness target, ordering guarantees, retry behavior).</li>
+        <li><strong>Trap.</strong> Skipping the <em>policy</em> (how often? complete or sampled? what if a source fails?). Without it, the pipeline has no stop condition.</li>
+      </ul>
+
+      <h3 id="class-algorithmic">D. Algorithmic / batch / ML</h3>
+      <ul>
+        <li><strong>Examples.</strong> Recommender, fraud scorer, ranking model, search-quality system, ad auction.</li>
+        <li><strong>Caller.</strong> Mix — a request-time scoring API plus an offline training/refresh pipeline.</li>
+        <li><strong>FR vocabulary.</strong> "For &lt;input&gt;, return &lt;output&gt; with &lt;correctness target&gt;; refresh model on &lt;cadence&gt;." Combines product-shaped (the scoring API) with pipeline-shaped (the training loop).</li>
+        <li><strong>Trap.</strong> Conflating the online and offline paths. Each has its own FRs and NFRs.</li>
+      </ul>
+
+      <p><strong>Mixed systems.</strong> Many real systems are a mix — Twitter is mostly product but its trending pipeline is automation; Sentry is product but its dedupe core is an infra primitive. When mixed, decompose into sub-systems and walk each through the right vocabulary separately.</p>
+    </div>
+  </section>
+
+  <!-- The clarification protocol -->
+  <section class="section">
+    <div class="container">
+      <h2>Step 2: The Clarification Protocol (Universal)</h2>
+
+      <p>Eliciting FRs is a back-and-forth with your interviewer (or product manager / customer / consumer team). You ask targeted questions; they confirm, deny, or scope. Treat this as a real conversation, not a checklist.</p>
+
+      <h3>The two question shapes (work for any system class)</h3>
+      <ul>
+        <li><strong>"Does the system need to do X?"</strong> — clarifies whether a candidate feature is in scope. Answer is yes / no / out-of-scope-but-noted.</li>
+        <li><strong>"What would happen if Y?"</strong> — clarifies edge-case behavior of a feature already in scope. Answer reshapes the feature's definition.</li>
+      </ul>
+
+      <h3>Five universal lenses</h3>
+      <p>Walk these in order, regardless of system class. The per-class checklists below tell you what to ask <em>within</em> each lens.</p>
+      <ol>
+        <li><strong>Caller / actor.</strong> Who or what calls this system? Humans, services, schedules, triggers. Each caller has its own FR set.</li>
+        <li><strong>Inputs.</strong> What goes in? Format, source, cardinality, mutability, ordering.</li>
+        <li><strong>Operations / capabilities.</strong> What does the system do with those inputs? The 3–6 core operations.</li>
+        <li><strong>Outputs / effects.</strong> What comes out? Format, destination, durability, side-effects on other systems.</li>
+        <li><strong>Edge cases &amp; out-of-scope.</strong> What looks adjacent but isn't this system's job? Failure modes (covered by FRs vs left to NFRs / failure-modes catalog).</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- Per-class FR checklists -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Step 3: Per-Class FR Checklists</h2>
+
+      <p>For each system class, the universal lenses translate to a specific question set. Use the matching checklist; mark items as in-scope, out-of-scope, or N/A.</p>
+
+      <h3 id="fr-product">A. Product-shaped systems</h3>
+      <ul>
+        <li><strong>Caller.</strong> <em>"Mobile, web, or both?"</em> <em>"Authenticated users only or also anon?"</em> <em>"Internal admin operations needed?"</em> <em>"Third-party developers via public API?"</em></li>
+        <li><strong>Inputs.</strong> <em>"What kinds of content can users create — text, image, video, structured?"</em> <em>"Size limits per item?"</em></li>
+        <li><strong>Operations.</strong> <em>"What 3–6 things can a user do?"</em> Phrase each as <em>"&lt;user-type&gt; can &lt;verb&gt; &lt;noun&gt;"</em>. Cover create, read, update, delete, list, search where applicable.</li>
+        <li><strong>Outputs / effects.</strong> <em>"Does an action notify other users?"</em> <em>"Are there derived feeds / inboxes / aggregates that must update?"</em></li>
+        <li><strong>Out-of-scope.</strong> <em>"Notifications — separate service?"</em> <em>"Search — in-scope or separate?"</em> <em>"Monetization / ads?"</em> <em>"Moderation / abuse-reporting?"</em></li>
+      </ul>
+
+      <h3 id="fr-infra">B. Infrastructure primitives</h3>
+      <ul>
+        <li><strong>Caller.</strong> <em>"Which services call this primitive?"</em> <em>"Synchronous or async callers, or both?"</em> <em>"How many distinct callers — 10s or 1000s?"</em> <em>"In-process library, sidecar, or remote service?"</em></li>
+        <li><strong>Inputs.</strong> <em>"What's the key shape — string, numeric, structured?"</em> <em>"Value shape and size — small (≤ 1 KB), medium, blob?"</em> <em>"Are inputs persisted, ephemeral, both?"</em></li>
+        <li><strong>Operations + semantics.</strong> The most important per-class question: not just what operations, but with what guarantees.
+          <ul>
+            <li><em>"Read-after-write semantics — strong, monotonic, eventual?"</em></li>
+            <li><em>"Linearizable, sequential, causal, or eventual ordering?"</em></li>
+            <li><em>"Exactly-once, at-least-once, at-most-once delivery?"</em></li>
+            <li><em>"Per-key serializability or only per-operation atomicity?"</em></li>
+            <li><em>"Are conditional operations needed (CAS, If-Match)?"</em></li>
+            <li><em>"TTL / expiration semantics — best-effort or precise?"</em></li>
+          </ul>
+        </li>
+        <li><strong>Outputs / effects.</strong> <em>"Synchronous responses only, or also pub-sub / change feed?"</em> <em>"Observability / metrics callers can read?"</em> <em>"Admin operations — drain, rebalance, snapshot?"</em></li>
+        <li><strong>Out-of-scope.</strong> <em>"Schema management — caller's job or ours?"</em> <em>"Authentication — assume mTLS upstream?"</em> <em>"Encryption at rest — caller-supplied keys or service-managed?"</em></li>
+      </ul>
+
+      <h3 id="fr-pipeline">C. Automation / pipeline</h3>
+      <ul>
+        <li><strong>Caller / trigger.</strong> <em>"Scheduled (cron) or event-driven?"</em> <em>"On-demand backfill capability needed?"</em> <em>"Manual replay of historical inputs?"</em></li>
+        <li><strong>Inputs.</strong> <em>"What are the input sources — DB, API, files, web, stream?"</em> <em>"Bounded or unbounded input?"</em> <em>"What if a source is slow / unavailable / malformed?"</em></li>
+        <li><strong>Operations + policy.</strong> The most important per-class question: not just what the pipeline computes, but the policy that governs it.
+          <ul>
+            <li><em>"Frequency — every minute, hourly, daily, on-demand?"</em></li>
+            <li><em>"Completeness target — process 100% of inputs, or sample / skip on error?"</em></li>
+            <li><em>"Freshness target — output reflects inputs up to T seconds old?"</em></li>
+            <li><em>"Ordering — does input order matter? Output order?"</em></li>
+            <li><em>"Idempotency — must re-running on the same input produce the same output?"</em></li>
+            <li><em>"Retry policy — on transient failure, retry forever or bounded?"</em></li>
+            <li><em>"Politeness / rate-limiting — when fetching from external sources, throttle?"</em></li>
+            <li><em>"Filters — which inputs to skip (URLs in robots.txt; events older than X)?"</em></li>
+          </ul>
+        </li>
+        <li><strong>Outputs / effects.</strong> <em>"Where does output land — DB, S3, Kafka, downstream API?"</em> <em>"Atomicity of output — partial output OK on partial failure?"</em> <em>"Notifications / metrics on completion?"</em></li>
+        <li><strong>Out-of-scope.</strong> <em>"Source onboarding — automated or manual?"</em> <em>"Schema evolution of input?"</em> <em>"Output consumption — our problem or downstream's?"</em></li>
+      </ul>
+
+      <h3 id="fr-algorithmic">D. Algorithmic / batch / ML</h3>
+      <ul>
+        <li><strong>Caller.</strong> Two callers usually: <em>"Online: who calls the scoring API?"</em> <em>"Offline: who triggers training / refresh — schedule, data-arrival, manual?"</em></li>
+        <li><strong>Inputs.</strong> <em>"Online: what features are available at request time?"</em> <em>"Offline: what training data — labeled, unlabeled, feedback-derived?"</em></li>
+        <li><strong>Operations + correctness target.</strong>
+          <ul>
+            <li><em>"Online: what does the scorer return — single label, ranked list, probability, top-K?"</em></li>
+            <li><em>"Correctness target — accuracy, precision/recall, AUC, NDCG, MRR? At what threshold?"</em></li>
+            <li><em>"Offline: training cadence — daily, weekly, on-demand on data arrival?"</em></li>
+            <li><em>"Cold-start behavior — what does the scorer return for unseen users / items?"</em></li>
+            <li><em>"Drift detection — how do we notice the model has gone stale?"</em></li>
+            <li><em>"Feedback loop — does scorer output get logged for next round of training?"</em></li>
+          </ul>
+        </li>
+        <li><strong>Outputs / effects.</strong> <em>"Scoring response shape; explanation / feature attribution required?"</em> <em>"Training output — model artifact location, metadata, version?"</em> <em>"A/B-testing or shadow-deploy of new models?"</em></li>
+        <li><strong>Out-of-scope.</strong> <em>"Feature engineering — caller's job or ours?"</em> <em>"Label collection — separate system?"</em> <em>"Fairness / bias auditing — separate workstream?"</em></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- The output -->
+  <section class="section">
+    <div class="container">
+      <h2>Step 4: The Output</h2>
+
+      <h3>What you produce</h3>
+      <p>A <strong>prioritized list of 3–6 capabilities</strong>, each phrased in the right vocabulary for the system class, plus an explicit out-of-scope list. More than 6 means you haven't prioritized; fewer than 3 usually means you've collapsed too much.</p>
+
+      <h3>Example A: Product (Twitter)</h3>
+      <pre><code class="language-text">System class: product-shaped.
+
+Functional requirements (prioritized):
+  1. User can post a tweet (text, ≤ 280 chars, optional image).
+  2. User can follow / unfollow another user.
+  3. User can see a ranked timeline of posts from people they follow.
+  4. User can see another user's profile and posts.
+  5. User can like / reply to a tweet.
+
+Out of scope:
+  - DM / private messaging — separate system.
+  - Notifications — handled by an upstream service.
+  - Ads / monetization — v1 only.
+
+Flagged assumption: reads:writes ≈ 100:1. Would confirm.</code></pre>
+
+      <h3>Example B: Infra primitive (distributed cache)</h3>
+      <pre><code class="language-text">System class: infrastructure primitive.
+Caller: backend services (synchronous, ~1k caller pods).
+
+Functional requirements (prioritized):
+  1. API: GET key, SET key value [ttl], DELETE key, CAS key value version.
+  2. LEASE_GET key (returns lease token on miss; for stampede prevention).
+  3. Semantics: read-your-writes within a single client; eventual across.
+  4. TTL: best-effort expiration; up to ±1 s late OK.
+  5. Admin: GET stats per shard; rebalance op (drain + reshuffle).
+
+Out of scope:
+  - Schema validation — value is opaque bytes.
+  - AuthN — assumed mTLS-stamped caller identity.
+  - Persistence — purely in-memory; loss on full-cluster restart OK.
+
+Flagged assumption: working-set fits in ~10 TB across cluster.</code></pre>
+
+      <h3>Example C: Automation (web crawler)</h3>
+      <pre><code class="language-text">System class: pipeline.
+Trigger: continuous; seed list refreshed daily.
+
+Functional requirements (prioritized):
+  1. Given a seed URL list, fetch each URL, follow redirects (max 5),
+     extract content + outlinks.
+  2. Respect robots.txt per host; skip disallowed URLs.
+  3. Politeness: ≤ 1 req/sec/host by default; per-host override allowed.
+  4. Output: HTML + extracted text + outlinks → S3 + Kafka topic.
+  5. Frequency: re-crawl each known URL at least once per 30 days;
+     priority queue for high-rank pages (more frequent).
+  6. Idempotency: re-fetching the same URL produces the same output
+     (modulo the actual page changing).
+
+Out of scope:
+  - JS rendering — static-HTML only in v1.
+  - Search index — downstream of crawler, separate system.
+  - Login-walled content.
+
+Flagged assumption: corpus ~10 B URLs; ~100 M new URLs/day.</code></pre>
+
+      <h3>Example D: Algorithmic (recommender)</h3>
+      <pre><code class="language-text">System class: algorithmic / ML (online API + offline training).
+
+Functional requirements (prioritized):
+  Online (scoring API):
+    1. Given (user_id, candidate_set ≤ 1000 items, context),
+       return ranked top-K (K ≤ 50) with score.
+    2. Cold start: for new users / items, return popularity-based fallback.
+    3. Explanation: optional feature attributions per recommendation.
+  Offline (training):
+    4. Re-train daily from past 30 days of (impression, click) events.
+    5. Shadow-deploy new model for 24 h before promotion;
+       auto-rollback if AUC regresses > 1%.
+
+Out of scope:
+  - Candidate generation — upstream system; we re-rank only.
+  - Feature engineering pipeline — separate workstream.
+  - Fairness / bias audits — separate review process.
+
+Flagged assumption: 100M DAU, 100 scoring requests/user/day.</code></pre>
+
+      <h3>Prioritization</h3>
+      <p>If forced to cut, which goes first? The prioritization signals which capability drives the architecture. The dominant capability shapes the design; secondary capabilities are addressed where they bite.</p>
+    </div>
+  </section>
+
+  <!-- Anti-patterns -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Anti-Patterns</h2>
+
+      <ul>
+        <li><strong>Wrong vocabulary for the class.</strong> Asking <em>"who are the users?"</em> when designing a distributed cache (the "users" are services); asking <em>"what's the API?"</em> when designing a crawler (it's policy + outputs, not an API). Identify the class first.</li>
+        <li><strong>FRs in implementation terms.</strong> <em>"The system has a Redis cache."</em> Not an FR — that's a design choice. FRs are caller-visible behavior.</li>
+        <li><strong>Vague capabilities.</strong> <em>"User can interact with content."</em> / <em>"Cache supports basic operations."</em> Ambiguous FRs hide design ambiguity.</li>
+        <li><strong>Operations without semantics</strong> (infra primitives). <em>"Cache supports SET and GET."</em> What's the consistency model? Is GET-after-SET on a different node guaranteed to see the SET? Without semantics, half the design is undefined.</li>
+        <li><strong>Operations without policy</strong> (pipelines). <em>"Crawler fetches URLs."</em> How often? With what completeness? What if a host is down for a day? Without policy, the pipeline has no stop condition.</li>
+        <li><strong>Conflating online and offline</strong> (algorithmic systems). The scoring API and the training pipeline have different FRs and different NFRs. Treat them as two sub-systems.</li>
+        <li><strong>Unbounded FR list.</strong> 15 capabilities in S0 means the design is unfocused. 6 max; the rest are out-of-scope.</li>
+        <li><strong>No out-of-scope list.</strong> Without explicit non-goals, every interviewer pushback ("what about JS rendering?" / "what about persistence?") is a problem you haven't bounded.</li>
+        <li><strong>Drawing boxes before FR alignment.</strong> The most common reason a candidate solves the wrong question well — the architecture optimizes for capabilities the interviewer didn't ask for, while missing ones they did.</li>
+        <li><strong>Skipping prioritization.</strong> "All five are equally important" tells the interviewer you can't read the room. There's always a primary capability that drives the architecture.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Scenario template -->
+  <section class="section">
+    <div class="container">
+      <h2>Scenario Page Template (S0 Functional Block)</h2>
+
+      <p>Every scenario page's S0 section opens with this block, before any other clarification. Cite this page; do not restate the protocol.</p>
+
+      <pre><code class="language-text">## S0 Scenario &amp; Requirements
+
+### Functional requirements (cite [functional-requirements.html](../canonicals/functional-requirements.html))
+
+System class: &lt;product | infra | pipeline | algorithmic | mixed&gt;
+Caller(s): &lt;who calls this — humans, services, schedules, triggers&gt;
+
+Functional requirements (prioritized):
+  1. &lt;capability or operation+semantics or policy item&gt;
+  2. ...
+  3. ...
+
+Out of scope:
+  - &lt;non-goal&gt; — &lt;reason&gt;
+  - &lt;non-goal&gt; — &lt;reason&gt;
+
+Flagged assumption: &lt;assumption&gt;.</code></pre>
+    </div>
+  </section>
+
+  <!-- Cross-references -->
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Cross-References</h2>
+      <ul>
+        <li><a href="nfr-checklist.html">NFR Checklist</a> — the companion: how to seek and quantify non-functional requirements after FRs are settled.</li>
+        <li><a href="bottlenecks.html">Bottlenecks</a> — Tier-A diagnostic: maps NFR failures to canonical bottleneck shapes.</li>
+        <li><a href="access-patterns.html">Access Patterns</a> — once FRs are settled, classify the read/write/skew shape against this taxonomy.</li>
+        <li><a href="cross-cutting.html">Cross-Cutting Concerns</a> — X1–X8 concerns that often surface as scope-clarifying questions ("is HIPAA in play?").</li>
+      </ul>
+    </div>
+  </section>
+
+</body>
+</html>

@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Designing a HIPAA Clinic SaaS &mdash; De-engineering: One Small Team, Postgres-Only &mdash; System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    svg text { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    svg .lbl { font-size: 11px; fill: #334155; }
+    svg .box { fill: #f1f5f9; stroke: #2563eb; stroke-width: 1.5; }
+    svg .accent { fill: #fef3c7; stroke: #d97706; stroke-width: 1.5; }
+    svg .danger { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.5; opacity: 0.55; }
+    svg .danger text, svg text.struck { text-decoration: line-through; }
+    svg .ok { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+    svg .cool { fill: #e0f2fe; stroke: #0891b2; stroke-width: 1.5; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+        <li><a href="../leetcode.md">LeetCode coverage</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>De-engineering: a HIPAA Clinic SaaS, One Small Team, Postgres-Only</h1>
+      <p class="hero-subtitle">Design a healthcare appointment + patient-record service for ~500 small clinics (~5&nbsp;M patients, ~50&nbsp;k appointments/day, a few hundred RPS peak) &mdash; HIPAA-compliant from day one, built and operated by a team of &le;&nbsp;3 engineers, with Postgres as the only datastore. The textbook NALSD answer has ~25 moving parts (15+ microservices, Kafka, Redis, Elasticsearch, an analytics warehouse, multi-region active-active, a service mesh, ~15&ndash;30 engineers, ~$50&ndash;150k/mo); under these three constraints we <em>de-engineer</em> it down to a 4-part shape &mdash; a modular monolith, one Postgres, a load balancer, and backups &mdash; that 3 people can run on-call, for ~$2&ndash;5k/mo.</p>
+      <p class="hero-meta">NALSD Walkthrough (inverted &mdash; de-engineering) &bull; ~35 min read &bull; no LC kernel</p>
+    </div>
+  </section>
+
+  <!-- "no LC kernel" callout -->
+  <section class="section dense-columns" id="no-lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width">
+        <p><strong>No LC kernel &mdash; this page runs the NALSD loop in reverse.</strong> The other scenario pages start from the dumbest thing that works and <em>add</em> one technique per measured bottleneck. This page starts from the <em>sophisticated</em> design every other page builds toward &mdash; and <em>removes</em> a component per binding constraint, naming the bottleneck it deliberately accepts and the trigger that would justify adding the component back. The &ldquo;no technique before its iteration&rdquo; rule still applies, but the direction is reversed: a move that an iteration <em>removes</em> must not appear in any section <em>after</em> that iteration. The &ldquo;production cousin&rdquo; relationship is inverted too &mdash; the sophisticated designs in <a href="42-error-aggregation-dedupe.html">#42</a>, <a href="41-home-timeline-fanout.html">#41</a>, <a href="23-job-scheduler.html">#23</a>, <a href="46-multi-region-active-active.html">#46</a> are what <em>this</em> system grows into if its constraints lift; each de-engineering iteration names the constraint that forbade the move and the trigger that would justify adding it back. The tone is <em>earned restraint</em>, not laziness: every removal is paired with a named accepted bottleneck and a revisit trigger. Cite for the philosophy: &ldquo;Choose Boring Technology&rdquo; (McKinley &mdash; you get ~3 innovation tokens; spend them on the product), Basecamp/37signals &ldquo;The Majestic Monolith&rdquo; + &ldquo;One Person Framework,&rdquo; the &ldquo;You Are Not Google&rdquo; / &ldquo;scalability! but at what cost?&rdquo; essays, Stack Overflow's famously small infra for huge traffic, Pinboard's one-person-business posts, HIPAA's &ldquo;minimum necessary&rdquo; standard and its &ldquo;addressable vs required&rdquo; implementation-specification mechanism, and the &ldquo;just use Postgres for everything&rdquo; genre. See <a href="../../cribs/_sources.md">cribs/_sources.md</a> &sect;#47.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S0. Scenario & Requirements                                   -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s0-scenario">
+    <div class="container">
+      <h2>S0. Scenario &amp; the inverting constraints</h2>
+      <p>A small-clinic SaaS: each clinic manages its provider schedules, books patient appointments, stores clinical notes and demographics, sends appointment reminders, and runs day-to-day billing. The product is back-office software, not a consumer app &mdash; usage is bursty around business hours, timezone-spread across the US, ~a few hundred RPS at peak. The interesting part is not the feature set; it's the three constraints that, taken together, forbid most of the moves the other scenario pages make. We will not build the over-engineered version (sketched in &sect;Reference); we will start from it and de-engineer.</p>
+
+      <div class="full-width">
+        <h3>The three inverting constraints</h3>
+        <ul>
+          <li><strong>Regulatory &mdash; HIPAA from day one.</strong> Protected health information (PHI) means: an audit log of every PHI access (who, what, when, why); encryption at rest and in transit; role-based access controls; per-tenant isolation strong enough that clinic A can never see clinic B's data; Business Associate Agreements (BAAs) with every subprocessor (the cloud provider, the email vendor); a breach-notification runbook; a documented contingency plan with backups + tested restore. HIPAA's <em>minimum necessary</em> standard and its <em>addressable vs. required</em> implementation-specification mechanism are themselves a de-engineering discipline: implement the <em>required</em> floor; for <em>addressable</em> items, either implement them or document a reasoned risk decision &mdash; you do not build a maximal security apparatus, you build the documented minimum.</li>
+          <li><strong>Staffing &mdash; &le;&nbsp;3 engineers, building and operating.</strong> Every component must be something 3 people can deploy, monitor, patch, and be paged for. A 3-way on-call rotation. No component whose failure modes the team cannot reason about at 3&nbsp;a.m. This forbids: a 15-service mesh, a streaming platform, a separate search cluster, an analytics warehouse, multi-region active-active, a dedicated data team, six environments.</li>
+          <li><strong>Tech minimalism &mdash; Postgres is the only datastore.</strong> No Kafka, no Redis, no Elasticsearch, no separate cache, no document store. Postgres 16 absorbs: the relational data (obviously), the job queue (a table + <code>SELECT &hellip; FOR UPDATE SKIP LOCKED</code>), the cache (its own buffer pool + a small in-process LRU), full-text search (<code>tsvector</code> + a GIN index), the audit log (an append-only, monthly-partitioned table), and per-tenant isolation (Row-Level Security policies). PgBouncer is allowed &mdash; it is part of &ldquo;running Postgres,&rdquo; not a new system.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>System class</h3>
+        <p><strong>Class:</strong> product service &mdash; user-facing CRUD over relational entities with a regulatory overlay &mdash; see <a href="../canonicals/functional-requirements.html#class-product">functional-requirements#class-product</a>. The FR vocabulary is user-facing capabilities; the load-bearing NFRs are not throughput or tail latency (the workload is tiny) but <em>operational complexity</em> (number of distinct systems to run), <em>compliance</em> (the HIPAA floor), and a <em>realistic</em> availability/durability target for a back-office clinic SaaS &mdash; not the seconds-RTO target a consumer product would pick.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarified requirements (cite <a href="../canonicals/functional-requirements.html">functional-requirements.html</a>)</h3>
+        <ul>
+          <li><strong>Appointments</strong> &mdash; per clinic: list/create/reschedule/cancel appointments against a provider's availability; prevent double-booking a provider slot; send a reminder some hours before.</li>
+          <li><strong>Patient records</strong> &mdash; per clinic: create/view/update patient demographics and clinical notes; search patients by name / DOB / phone within the clinic.</li>
+          <li><strong>Access &amp; audit</strong> &mdash; role-based access (front-desk vs. clinician vs. clinic admin vs. our support staff); every PHI read/write recorded in an append-only audit log with actor, target, timestamp, and purpose; a &ldquo;break-glass&rdquo; emergency-access override that is itself audited.</li>
+          <li><strong>Billing (lightweight)</strong> &mdash; mark appointments billable; export claim-ready summaries; payment processing itself is delegated to a BAA-covered processor (out of scope).</li>
+          <li><strong>Reminders / notifications</strong> &mdash; enqueue an email/SMS reminder per upcoming appointment; delivered via a BAA-covered vendor; at-least-once is acceptable (a duplicate reminder is benign).</li>
+        </ul>
+        <p><strong>Non-goals (named, not silently dropped):</strong> a patient-facing portal / mobile app (clinic staff are the users; patient self-service is a later product, not infra); e-prescribing / lab integrations / HL7-FHIR interop (a separate integration product); a clinical decision-support / ML layer; an analytics/BI warehouse for cross-clinic reporting (we keep the records; we do not build a dimensional model); video telehealth; payments processing (delegated to a processor under a BAA); multi-region service (single region, in a US AZ pair); sub-second SLOs of any kind; building our own KMS/HSM (we use the cloud provider's KMS under a BAA); a SIEM / dedicated security operations function (we have an audit log and runbooks, not a 24/7 SOC).</p>
+        <p><strong>Flagged assumptions (would confirm with the customer / interviewer):</strong> (1) the BAA with the largest clinic agrees an RTO of ~1&nbsp;hour and an RPO of ~minutes &mdash; back-office software, an hour of downtime during a workday is painful but not catastrophic, and there is no contract today demanding the seconds-RTO a hot active-active gives; (2) a clinic's hot working set &mdash; the patients it touches in a day plus their recent notes &mdash; is small (a clinic sees maybe a few hundred patients/day); (3) cross-clinic queries are not a product requirement (so we never need to fan a query across all clinics); (4) PHI access volume is ~a few touches per patient per day on average across the fleet; (5) the team is exactly 3 engineers and that is not changing in the next year.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Non-functional requirements (cite <a href="../canonicals/nfr-checklist.html">nfr-checklist.html</a>)</h3>
+        <p>The general checklist plus the product-class additions (per-tenant isolation, compliance, retention, deletion semantics) were walked; the ones that bind &mdash; and, unusually for a NALSD page, the binding ones are <em>operational</em> and <em>regulatory</em>, not performance:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>NFR</th><th>Target</th><th>Where it bites</th></tr></thead>
+            <tbody>
+              <tr><td>Operational complexity</td><td>&le;&nbsp;4 distinct systems to patch / monitor / page on; a 3-way on-call rotation; no component the team can't reason about at 3&nbsp;a.m.</td><td>the architecture shape itself &mdash; every component is a thing 3 people must run; this is the dominant constraint and the one most NALSD pages ignore</td></tr>
+              <tr><td>Compliance (HIPAA, cite <a href="../canonicals/nfr-checklist.html#compliance">nfr-checklist#compliance</a> + <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>)</td><td>audit log of every PHI access; encryption at rest + in transit; RBAC + per-tenant isolation; BAAs; breach runbook; backups + tested restore; document every <em>addressable</em> safeguard decision</td><td>the data model (audit table, RLS) and the operational runbooks &mdash; not a separate system, by design</td></tr>
+              <tr><td>Availability</td><td>~99.9% (a back-office SaaS; not 99.99%) &mdash; an AZ loss = warm-standby promote, RTO ~1&nbsp;hour</td><td>the DR posture: a warm standby + a drilled runbook, deliberately <em>not</em> a hot active-active</td></tr>
+              <tr><td>Durability</td><td>RPO ~minutes (WAL archiving + daily base backups); zero-data-loss is <em>not</em> required for clinical records of a small clinic SaaS at this stage</td><td>the backup configuration; not synchronous multi-AZ replication on the commit path (which we'll discuss and decline at our scale)</td></tr>
+              <tr><td>Latency / throughput</td><td>p99 page load &le; ~300&nbsp;ms; a few hundred RPS peak &mdash; trivially met by one mid-size Postgres + 2&ndash;3 app instances</td><td>nowhere &mdash; the workload is tiny; this NFR is satisfied by the Naive&hellip; er, by the <em>reference</em> design and stays satisfied by the minimal one</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Out-of-scope NFRs (named):</strong> sub-second latency (not a product need); 99.99%+ availability (no contract demands it; the trade isn't worth the operational complexity at this scale); zero-RPO durability (RPO ~minutes is the documented agreement); horizontal write scaling (one Postgres node has 10&ndash;50&times; headroom over the current write rate); multi-region (single AZ pair; multi-region is a revisit trigger, not a day-one requirement).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Constraints (numbers we will use)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Constraint</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>Clinics</td><td>~500 tenants</td></tr>
+              <tr><td>Patients</td><td>~5&nbsp;M total across all clinics; ~10&nbsp;KB of hot data per patient (demographics + a handful of recent notes) &rarr; ~50&nbsp;GB hot working set</td></tr>
+              <tr><td>Appointments</td><td>~50&nbsp;k/day &asymp; ~0.6/s average; peak ~5&ndash;20/s (business hours, timezone-spread)</td></tr>
+              <tr><td>Read traffic</td><td>~a few hundred RPS peak total (record views, schedule lookups, patient search)</td></tr>
+              <tr><td>PHI access volume</td><td>~3 PHI touches per patient per day on average &rarr; ~15&nbsp;M audit rows/day &times; ~200&nbsp;B/row &asymp; ~3&nbsp;GB/day</td></tr>
+              <tr><td>Postgres primary</td><td>db.r6g.2xlarge-class: 8 vCPU, 64&nbsp;GB RAM &mdash; the ~50&nbsp;GB hot set fits in the buffer pool; ~$0.50/hr managed &rarr; ~$360/mo (cite <a href="../design-moves/pricing-constants.html#managed-services">pricing-constants#managed-services</a>)</td></tr>
+              <tr><td>Postgres warm standby</td><td>same instance class in a second AZ via streaming replication; ~$360/mo</td></tr>
+              <tr><td>App instances</td><td>2&ndash;3 &times; c-class (~$0.20&ndash;0.40/hr each) behind a load balancer running the modular monolith &mdash; ~$300&ndash;500/mo total (cite <a href="../design-moves/pricing-constants.html#compute">pricing-constants#compute</a>)</td></tr>
+              <tr><td>Load balancer</td><td>managed L7 ALB-class; ~$25/mo + trivial LCU</td></tr>
+              <tr><td>Backups / object storage</td><td>WAL archive + daily base backups + archived cold audit partitions; ~$0.023/GB-mo standard, less for infrequent-access (cite <a href="../design-moves/pricing-constants.html#storage">pricing-constants#storage</a>) &rarr; ~$50&ndash;150/mo</td></tr>
+              <tr><td>KMS</td><td>cloud KMS, ~a few keys; ~$1&ndash;5/mo</td></tr>
+              <tr><td>Email/SMS vendor</td><td>BAA-covered transactional vendor; usage-priced; ~$50&ndash;200/mo at ~50&nbsp;k reminders/day</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Sister scenarios &amp; the reference comparand</h3>
+        <ul>
+          <li><code>42-error-aggregation-dedupe.html</code> &mdash; a Sentry-style ingest pipeline (Kafka + workers + a columnar store); the analytics/event-stream half of the &ldquo;reference&rdquo; design here is that page. We <em>decline</em> to build it.</li>
+          <li><code>23-job-scheduler.html</code> &mdash; a distributed job scheduler; our reminder queue is the de-engineered version (one Postgres table + <code>SKIP LOCKED</code>, no leader election, no Redis sorted set).</li>
+          <li><code>38-calendar-availability.html</code> &mdash; the availability/booking-concurrency machinery our appointments module reuses (within one Postgres, with a row lock instead of a distributed lock).</li>
+          <li><code>04-monolith-vs-microservices.html</code> &mdash; the monolith-vs-microservices tradeoff this page lands hard on the monolith side of, for staffing reasons.</li>
+          <li><code>46-multi-region-active-active.html</code> &mdash; the multi-region design we explicitly defer; it is a revisit trigger (a clinic contract demanding a tighter RTO), not a day-one requirement.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>The fundamental tension:</strong> the &ldquo;scale it like everyone scales&rdquo; reflex says microservices + Kafka + Redis + Elasticsearch + multi-region + a data team. That design is <em>correct at Epic/Cerner scale</em>. At ~500 clinics, ~5&nbsp;M patients, a few hundred RPS, and a 3-person team, every one of those moves <em>costs more operational complexity than the bottleneck it solves costs at our scale</em> &mdash; and HIPAA's minimum-necessary discipline says implement the documented minimum, not the maximum. Every de-engineering iteration below removes one component, names the bottleneck we now accept, quantifies when it bites, and states the trigger that would justify adding the component back. This page is the <em>prequel</em> to the other scenario pages: it is what their systems looked like before their constraints forced the sophistication.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S1. Core Entities                                             -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="s1-entities">
+    <div class="container">
+      <h2>S1. Core Entities (cite <a href="../canonicals/entities-and-data.html">entities-and-data.html</a>)</h2>
+      <p>The nouns. Minimum shape only; full schemas land where each store is introduced (C9-bis) &mdash; here, where each Postgres table or capability first appears in an iteration; S6 has a consolidated reference. Every PHI-bearing row carries <code>clinic_id</code> (the RLS partition) and is touched only via code paths that write an <code>audit_log</code> row.</p>
+      <div class="table-responsive full-width">
+        <table>
+          <thead><tr><th>Entity</th><th>id</th><th>Key fields</th><th>Tenant key</th></tr></thead>
+          <tbody>
+            <tr><td>Clinic</td><td><code>clinic_id</code> (slug or short int)</td><td><code>name</code>, <code>timezone</code>, plan, BAA-signed-at</td><td>&mdash; (the tenant itself)</td></tr>
+            <tr><td>User</td><td><code>user_id</code></td><td><code>clinic_id</code>, <code>email</code>, <code>role</code> (front_desk | clinician | clinic_admin | our_support), password hash / SSO ref, last login</td><td><code>clinic_id</code> (our_support: cross-clinic, break-glass-gated)</td></tr>
+            <tr><td>Patient</td><td><code>patient_id</code></td><td><code>clinic_id</code>, name, DOB, phone, address, <code>search_tsv</code> (tsvector), created/updated</td><td><code>clinic_id</code></td></tr>
+            <tr><td>Provider</td><td><code>provider_id</code></td><td><code>clinic_id</code>, name, availability rules</td><td><code>clinic_id</code></td></tr>
+            <tr><td>Appointment</td><td><code>appointment_id</code></td><td><code>clinic_id</code>, <code>patient_id</code>, <code>provider_id</code>, start/end, status, billable, reminder state</td><td><code>clinic_id</code></td></tr>
+            <tr><td>Note</td><td><code>note_id</code></td><td><code>clinic_id</code>, <code>patient_id</code>, <code>author_user_id</code>, body (encrypted-at-rest like everything), created</td><td><code>clinic_id</code></td></tr>
+            <tr><td>JobQueue row</td><td><code>job_id</code></td><td><code>kind</code> (send_reminder | export_claims | &hellip;), <code>payload</code> (jsonb), <code>run_at</code>, <code>attempts</code>, <code>locked_by</code>, <code>locked_at</code>, <code>status</code></td><td>(operational; <code>clinic_id</code> in payload)</td></tr>
+            <tr><td>AuditLog row</td><td><code>(ts, id)</code></td><td><code>actor_user_id</code>, <code>clinic_id</code>, action (read|write), <code>resource_type</code>, <code>resource_id</code>, <code>purpose</code>, <code>break_glass</code> bool, request id &mdash; append-only, monthly-partitioned</td><td><code>clinic_id</code> (within a month partition)</td></tr>
+            <tr><td>ConfigVersion / migration</td><td>(schema migration version)</td><td>standard migration ledger; not an entity per se</td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>ID scheme</strong> (cite <a href="../canonicals/identifier-schemes.html">identifier-schemes.html</a>): everything is a Postgres <code>bigint</code> sequence or a <a href="../canonicals/identifier-schemes.html#uuidv7">UUIDv7</a> (time-ordered, so it indexes well and doesn't leak count) &mdash; minted by Postgres, single-node, no distributed-ID machinery needed because there is one Postgres. <code>clinic_id</code> is a short slug (human-readable in URLs and logs). No content-hash IDs (no dedup story here). The audit-log partition key is <code>(month, ts)</code> &mdash; partitioning, not sharding; one node.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S2. API / Interface Contracts                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s2-api">
+    <div class="container">
+      <h2>S2. API contracts (cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h2>
+      <p>One surface: a REST API the clinic web app calls. Patterns &mdash; versioning, idempotency, pagination, errors &mdash; cite the canonical; only the scenario-specific shape is inline. There is no internal service-to-service API <em>by design</em> &mdash; the monolith's modules call each other in-process (a function call, not an RPC); the &ldquo;API&rdquo; that matters is the one external boundary.</p>
+
+      <div>
+        <h3>REST API (the one external boundary)</h3>
+<pre class="line-numbers"><code class="language-text">// Auth + tenancy: every request carries a session/SSO token -> (user_id, clinic_id, role); the app sets
+// Postgres session GUCs (SET app.current_clinic = ..., app.current_user = ...) so RLS policies enforce isolation
+// at the DB layer even if an app-code check is missed. Every PHI-touching handler writes an audit_log row.
+
+GET    /v1/patients?q=...&cursor=...        -> [{patient_id, name, dob, phone}, ...]   // tsvector search within clinic
+POST   /v1/patients                          {name, dob, phone, address} -> {patient_id}
+GET    /v1/patients/{id}                     -> {patient ...}              // writes audit_log(read, patient, id, purpose)
+PATCH  /v1/patients/{id}                     {fields...} -> {patient ...}  // writes audit_log(write, ...)
+GET    /v1/patients/{id}/notes               -> [{note ...}, ...]
+POST   /v1/patients/{id}/notes               {body} -> {note_id}
+
+GET    /v1/providers/{id}/availability?date= -> [{slot_start, slot_end, free}]
+POST   /v1/appointments                      {patient_id, provider_id, start, end}
+                                             -> {appointment_id} | 409 SLOT_TAKEN   // row lock prevents double-book
+PATCH  /v1/appointments/{id}                 {start?, end?, status?} -> {appointment ...}
+DELETE /v1/appointments/{id}                 -> 204                          // cancel; reminder job cancelled
+
+POST   /v1/support/break-glass               {clinic_id, patient_id, reason} -> 200   // our_support emergency access;
+                                             // writes audit_log(break_glass=true) AND alerts; expires after a short TTL
+
+Versioning:  cite api-design-patterns#versioning -- URL-versioned (/v1/); additive changes only within a version.
+Idempotency: cite api-design-patterns#idempotency -- POSTs that create take an Idempotency-Key header (stored in a
+             small table with the response) so a retried booking doesn't create two appointments.
+Pagination:  cite api-design-patterns#pagination -- keyset/cursor on (created_at, id); no OFFSET.
+Errors:      cite api-design-patterns#errors -- 4xx with a machine code (SLOT_TAKEN, RLS_DENIED, RATE_LIMITED), 5xx otherwise.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Per-call SLO &amp; the deliberate absences</h3>
+        <ul>
+          <li>p99 page-load API call &le; ~300&nbsp;ms; p99 patient search &le; ~200&nbsp;ms (a <code>tsvector</code> GIN lookup over 5&nbsp;M rows, filtered by <code>clinic_id</code> &mdash; a clinic has thousands of patients, not millions, so the index range is tiny).</li>
+          <li><strong>No</strong> internal RPC SLOs &mdash; there is no internal RPC. <strong>No</strong> async event-bus contract &mdash; the only async work is the reminder job, polled from a Postgres table. <strong>No</strong> separate search API &mdash; search is a query against the same database the rest of the app uses.</li>
+          <li>Reminder delivery: enqueued at booking time with <code>run_at = appointment_start &minus; lead_time</code>; the poller picks it up within ~one poll interval (a few seconds); at-least-once (a retried job may send a duplicate reminder &mdash; benign and acceptable).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Essential Formulas                                            -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="formulas">
+    <div class="container">
+      <h2>Essential Formulas</h2>
+      <p>Every number on this page derives from these. Unit prices cite <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>. Note the unusual headline metric: <em>#systems-to-operate</em> &mdash; the count of distinct things the 3-person team must patch, monitor, and be paged for &mdash; sits alongside the dollar figure as a first-class cost.</p>
+      <div>
+        <h3>Workload constants</h3>
+<pre class="line-numbers"><code class="language-text">N_clinics   = ~500            N_patients = ~5,000,000      hot_data/patient ~= 10 KB -> hot_set ~= 50 GB
+appts/day   = ~50,000  ->  ~0.6/s avg, ~5-20/s peak        read RPS_peak ~= a few hundred
+PHI_touch   = ~3 / patient / day  ->  audit_rows/day ~= 15,000,000  x ~200 B  ~= 3 GB/day  ~= 90 GB/mo  ~= 1 TB/yr
+team_size   = 3 engineers (build + operate; 3-way on-call)
+SLO         = p99 page-load <= ~300 ms ; availability ~= 99.9% ; RPO ~= minutes ; RTO ~= 1 hour
+</code></pre>
+      </div>
+      <div>
+        <h3>Hardware / capacity facts (the headroom that makes minimalism work)</h3>
+<pre class="line-numbers"><code class="language-text">Postgres db.r6g.2xlarge: 8 vCPU, 64 GB RAM. Hot set ~50 GB fits the buffer pool -> point reads ~= ~1 ms (RAM hit).
+A single Postgres node: ~thousands of OLTP write txns/s with synchronous_commit=on; our write rate ~= ~tens/s incl. audit rows.
+  -> write headroom factor ~= thousands / tens  ~=  ~10-50x  before a single node is the gate.
+SKIP LOCKED job queue: easily ~thousands of jobs/min through ONE poller loop over a small "ready" partial index;
+  our reminder rate ~= 50,000/day ~= ~35/min  ->  ~3 orders of magnitude of headroom.
+tsvector + GIN over 5M patient rows: index build/maintenance is cheap (small rows); a clinic-scoped prefix query
+  scans thousands of rows, not millions  ->  sub-100 ms; NOT Google-grade relevance, but exact enough for "find this patient".
+Modular monolith on 2-3 c-class instances: a few hundred RPS / ~few-ms handlers  ->  <10% CPU; instances exist for redundancy
+  + rolling deploys, not for throughput.
+</code></pre>
+      </div>
+      <div class="full-width">
+        <h3>Core formulas</h3>
+<pre class="line-numbers"><code class="language-text">// The headline metric of THIS page:
+#systems_to_operate(design) = count of distinct components the team patches / monitors / pages on
+  reference design  ~= ~15+ services + ~5 datastores + Kafka + a mesh + a warehouse + multi-region tooling  ~= ~25
+  minimal design    ~= app (1 deployable) + Postgres (1, +warm standby) + load balancer + backups/object-store ~= ~4
+
+implied_headcount(design)   ~= rough rule: ~1-2 engineers per ~3-5 components on a sane on-call rotation
+  reference ~25 components -> ~15-30 engineers ;  minimal ~4 components -> ~3 engineers (the constraint, satisfied)
+
+$/month(design)  = sum over components of (instance_cost + storage_cost + managed_service_cost)
+  reference  ~= ~$50,000 - $150,000 / mo  (a fleet of services, Kafka, ES cluster, warehouse, x2 regions, ...)
+  minimal    ~= ~$2,000 - $5,000 / mo     (PG primary + warm standby + 2-3 app instances + LB + backups + KMS + email vendor)
+
+audit_storage_growth = audit_rows/day x bytes/row ; partition monthly ; archive partitions older than 12 mo to object storage
+  ~= 3 GB/day -> ~1 TB/yr ; archived at ~$0.023/GB-mo (or less, infrequent-access) -> ~$25/mo for a year of cold audit. Trivial.
+
+// HIPAA discipline (required vs addressable):
+implement(required_safeguard) := always
+implement(addressable_safeguard) := if (cheap || risk_high) then implement else document_reasoned_risk_decision
+</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Reference design (the over-engineered version we're NOT building) -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="reference">
+    <div class="container">
+      <h2>Reference design &mdash; the over-engineered version we are <em>not</em> building</h2>
+      <p>This is the &ldquo;scale it like everyone scales&rdquo; design &mdash; the thing the other scenario pages build toward. It is sketched here only so each de-engineering iteration has a concrete &ldquo;before&rdquo;. Every move in it is <em>correct at Epic/Cerner scale</em>; every move in it is <em>wrong here</em>, and the iterations say why.</p>
+
+      <div class="full-width">
+        <h3>Architecture (the thing we will shrink)</h3>
+        <svg viewBox="0 0 1240 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Reference over-engineered design: a service mesh fronts about a dozen-plus microservices (appointments, records, billing, notifications, search-indexer, auth, ...); each owns its own database; an event stream (Kafka) carries appointment-booked events fanned to notifications, billing, calendar-sync; Redis for sessions and a hot cache; Elasticsearch for patient search; an analytics warehouse fed by a CDC/ETL pipeline; all of it deployed active-active across two regions with a CI/CD pipeline of six environments and a dedicated data team. About 25 components; about 15-30 engineers; about 50 to 150 thousand dollars per month.">
+          <defs>
+            <marker id="arrRs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrRd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="30" width="150" height="60" rx="8"/>
+          <text x="95" y="56" text-anchor="middle" font-weight="bold">Clinic web app</text>
+          <text x="95" y="74" text-anchor="middle" class="lbl">CDN + a few hundred RPS</text>
+
+          <rect class="box" x="210" y="20" width="160" height="80" rx="8"/>
+          <text x="290" y="46" text-anchor="middle" font-weight="bold">API gateway</text>
+          <text x="290" y="64" text-anchor="middle" class="lbl">+ service mesh</text>
+          <text x="290" y="82" text-anchor="middle" class="lbl">(Envoy sidecars)</text>
+
+          <rect class="box" x="410" y="20" width="380" height="180" rx="8"/>
+          <text x="600" y="44" text-anchor="middle" font-weight="bold">~12+ microservices (each its own DB)</text>
+          <rect class="box" x="425" y="56" width="110" height="56" rx="6"/><text x="480" y="80" text-anchor="middle" class="lbl">appointments</text><text x="480" y="96" text-anchor="middle" class="lbl">svc + DB</text>
+          <rect class="box" x="545" y="56" width="110" height="56" rx="6"/><text x="600" y="80" text-anchor="middle" class="lbl">records svc</text><text x="600" y="96" text-anchor="middle" class="lbl">+ DB</text>
+          <rect class="box" x="665" y="56" width="110" height="56" rx="6"/><text x="720" y="80" text-anchor="middle" class="lbl">billing svc</text><text x="720" y="96" text-anchor="middle" class="lbl">+ DB</text>
+          <rect class="box" x="425" y="124" width="110" height="56" rx="6"/><text x="480" y="148" text-anchor="middle" class="lbl">notifications</text><text x="480" y="164" text-anchor="middle" class="lbl">svc + DB</text>
+          <rect class="box" x="545" y="124" width="110" height="56" rx="6"/><text x="600" y="148" text-anchor="middle" class="lbl">search-indexer</text><text x="600" y="164" text-anchor="middle" class="lbl">svc</text>
+          <rect class="box" x="665" y="124" width="110" height="56" rx="6"/><text x="720" y="148" text-anchor="middle" class="lbl">auth / +6 more</text><text x="720" y="164" text-anchor="middle" class="lbl">svc + DB</text>
+
+          <rect class="box" x="410" y="220" width="180" height="70" rx="8"/>
+          <text x="500" y="246" text-anchor="middle" font-weight="bold">Kafka</text>
+          <text x="500" y="264" text-anchor="middle" class="lbl">appt-booked -&gt; notify</text>
+          <text x="500" y="280" text-anchor="middle" class="lbl">-&gt; bill -&gt; calendar-sync</text>
+
+          <rect class="box" x="610" y="220" width="170" height="70" rx="8"/>
+          <text x="695" y="246" text-anchor="middle" font-weight="bold">Redis cluster</text>
+          <text x="695" y="264" text-anchor="middle" class="lbl">sessions + hot cache</text>
+
+          <rect class="box" x="810" y="60" width="150" height="70" rx="8"/>
+          <text x="885" y="86" text-anchor="middle" font-weight="bold">Elasticsearch</text>
+          <text x="885" y="104" text-anchor="middle" class="lbl">patient search cluster</text>
+          <text x="885" y="120" text-anchor="middle" class="lbl">(3+ nodes)</text>
+
+          <rect class="box" x="810" y="160" width="150" height="80" rx="8"/>
+          <text x="885" y="186" text-anchor="middle" font-weight="bold">Analytics WH</text>
+          <text x="885" y="204" text-anchor="middle" class="lbl">CDC/ETL pipeline</text>
+          <text x="885" y="220" text-anchor="middle" class="lbl">+ a data team</text>
+
+          <rect class="ok" x="1000" y="60" width="200" height="180" rx="8"/>
+          <text x="1100" y="86" text-anchor="middle" font-weight="bold">&times; 2 regions, active-active</text>
+          <text x="1100" y="108" text-anchor="middle" class="lbl">cross-region replication for</text>
+          <text x="1100" y="124" text-anchor="middle" class="lbl">every DB + Kafka + Redis + ES</text>
+          <text x="1100" y="146" text-anchor="middle" class="lbl">CI/CD: 6 environments</text>
+          <text x="1100" y="162" text-anchor="middle" class="lbl">a dedicated SRE/data team</text>
+          <text x="1100" y="186" text-anchor="middle" font-weight="bold">~25 components total</text>
+          <text x="1100" y="204" text-anchor="middle" class="lbl">~15-30 engineers</text>
+          <text x="1100" y="220" text-anchor="middle" class="lbl">~$50k-$150k / mo</text>
+
+          <line x1="170" y1="60" x2="210" y2="60" stroke="#475569" marker-end="url(#arrRs)"/>
+          <line x1="370" y1="60" x2="410" y2="80" stroke="#475569" marker-end="url(#arrRs)"/>
+          <line x1="500" y1="200" x2="500" y2="220" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrRd)"/>
+          <line x1="600" y1="200" x2="660" y2="220" stroke="#475569" marker-end="url(#arrRs)"/>
+          <line x1="655" y1="152" x2="810" y2="100" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrRd)"/>
+          <line x1="600" y1="200" x2="830" y2="190" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arrRd)"/>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Why each move is correct &mdash; at a different scale &mdash; and the iteration that removes it here. </strong> <em>Solid slate = sync request path; dashed gray = async / event / index-feed path.</em></p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Microservices + mesh</strong> &mdash; correct when many teams must ship independently and a service's blast radius must be contained. With a 3-person team there are no independent teams; the mesh is pure operational tax. <em>Removed in Iter 0.</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Per-service databases</strong> &mdash; correct when services genuinely have independent scaling/ownership. Here all the data is small, relational, and queried together; per-service DBs just multiply the things to patch. <em>Removed in Iter 0 (collapsed) / Iter 1 (the rest).</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Kafka event stream</strong> &mdash; correct at high event volume with many independent consumers and replay needs. ~50&nbsp;k appointments/day = ~0.6 events/s; a Postgres table + a poller handles it with ~1000&times; headroom. <em>Removed in Iter 1.</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Redis (sessions + hot cache)</strong> &mdash; correct when the working set or QPS exceeds what the DB's buffer pool absorbs. Here the ~50&nbsp;GB hot set fits Postgres's 64&nbsp;GB buffer pool and reads are ~1&nbsp;ms anyway. <em>Removed in Iter 1.</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Elasticsearch</strong> &mdash; correct for Google-grade relevance, fuzzy matching, aggregations over huge corpora. Here it's &ldquo;find this patient by name/DOB/phone within one clinic&rdquo;: <code>tsvector</code> + GIN over 5&nbsp;M rows, clinic-scoped, is sub-100&nbsp;ms. <em>Removed in Iter 1.</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Analytics warehouse + data team</strong> &mdash; correct when cross-tenant analytics is a product. It is a non-goal here; we keep the records (and the audit log) but build no dimensional model. <em>Removed (never built) &mdash; not a Core iteration; it's a non-goal in S0.</em></li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;"><strong>Multi-region active-active + hot standby + 24/7 SRE</strong> &mdash; correct when seconds of downtime is a real revenue hit or a contract demand. Here a back-office clinic SaaS with no such contract is fine with a warm standby and a ~1-hour RTO. <em>Reduced in Iter 3 (to a warm standby + runbook).</em></li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>What it costs &mdash; the count, the headcount, the bill</h3>
+<pre class="line-numbers"><code class="language-text">#systems_to_operate ~= ~12+ services + ~12+ per-service DBs + Kafka + Redis + Elasticsearch + a warehouse + CDC/ETL
+                       + a mesh + CI/CD-6-envs + x2 regions of all of it  ->  ~25 distinct things to patch / monitor / page on
+on-call surface     ~= every service, every datastore, the mesh, the stream, the index pipeline, cross-region replication lag
+implied headcount   ~= ~15-30 engineers (a service-per-team-ish org; an SRE rotation; a data team)
+$/month             ~= a fleet of service instances + a Kafka cluster + a Redis cluster + a 3-node ES + a warehouse + x2 regions
+                       ~= ~$50,000 - $150,000 / mo  (order of magnitude; the exact figure depends on the cloud and the redundancy)
+verdict             ~= every move above is the RIGHT answer at Epic/Cerner scale. At 500 clinics / 5M patients / a few hundred RPS
+                       with 3 engineers, it is the WRONG answer: the operational complexity dwarfs the bottlenecks it solves.
+</code></pre>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>The reference design is not a strawman &mdash; it's a future.</strong> If this clinic SaaS grows to 50&nbsp;k clinics, or one clinic's contract demands a 5-minute RTO, or cross-clinic analytics becomes a product, or the team grows to 30 engineers, the moves above start to pay for themselves &mdash; and you'd introduce them <em>one at a time, each justified by a measured bottleneck</em>, which is exactly what the other scenario pages do. This page is the prequel. The de-engineering iterations below are the reverse of that journey: they show, for each move, the constraint that forbids it <em>today</em> and the trigger that would justify it <em>later</em>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- DE-ENG ITER 0                                                  -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-0">
+    <div class="container">
+      <h2>De-engineering Iteration 0 &mdash; collapse the microservices into a modular monolith</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck analysis of the reference design (what's the dominant problem at our scale)</h3>
+        <p>The reference design's dominant problem is not a performance bottleneck &mdash; it's the operational-complexity NFR. A 3-person team cannot run ~12+ services + their sidecars + the mesh control plane + a per-service deploy pipeline + a per-service on-call surface. The mesh exists to give independent teams independent blast radii and independent release cadence; there are no independent teams. The microservice split exists to let services scale independently; the whole app at this scale fits a couple of mid-size instances, so there is nothing to scale independently. Evidence: <code>#systems_to_operate &asymp; 25</code> against a team of 3; the implied headcount (~15&ndash;30) is 5&ndash;10&times; the constraint. This is the constraint that <em>forces</em> the first removal &mdash; cite the &ldquo;Majestic Monolith&rdquo; (Basecamp/37signals: a small team should ship a well-modularized monolith, not a distributed system) and &ldquo;You Are Not Google&rdquo; (don't adopt FAANG-scale architecture for non-FAANG-scale problems).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1220 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 0: the service mesh and the dozen-plus microservices and their per-service databases are removed (shown faded and crossed out). In their place is one deployable, a well-modularized monolith with clear module boundaries (appointments, records, billing, notifications, auth) but one process, one Postgres database, one deploy pipeline. The clinic web app hits a load balancer in front of two or three instances of the monolith; the monolith talks to one Postgres. Kafka, Redis, and Elasticsearch still exist at this stage and are removed in Iteration 1. About 25 components dropped to about 6.">
+          <defs>
+            <marker id="arr0s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr0d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="40" width="150" height="60" rx="8"/>
+          <text x="95" y="66" text-anchor="middle" font-weight="bold">Clinic web app</text>
+          <text x="95" y="84" text-anchor="middle" class="lbl">a few hundred RPS</text>
+
+          <rect class="box" x="210" y="40" width="120" height="60" rx="8"/>
+          <text x="270" y="66" text-anchor="middle" font-weight="bold">Load balancer</text>
+          <text x="270" y="84" text-anchor="middle" class="lbl">managed L7</text>
+
+          <rect class="accent" x="370" y="20" width="320" height="170" rx="8"/>
+          <text x="530" y="44" text-anchor="middle" font-weight="bold">Modular monolith &mdash; ONE deployable &times;2-3</text>
+          <text x="530" y="62" text-anchor="middle" class="lbl">clear module boundaries, one process, one deploy</text>
+          <rect class="box" x="385" y="74" width="95" height="44" rx="6"/><text x="432" y="92" text-anchor="middle" class="lbl">appointments</text><text x="432" y="106" text-anchor="middle" class="lbl">module</text>
+          <rect class="box" x="488" y="74" width="95" height="44" rx="6"/><text x="535" y="92" text-anchor="middle" class="lbl">records</text><text x="535" y="106" text-anchor="middle" class="lbl">module</text>
+          <rect class="box" x="591" y="74" width="90" height="44" rx="6"/><text x="636" y="92" text-anchor="middle" class="lbl">billing</text><text x="636" y="106" text-anchor="middle" class="lbl">module</text>
+          <rect class="box" x="385" y="128" width="95" height="44" rx="6"/><text x="432" y="146" text-anchor="middle" class="lbl">notif.</text><text x="432" y="160" text-anchor="middle" class="lbl">module</text>
+          <rect class="box" x="488" y="128" width="95" height="44" rx="6"/><text x="535" y="146" text-anchor="middle" class="lbl">auth</text><text x="535" y="160" text-anchor="middle" class="lbl">module</text>
+          <rect class="box" x="591" y="128" width="90" height="44" rx="6"/><text x="636" y="146" text-anchor="middle" class="lbl">search</text><text x="636" y="160" text-anchor="middle" class="lbl">module</text>
+
+          <rect class="cool" x="740" y="50" width="170" height="80" rx="8"/>
+          <text x="825" y="76" text-anchor="middle" font-weight="bold">Postgres (ONE)</text>
+          <text x="825" y="94" text-anchor="middle" class="lbl">db.r6g.2xlarge</text>
+          <text x="825" y="112" text-anchor="middle" class="lbl">all modules' tables</text>
+
+          <rect class="danger" x="370" y="220" width="200" height="100" rx="8"/>
+          <text x="470" y="246" text-anchor="middle" font-weight="bold" class="struck">service mesh</text>
+          <text x="470" y="264" text-anchor="middle" class="lbl">+ ~12 microservices</text>
+          <text x="470" y="282" text-anchor="middle" class="lbl">+ ~12 per-service DBs</text>
+          <text x="470" y="300" text-anchor="middle" class="lbl">REMOVED</text>
+
+          <rect class="ok" x="600" y="220" width="310" height="100" rx="8"/>
+          <text x="755" y="246" text-anchor="middle" font-weight="bold">Still here (removed in Iter 1):</text>
+          <text x="755" y="266" text-anchor="middle" class="lbl">Kafka &middot; Redis &middot; Elasticsearch</text>
+          <text x="755" y="286" text-anchor="middle" class="lbl">analytics warehouse &mdash; never built (S0 non-goal)</text>
+          <text x="755" y="306" text-anchor="middle" class="lbl">multi-region / hot standby &mdash; reduced in Iter 3</text>
+
+          <line x1="170" y1="70" x2="210" y2="70" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="190" cy="70" r="9" fill="#fff" stroke="#475569"/><text x="190" y="74" text-anchor="middle" font-size="10">1</text>
+          <line x1="330" y1="70" x2="370" y2="80" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="350" cy="74" r="9" fill="#fff" stroke="#475569"/><text x="350" y="78" text-anchor="middle" font-size="10">2</text>
+          <line x1="690" y1="95" x2="740" y2="95" stroke="#475569" marker-end="url(#arr0s)"/>
+          <circle cx="715" cy="95" r="9" fill="#fff" stroke="#475569"/><text x="715" y="99" text-anchor="middle" font-size="10">3</text>
+          <line x1="470" y1="190" x2="470" y2="220" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr0d)"/>
+          <circle cx="487" cy="205" r="9" fill="#fff" stroke="#94a3b8"/><text x="487" y="209" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered) and line-style legend.</strong> <em>Solid slate = sync request path; dashed gray = &ldquo;this got removed&rdquo;; (no hedge/retry paths in this design).</em> Faded/struck-through boxes are removed components; the gold box is the boring thing (the modular monolith) that absorbs all those responsibilities now.</p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Clinic web app &rarr; Load balancer</strong> &mdash; a few hundred RPS; the LB just spreads requests over the monolith instances and does health checks. Managed; ~$25/mo.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Load balancer &rarr; Modular monolith</strong> &mdash; 2&ndash;3 instances behind the LB for redundancy + rolling deploys, not for throughput (each is &lt;10% CPU). One artifact, one deploy pipeline, one on-call.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Monolith &rarr; Postgres</strong> &mdash; all modules' tables in one database; module boundaries are enforced in the codebase (separate packages, no cross-module table access) but it is one schema in one node. Inter-module calls are in-process function calls, not RPCs &mdash; no network, no serialization, no mesh.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Removed:</strong> the service mesh, the inter-service RPC, the ~12+ microservices, the ~12+ per-service databases &mdash; gone. (Kafka, Redis, Elasticsearch still present at this stage; Iter 1 removes those.)</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Which constraint forced the removal &amp; what we did instead</h3>
+        <ul>
+          <li><strong>Constraint:</strong> &le;&nbsp;3 engineers can't operate ~12+ services + a mesh + per-service deploys + per-service on-call. The microservice split bought nothing here (no independent teams, nothing to scale independently) and cost everything (the operational-complexity NFR).</li>
+          <li><strong>What we did instead:</strong> one deployable &mdash; a well-modularized monolith (clear module boundaries in the codebase: <code>appointments/</code>, <code>records/</code>, <code>billing/</code>, <code>notifications/</code>, <code>auth/</code>, <code>search/</code>; no module reaches into another's tables; cross-module work is a typed function call), one process, one Postgres, one deploy pipeline. Cite <a href="04-monolith-vs-microservices.html">#04 monolith vs. microservices</a> for the tradeoff; this is the deliberate monolith side, picked for staffing.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Bottleneck we now accept (and when it bites)</h3>
+        <ul>
+          <li><strong>Accepted bottleneck:</strong> you can't scale modules independently &mdash; the whole app scales as a unit, and a runaway in one module (a search query storm, a billing-export loop) can starve the others' threads/connections in the same process. Classified loosely as <a href="../canonicals/bottlenecks.html#lock-contention">lock-contention</a> / shared-resource contention within one process.</li>
+          <li><strong>When it bites:</strong> when one module's load is ~10&times; the rest's and growing &mdash; e.g., if patient search becomes 10&times; the OLTP load and is hammering the buffer pool. <strong>Revisit trigger:</strong> a sustained per-module CPU/connection imbalance &rarr; extract <em>that one module</em> into a service (it's already a clean package boundary, so the extraction is mechanical) &mdash; not a rewrite, a carve-out. That's a &ldquo;good problem,&rdquo; years away at the current trajectory.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Numbers after Iter 0</h3>
+<pre class="line-numbers"><code class="language-text">#systems_to_operate:  ~25  ->  ~6   (app + Postgres + LB + Kafka + Redis + Elasticsearch ; the warehouse was never built;
+                                      multi-region/hot-standby will be reduced in Iter 3 -- counted as part of "Postgres" + ops here)
+on-call surface:      one app, one DB, a load balancer, plus the three datastores Iter 1 will remove -- already a 3-person rotation
+implied headcount:    ~15-30  ->  feasible for ~3 once Iter 1 lands; the monolith itself is a 1-2-person codebase
+$/month:              the per-service fleet + the mesh control plane collapse into 2-3 app instances (~$300-500/mo) + 1 Postgres
+                      (~$360/mo) + an LB (~$25/mo)  ->  roughly -$tens-of-thousands/mo vs the reference's per-service fleet;
+                      Kafka/Redis/ES still on the bill at this stage (Iter 1 removes them).  Order of magnitude: ~$3k-$8k/mo here.
+latency / throughput: UNCHANGED and fine -- a few hundred RPS / ~few-ms in-process handlers / one Postgres with ~1 ms reads;
+                      actually IMPROVED slightly (an inter-module call is a function call, not a network RPC -- no hop, no retry).
+</code></pre>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>Impact:</strong> the single biggest de-engineering move &mdash; ~25 components &rarr; ~6, the mesh and the RPC fabric gone, the deploy pipeline collapsed from per-service to one. The accepted cost (no independent module scaling) is a problem the system doesn't have and won't have for years; when it does, the fix (carve out the hot module) is a clean extraction, not a rebuild &mdash; because the module boundaries were kept honest in the codebase from day one. That is the &ldquo;modular monolith&rdquo; bet: pay the discipline cost (real boundaries in the code) to keep the extraction cheap, and skip the operational cost (running a distributed system) until something forces it.</p>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>&#128256; If the team were 20 engineers instead of 3</summary>
+        <ul>
+          <li>This iteration reverses: independent teams want independent deploy cadence and blast radii &rarr; split the monolith back into services, one at a time, each justified by a team boundary or a measured scaling bottleneck (exactly the journey the other scenario pages take).</li>
+          <li>The mesh comes back when there are enough services that hand-rolled service discovery + mTLS + retries become the tax instead of the saving.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- DE-ENG ITER 1                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-1">
+    <div class="container">
+      <h2>De-engineering Iteration 1 &mdash; Postgres absorbs the queue, the cache, and search</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck analysis of the post-Iter-0 design</h3>
+        <p>After Iter 0 the design is a monolith + Postgres + LB &mdash; plus Kafka, Redis, and Elasticsearch still hanging off the side. Those three are now the dominant operational-complexity bottleneck: each is a distributed system with its own failure modes (Kafka: ISR shrink, log retention, consumer-lag storms; Redis: bgsave fork OOM, eviction surprises, cluster resharding; Elasticsearch: shard rebalancing, mapping explosions, JVM heap pressure) that a 3-person team must run, patch, and be paged for &mdash; and the tech-minimalism constraint flatly forbids them. Evidence: <code>#systems_to_operate</code> is stuck at ~6 because of these three; each adds ~1 system that contributes ~0 product value at our scale (the volumes are 2&ndash;3 orders of magnitude below where any of them earns its keep &mdash; see the headroom facts in Essential Formulas). This is the constraint that forces the next removal &mdash; cite the &ldquo;just use Postgres for everything&rdquo; genre and &ldquo;Choose Boring Technology&rdquo; (you get ~3 innovation tokens; running Kafka + Redis + ES at this scale spends all of them on plumbing).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1220 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 1: Kafka, Redis, and Elasticsearch are removed (faded, crossed out). Postgres absorbs all three: the job queue becomes a Postgres table with SELECT FOR UPDATE SKIP LOCKED polled by an in-process worker in the monolith; the cache becomes Postgres's own buffer pool plus a small in-process LRU in the monolith for the truly hot lookups; full-text patient search becomes a tsvector column plus a GIN index in the same Postgres. The shape is now: clinic web app to load balancer to two or three monolith instances, each talking to one Postgres. About 6 components dropped to 4: app, Postgres, load balancer, and backups (introduced fully in Iter 3, named here).">
+          <defs>
+            <marker id="arr1s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="50" width="140" height="60" rx="8"/>
+          <text x="90" y="76" text-anchor="middle" font-weight="bold">Clinic web app</text>
+          <text x="90" y="94" text-anchor="middle" class="lbl">a few hundred RPS</text>
+
+          <rect class="box" x="200" y="50" width="110" height="60" rx="8"/>
+          <text x="255" y="76" text-anchor="middle" font-weight="bold">Load balancer</text>
+
+          <rect class="box" x="350" y="20" width="320" height="180" rx="8"/>
+          <text x="510" y="44" text-anchor="middle" font-weight="bold">Modular monolith &times;2-3</text>
+          <rect class="box" x="365" y="58" width="140" height="44" rx="6"/><text x="435" y="76" text-anchor="middle" class="lbl">request handlers</text><text x="435" y="90" text-anchor="middle" class="lbl">(appt/records/...)</text>
+          <rect class="accent" x="515" y="58" width="140" height="44" rx="6"/><text x="585" y="76" text-anchor="middle" class="lbl">in-process LRU</text><text x="585" y="90" text-anchor="middle" class="lbl">(tiny hot cache)</text>
+          <rect class="accent" x="365" y="112" width="140" height="44" rx="6"/><text x="435" y="130" text-anchor="middle" class="lbl">queue worker loop</text><text x="435" y="144" text-anchor="middle" class="lbl">SKIP LOCKED poller</text>
+          <rect class="box" x="515" y="112" width="140" height="44" rx="6"/><text x="585" y="130" text-anchor="middle" class="lbl">search handler</text><text x="585" y="144" text-anchor="middle" class="lbl">tsvector query</text>
+          <text x="510" y="178" text-anchor="middle" class="lbl">module boundaries enforced in code; one process</text>
+
+          <rect class="cool" x="720" y="30" width="200" height="170" rx="8"/>
+          <text x="820" y="56" text-anchor="middle" font-weight="bold">Postgres (ONE) &mdash; absorbs all</text>
+          <text x="820" y="76" text-anchor="middle" class="lbl">relational tables</text>
+          <rect class="accent" x="735" y="86" width="170" height="32" rx="5"/><text x="820" y="106" text-anchor="middle" class="lbl">job_queue table (+SKIP LOCKED)</text>
+          <rect class="accent" x="735" y="124" width="170" height="32" rx="5"/><text x="820" y="144" text-anchor="middle" class="lbl">buffer pool = the "cache"</text>
+          <rect class="accent" x="735" y="162" width="170" height="32" rx="5"/><text x="820" y="182" text-anchor="middle" class="lbl">tsvector + GIN = "search"</text>
+
+          <rect class="danger" x="350" y="230" width="250" height="100" rx="8"/>
+          <text x="475" y="256" text-anchor="middle" font-weight="bold" class="struck">Kafka</text>
+          <text x="475" y="276" text-anchor="middle" font-weight="bold" class="struck">Redis</text>
+          <text x="475" y="296" text-anchor="middle" font-weight="bold" class="struck">Elasticsearch</text>
+          <text x="475" y="314" text-anchor="middle" class="lbl">REMOVED &mdash; folded into Postgres</text>
+
+          <rect class="ok" x="640" y="230" width="280" height="100" rx="8"/>
+          <text x="780" y="256" text-anchor="middle" font-weight="bold">#systems_to_operate now ~4</text>
+          <text x="780" y="276" text-anchor="middle" class="lbl">app &middot; Postgres &middot; load balancer &middot; backups</text>
+          <text x="780" y="296" text-anchor="middle" class="lbl">(backups fully built in Iter 3; named here)</text>
+          <text x="780" y="314" text-anchor="middle" class="lbl">a 3-person on-call rotation now fits</text>
+
+          <line x1="160" y1="80" x2="200" y2="80" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="180" cy="80" r="9" fill="#fff" stroke="#475569"/><text x="180" y="84" text-anchor="middle" font-size="10">1</text>
+          <line x1="310" y1="80" x2="350" y2="90" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="330" cy="84" r="9" fill="#fff" stroke="#475569"/><text x="330" y="88" text-anchor="middle" font-size="10">2</text>
+          <line x1="670" y1="100" x2="720" y2="100" stroke="#475569" marker-end="url(#arr1s)"/>
+          <circle cx="695" cy="100" r="9" fill="#fff" stroke="#475569"/><text x="695" y="104" text-anchor="middle" font-size="10">3</text>
+          <line x1="475" y1="200" x2="475" y2="230" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr1d)"/>
+          <circle cx="492" cy="215" r="9" fill="#fff" stroke="#94a3b8"/><text x="492" y="219" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered) and line-style legend.</strong> <em>Solid slate = sync request path; dashed gray = &ldquo;removed&rdquo;.</em> Gold boxes = the boring thing (Postgres, plus a tiny in-process LRU and a poller loop inside the monolith) that absorbs the queue, the cache, and search.</p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Clinic web app &rarr; Load balancer</strong> &mdash; unchanged; a few hundred RPS.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>Load balancer &rarr; Monolith</strong> &mdash; unchanged; 2&ndash;3 instances; each instance also runs the queue-worker loop (a background goroutine/thread, gated so only N workers poll &mdash; <code>SKIP LOCKED</code> makes concurrent pollers safe).</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Monolith &rarr; Postgres</strong> &mdash; now carries everything: the relational reads/writes, the <code>job_queue</code> dequeue (<code>SELECT &hellip; FROM job_queue WHERE status='ready' AND run_at &le; now() ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT k</code>), and the <code>tsvector</code> search query. Connections via PgBouncer (transaction pooling) so 2&ndash;3 app instances &times; their pools don't exhaust Postgres's ~hundreds-of-connections limit.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Removed:</strong> Kafka, Redis, Elasticsearch &mdash; all three folded into Postgres. The cache &ldquo;moves&rdquo; into Postgres's buffer pool (the ~50&nbsp;GB hot set fits the 64&nbsp;GB RAM) plus a small in-process LRU in the monolith for the truly hot, tiny lookups (a clinic's provider list, feature flags) &mdash; at a few hundred RPS over a working set that fits RAM, a separate cache cluster is pure operational overhead.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Which constraint forced the removal &amp; what each replacement is &mdash; with the rate where it stops</h3>
+        <ul>
+          <li><strong>Queue &rarr; Postgres table + <code>SELECT &hellip; FOR UPDATE SKIP LOCKED</code>.</strong> A <code>job_queue</code> table with a partial index on <code>(run_at) WHERE status='ready'</code>; a transactional outbox (the booking transaction inserts the reminder job in the same commit, so a job is never lost or duplicated relative to its trigger); a poller loop that grabs a batch with <code>SKIP LOCKED</code> (so multiple pollers don't fight over the same rows), processes, marks done. <strong>Why not SQS/Kafka here:</strong> SQS is another managed service (another BAA, another thing to monitor) and Kafka is a distributed log to operate &mdash; both buy ordering/replay/throughput we don't need. A single Postgres + <code>SKIP LOCKED</code> handles ~thousands of jobs/min comfortably; our rate is ~35/min (~50&nbsp;k reminders/day). <strong>Where it stops:</strong> roughly when sustained job rate approaches ~tens of thousands/min, or when the queue table's churn (insert+update+delete per job) starts producing autovacuum lag that hurts OLTP &mdash; then you'd move the queue to its own Postgres, or finally adopt SQS. Cite <a href="23-job-scheduler.html">#23 job scheduler</a> for the sophisticated version (leader election, Redis sorted set) &mdash; deliberately not built here.</li>
+          <li><strong>Cache &rarr; Postgres buffer pool + a tiny in-process LRU.</strong> Postgres caches its own hot pages; the ~50&nbsp;GB hot set fits the 64&nbsp;GB instance, so point reads are ~1&nbsp;ms RAM hits anyway. The in-process LRU is just for the handful of tiny, ultra-hot, slow-changing lookups (a clinic's provider list, role definitions, feature flags) &mdash; bounded, in the app heap, no network. <strong>Why not Redis here:</strong> at a few hundred RPS over a RAM-resident working set, a Redis cluster adds a network hop, a cache-coherence problem (invalidation), and a thing to operate, for ~0 latency win. <strong>Where it stops:</strong> when the hot working set exceeds the buffer pool (read miss rate climbs, p99 reads go to disk-IO territory) or when QPS is high enough that the per-query parse/plan overhead matters &mdash; then add a read replica (still Postgres) for read scaling, and only then a cache. Cite <a href="../caching.html">caching.html</a> for the read-through pattern &mdash; and the corollary: don't add a cache until the buffer pool isn't enough. Classified accepted bottleneck: a single node's <a href="../canonicals/bottlenecks.html#memory-capacity-bound">memory-capacity</a> ceiling for the hot set.</li>
+          <li><strong>Search &rarr; <code>tsvector</code> + GIN index.</strong> A generated <code>search_tsv tsvector</code> column on <code>patient</code> (name, DOB-as-text, phone), a GIN index on it, queries filtered by <code>clinic_id</code> first (so the scan is over a clinic's thousands of patients, not 5&nbsp;M). <strong>Why not Elasticsearch here:</strong> ES gives Google-grade relevance, fuzzy/typo tolerance, faceting, aggregations &mdash; none of which &ldquo;find this patient&rdquo; needs; it costs a 3-node cluster, an index-feed pipeline, mapping management, and JVM heap babysitting. <code>tsvector</code> over 5&nbsp;M small rows, clinic-scoped, is sub-100&nbsp;ms. <strong>Where it stops:</strong> when search queries get genuinely complex (cross-clinic, fuzzy, ranked-by-relevance, faceted) or when search load is ~10&times; OLTP and competing for the buffer pool &mdash; then add a read replica dedicated to search, or finally pull search into ES. Classified accepted bottleneck: a heavy search query competes with OLTP for the buffer pool / <a href="../canonicals/bottlenecks.html#disk-io-bound">disk IO</a> on the one node.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Bottleneck we now accept (and when it bites)</h3>
+        <ul>
+          <li><strong>Accepted bottleneck:</strong> a single Postgres node carries <em>everything</em> &mdash; OLTP writes (capped at ~thousands/s with <code>synchronous_commit=on</code>; we use ~tens/s), the connection limit (~hundreds; PgBouncer transaction-pooling keeps us well under it), the queue churn, the search load, and the audit-log writes (Iter 2). A heavy search or a queue-churn spike competes with OLTP for the buffer pool and IO. Cite <a href="../canonicals/bottlenecks.html#connection-saturation">connection-saturation</a> (mitigated by PgBouncer, accepted as a watch item), <a href="../canonicals/bottlenecks.html#memory-capacity-bound">memory-capacity-bound</a>, <a href="../canonicals/bottlenecks.html#disk-io-bound">disk-io-bound</a> &mdash; we are explicitly <em>not</em> fixing these, we are noting when they'll bite.</li>
+          <li><strong>When it bites:</strong> ~10&ndash;50&times; the current write rate, or if search queries get complex, or if the hot set outgrows RAM. <strong>Revisit trigger (in order):</strong> (1) read p99 climbing / buffer-cache hit ratio dropping &rarr; add a Postgres read replica, route reads + search there; (2) write rate approaching ~1000/s sustained &rarr; pull the queue and/or audit log into their own Postgres; (3) search complexity exceeds <code>tsvector</code> &rarr; ES. Each is a single, well-understood step &mdash; the inverse of de-engineering, taken one move at a time.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema delta (C9-bis &mdash; the stores this iteration introduces)</h3>
+<pre class="line-numbers"><code class="language-sql">-- The job queue, the cache (no schema -- it's the buffer pool + an in-process LRU), and search live in the SAME Postgres.
+CREATE TABLE job_queue (
+  job_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind        text NOT NULL,                 -- 'send_reminder' | 'export_claims' | ...
+  payload     jsonb NOT NULL,                -- includes clinic_id
+  run_at      timestamptz NOT NULL,
+  status      text NOT NULL DEFAULT 'ready', -- 'ready' | 'running' | 'done' | 'failed'
+  attempts    int NOT NULL DEFAULT 0,
+  locked_by   text, locked_at timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX job_queue_ready ON job_queue (run_at) WHERE status = 'ready';   -- the poller's only scan
+-- dequeue:  SELECT * FROM job_queue WHERE status='ready' AND run_at &lt;= now()
+--           ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 50;   -- then UPDATE status='running', process, UPDATE 'done'
+
+ALTER TABLE patient ADD COLUMN search_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('simple', coalesce(name,'')||' '||coalesce(dob::text,'')||' '||coalesce(phone,''))) STORED;
+CREATE INDEX patient_search_gin ON patient USING gin (search_tsv);
+CREATE INDEX patient_by_clinic   ON patient (clinic_id);   -- search query: WHERE clinic_id = $1 AND search_tsv @@ plainto_tsquery($2)
+
+-- PgBouncer (transaction pooling) in front of Postgres: app instances x small pools -> a few dozen server connections,
+-- well under Postgres's max_connections (~hundreds). PgBouncer is part of "running Postgres", not a new datastore.
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Numbers after Iter 1</h3>
+<pre class="line-numbers"><code class="language-text">#systems_to_operate:  ~6  ->  ~4   (app + Postgres + load balancer + backups)  -- the team's constraint (<=4) is now met
+implied headcount:    feasible for ~3 -- the monolith is a 1-2 person codebase; Postgres + LB + backups are managed-ish
+$/month:              Kafka cluster + Redis cluster + 3-node ES drop off the bill  ->  ~-$1k-$3k+/mo vs post-Iter-0;
+                      now: ~2-3 app instances (~$300-500) + 1 Postgres (~$360) + LB (~$25) + (backups, full in Iter 3)
+                      ~=  ~$1k-$2k/mo at this stage (Iter 2 adds audit storage ~$25/mo; Iter 3 adds a warm standby ~$360/mo + backups)
+latency / throughput: UNCHANGED and fine -- point reads ~1 ms (RAM); search sub-100 ms (clinic-scoped tsvector); queue picks up
+                      jobs within ~one poll interval (a few seconds); all 2-3 orders of magnitude inside their headroom.
+what changed / didn't: REMOVED 3 datastores; the queue/cache/search are now "psql away" not "three more systems to patch+monitor".
+                       UNCHANGED: the relational model, the request latency, the workload. Postgres got a job_queue table and a
+                       tsvector column -- cheap additions, not new infra.
+</code></pre>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>Impact:</strong> the operational-complexity NFR (&le;&nbsp;4 systems) is now met &mdash; app, Postgres, LB, backups. Three distributed systems, each with its own failure modes and on-call surface, replaced by features of the database the app already uses. The accepted cost &mdash; one Postgres node carries all of it &mdash; comes with a clear, ordered revisit ladder (read replica &rarr; split out the queue/audit &rarr; ES), each rung a single understood step. This is the &ldquo;just use Postgres&rdquo; bet: a modern Postgres is a queue, a cache, a search engine, and a relational store, and at this scale all four jobs together are well inside one node's headroom &mdash; so don't run four systems when one does.</p>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>&#128256; If the volumes were 100&times; (5&nbsp;M appointments/day, tens of thousands of jobs/min, complex search)</summary>
+        <ul>
+          <li>Queue: <code>SKIP LOCKED</code> on the main DB stops being safe (autovacuum lag on the churny queue table hurts OLTP) &rarr; queue gets its own Postgres, or SQS/Kafka comes back. (This is the trigger named above.)</li>
+          <li>Cache: hot set outgrows the buffer pool &rarr; read replica first, then Redis. Search: <code>tsvector</code> can't do the relevance/fuzzy queries the product now needs &rarr; Elasticsearch. Each is a single re-engineering step, motivated by a measured bottleneck &mdash; the inverse of this iteration.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- DE-ENG ITER 2 -- HIPAA, minimum-necessary                      -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iter-2">
+    <div class="container">
+      <h2>De-engineering Iteration 2 &mdash; HIPAA, the minimum-necessary way (add only what's <em>required</em>, document what's merely <em>addressable</em>)</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck analysis &mdash; the regulatory floor we haven't met yet</h3>
+        <p>This is the one iteration that <em>adds</em> &mdash; but the discipline is still de-engineering: HIPAA's Security Rule splits implementation specifications into <em>required</em> (you must) and <em>addressable</em> (you must either implement <em>or</em> document a reasoned risk decision and an equivalent alternative), and the <em>minimum necessary</em> standard says limit PHI use/disclosure to the minimum needed. So the move is &ldquo;implement the required floor; for each addressable item, decide and document; build nothing maximal.&rdquo; The gap after Iter 1: the design has no audit log of PHI access, no explicit per-tenant isolation enforced below the app layer, no documented encryption/BAAs/breach plan. The constraint that forces this iteration is regulatory; the constraint that <em>shapes</em> it (no new systems, no security team, no HSM) is the staffing + tech-minimalism pair &mdash; so everything HIPAA needs is built <em>inside Postgres</em> (an audit table, RLS policies) or <em>inside the cloud platform we already use under a BAA</em> (TDE/encrypted volumes, KMS, TLS, backups) &mdash; no SIEM, no DLP suite, no dedicated SOC. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a> for the standing definitions of audit / residency / retention / deletion; only the scenario-specific choices are inline.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 1220 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 2: the same monolith, load balancer, and one Postgres -- now with the HIPAA floor built in. Postgres gains an append-only audit_log table partitioned by month, write-once, capturing every PHI access; Postgres Row-Level Security policies enforce per-clinic isolation at the database layer; data is encrypted at rest (transparent data encryption on encrypted volumes) and in transit (TLS); the cloud KMS holds the keys; a break-glass emergency-access path writes an audit row and alerts. What is deliberately NOT added: a separate SIEM, a dedicated security team, a hardware HSM, a data-loss-prevention suite -- those are documented as addressable-with-risk-decision. Backups remain named for Iter 3. About 4 components -- HIPAA added rows and policies in Postgres, not a new system.">
+          <defs>
+            <marker id="arr2s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr2d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="60" width="140" height="60" rx="8"/>
+          <text x="90" y="86" text-anchor="middle" font-weight="bold">Clinic web app</text>
+          <text x="90" y="104" text-anchor="middle" class="lbl">TLS; role-scoped</text>
+
+          <rect class="box" x="200" y="60" width="110" height="60" rx="8"/>
+          <text x="255" y="86" text-anchor="middle" font-weight="bold">Load balancer</text>
+          <text x="255" y="104" text-anchor="middle" class="lbl">TLS termination</text>
+
+          <rect class="box" x="350" y="20" width="300" height="160" rx="8"/>
+          <text x="500" y="44" text-anchor="middle" font-weight="bold">Modular monolith &times;2-3</text>
+          <rect class="box" x="365" y="56" width="130" height="44" rx="6"/><text x="430" y="74" text-anchor="middle" class="lbl">handlers (RBAC)</text><text x="430" y="88" text-anchor="middle" class="lbl">+ queue worker</text>
+          <rect class="accent" x="505" y="56" width="130" height="44" rx="6"/><text x="570" y="74" text-anchor="middle" class="lbl">audit-write hook</text><text x="570" y="88" text-anchor="middle" class="lbl">every PHI touch</text>
+          <rect class="accent" x="365" y="110" width="130" height="44" rx="6"/><text x="430" y="128" text-anchor="middle" class="lbl">SET app.clinic/user</text><text x="430" y="142" text-anchor="middle" class="lbl">-&gt; RLS in DB</text>
+          <rect class="accent" x="505" y="110" width="130" height="44" rx="6"/><text x="570" y="128" text-anchor="middle" class="lbl">break-glass path</text><text x="570" y="142" text-anchor="middle" class="lbl">audited + alerts</text>
+
+          <rect class="cool" x="700" y="20" width="220" height="180" rx="8"/>
+          <text x="810" y="44" text-anchor="middle" font-weight="bold">Postgres (ONE) &mdash; +HIPAA floor</text>
+          <text x="810" y="64" text-anchor="middle" class="lbl">relational + job_queue + tsvector</text>
+          <rect class="accent" x="715" y="74" width="190" height="34" rx="5"/><text x="810" y="95" text-anchor="middle" class="lbl">audit_log: append-only, by month</text>
+          <rect class="accent" x="715" y="114" width="190" height="34" rx="5"/><text x="810" y="135" text-anchor="middle" class="lbl">RLS policies: per-clinic isolation</text>
+          <rect class="accent" x="715" y="154" width="190" height="34" rx="5"/><text x="810" y="175" text-anchor="middle" class="lbl">encrypted at rest (TDE/volume)</text>
+
+          <rect class="ok" x="960" y="40" width="160" height="80" rx="8"/>
+          <text x="1040" y="66" text-anchor="middle" font-weight="bold">Cloud KMS</text>
+          <text x="1040" y="84" text-anchor="middle" class="lbl">key material</text>
+          <text x="1040" y="102" text-anchor="middle" class="lbl">(under a BAA)</text>
+
+          <rect class="danger" x="350" y="210" width="320" height="120" rx="8"/>
+          <text x="510" y="236" text-anchor="middle" font-weight="bold" class="struck">separate SIEM</text>
+          <text x="510" y="256" text-anchor="middle" font-weight="bold" class="struck">dedicated security team / 24x7 SOC</text>
+          <text x="510" y="276" text-anchor="middle" font-weight="bold" class="struck">hardware HSM</text>
+          <text x="510" y="296" text-anchor="middle" font-weight="bold" class="struck">DLP suite</text>
+          <text x="510" y="316" text-anchor="middle" class="lbl">NOT built &mdash; documented as addressable, risk-accepted</text>
+
+          <rect class="ok" x="700" y="210" width="220" height="120" rx="8"/>
+          <text x="810" y="236" text-anchor="middle" font-weight="bold">Audit growth (accepted)</text>
+          <text x="810" y="256" text-anchor="middle" class="lbl">~15M rows/day ~= ~3 GB/day</text>
+          <text x="810" y="276" text-anchor="middle" class="lbl">monthly partitions; archive &gt;12 mo</text>
+          <text x="810" y="296" text-anchor="middle" class="lbl">to object storage (~$25/mo for a year)</text>
+          <text x="810" y="316" text-anchor="middle" class="lbl">NOT an audit-analytics system &mdash; just retention</text>
+
+          <line x1="160" y1="90" x2="200" y2="90" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="180" cy="90" r="9" fill="#fff" stroke="#475569"/><text x="180" y="94" text-anchor="middle" font-size="10">1</text>
+          <line x1="310" y1="90" x2="350" y2="100" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="330" cy="94" r="9" fill="#fff" stroke="#475569"/><text x="330" y="98" text-anchor="middle" font-size="10">2</text>
+          <line x1="650" y1="100" x2="700" y2="100" stroke="#475569" marker-end="url(#arr2s)"/>
+          <circle cx="675" cy="100" r="9" fill="#fff" stroke="#475569"/><text x="675" y="104" text-anchor="middle" font-size="10">3</text>
+          <line x1="920" y1="100" x2="960" y2="90" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr2d)"/>
+          <circle cx="940" cy="92" r="9" fill="#fff" stroke="#94a3b8"/><text x="940" y="96" text-anchor="middle" font-size="10">4</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered) and line-style legend.</strong> <em>Solid slate = sync request path; dashed gray = key fetch / out-of-band.</em> Gold boxes = the boring things absorbing the HIPAA floor (Postgres tables + policies; the cloud KMS we already have). Faded/struck = the sophisticated security apparatus we did <em>not</em> build, documented as addressable-with-a-risk-decision.</p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Web app &rarr; LB</strong> &mdash; TLS; the app authenticates the user and resolves <code>(user_id, clinic_id, role)</code> from the session/SSO token.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>LB &rarr; Monolith</strong> &mdash; TLS terminated at the LB (or re-encrypted to the app); every PHI-touching handler does an RBAC check <em>and</em> writes an <code>audit_log</code> row (actor, clinic, action, resource, purpose, request id) in the same transaction as the read/write.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Monolith &rarr; Postgres</strong> &mdash; on each request the app sets session GUCs (<code>SET app.current_clinic</code>, <code>app.current_user</code>); RLS policies on every PHI table (<code>USING (clinic_id = current_setting('app.current_clinic')::bigint)</code>) enforce isolation at the DB layer, so even an app-code bug can't leak cross-clinic data. Connection is TLS. The <code>audit_log</code> insert is part of the same transaction.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Postgres &rarr; Cloud KMS</strong> &mdash; data encrypted at rest via transparent data encryption / an encrypted volume; the data-encryption key is wrapped by a KMS key (envelope encryption); KMS is a managed service we already use under a BAA &mdash; no self-run HSM. (Backups are also KMS-encrypted; the backup machinery is built fully in Iter 3.)</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>The <em>required</em> floor (implemented) vs the <em>addressable</em> items (decided &amp; documented)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>HIPAA safeguard</th><th>Spec type</th><th>What we do</th></tr></thead>
+            <tbody>
+              <tr><td>Audit controls (record &amp; examine PHI access)</td><td>required</td><td>Append-only <code>audit_log</code> table in Postgres, partitioned by month, write-once (no UPDATE/DELETE grant; INSERT only); every PHI read/write writes a row in the same transaction; rows include actor, clinic, action, resource type+id, purpose, break-glass flag, request id.</td></tr>
+              <tr><td>Access control / unique user ID</td><td>required</td><td>Per-clinic RBAC in the app (front_desk / clinician / clinic_admin / our_support); unique <code>user_id</code> per person; Postgres RLS policies enforce per-clinic isolation at the DB layer as defense-in-depth.</td></tr>
+              <tr><td>Transmission security / integrity</td><td>required (addressable for some sub-specs)</td><td>TLS for all external traffic and app&harr;Postgres; integrity controls = the DB's own checksums + write-once audit log.</td></tr>
+              <tr><td>Encryption of PHI at rest</td><td>addressable &rarr; <strong>implemented</strong> (it's cheap)</td><td>TDE / encrypted volumes for Postgres + backups + archived audit partitions; envelope encryption with cloud KMS.</td></tr>
+              <tr><td>Automatic logoff</td><td>addressable &rarr; <strong>implemented</strong> (cheap)</td><td>Short idle-session timeout in the app; tokens expire.</td></tr>
+              <tr><td>Emergency access ("break-glass")</td><td>required</td><td>An <code>our_support</code> path that, with a typed reason, grants short-TTL cross-clinic read access &mdash; writes an <code>audit_log</code> row with <code>break_glass=true</code> AND fires an alert to the on-call channel.</td></tr>
+              <tr><td>BAAs with subprocessors</td><td>required</td><td>BAA with the cloud provider (compute, Postgres, KMS, object storage) and with the email/SMS vendor; recorded with dates.</td></tr>
+              <tr><td>Contingency plan (data backup, DR, emergency mode)</td><td>required</td><td>Automated backups + tested restore + a documented runbook &mdash; built fully in Iter 3 (warm standby + WAL archiving + a drilled restore).</td></tr>
+              <tr><td>Encryption of PHI on a closed internal network segment</td><td>addressable &rarr; <strong>risk-accepted &amp; documented</strong></td><td>Already TLS app&harr;Postgres, so moot; but the principle &mdash; we document the decision rather than build extra controls.</td></tr>
+              <tr><td>Separate SIEM / dedicated SOC / hardware HSM / DLP suite</td><td>addressable &rarr; <strong>NOT built; documented</strong></td><td>Risk decision: at our scale the audit log + alerting + the cloud KMS + access reviews are a reasonable, equivalent alternative; a SIEM/SOC/HSM/DLP suite is disproportionate &mdash; documented per the addressable-implementation-specification mechanism, revisit if scale or a customer audit demands it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Bottleneck we now accept (and when it bites)</h3>
+        <ul>
+          <li><strong>Accepted bottleneck:</strong> the audit log grows forever &mdash; every PHI read is a row; ~5&nbsp;M patients &times; ~3 touches/day &asymp; ~15&nbsp;M rows/day &times; ~200&nbsp;B &asymp; ~3&nbsp;GB/day &asymp; ~1&nbsp;TB/year on one Postgres. Unmanaged, that's <a href="../canonicals/bottlenecks.html#disk-io-bound">disk-io / capacity pressure</a> on the same node serving OLTP, plus ever-slower audit queries.</li>
+          <li><strong>What we do:</strong> partition the audit table by month; the active month stays hot; partitions older than ~12 months are detached and archived to cheap object storage (still queryable on demand, just not online) &mdash; ~$0.023/GB-mo or less for infrequent-access &rarr; ~$25/mo for a year of cold audit. We are <em>not</em> building an audit-analytics system &mdash; just retaining the records per HIPAA's retention requirement.</li>
+          <li><strong>When it bites:</strong> if a regulator or customer wants fast ad-hoc queries over years of audit data, or if PHI-access volume jumps an order of magnitude &mdash; then move the audit log to its own Postgres (it's already a self-contained, append-only table) or to a columnar store. <strong>Revisit trigger:</strong> audit-table size approaching ~a few hundred GB online, or audit-query latency hurting the OLTP node.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Schema delta (C9-bis &mdash; the audit log + RLS, introduced here)</h3>
+<pre class="line-numbers"><code class="language-sql">-- Append-only audit log, monthly-partitioned, write-once.
+CREATE TABLE audit_log (
+  ts          timestamptz NOT NULL DEFAULT now(),
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  actor_user_id bigint NOT NULL,
+  clinic_id   bigint NOT NULL,
+  action      text NOT NULL,        -- 'read' | 'write'
+  resource_type text NOT NULL,      -- 'patient' | 'note' | 'appointment' | ...
+  resource_id bigint,
+  purpose     text,                 -- free-text reason / treatment | payment | operations code
+  break_glass boolean NOT NULL DEFAULT false,
+  request_id  uuid,
+  PRIMARY KEY (ts, id)
+) PARTITION BY RANGE (ts);
+-- one partition per month: CREATE TABLE audit_log_2026_05 PARTITION OF audit_log FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+-- the app role has INSERT only on audit_log; no UPDATE/DELETE grant -> append-only by privilege.
+-- partitions older than ~12 months: ALTER TABLE audit_log DETACH PARTITION audit_log_2025_05;  -- then pg_dump -> object storage.
+
+-- Row-Level Security: per-clinic isolation enforced in the DB.
+ALTER TABLE patient ENABLE ROW LEVEL SECURITY;       -- (and provider, appointment, note, user)
+CREATE POLICY clinic_isolation ON patient
+  USING (clinic_id = current_setting('app.current_clinic')::bigint);
+-- our_support break-glass: a SECURITY DEFINER function that, given a logged reason, sets app.current_clinic for a short TTL
+--   and writes an audit_log(break_glass=true) row + emits an alert; normal app role cannot bypass the policy.
+
+-- Encryption: TDE / encrypted volumes for the Postgres data + WAL + backups; envelope-encrypted with a cloud KMS key (BAA-covered).
+</code></pre>
+      </div>
+
+      <div>
+        <h3>Numbers after Iter 2</h3>
+<pre class="line-numbers"><code class="language-text">#systems_to_operate:  ~4  ->  ~4   UNCHANGED -- HIPAA added a table, partition rules, RLS policies, and TLS/KMS config to
+                                    things we already run; the cloud KMS is a managed service we already use under a BAA, not a
+                                    new "system to patch + page on" in the operational sense. (If you count KMS, it's ~4-5.)
+$/month:              + audit storage ~$25/mo (a year of cold audit partitions) + KMS ~$1-5/mo + (negligible TDE/TLS cost)
+                      ~=  still ~$1k-$2k/mo at this stage (Iter 3 adds the warm standby + full backups).
+latency / throughput: each PHI handler now does +1 small INSERT (audit row) in its transaction -- ~sub-ms; RLS adds a WHERE
+                      clause the DB optimizer folds in -- negligible. p99 unchanged (~few-ms handlers, ~1 ms reads).
+what changed / didn't: ADDED: append-only audit_log (monthly-partitioned, archived), per-clinic RLS, encryption-at-rest+TLS+KMS,
+                       RBAC, break-glass, BAAs, the documented addressable-safeguard decisions. NOT added: SIEM, SOC, HSM, DLP.
+                       UNCHANGED: the 4-component shape, the workload, the latency, and the discipline (minimum necessary).
+</code></pre>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>Impact:</strong> the regulatory floor is met &mdash; an auditor's three questions (who accessed PHI? is it encrypted? can you restore it?) are answered by an append-only Postgres table, the cloud KMS, and (next iteration) a drilled restore runbook. Crucially, HIPAA added <em>zero new systems</em>: the audit log is a table, isolation is a policy, encryption is a config flag on infrastructure we already run under a BAA. The minimum-necessary discipline did the work &mdash; we built the required floor and <em>documented our risk decision</em> for everything addressable rather than reflexively standing up a SIEM/SOC/HSM/DLP stack a 3-person team can't run. The accepted cost (the audit log grows forever) is handled by partitioning + archival for ~$25/mo, with a clear trigger to split it out if scale demands.</p>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>&#128256; If this were PCI-DSS (card data) or full enterprise (SOC 2 Type II + a security team) instead of HIPAA</summary>
+        <ul>
+          <li>PCI: card data never touches our stores (the BAA-covered processor tokenizes it) &mdash; so the &ldquo;in scope&rdquo; surface shrinks, but you add network segmentation evidence and quarterly scans; still no new datastore.</li>
+          <li>SOC 2 Type II + a real security team: now the SIEM and the formal access reviews and continuous monitoring <em>do</em> get built &mdash; because the headcount and the customer demand make them pay. That's a re-engineering step, motivated by a constraint that changed; the audit log we already have is the foundation it sits on.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- DE-ENG ITER 3 -- DR & ops, the runbook way                     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iter-3">
+    <div class="container">
+      <h2>De-engineering Iteration 3 &mdash; DR and operations, the runbook way (not the hot-standby way)</h2>
+
+      <div class="full-width">
+        <h3>Bottleneck analysis &mdash; the contingency-plan gap</h3>
+        <p>After Iter 2 the design is a monolith + one Postgres + an LB + the HIPAA data floor &mdash; but there is one Postgres in one AZ, no standby, and no tested restore. HIPAA's contingency-plan requirement (data backup + disaster recovery + emergency mode) is unmet, and a single-AZ Postgres is a single point of failure. The reference design's answer &mdash; multi-region active-active + a hot standby + a 24/7 SRE rotation &mdash; is exactly the operational complexity the staffing constraint forbids: 3 people cannot reason about cross-region replication lag, split-brain, and active-active conflict resolution at 3&nbsp;a.m. So the move is the <em>minimum</em> contingency plan that satisfies HIPAA and the agreed BAA RTO/RPO: a warm standby (built-in Postgres streaming replication) + automated backups + a drilled restore runbook + a small on-call rotation. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a> for the standing RPO/RTO/drill definitions; <a href="../canonicals/bottleneck-to-decisions.html#cross-region">bottleneck-to-decisions#cross-region</a> in the <em>anti-direction</em> &mdash; this is the decision the page <em>declines</em> to revisit (multi-region) because the fix costs more operational complexity than the bottleneck (an AZ loss) costs at our scale.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>System after this iteration &mdash; the final shape</h3>
+        <svg viewBox="0 0 1240 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 3 (final): clinic web app to a load balancer to two or three modular-monolith instances, talking to a primary Postgres in availability zone A. A warm standby Postgres in availability zone B receives streaming replication. WAL archiving plus daily base backups go to object storage; archived cold audit partitions also go there. A documented and drilled restore runbook is the recovery procedure; a 3-way on-call rotation among the team is the human side. What is deliberately removed versus the reference design (faded, crossed out): multi-region active-active, a hot standby with automatic sub-second failover, a 24-7 dedicated SRE team. Recovery point objective about minutes; recovery time objective about one hour. Four components: app, Postgres (primary plus warm standby), load balancer, backups.">
+          <defs>
+            <marker id="arr3s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arr3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+            <marker id="arr3r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/></marker>
+          </defs>
+
+          <rect class="ok" x="20" y="50" width="130" height="60" rx="8"/>
+          <text x="85" y="76" text-anchor="middle" font-weight="bold">Clinic web app</text>
+          <text x="85" y="94" text-anchor="middle" class="lbl">a few hundred RPS</text>
+
+          <rect class="box" x="190" y="50" width="100" height="60" rx="8"/>
+          <text x="240" y="76" text-anchor="middle" font-weight="bold">Load bal.</text>
+          <text x="240" y="94" text-anchor="middle" class="lbl">managed L7</text>
+
+          <rect class="box" x="330" y="40" width="190" height="90" rx="8"/>
+          <text x="425" y="64" text-anchor="middle" font-weight="bold">Modular monolith &times;2-3</text>
+          <text x="425" y="82" text-anchor="middle" class="lbl">+ queue worker + audit hook</text>
+          <text x="425" y="100" text-anchor="middle" class="lbl">one deployable, one pipeline</text>
+          <text x="425" y="118" text-anchor="middle" class="lbl">RLS-scoped DB sessions</text>
+
+          <rect class="cool" x="560" y="20" width="190" height="100" rx="8"/>
+          <text x="655" y="46" text-anchor="middle" font-weight="bold">Postgres primary</text>
+          <text x="655" y="64" text-anchor="middle" class="lbl">AZ&nbsp;A &middot; db.r6g.2xlarge</text>
+          <text x="655" y="82" text-anchor="middle" class="lbl">all tables + queue + tsvector</text>
+          <text x="655" y="100" text-anchor="middle" class="lbl">+ audit_log + RLS + TDE</text>
+
+          <rect class="accent" x="560" y="150" width="190" height="90" rx="8"/>
+          <text x="655" y="176" text-anchor="middle" font-weight="bold">Postgres warm standby</text>
+          <text x="655" y="194" text-anchor="middle" class="lbl">AZ&nbsp;B &middot; streaming replication</text>
+          <text x="655" y="212" text-anchor="middle" class="lbl">promote on AZ&nbsp;A loss</text>
+          <text x="655" y="230" text-anchor="middle" class="lbl">(NOT auto-failover; runbook)</text>
+
+          <rect class="accent" x="790" y="60" width="180" height="100" rx="8"/>
+          <text x="880" y="86" text-anchor="middle" font-weight="bold">Backups / object store</text>
+          <text x="880" y="104" text-anchor="middle" class="lbl">WAL archive (cont.)</text>
+          <text x="880" y="122" text-anchor="middle" class="lbl">+ daily base backups</text>
+          <text x="880" y="140" text-anchor="middle" class="lbl">+ cold audit partitions</text>
+
+          <rect class="ok" x="790" y="190" width="180" height="80" rx="8"/>
+          <text x="880" y="216" text-anchor="middle" font-weight="bold">Drilled restore runbook</text>
+          <text x="880" y="234" text-anchor="middle" class="lbl">RPO ~minutes / RTO ~1 hr</text>
+          <text x="880" y="252" text-anchor="middle" class="lbl">3-way on-call rotation</text>
+
+          <rect class="danger" x="1000" y="60" width="220" height="200" rx="8"/>
+          <text x="1110" y="86" text-anchor="middle" font-weight="bold" class="struck">multi-region active-active</text>
+          <text x="1110" y="108" text-anchor="middle" font-weight="bold" class="struck">hot standby (auto sub-sec failover)</text>
+          <text x="1110" y="130" text-anchor="middle" font-weight="bold" class="struck">24/7 dedicated SRE team</text>
+          <text x="1110" y="158" text-anchor="middle" class="lbl">REMOVED vs reference design</text>
+          <text x="1110" y="178" text-anchor="middle" class="lbl">accepted: AZ loss = ~minutes-to-1hr down</text>
+          <text x="1110" y="198" text-anchor="middle" class="lbl">revisit when a contract demands tighter RTO</text>
+          <text x="1110" y="218" text-anchor="middle" class="lbl">or downtime is a real revenue hit</text>
+          <text x="1110" y="244" text-anchor="middle" class="lbl">(then: promote standby to hot + multi-AZ LB)</text>
+
+          <line x1="150" y1="80" x2="190" y2="80" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="170" cy="80" r="9" fill="#fff" stroke="#475569"/><text x="170" y="84" text-anchor="middle" font-size="10">1</text>
+          <line x1="290" y1="80" x2="330" y2="85" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="310" cy="82" r="9" fill="#fff" stroke="#475569"/><text x="310" y="86" text-anchor="middle" font-size="10">2</text>
+          <line x1="520" y1="85" x2="560" y2="70" stroke="#475569" marker-end="url(#arr3s)"/>
+          <circle cx="540" cy="77" r="9" fill="#fff" stroke="#475569"/><text x="540" y="81" text-anchor="middle" font-size="10">3</text>
+          <line x1="655" y1="120" x2="655" y2="150" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="672" cy="135" r="9" fill="#fff" stroke="#94a3b8"/><text x="672" y="139" text-anchor="middle" font-size="10">4</text>
+          <line x1="750" y1="80" x2="790" y2="90" stroke="#94a3b8" stroke-dasharray="4,4" marker-end="url(#arr3d)"/>
+          <circle cx="770" cy="83" r="9" fill="#fff" stroke="#94a3b8"/><text x="770" y="87" text-anchor="middle" font-size="10">5</text>
+          <line x1="560" y1="195" x2="425" y2="130" stroke="#dc2626" stroke-dasharray="6,3" marker-end="url(#arr3r)"/>
+          <circle cx="492" cy="162" r="9" fill="#fff" stroke="#dc2626"/><text x="492" y="166" text-anchor="middle" font-size="10">6</text>
+        </svg>
+      </div>
+
+      <div class="callout callout-info full-width">
+        <p><strong>Connections (numbered) and line-style legend.</strong> <em>Solid slate = sync request path; dashed gray = async replication / backup; dashed red = failover (a deliberate, runbook-driven action, not automatic).</em> Gold boxes = the boring DR primitives (streaming replication, WAL archiving, a drilled runbook). Faded/struck = the multi-region/hot-standby/SRE-team apparatus we did <em>not</em> build.</p>
+        <ul style="column-count:2;column-gap:2rem;list-style:none;padding-left:0;margin:0.5rem 0;">
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9312; <strong>Web app &rarr; LB</strong> &mdash; unchanged.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9313; <strong>LB &rarr; Monolith</strong> &mdash; unchanged; 2&ndash;3 instances spread across AZs A and B so an AZ loss doesn't take all the app instances.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9314; <strong>Monolith &rarr; Postgres primary (AZ A)</strong> &mdash; all reads + writes go to the primary; <code>synchronous_commit=on</code> (durable on local commit); the app knows the primary's address from a single DNS/config entry it re-resolves on failover.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9315; <strong>Primary &rarr; Warm standby (AZ B)</strong> &mdash; Postgres streaming replication (asynchronous &mdash; we accept ~seconds of replication lag = the RPO floor for an AZ-loss scenario; we are <em>not</em> doing synchronous multi-AZ commit, which would add latency to every write for a durability guarantee a small clinic SaaS doesn't need at this stage). The standby is &ldquo;warm&rdquo;: caught up, not serving traffic, ready to promote.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9316; <strong>Primary &rarr; Backups / object store</strong> &mdash; continuous WAL archiving + a daily base backup to object storage (KMS-encrypted) &rarr; point-in-time recovery to any moment in the retention window (RPO ~minutes via WAL); cold audit partitions land here too. Tested: a quarterly restore drill (restore to a scratch instance, verify a few rows, time it) &mdash; an untested backup is not a backup.</li>
+          <li style="break-inside:avoid;margin-bottom:0.5rem;">&#9317; <strong>Warm standby &rarr; Monolith (failover, runbook)</strong> &mdash; on AZ-A loss: an on-call engineer runs the runbook &mdash; promote the standby, repoint the app's DB DNS entry, verify, optionally spin a new standby in a third AZ. ~minutes-to-~1-hour end to end (the standby is already caught up; the time is detection + the human-in-the-loop steps + DNS propagation). Deliberately not automatic: a 3-person team prefers a known, drilled, manual promote over an automatic failover that can flap or split-brain in ways they can't debug at 3&nbsp;a.m.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Which constraint forced the removal &amp; what we did instead</h3>
+        <ul>
+          <li><strong>Constraint:</strong> &le;&nbsp;3 engineers + a modest budget &mdash; but HIPAA requires a contingency plan. A multi-region active-active design (the reference) means the team reasons about cross-region replication lag, conflict resolution, and split-brain &mdash; failure modes 3 people can't debug under pressure; a hot standby with automatic failover adds flapping/split-brain risk for a sub-second-RTO benefit no contract demands.</li>
+          <li><strong>What we did instead:</strong> a warm standby via built-in Postgres streaming replication (one extra node, one well-understood mechanism); continuous WAL archiving + daily base backups to object storage (RPO ~minutes via PITR); a documented <em>and drilled</em> restore runbook (RTO ~1 hour &mdash; the agreed BAA target for a back-office clinic SaaS); and a small on-call rotation among the 3 engineers with a clear escalation path. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>; cite <a href="../canonicals/replication-decisions.html#single-async">replication-decisions#single-async</a> (single-leader async replica &mdash; the chosen topology) over <a href="../canonicals/replication-decisions.html#single-sync">#single-sync</a> (rejected: per-write latency for durability we don't need) and <a href="../canonicals/replication-decisions.html#multi-leader-async">#multi-leader-async</a> (rejected: conflict resolution the team can't operate). <strong>Why streaming replication over Aurora-style multi-AZ or a hot active-active</strong>: streaming replication is in the box, one mechanism, one mental model; Aurora multi-AZ is more automatic but more magic to debug and more $; a hot active-active is the reference design's complexity. At our scale and team size, &ldquo;the boring built-in thing with a drilled runbook&rdquo; wins.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Bottleneck we now accept (and when it bites)</h3>
+        <ul>
+          <li><strong>Accepted bottleneck:</strong> an AZ loss = ~minutes-to-~1-hour of downtime (detect + promote the standby + DNS propagation), not the seconds a hot active-active gives; and the async standby means RPO ~seconds (the replication lag) rather than zero. Classified as accepting the consequences of <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a> on a manual-failover topology, and declining the <a href="../canonicals/bottleneck-to-decisions.html#cross-region">cross-region</a> fix.</li>
+          <li><strong>When it bites:</strong> when a clinic's contract demands a tighter RTO (e.g., 5 minutes), or when you're at enough clinics that an hour of downtime in a workday is a material revenue/reputation hit. <strong>Revisit trigger:</strong> a contract clause or a revenue-impact threshold &rarr; promote the warm standby to a hot standby with automatic failover + multi-AZ load balancing (cuts RTO to ~minutes) &mdash; cost: +effectively the same Postgres node (it's already there, just now serving) + meaningful operational complexity (now you reason about replication lag affecting reads and split-brain detection). Past <em>that</em>: multi-region active-active &mdash; the reference design, introduced one bottleneck at a time, exactly as <a href="46-multi-region-active-active.html">#46</a> does. <strong>Bottleneck budget exhausted</strong> (Reference + 4 de-engineering iterations: Iter 0 monolith, Iter 1 Postgres-absorbs-3, Iter 2 HIPAA floor, Iter 3 DR runbook).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Numbers after Iter 3 (final)</h3>
+<pre class="line-numbers"><code class="language-text">#systems_to_operate:  ~4   app (1 deployable) + Postgres (primary + warm standby = one system to reason about, replicated) +
+                            load balancer + backups/object-store.  (KMS is a managed dependency, not a "patch + page" system.)
+implied headcount:    ~3   the constraint, met:  the monolith is a 1-2 person codebase; Postgres+standby+backups+LB are managed-ish
+                            with a drilled runbook; a 3-way on-call rotation covers it.
+$/month:              Postgres primary ~$360 + warm standby ~$360 + 2-3 app instances ~$300-500 + LB ~$25 + backups/object
+                      storage ~$50-150 + KMS ~$1-5 + email/SMS vendor ~$50-200  ->  ~$1.2k-$1.6k base, call it ~$2k-$5k/mo
+                      all-in with headroom and traffic egress.  vs reference ~$50k-$150k/mo.  ~10-50x cheaper.
+RPO / RTO:            RPO ~minutes (continuous WAL archiving + PITR; standby lag ~seconds for the AZ-loss case).
+                      RTO ~1 hour (detect + promote warm standby + DNS) -- the agreed BAA target.
+availability:         ~99.9% (single-AZ-loss = a planned, drilled ~1-hour event; not the 99.99% a hot active-active gives).
+latency / throughput: UNCHANGED -- ~few-ms handlers, ~1 ms reads, sub-100 ms search; a few hundred RPS with 10-50x write headroom.
+what changed / didn't: ADDED: a warm standby (streaming replication), WAL archiving + daily backups, a drilled restore runbook,
+                       a 3-way on-call rotation.  NOT added: multi-region, hot standby, auto-failover, a dedicated SRE team.
+                       UNCHANGED: the 4-component shape, the modular monolith, the one Postgres, the HIPAA floor, the workload.
+</code></pre>
+      </div>
+
+      <div class="callout callout-warn full-width">
+        <p><strong>Impact:</strong> the HIPAA contingency-plan requirement is met and the single-AZ SPOF is removed &mdash; with <em>one</em> extra Postgres node (a warm standby via the database's built-in streaming replication), backups to object storage, and a runbook the team drills quarterly. The accepted cost &mdash; an AZ loss is a ~1-hour, human-in-the-loop event, not a seconds-long automatic one &mdash; is the <em>right</em> trade when the alternative is 3 people running a multi-region system whose failure modes they can't reason about at 3&nbsp;a.m.; and the revisit trigger (a contract demanding a tighter RTO) is named, so the day someone needs hot-standby, the path is clear. This is the &ldquo;runbook beats robot&rdquo; bet at small team size: a drilled manual failover you understand beats an automatic one you don't.</p>
+      </div>
+
+      <details class="constraint-flip">
+        <summary>&#128256; If a top-3 clinic's contract demanded a 5-minute RTO and zero RPO</summary>
+        <ul>
+          <li>Iter 3 reverses one step: promote the warm standby to a hot standby with automatic failover (cuts RTO to ~minutes) and switch the primary's commit to synchronous replication to the standby (RPO &rarr; 0, at +a few ms per write). Cost: ~the same node count, +operational complexity (replication-lag-aware reads, split-brain detection). That's a re-engineering step, motivated by a contract that changed &mdash; not a day-one default.</li>
+          <li>If <em>many</em> contracts demand it, or downtime becomes a real revenue hit: go multi-region active-active &mdash; the reference design, introduced one measured bottleneck at a time. See <a href="46-multi-region-active-active.html">#46</a> for that journey; this page is its prequel.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- PROBES                                                         -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="probes">
+    <div class="container">
+      <h2>Probe iterations <span style="font-weight:normal;font-size:0.7em;">(the interviewer pulls the thread &mdash; beyond the 4 de-engineering iterations)</span></h2>
+      <p>The de-engineering budget is spent (Reference + Iter 0&ndash;3). These probes are the threads an interviewer pulls &mdash; mostly about <em>re-engineering</em> (the inverse of this page), plus the regulatory and failure stress tests.</p>
+
+      <details>
+        <summary><strong>&ldquo;What if you grow to 10&times; clinics &mdash; 5,000 clinics, 50&nbsp;M patients?&rdquo; &mdash; the de-engineering in reverse</strong></summary>
+        <p>You re-engineer, one measured bottleneck at a time &mdash; the exact inverse of the order this page de-engineered: (1) <strong>read replica</strong> &mdash; when the buffer-cache hit ratio drops and read p99 climbs, add a Postgres read replica (still Postgres) and route reads + patient search to it; the primary now does writes + the queue + audit (this also relieves the &ldquo;heavy search competes with OLTP&rdquo; bottleneck Iter 1 accepted). (2) <strong>extract search to Elasticsearch</strong> &mdash; when search queries get genuinely complex (fuzzy, ranked, cross-clinic) or search load is ~10&times; OLTP, feed an ES cluster from the patient table's change stream; the <code>tsvector</code> column stays as a fallback. (3) <strong>split out the queue/audit</strong> &mdash; when the queue's churn (or the audit log's write rate) starts producing autovacuum lag that hurts OLTP, move the <code>job_queue</code> table (and/or the <code>audit_log</code>) to its own Postgres &mdash; they're already self-contained. (4) <strong>extract the highest-load module into a service</strong> &mdash; when one module's CPU/connection share is ~10&times; the rest and growing, carve it out (it's a clean package boundary); now you have a 2-service system, not a monolith &mdash; and you adopt the minimal mesh-ish glue (service discovery, mTLS) for those two. (5) <strong>multi-region</strong> &mdash; when a contract or a revenue threshold demands it, the warm standby becomes a hot standby, then a second region &mdash; the reference design, reached the right way. Each step is one move with a measured trigger &mdash; this page's iterations, run backward.</p>
+      </details>
+
+      <details>
+        <summary><strong>&ldquo;A regulator audits you tomorrow &mdash; what do you show them?&rdquo;</strong></summary>
+        <p>You point at three things, all of which already exist: (1) the <code>audit_log</code> table &mdash; append-only, monthly-partitioned, write-once-by-privilege, with cold partitions archived to object storage; you run a query and show every PHI access (actor, clinic, resource, purpose, break-glass flag, timestamp) for any patient over any window. (2) the <em>documented risk decisions</em> for every <em>addressable</em> safeguard &mdash; encryption-at-rest (implemented), automatic logoff (implemented), the SIEM/SOC/HSM/DLP suite (not implemented; here is the reasoned decision and the equivalent alternative), per the addressable-implementation-specification mechanism. (3) the <em>drilled restore runbook</em> + the last quarterly drill's timing &mdash; the contingency plan, tested. Plus: the BAAs (with dates) with the cloud provider, KMS, object storage, and the email/SMS vendor; the RBAC role definitions; the encryption config (TDE, TLS, KMS envelope). The audit log, the documented decisions, and the drilled restore <em>are</em> the answer &mdash; this is exactly why Iter 2 built the floor and Iter 3 drilled the restore. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</p>
+      </details>
+
+      <details>
+        <summary><strong>&ldquo;Your one Postgres primary dies right now &mdash; walk me through it.&rdquo;</strong></summary>
+        <p>On-call gets paged (the LB health checks and the app's DB-error rate both fire). Runbook step 1: confirm it's the primary, not a network blip (check the standby's replication state &mdash; is it still receiving WAL?). Step 2: <code>pg_ctl promote</code> the warm standby in AZ B (it's caught up to within ~seconds &mdash; that's the RPO). Step 3: repoint the app's single DB DNS/config entry to the new primary (the app re-resolves on connection error); the app comes back. Step 4: optionally spin a fresh standby in a third AZ. End to end: ~minutes-to-~1-hour (mostly detection + the human steps + DNS propagation) &mdash; the agreed RTO. The data loss is bounded by the replication lag (~seconds) plus, if the standby were also lost, point-in-time recovery from WAL archive (RPO ~minutes). This is deliberately a human-in-the-loop procedure: a 3-person team prefers a drilled manual promote over an automatic failover that can flap. Cite <a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a>.</p>
+      </details>
+
+      <details>
+        <summary><strong>&ldquo;You hire 20 more engineers &mdash; now what?&rdquo;</strong></summary>
+        <p>Now the reference design's moves start to pay off &mdash; but you introduce them <em>one at a time, each justified by a measured bottleneck</em>, exactly like a normal NALSD page (this scenario is the prequel to the others). With teams that need independent release cadence, split the monolith into services along the module boundaries you kept honest from day one. With higher event volume and consumers that need replay, the Postgres queue becomes Kafka. With a working set that outgrows the buffer pool, a read replica then Redis. With complex search, Elasticsearch. With a cross-tenant analytics product, a warehouse + a data team. With a contract demanding a tighter RTO, a hot standby then multi-region. The discipline doesn't change &mdash; you just have the headcount to <em>operate</em> the sophistication now, so the operational-complexity NFR loosens and the bottlenecks that were &ldquo;accepted, revisit later&rdquo; become &ldquo;fix now.&rdquo; The mistake to avoid: doing all of it at once because you can afford the people &mdash; you still introduce each move only when a number forces it.</p>
+      </details>
+
+      <details>
+        <summary><strong>The boring-technology budget &mdash; how many risky choices do you get?</strong></summary>
+        <p>McKinley's &ldquo;Choose Boring Technology&rdquo; framing: you get ~3 &ldquo;innovation tokens&rdquo; &mdash; new/risky technologies whose failure modes you don't yet know in your bones. Running Kafka + Redis + Elasticsearch at this scale spends all 3 tokens on <em>plumbing</em> &mdash; infrastructure that adds zero product value here. Spend the tokens on the <em>product</em> instead: maybe a clever appointment-overlap data structure, maybe a slick clinical-note editor, maybe a smart reminder-timing model &mdash; things customers see. Postgres, a modular monolith, a load balancer, and backups are <em>boring on purpose</em>: their failure modes are documented, the team knows them, the operational surface is small. The de-engineering iterations on this page are, in aggregate, &ldquo;don't spend your innovation tokens on infrastructure you don't need at this scale&rdquo; &mdash; which is the same thing as &ldquo;you are not Google,&rdquo; the same thing as &ldquo;the majestic monolith,&rdquo; the same thing as HIPAA's &ldquo;minimum necessary.&rdquo;</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S6. Final (minimal) Design                                     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s6-final">
+    <div class="container">
+      <h2>S6. Final (minimal) Design</h2>
+      <p>The shape after de-engineering: <strong>4 components</strong> &mdash; a modular monolith (one deployable), one Postgres (primary + a warm standby), a managed load balancer, and backups to object storage. Plus the cloud KMS as a managed dependency and a BAA-covered email/SMS vendor. The architecture diagram is Iter 3's diagram &mdash; that <em>is</em> the final design (the final de-engineering iteration <em>is</em> the final design, by construction). Below: the de-engineering stack table, the fleet comparison, the consolidated schema, the cross-cutting table, the degradation contract, operations, and cost.</p>
+
+      <div class="full-width">
+        <h3>De-engineering stack (per-iteration delta &mdash; what was removed, what bottleneck was accepted)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Stage</th><th>What was removed</th><th>Constraint that forced it</th><th>Bottleneck accepted</th><th>Revisit trigger</th><th>#systems</th><th>headcount</th><th>$/mo (OOM)</th></tr></thead>
+            <tbody>
+              <tr><td>Reference (not built)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>~25</td><td>~15&ndash;30</td><td>~$50k&ndash;150k</td></tr>
+              <tr><td>&minus; Iter 0: collapse to a modular monolith</td><td>service mesh, inter-service RPC, ~12+ microservices, ~12+ per-service DBs</td><td>&le;&nbsp;3 engineers can't operate a 15-service mesh</td><td>can't scale modules independently (whole app scales as a unit)</td><td>one module's load ~10&times; the rest &rarr; carve it out (clean package boundary)</td><td>~6</td><td>feasible at ~3 once Iter 1 lands</td><td>~$3k&ndash;8k</td></tr>
+              <tr><td>&minus; Iter 1: Postgres absorbs queue + cache + search</td><td>Kafka, Redis, Elasticsearch</td><td>Postgres-only; &le;&nbsp;3 engineers don't run 3 distributed systems</td><td>one Postgres node carries everything (write cap ~thousands/s; conn limit; search vs OLTP)</td><td>read p99 &uarr; &rarr; read replica; write rate &asymp; 1000/s &rarr; split out queue/audit; complex search &rarr; ES</td><td>~4</td><td>~3 (constraint met)</td><td>~$1k&ndash;2k</td></tr>
+              <tr><td>+ Iter 2: HIPAA, minimum-necessary (adds the regulatory floor)</td><td>(adds: audit log, RLS, encryption, BAAs) &mdash; <em>declines</em>: SIEM, SOC, HSM, DLP</td><td>HIPAA required floor; staffing/tech-minimalism shape it</td><td>audit log grows forever (~3&nbsp;GB/day on one node)</td><td>audit table &asymp; hundreds of GB online or audit queries hurt OLTP &rarr; split it out</td><td>~4</td><td>~3</td><td>~$1k&ndash;2k</td></tr>
+              <tr><td>&minus; Iter 3: DR the runbook way</td><td>multi-region active-active, hot standby + auto-failover, 24/7 dedicated SRE team</td><td>&le;&nbsp;3 engineers can't reason about multi-region/split-brain at 3&nbsp;a.m.</td><td>AZ loss = ~minutes-to-~1-hour down (not seconds); RPO ~seconds (async standby)</td><td>contract demands tighter RTO / downtime = real revenue hit &rarr; hot standby, then multi-region</td><td>~4</td><td>~3</td><td>~$2k&ndash;5k all-in</td></tr>
+              <tr><td><strong>Final (minimal)</strong></td><td>&mdash;</td><td>&mdash;</td><td>(the four above, each with a named trigger)</td><td>(see each iteration)</td><td><strong>~4</strong></td><td><strong>~3</strong></td><td><strong>~$2k&ndash;5k</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Total de-engineering:</strong> ~25 components &rarr; ~4 (≈6&times; fewer things to operate); ~15&ndash;30 engineers &rarr; ~3 (the constraint, met); ~$50k&ndash;150k/mo &rarr; ~$2k&ndash;5k/mo (≈10&ndash;50&times; cheaper). And the latency/throughput NFR was satisfied the whole time &mdash; the reference design over-built for a workload that one mid-size Postgres + 2&ndash;3 app instances handles with 10&ndash;50&times; headroom. The point isn't that the reference design is wrong &mdash; it's the right answer at a scale this system isn't at. The point is that <em>matching the design to the constraint</em> (small team, Postgres-only, HIPAA-minimum) is the senior move; reflexive sophistication is the junior one.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>No LC kernel &mdash; this page practices de-engineering</h3>
+        <div class="callout callout-info">
+          <p><strong>No LC kernel; this page practices de-engineering.</strong> Each iteration <em>removes</em> a move and names the bottleneck it deliberately accepts (and the trigger that would justify adding the move back). The &ldquo;production cousin&rdquo; relationship is <em>inverted</em>: the sophisticated designs in the other scenario pages are what this system would <em>grow into</em> if its constraints lifted &mdash; see each iteration for the constraint that forbade the move and the trigger that would justify it. So there is no &ldquo;textbook structure &rarr; production cousin&rdquo; property-trade table here; instead, the &ldquo;property trade&rdquo; is, for each component the reference design has: <em>property gained by removing it</em> = fewer things to operate, smaller on-call surface, fewer innovation tokens spent on plumbing; <em>property lost</em> = the named accepted bottleneck; <em>why the (de-)swap</em> = the constraint. Reference&rarr;minimal mapping: microservices+mesh &rarr; modular monolith (gain: 1 deployable; lose: independent module scaling; why: 3 engineers); Kafka &rarr; Postgres+<code>SKIP LOCKED</code> (gain: no stream to run; lose: replay/ordering/throughput we don't need; why: Postgres-only + ~1000&times; headroom); Redis &rarr; buffer pool + in-process LRU (gain: no cache cluster; lose: nothing at this scale; why: hot set fits RAM); Elasticsearch &rarr; <code>tsvector</code>+GIN (gain: no search cluster; lose: relevance/fuzzy; why: &ldquo;find this patient&rdquo; doesn't need it); warehouse &rarr; (not built; the records + audit log are retained) (gain: no ETL/data team; lose: cross-tenant BI; why: S0 non-goal); multi-region/hot-standby/SRE-team &rarr; warm standby + drilled runbook (gain: a DR plan a 3-person team can run; lose: seconds-RTO and zero-RPO; why: no contract demands them yet).</p>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; consolidated schema reference (everything in <em>one</em> Postgres)</h3>
+        <p>Introduced piecemeal: the relational tables exist from the start (modular monolith, Iter 0); the <code>job_queue</code> table + <code>tsvector</code> search column in Iter 1; the <code>audit_log</code> partitioned table + RLS policies in Iter 2; the warm standby + WAL archiving config in Iter 3. Consolidated here &mdash; not the only place it lives.</p>
+<pre class="line-numbers"><code class="language-sql">-- One Postgres 16. Why Postgres over MySQL/Aurora/CockroachDB here: Postgres ships SKIP LOCKED (the queue), tsvector+GIN
+--   (search), RLS (per-tenant isolation), partitioning (the audit log), and TDE/encrypted volumes -- all the moves this design
+--   needs, in one boring engine the team knows. MySQL: weaker full-text + no native RLS. Aurora: more automatic, more $, more
+--   magic to debug for a 3-person team. CockroachDB: distributed (multi-region) -- the complexity we're explicitly declining.
+CREATE TABLE clinic   ( clinic_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text, timezone text, plan text, baa_signed_at date );
+CREATE TABLE app_user ( user_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, clinic_id bigint NOT NULL REFERENCES clinic,
+                        email citext UNIQUE NOT NULL, role text NOT NULL, pw_hash text, last_login_at timestamptz );
+CREATE TABLE patient  ( patient_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, clinic_id bigint NOT NULL REFERENCES clinic,
+                        name text, dob date, phone text, address text, created_at timestamptz DEFAULT now(), updated_at timestamptz,
+                        search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(name,'')||' '||coalesce(dob::text,'')||' '||coalesce(phone,''))) STORED );
+CREATE INDEX patient_by_clinic ON patient (clinic_id);
+CREATE INDEX patient_search_gin ON patient USING gin (search_tsv);   -- search: WHERE clinic_id=$1 AND search_tsv @@ plainto_tsquery($2)
+CREATE TABLE provider    ( provider_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, clinic_id bigint NOT NULL REFERENCES clinic, name text, availability jsonb );
+CREATE TABLE appointment ( appointment_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, clinic_id bigint NOT NULL REFERENCES clinic,
+                           patient_id bigint NOT NULL REFERENCES patient, provider_id bigint NOT NULL REFERENCES provider,
+                           starts_at timestamptz NOT NULL, ends_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'booked',
+                           billable boolean DEFAULT false, reminder_job_id bigint,
+                           EXCLUDE USING gist (provider_id WITH =, tstzrange(starts_at, ends_at) WITH &amp;&amp;) WHERE (status &lt;&gt; 'cancelled') );  -- no double-book
+CREATE TABLE note ( note_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, clinic_id bigint NOT NULL REFERENCES clinic,
+                    patient_id bigint NOT NULL REFERENCES patient, author_user_id bigint NOT NULL REFERENCES app_user, body text, created_at timestamptz DEFAULT now() );
+
+-- The queue (Iter 1):  job_queue (job_id, kind, payload jsonb, run_at, status, attempts, locked_by, locked_at, created_at)
+--   + partial index ON (run_at) WHERE status='ready';  dequeue with SELECT ... FOR UPDATE SKIP LOCKED LIMIT 50.
+-- The audit log (Iter 2):  audit_log (ts, id, actor_user_id, clinic_id, action, resource_type, resource_id, purpose, break_glass, request_id)
+--   PARTITION BY RANGE (ts), one partition/month; app role has INSERT only; partitions &gt;12 mo detached -> object storage.
+-- RLS (Iter 2):  every PHI table ENABLE ROW LEVEL SECURITY; POLICY USING (clinic_id = current_setting('app.current_clinic')::bigint);
+--   our_support break-glass via a SECURITY DEFINER function that logs + alerts + sets the GUC for a short TTL.
+-- Idempotency: idempotency_key (key text PK, response jsonb, created_at) -- a retried POST returns the stored response.
+-- Encryption (Iter 2): TDE / encrypted volumes for data + WAL + backups; envelope-encrypted with cloud KMS (BAA-covered).
+-- DR (Iter 3): a warm standby (streaming replication, async) in AZ B; continuous WAL archive + daily base backup to object storage (PITR).
+-- PgBouncer (transaction pooling) in front -> a few dozen server connections, well under max_connections. Part of "running Postgres".
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>) &mdash; several cells are &ldquo;N/A, out of scope under this constraint, here's the risk we accept&rdquo;</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>RBAC (4 roles) + Postgres RLS for per-clinic isolation (defense-in-depth); TLS everywhere; TDE/encrypted volumes; cloud KMS envelope encryption (BAA-covered, no self-run HSM &mdash; documented as addressable-risk-accepted); break-glass emergency access is logged + alerted; config/migration changes via the standard pipeline. <strong>Deliberately N/A:</strong> a SIEM, a dedicated SOC, a DLP suite &mdash; out of scope under the staffing constraint; risk accepted &amp; documented per HIPAA's addressable-implementation-specification mechanism; revisit if a customer audit or scale demands it. Cite <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>The append-only <code>audit_log</code> (monthly-partitioned, write-once-by-privilege, cold partitions archived) records every PHI access; minimum-necessary RBAC; per-clinic RLS; data-deletion semantics = a clinic offboard runs a documented purge (its rows + a tombstone in the audit log); retention windows documented; BAAs with every subprocessor. Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>Warm standby in a second AZ (Postgres streaming replication, async) + continuous WAL archive + daily base backups to object storage (PITR) + a documented, quarterly-<em>drilled</em> restore runbook. RPO ~minutes; RTO ~1 hour (the agreed BAA target). <strong>Deliberately N/A:</strong> multi-region active-active, a hot standby with auto-failover &mdash; out of scope under the staffing/budget constraint; accepted risk = an AZ loss is a ~1-hour human-in-the-loop event; revisit when a contract demands a tighter RTO. Cite <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>The whole workload (a few hundred RPS, ~50&nbsp;k appointments/day, ~50&nbsp;GB hot set) sits in one mid-size Postgres + 2&ndash;3 app instances with ~10&ndash;50&times; write headroom and a hot set that fits the buffer pool. Autoscaling = add an app instance if CPU climbs (rare); the headroom factor (10&ndash;50&times;) is the planning margin, and the revisit ladder (read replica &rarr; split out queue/audit &rarr; ES) is the growth plan. Cite <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td><strong>N/A</strong> &mdash; single backend tier (one monolith fleet), one datastore, no fanout problem; nothing to subset. (If the team grows and the monolith splits, the carved-out service might need a connection-subset to Postgres &mdash; a future concern.) Cite <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td><strong>Mostly N/A by design</strong> &mdash; one region, one Postgres; the blast radius of a failure is &ldquo;the whole service&rdquo; (accepted, given the ~99.9% target). The closest thing to cell isolation is per-clinic RLS (a clinic can't see another's data) and the fact that the audit log is per-month-partitioned. A multi-cell architecture is a re-engineering step for the 10&times;-clinics future. Cite <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Real-time push</td><td><strong>N/A</strong> &mdash; the product is request/response (clinic staff load pages); no live-tail / streaming-to-client requirement. Reminders are delivered via the BAA-covered email/SMS vendor, enqueued in the Postgres <code>job_queue</code> and polled &mdash; not pushed. Cite <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td><strong>N/A for the application</strong> &mdash; a CDN sits in front of static assets (standard), but there's no edge-compute / geo-distributed-routing requirement for a single-region back-office SaaS. Edge is a re-engineering step if/when the patient-facing portal (a S0 non-goal) is built. Cite <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p>When the <strong>Postgres primary fails</strong> &rarr; on-call runs the runbook: promote the warm standby (caught up to ~seconds = the RPO), repoint the app's DB DNS entry, verify; ~minutes-to-~1-hour (= the RTO); during that window the app returns 5xx (it's a back-office tool &mdash; staff retry shortly). When the <strong>warm standby fails</strong> &rarr; the primary keeps serving (no replica = degraded DR posture, alerted); spin a fresh standby. When an <strong>app instance fails</strong> &rarr; the LB health-checks it out; the other 1&ndash;2 instances absorb the load (each was &lt;10% CPU); the queue worker on the surviving instances keeps polling. When a <strong>bad deploy ships</strong> &rarr; standard rollback (one artifact, one pipeline &mdash; redeploy the previous version); a small staging environment + a smoke test gate it (cite <a href="../canonicals/failure-modes.html#bad-deploy">failure-modes#bad-deploy</a>). When <strong>Postgres is slow</strong> (a heavy query, autovacuum, a missing index) &rarr; <code>pg_stat_statements</code> + <code>pg_stat_activity</code> name the offender; kill it / add the index; the queue worker backs off (cite <a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a>). When the <strong>email/SMS vendor is down</strong> &rarr; reminder jobs retry (the <code>job_queue</code> row stays, <code>attempts++</code>, exponential backoff) &mdash; at-least-once delivery; a delayed reminder is acceptable. When a <strong>row is corrupted / a clinic offboards</strong> &rarr; point-in-time recovery to before the corruption (WAL archive), or the documented purge for offboarding (cite <a href="../canonicals/failure-modes.html#data-corruption">failure-modes#data-corruption</a>). The invariant: <em>the service degrades to &ldquo;down for ~minutes-to-an-hour&rdquo; in the worst case (an AZ loss), never to &ldquo;data lost&rdquo; (RPO ~minutes) and never to &ldquo;PHI accessed without an audit trail&rdquo; (the audit insert is in the same transaction as the access).</em></p>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6) &mdash; deliberately minimal</h3>
+        <ul>
+          <li><strong>Metrics (SLIs &rarr; NFRs).</strong> A small dashboard: app request p99/p999 + 5xx rate (&rarr; the latency NFR); Postgres &mdash; buffer-cache hit ratio (&rarr; the &ldquo;hot set fits RAM&rdquo; assumption; if it drops, the read-replica trigger is near), connection count vs <code>max_connections</code> (&rarr; the connection-saturation watch item), replication lag to the warm standby (&rarr; the RPO), longest-running query, autovacuum lag, table sizes (esp. <code>audit_log</code> and <code>job_queue</code> &mdash; the split-out triggers); queue depth + oldest-ready-job age (&rarr; reminder timeliness); audit-log write rate + monthly-partition size (&rarr; the audit-growth trigger + an A/B-style integrity sanity check &mdash; PHI-reads should produce ~1 audit row each); break-glass-events count (should be ~0; each one alerts); backup age + last-restore-drill timestamp (&rarr; the DR NFR). That's it &mdash; ~a dozen graphs a 3-person team actually looks at, not a wall of dashboards nobody reads.</li>
+          <li><strong>Rollout.</strong> One artifact, one pipeline: build &rarr; a small staging env (one app instance + a small Postgres with anonymized data) &rarr; a smoke test &rarr; deploy to production (rolling over the 2&ndash;3 instances; the LB drains each). DB migrations: backward-compatible, applied before the code that needs them, with a one-command rollback for the code; expand-then-contract for any breaking change. A bad deploy rolls back by redeploying the previous artifact &mdash; minutes.</li>
+          <li><strong>On-call.</strong> A 3-way rotation among the 3 engineers; a short, drilled runbook for the handful of real incidents (primary failover, slow Postgres, bad deploy, vendor outage); a clear escalation path (everyone can do everything, so escalation is &ldquo;wake up a second person&rdquo;). The drilled-restore is quarterly. There is no 24/7 SOC and no separate SRE team &mdash; deliberately; the architecture was chosen so that 3 people <em>can</em> run it.</li>
+          <li><strong>Headroom.</strong> ~10&ndash;50&times; write headroom on the one Postgres node; the hot set (~50&nbsp;GB) fits the 64&nbsp;GB buffer pool with margin; app instances run &lt;10% CPU (they exist for redundancy + rolling deploys). Reasons for the margin: traffic growth, a noisy day, a heavy ad-hoc query, a rolling deploy that briefly runs N&minus;1 instances. The margin is the planning device &mdash; when it's eaten, the revisit ladder (read replica &rarr; split out queue/audit &rarr; ES) kicks in.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7 &mdash; cost AND operational complexity; cite <a href="../design-moves/cost-shapes.html">cost-shapes.html</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+<pre class="line-numbers"><code class="language-text">Minimal design, monthly (order of magnitude; exact figures depend on cloud + redundancy):
+  Postgres primary (db.r6g.2xlarge, managed):               ~$0.50/hr x 720          ~= $360/mo
+  Postgres warm standby (same class, AZ B, streaming repl): ~$0.50/hr x 720          ~= $360/mo
+  App instances (2-3 x c-class):                            ~2.5 x $0.30/hr x 720    ~= $540/mo  (call it $300-500)
+  Load balancer (managed L7):                               ~$25/mo + trivial LCU
+  Backups + WAL archive + cold audit partitions (object storage): ~50-150 GB-mo growing -> ~$50-150/mo (less for IA tier)
+  Cloud KMS (a few keys):                                   ~$1-5/mo
+  Email/SMS vendor (BAA-covered, ~50k reminders/day):       ~$50-200/mo (usage-priced)
+  ------------------------------------------------------------------------------------------------
+  TOTAL  ~=  ~$1.4k base  ->  ~$2k-$5k/mo all-in with traffic egress + headroom.   (1 sig fig: ~$3k/mo.)
+
+Reference (over-engineered) design, monthly:  a fleet of service instances + a Kafka cluster + a Redis cluster + a 3-node
+  Elasticsearch + an analytics warehouse + CDC/ETL + x2 regions of all of it  ~=  ~$50k-$150k/mo.   (1 sig fig: ~$100k/mo.)
+  Ratio: minimal is ~10-50x cheaper in dollars.
+
+Dominant cost (minimal design): the two Postgres nodes (~$720/mo, ~half the base) -- and that's the RIGHT place for the money
+  (the database is the durable, stateful, can't-lose-it part). Cost-shape lesson (cite cost-shapes.html, the database-heavy shape):
+  a small product service's bill is dominated by its primary datastore + its standby; everything else is a rounding error -- so
+  the cost lever is "do you need the standby's twin to be HOT (serving) or WARM (idle, ready)?".
+
+The cost-vs-X knob: the warm standby. Promote it to a HOT standby (serving reads, with automatic failover) + multi-AZ load
+  balancing -> RTO drops from ~1 hour to ~minutes, RPO can drop toward 0 (switch to synchronous replication, +a few ms/write).
+  Cost: ~the same node (it's already provisioned -- now it's serving) + MEANINGFUL operational complexity (you now reason about
+  replication-lag-affected reads and split-brain detection -- things a 3-person team must drill). Worth it ONLY past a named
+  threshold: a clinic contract clause demanding a tighter RTO, or a clinic count where an hour of downtime in a workday is a
+  material revenue/reputation hit. Below that threshold, warm standby + a drilled runbook is the cheaper AND simpler choice --
+  and "simpler" is a cost a 3-person team pays in sleep. There is no latency knob (the workload is tiny; everything is already ms).
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Real-system comparison</h3>
+        <p>This is the architecture a lot of successful small SaaS companies actually run, and a few have written about it: <strong>Basecamp/37signals</strong> popularized &ldquo;The Majestic Monolith&rdquo; (a small team should ship a well-modularized monolith, not a microservice constellation) and the &ldquo;One Person Framework&rdquo; idea (the framework should let one person build and run a real product); <strong>Stack Overflow</strong> famously served enormous traffic for years on a handful of servers and a couple of SQL Server boxes &mdash; the canonical &ldquo;you don't need FAANG architecture for non-FAANG scale&rdquo; case; <strong>Pinboard</strong> (Maciej Cegłowski) ran a profitable bookmarking business as one person on one boring box for over a decade and wrote about why; <strong>Dan McKinley's &ldquo;Choose Boring Technology&rdquo;</strong> is the &ldquo;innovation tokens&rdquo; argument verbatim; the &ldquo;You Are Not Google&rdquo; / &ldquo;scalability! but at what cost?&rdquo; essays are the direct push-back on premature distributed-systems adoption; and the &ldquo;just use Postgres&rdquo; / &ldquo;Postgres is enough&rdquo; genre documents exactly the Iter-1 move (Postgres as queue via <code>SKIP LOCKED</code>, as cache via the buffer pool, as search via <code>tsvector</code>). On the regulatory side, HIPAA's <em>minimum necessary</em> standard and its <em>addressable vs. required</em> implementation-specification mechanism (in the Security Rule) are the source of the Iter-2 discipline &mdash; you implement the required floor and document a reasoned risk decision for everything addressable; AWS's HIPAA reference materials and the &ldquo;HIPAA on a small team&rdquo; write-ups show the audit-log + RLS + KMS + BAA pattern. Where this page diverges from any one of those: it fuses all three constraints (small team + Postgres-only + HIPAA) onto one premise so every de-engineering lever is exercised; in the wild a given company hits one or two of them, not all three at once &mdash; but the moves transfer unchanged. Sources: see <a href="../../cribs/_sources.md">cribs/_sources.md</a> &sect;#47.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated Pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+      <p>Stress tests against the derivation above &mdash; depth rehearsal, not interview rehearsal. The flavor is &ldquo;a senior engineer defending restraint, with receipts.&rdquo;</p>
+
+      <div>
+        <h3>What if you grow to 10&times; clinics tomorrow &mdash; doesn't this whole design fall over? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>It doesn't fall over &mdash; it grows along a named ladder, and each rung is one move. 10&times; clinics = ~5,000 clinics, ~50&nbsp;M patients, ~500&nbsp;k appointments/day &asymp; ~6/s avg, a few thousand RPS peak, ~30&nbsp;GB/day of audit. First thing that bites: the buffer-cache hit ratio (the hot set may now exceed 64&nbsp;GB) &rarr; bump the Postgres instance class, then add a read replica and route reads + search to it (still Postgres). Next: the <code>job_queue</code> churn or the <code>audit_log</code> write rate starts producing autovacuum lag on the OLTP node &rarr; move those self-contained tables to their own Postgres. Next: search complexity outgrows <code>tsvector</code> &rarr; Elasticsearch. Next: one module's load dominates &rarr; carve it out into a service. Next: a contract demands a tighter RTO &rarr; hot standby, then multi-region. That's the reference design, reached one measured bottleneck at a time &mdash; which is exactly what every other scenario page does. The minimal design isn't &ldquo;the design forever&rdquo;; it's &ldquo;the design now, with the growth path explicit.&rdquo;</p>
+      </div>
+
+      <div>
+        <h3>Why not just use Aurora / DynamoDB / a managed everything &mdash; isn't self-managed Postgres the risky choice for a 3-person team? <span style="font-weight:normal;font-size:0.85em;">(alt-engine)</span></h3>
+        <p>Use <em>managed</em> Postgres &mdash; the page does (the constraints table says &ldquo;managed&rdquo;): the cloud provider runs the OS, the patching, the backups, the failover plumbing; the team configures it and runs the app. The choice that matters isn't &ldquo;self-managed vs. managed&rdquo;; it's &ldquo;one boring relational engine the team knows vs. five specialized systems.&rdquo; Aurora is a fine managed-Postgres variant &mdash; more automatic, somewhat more expensive, and somewhat more magic to debug when something weird happens (the storage layer is opaque); for a 3-person team that values being able to reason about the system, vanilla managed Postgres is the slightly more boring choice. DynamoDB is the wrong shape: the data is highly relational (joins across patient/appointment/provider/note, RLS-style isolation, full-text search, a transactional outbox) &mdash; modeling that on a KV store is fighting the tool, and you'd still need something for search. The deeper point: every &ldquo;why not X&rdquo; here has the same answer &mdash; X is another thing to operate, and at this scale Postgres already does X's job with headroom; revisit when a number says otherwise. Cite <a href="../canonicals/storage-engines.html#btree">storage-engines#btree</a> (the relational/B-tree engine is the right fit for this data) and <a href="../canonicals/replication-decisions.html#single-async">replication-decisions#single-async</a> (the chosen DR topology).</p>
+      </div>
+
+      <div>
+        <h3>Isn't a monolith a single point of failure &mdash; one bug takes down everything? <span style="font-weight:normal;font-size:0.85em;">(failure-mode probe)</span></h3>
+        <p>A monolith deployed as 2&ndash;3 instances behind a load balancer is no more a single point of failure than 12 microservices &mdash; less, actually, because there are fewer moving parts and fewer network boundaries to fail at. A bug that crashes the process crashes one instance; the LB routes around it; you roll back the deploy (one artifact, one pipeline &mdash; minutes). A bug that <em>doesn't</em> crash but corrupts data is just as dangerous in microservices &mdash; arguably worse, because the corruption can leak across service boundaries via events you can't easily undo; in a monolith it's one transaction in one database with point-in-time recovery. The real SPOF in this design is the Postgres primary &mdash; which is why Iter 3 added a warm standby and a drilled failover runbook. Microservices trade &ldquo;one process can fail&rdquo; for &ldquo;the mesh can fail, service discovery can fail, the event bus can fail, N&times; the deploy surface can fail&rdquo; &mdash; a worse trade for a 3-person team. The module boundaries kept honest in the codebase give you the <em>future</em> option to split out a hot module without giving you the operational tax today. Cite <a href="../canonicals/failure-modes.html#bad-deploy">failure-modes#bad-deploy</a>.</p>
+      </div>
+
+      <div>
+        <h3>HIPAA from day one with a 3-person team &mdash; aren't you under-investing in compliance? What if you get breached? <span style="font-weight:normal;font-size:0.85em;">(regulatory)</span></h3>
+        <p>You're investing exactly what HIPAA's own framework says to: the <em>required</em> floor (audit log of every PHI access, encryption at rest + in transit, access controls + per-tenant isolation, BAAs, a contingency plan with tested restore, a breach-notification process) is fully implemented; for every <em>addressable</em> safeguard you've made and documented a reasoned risk decision (encryption-at-rest: implemented, cheap; automatic logoff: implemented, cheap; a SIEM/SOC/HSM/DLP suite: not implemented, here's the equivalent alternative and why it's proportionate at our scale) &mdash; which is what the addressable-implementation-specification mechanism explicitly permits. If you're breached: the audit log tells you exactly what PHI was accessed (so the breach-notification scope is precise, not &ldquo;assume everything&rdquo;); the encryption-at-rest may qualify for safe-harbor on encrypted-at-rest data; the documented risk decisions show you reasoned, not ignored; the breach runbook drives the notification. Under-investing would be <em>not</em> having the audit log, or having backups you never tested, or a SIEM you can't actually monitor (a checkbox, not a control). The minimum-necessary discipline isn't &ldquo;do less compliance&rdquo;; it's &ldquo;do the controls that are real for a team your size, document the rest, and revisit when scale or an audit demands more.&rdquo; Cite <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a> + <a href="../canonicals/nfr-checklist.html#compliance">nfr-checklist#compliance</a>.</p>
+      </div>
+
+      <div>
+        <h3>Where does the bill come from, and what's the one knob that moves it? <span style="font-weight:normal;font-size:0.85em;">(cost flip)</span></h3>
+        <p>~$2k&ndash;5k/mo all-in, and ~half of it is the two Postgres nodes (~$720/mo: primary + warm standby) &mdash; which is the right place for the money, because the database is the durable, can't-lose-it part. The app instances (~$300&ndash;500/mo) exist for redundancy + rolling deploys, not throughput; the LB, KMS, and backups are rounding errors; the email/SMS vendor is usage-priced and small. The one knob: the warm standby. Make it a <em>hot</em> standby (serving reads, with automatic failover) + add multi-AZ load balancing &rarr; RTO drops from ~1 hour to ~minutes (and RPO toward 0 if you also switch to synchronous replication, at +a few ms per write) &mdash; cost: ~the same node (already provisioned, now it earns its keep) + <em>meaningful operational complexity</em> (replication-lag-aware reads, split-brain detection &mdash; new failure modes to drill). Worth it only past a named threshold: a clinic contract demanding a tighter RTO, or a clinic count where an hour of workday downtime is a material revenue hit. Below that, warm-standby-plus-runbook is cheaper <em>and</em> simpler &mdash; and simpler is a real cost a 3-person team pays in sleep and in mean-time-to-understand. Cite <a href="../design-moves/cost-shapes.html#database-heavy">cost-shapes#database-heavy</a>.</p>
+      </div>
+
+      <div>
+        <h3>How do you roll this out from a typical &ldquo;we already built three microservices and a Redis&rdquo; starting point without an incident? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>De-engineering is a migration like any other &mdash; strangler-fig in reverse. Step 1: stand up the modular monolith alongside the existing services, with the new modules calling into the same databases the old services own (read-mostly first); route a slice of traffic to the monolith behind a flag, watch error rates. Step 2: move write paths into the monolith module-by-module, dual-writing briefly where needed, then cut over and decommission the corresponding microservice. Step 3: collapse the per-service databases &mdash; one at a time, migrate each service's tables into the one Postgres (with a logical-replication or dump-and-load window, keeping the old DB read-only as a fallback until the monolith is proven). Step 4: fold the queue &mdash; double-publish to both the old queue and the new <code>job_queue</code> table, switch consumers to the table, then stop publishing to the old queue and tear it down. Step 5: fold the cache &mdash; turn off the Redis read-through path, confirm the buffer-pool hit ratio holds, decommission Redis. Step 6: fold search &mdash; build the <code>tsvector</code> column + GIN index, shadow-query both ES and Postgres comparing results, switch to Postgres, decommission ES. Rollback at any step: flip the flag / re-enable the old path (which you kept until the new one was proven). The whole thing is &ldquo;one component at a time, old path stays until new path is proven&rdquo; &mdash; no big-bang. (If you're <em>starting</em> fresh, you just build the minimal design directly &mdash; which is the point.)</p>
+      </div>
+
+      <div>
+        <h3>Production is slow right now &mdash; where do you look first? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>The dashboard is small, so the decision tree is short: (1) app p99 elevated + 5xx climbing? &rarr; almost always Postgres &mdash; check <code>pg_stat_activity</code> for a long-running query (a missing index, a clinic with an unusually big patient set, an ad-hoc report) and <code>pg_stat_statements</code> for the cumulative offender; kill it / add the index. (2) buffer-cache hit ratio dropped? &rarr; the hot set may have outgrown RAM (the read-replica trigger is near) or a big scan polluted the cache; check what ran. (3) reminders late? &rarr; the queue worker &mdash; oldest-ready-job age + queue depth; is a poison job stuck (high <code>attempts</code>)? is the email vendor down (jobs retrying)? (4) connection count near <code>max_connections</code>? &rarr; PgBouncer pool exhaustion or a connection leak in the app; recycle pools, find the leak. (5) replication lag to the warm standby climbing? &rarr; the standby is struggling or the network is &mdash; alert, because the RPO is degrading; not user-visible yet. (6) everything fine but one clinic complains? &rarr; check the audit log for that clinic (was there a break-glass event? an RLS-denied storm from a misconfigured role?). Each branch maps to a degradation-contract entry and a runbook step &mdash; and there are few enough branches that a 3-person team can hold the whole tree in their heads, which is the point of keeping the design to ~4 components.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- S7. Key Takeaways & Related Topics                             -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="s7-takeaways">
+    <div class="container">
+      <h2>S7. Key Takeaways</h2>
+      <ul>
+        <li><strong>De-engineering is a skill: match the design to the constraint, not to the conference talk.</strong> The sophisticated design (microservices + Kafka + Redis + ES + multi-region + a data team) is the <em>right</em> answer at Epic/Cerner scale and the <em>wrong</em> answer at 500 clinics with 3 engineers. The senior move is to start from the sophisticated design and <em>remove</em> a component per binding constraint, naming the bottleneck you accept and the trigger that would justify adding it back. Reflexive sophistication is the junior move.</li>
+        <li><strong>Every removal pairs with a named accepted bottleneck and a revisit trigger &mdash; that's what makes it restraint, not laziness.</strong> Collapse to a monolith &rarr; accept &ldquo;can't scale modules independently&rdquo; &rarr; revisit when one module's load is ~10&times; the rest. Postgres absorbs the queue/cache/search &rarr; accept &ldquo;one node carries everything&rdquo; &rarr; revisit ladder: read replica &rarr; split out queue/audit &rarr; ES. Warm standby instead of hot &rarr; accept &ldquo;AZ loss = ~1-hour outage&rdquo; &rarr; revisit when a contract demands a tighter RTO. If you can't name the accepted bottleneck and the trigger, you haven't done the analysis &mdash; you've just cut corners.</li>
+        <li><strong>A modern Postgres is a queue, a cache, a search engine, and a relational store &mdash; and at small scale, all four jobs together fit one node's headroom.</strong> <code>SELECT &hellip; FOR UPDATE SKIP LOCKED</code> + a poller is a perfectly good job queue up to ~thousands/min; the buffer pool + a tiny in-process LRU is a perfectly good cache when the hot set fits RAM; <code>tsvector</code> + GIN is a perfectly good search engine for &ldquo;find this record&rdquo; queries. Don't run Kafka + Redis + Elasticsearch when one boring database does the work &mdash; that's three more systems to patch, monitor, and be paged for, in exchange for capabilities you don't need yet.</li>
+        <li><strong>HIPAA's own framework is a de-engineering discipline: implement the <em>required</em> floor, document a reasoned risk decision for everything <em>addressable</em>, build nothing maximal.</strong> The required floor &mdash; an append-only audit log of every PHI access, encryption at rest + in transit, RBAC + per-tenant isolation, BAAs, a contingency plan with tested restore &mdash; is built <em>inside Postgres</em> (an audit table, RLS policies) and <em>inside the cloud platform you already use under a BAA</em> (TDE, KMS, backups). The maximal apparatus (SIEM, SOC, HSM, DLP) is documented as addressable-with-a-risk-decision and revisited if scale or an audit demands it. Compliance done right adds zero new systems.</li>
+        <li><strong>For a small team, a drilled runbook beats an automatic robot.</strong> A warm standby (built-in streaming replication) + WAL archiving + a quarterly-drilled restore runbook gives RPO ~minutes and RTO ~1 hour with one extra node and one well-understood mechanism. A hot standby with automatic failover gives seconds-RTO &mdash; and split-brain/flapping failure modes a 3-person team can't debug at 3&nbsp;a.m. Pick the automatic version only past a named threshold (a contract clause, a revenue-impact line); below it, the boring manual procedure you understand is both cheaper and safer.</li>
+        <li><strong>You get ~3 innovation tokens &mdash; spend them on the product, not the plumbing.</strong> Postgres, a modular monolith, a load balancer, and backups are boring on purpose: documented failure modes, a small operational surface, a team that knows them in its bones. Running a streaming platform, a cache cluster, and a search cluster at this scale spends all three tokens on infrastructure that adds zero customer-visible value. The de-engineering iterations on this page are, in aggregate, &ldquo;you are not Google&rdquo; + &ldquo;the majestic monolith&rdquo; + &ldquo;choose boring technology&rdquo; + &ldquo;minimum necessary&rdquo; &mdash; the same idea, four ways.</li>
+        <li><strong>This page is the prequel to the other scenario pages.</strong> Their sophisticated designs are what this system grows into <em>if</em> its constraints lift &mdash; and when they do, you introduce each move one at a time, justified by a measured bottleneck, which is exactly what those pages do. The de-engineering arc here, run backward, is the re-engineering arc there. Knowing both directions &mdash; when to add a component <em>and</em> when to refuse one &mdash; is the actual skill.</li>
+      </ul>
+
+      <h2>Related topics</h2>
+      <div class="card-grid full-width">
+        <a href="04-monolith-vs-microservices.html" class="card topic-card">
+          <h3>#04 Monolith vs. microservices</h3>
+          <p>The tradeoff this page lands hard on the monolith side of &mdash; for staffing reasons. The &ldquo;majestic monolith&rdquo; argument, with the module-boundary discipline that keeps a future split cheap.</p>
+        </a>
+        <a href="../canonicals/bottleneck-to-decisions.html#cross-region" class="card topic-card">
+          <h3>Bottleneck&rarr;decisions: cross-region</h3>
+          <p>Cited here in the <em>anti-direction</em> &mdash; the decision this page <em>declines</em> to revisit (multi-region), because the fix costs more operational complexity than the bottleneck (an AZ loss) costs at our scale.</p>
+        </a>
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching strategies</h3>
+          <p>The read-through pattern &mdash; and the corollary this page leans on: don't add a cache cluster until Postgres's buffer pool isn't enough; at a few hundred RPS over a RAM-resident working set, it is.</p>
+        </a>
+        <a href="../canonicals/cross-cutting.html#privacy" class="card topic-card">
+          <h3>Cross-cutting: privacy / compliance</h3>
+          <p>The standing definitions of audit, residency, retention, and deletion &mdash; and the HIPAA flavor: required vs. addressable, minimum necessary, the audit log + RLS + KMS + BAA pattern.</p>
+        </a>
+        <a href="23-job-scheduler.html" class="card topic-card">
+          <h3>#23 Job scheduler</h3>
+          <p>The sophisticated version of the reminder queue (leader election, Redis sorted set) &mdash; the thing this page de-engineers down to a Postgres table + <code>SKIP LOCKED</code>.</p>
+        </a>
+        <a href="46-multi-region-active-active.html" class="card topic-card">
+          <h3>#46 Multi-region active-active</h3>
+          <p>The multi-region design this page explicitly defers &mdash; reached one measured bottleneck at a time. This page is its prequel.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+</body>
+</html>
+

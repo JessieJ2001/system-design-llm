@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Cache (LRU at Scale + Hot-Key Mitigation) — System Design Interview Scenarios</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism-themes/1.9.0/prism-vs.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    /* Use full viewport width — avoids dead space when zoomed out */
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+  </style>
+</head>
+<body class="has-sidebar">
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../index.html">Home</a></li>
+        <li><a href="../design-principles.html">Design Principles</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero Section -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Design a Distributed Cache</h1>
+      <p class="hero-subtitle">10TB of key-value data, 1M reads/sec, sub-5ms latency, 99.99% availability &mdash; and a celebrity tweet that aims 50,000 reads/sec at one key. Start from the LC #146 doubly-linked-list + hashmap LRU; iterate to a sharded, replicated, hot-key-resistant cache. (Absorbs the former "Imbalanced Cache" scenario as Iteration 4.)</p>
+      <p class="hero-meta">NALSD Walkthrough &bull; ~25 min read &bull; LC #146 (LRU Cache)</p>
+    </div>
+  </section>
+
+  <!-- LC kernel banner -->
+  <section class="section dense-columns" id="lc-kernel-banner">
+    <div class="container">
+      <div class="callout callout-info full-width" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius);">
+        <p><strong>LC kernel.</strong> LRU Cache (LC #146). Textbook structure: a <strong>hashmap</strong> (key &rarr; node) over a <strong>doubly-linked list</strong> ordered by recency &mdash; <code>get</code> moves the node to the head, <code>put</code> inserts at head and evicts the tail when over capacity, both O(1). System class: <em>infrastructure primitive</em> (cite <a href="../canonicals/functional-requirements.html#class-infra">functional-requirements#class-infra</a>) &mdash; a building block other services depend on, not a product. <strong>Four properties that break at scale, each motivating an iteration:</strong> (1) <em>one node's RAM &ll; the working set</em> &mdash; 10TB doesn't fit in one box's 64GB; you must shard, which loses the global recency order (Iter&nbsp;2 &mdash; consistent hashing + per-shard CLOCK approximates global LRU); (2) <em>a single-node LRU has no failure story</em> &mdash; a crash erases the whole cache, and a cold restart thunders the backend (Iter&nbsp;1 &mdash; replication; Iter&nbsp;3 &mdash; warm-up + eviction monitoring); (3) <em>a hot key melts its shard</em> &mdash; one node sees all of a key's traffic, so 50K reads/sec on one key drives that shard to its knees and the 20M innocent co-tenants with it (Iter&nbsp;4 &mdash; detect &rarr; replicate-the-key &rarr; L1 local cache; consistent hashing with bounded loads); (4) <em>a stampede on a cold key thunders the backend</em> &mdash; a million simultaneous misses on one freshly-evicted key become a million DB queries (Iter&nbsp;4 &mdash; single-flight, cite <a href="../design-moves/single-flight.html">single-flight.html</a>). The C8 production cousin: the dll+hashmap becomes a per-shard CLOCK / W-TinyLFU approximation plus a consistent-hashing ring across shards, with key-replication and an in-process L1 in front of the hot keys.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- The Scenario                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="scenario">
+    <div class="container">
+      <h2>The Scenario</h2>
+      <p>You are the infrastructure lead at a large e-commerce company. Your application layer makes millions of database queries per second. The database is buckling under the load &mdash; query latency has crept from 5ms to 200ms during peak traffic. Your team decides to place a distributed cache between the application and the database to absorb the read-heavy workload.</p>
+
+      <div>
+        <h3>Requirements</h3>
+        <ul>
+          <li><strong>Dataset size:</strong> 10TB of active key-value data must be cache-resident at all times.</li>
+          <li><strong>Read throughput:</strong> 1,000,000 reads/sec (1M reads/sec).</li>
+          <li><strong>Write throughput:</strong> 100,000 writes/sec (100K writes/sec).</li>
+          <li><strong>Read latency:</strong> &lt;5ms at p99.</li>
+          <li><strong>Write latency:</strong> &lt;10ms at p99.</li>
+          <li><strong>Availability:</strong> 99.99% (52 minutes of downtime per year maximum).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>Data Characteristics</h3>
+        <ul>
+          <li>Key-value pairs. Average key size: <strong>50 bytes</strong>. Average value size: <strong>1KB</strong>.</li>
+          <li>Total number of keys: 10TB / (50B + 1KB) &asymp; <strong>10 billion keys</strong>. However, with Redis overhead per key (~100 bytes for internal structures), effective capacity per key is ~1.15KB.</li>
+          <li>Access pattern: <strong>read-heavy, ~10:1 reads:writes</strong> (cite <a href="../canonicals/access-patterns.html#read-heavy-uniform">access-patterns#read-heavy-uniform</a>). Underlyingly Zipf, not uniform &mdash; a small head of keys takes a large share of traffic (cite <a href="../canonicals/access-patterns.html#power-law">access-patterns#power-law</a>); the hot-key tail is the subject of Iteration&nbsp;4.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>System class &amp; functional requirements</h3>
+        <p><strong>Class:</strong> infrastructure primitive (cite <a href="../canonicals/functional-requirements.html#class-infra">functional-requirements#class-infra</a>) &mdash; a look-aside KV cache other services call; it is an <em>optimization in front of the database</em>, not a system of record. <strong>FRs</strong> (cite <a href="../canonicals/functional-requirements.html#fr-infra">functional-requirements#fr-infra</a>): <code>GET(k) &rarr; value | miss</code>; <code>SET(k, v, ttl)</code>; <code>DEL(k)</code> (for cache-aside invalidation); per-key TTL; bounded memory with automatic eviction; transparent failover so callers never special-case a dead shard.</p>
+        <p><strong>Out of scope (named, not silently dropped):</strong> being a database &mdash; no durability guarantee, no transactions across keys (Redis MULTI within one slot only); secondary indexes / range scans / SQL &mdash; this is a flat KV store; cross-region replication &mdash; single region with multi-AZ here (the geo variant is a probe); the cache-aside <em>application</em> logic that fills and invalidates keys &mdash; that belongs to the calling service, we provide GET/SET/DEL; auth / per-tenant quotas &mdash; the cache lives inside the trust boundary, callers are first-party services on mTLS.</p>
+        <p><strong>Flagged assumptions (would confirm with the interviewer):</strong> (1) the dataset is <em>working-set-resident</em> &mdash; 10TB is what's hot, not the whole 200TB of DB rows, so a >95% hit rate is plausible; (2) values are small (~1KB) &mdash; if they were 100KB serialized blobs, NIC bandwidth, not RAM, would bind first; (3) ms-level staleness is acceptable on a read &mdash; this is a cache, the DB is authoritative (if the caller needs read-your-writes it does cache-aside DELETE-on-write, or bypasses the cache); (4) the backend (the DB) <em>can survive a full cache miss-storm at degraded latency</em> &mdash; i.e. the cache is an optimization, not a load-bearing dependency. We revisit (4) in the degradation contract; if the DB <em>cannot</em> survive a cold cache, the cache becomes load-bearing and the SLO tightens (see Pushbacks).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Clarification ledger</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Question asked</th><th>Answer assumed</th><th>If different &hellip;</th></tr></thead>
+            <tbody>
+              <tr><td>Is the cache load-bearing, or an optimization?</td><td>Optimization &mdash; DB sized to survive a cold cache at p99 &asymp; 50&nbsp;ms.</td><td>If load-bearing: stronger replication, persistence (AOF), warm-standby, tighter availability SLO &mdash; closer to a DB.</td></tr>
+              <tr><td>Cache-aside, write-through, or write-behind?</td><td>Cache-aside (DELETE on write) &mdash; simplest, no write coupling, cite <a href="../caching.html">caching.html</a>.</td><td>Write-through cuts a read-after-write miss but couples write latency to the cache; write-behind risks loss on crash.</td></tr>
+              <tr><td>Eviction policy?</td><td><code>allkeys-lru</code> (approximate LRU) &mdash; the LC kernel, what callers expect.</td><td>W-TinyLFU (Caffeine-style) has a higher hit rate on Zipf workloads at the same memory; LFU helps if recency lies; FIFO/CLOCK is cheaper if you can't afford LRU bookkeeping.</td></tr>
+              <tr><td>Topology: client-side hashing, a proxy, or Redis Cluster mode?</td><td>Client-side consistent-hash ring (smart client) &mdash; one fewer hop, no proxy tier to run.</td><td>A proxy (twemproxy / mcrouter / Envoy) centralizes the ring and connection pooling; Redis Cluster mode bakes the slot map into the server; a sidecar per pod is a third option (see Iter&nbsp;2 C4).</td></tr>
+              <tr><td>How hot can one key get?</td><td>Up to ~50K reads/sec during a viral event (Zipf head).</td><td>If a key can't get hot (truly uniform), skip Iter&nbsp;4; if it can hit 500K reads/sec, you need both L1 and key-splitting, not just replication.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Total data</td><td>10TB</td></tr>
+            <tr><td>Average key size</td><td>50 bytes</td></tr>
+            <tr><td>Average value size</td><td>1KB</td></tr>
+            <tr><td>Effective size per entry (with Redis overhead)</td><td>~1.15KB</td></tr>
+            <tr><td>Total keys</td><td>~9.1 billion</td></tr>
+            <tr><td>Read throughput</td><td>1,000,000 ops/sec</td></tr>
+            <tr><td>Write throughput</td><td>100,000 ops/sec</td></tr>
+            <tr><td>p99 read latency target</td><td>&lt;5ms</td></tr>
+            <tr><td>p99 write latency target</td><td>&lt;10ms</td></tr>
+            <tr><td>Availability target</td><td>99.99%</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- BOE Math                                                      -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="boe">
+    <div class="container">
+      <h2>Back-of-Envelope Math</h2>
+      <p>Before drawing a single architecture diagram, we need to figure out how many cache instances we need. There are three potential bottlenecks: <strong>storage</strong>, <strong>read throughput</strong>, and <strong>write throughput</strong>. Whichever requires the most instances is our bottleneck.</p>
+
+      <div>
+        <h3>Storage Bottleneck</h3>
+        <p>A single Redis instance can hold data up to the size of its RAM. We will use machines with <strong>64GB RAM</strong> each (a common production choice &mdash; large enough to be efficient, small enough that failure impact is limited).</p>
+        <pre class="line-numbers"><code class="language-text">Total data:       10TB = 10,240 GB
+RAM per instance:  64 GB
+Usable RAM:        ~60 GB (reserve 4GB for OS + Redis overhead)
+
+Primary shards needed = 10,240 GB / 60 GB = 170.7 → 167 shards
+  (167 × 60 GB = 10,020 GB ≈ 10 TB; close to capacity but workable)
+
+With 3× replication (each key stored on 3 nodes):
+  Total instances = 167 × 3 = 501 instances
+  (Each node stores ~60GB of keys — matches our 60GB usable RAM)</code></pre>
+      </div>
+
+      <div>
+        <h3>Read Throughput Bottleneck</h3>
+        <p>A single Redis instance handles approximately <strong>100,000 simple GET operations per second</strong> for 1KB values (this is a well-known benchmark figure that accounts for network overhead and serialization).</p>
+        <pre class="line-numbers"><code class="language-text">Total reads:           1,000,000 ops/sec
+Throughput per Redis:  100,000 ops/sec
+
+Instances needed = 1,000,000 / 100,000 = 10 instances
+
+With replicas serving reads (3× replication):
+  Effective read capacity = 501 × 100K = 50.1M reads/sec
+  (Massively overprovisioned for reads)</code></pre>
+      </div>
+
+      <div>
+        <h3>Write Throughput Bottleneck</h3>
+        <pre class="line-numbers"><code class="language-text">Total writes:          100,000 ops/sec
+Throughput per Redis:  100,000 ops/sec
+
+Instances needed = 100,000 / 100,000 = 1 instance
+
+With 501 instances, writes are spread across primaries:
+  167 primary nodes × 100K = 16.7M write capacity
+  (Also massively overprovisioned)</code></pre>
+      </div>
+
+      <div>
+        <h3>The Bottleneck Is Storage</h3>
+        <div class="callout" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.25rem; border-radius: var(--radius); margin: 1.5rem 0;">
+          <strong>Key insight:</strong> We need 167 primary shards for storage alone, but only 10 for read throughput and 1 for write throughput. Storage is the dominant constraint. With 3&times; replication for availability, that&rsquo;s <strong>501 instances</strong> total. Note this just barely covers 10 TB &mdash; if data grows, we&rsquo;ll need to either add shards or use larger nodes.
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Summary Table</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Constraint</th><th>Instances Needed</th><th>Bottleneck?</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Storage (10TB / 60GB)</td><td>167 (×3 replication = 501)</td><td style="color: var(--color-danger); font-weight: 600;">Yes</td></tr>
+              <tr><td>Read throughput (1M / 100K)</td><td>10</td><td>No</td></tr>
+              <tr><td>Write throughput (100K / 100K)</td><td>1</td><td>No</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Final count: 501 instances</strong> (167 primary shards &times; 3 replicas each).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Naive Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="naive">
+    <div class="container">
+      <h2>Naive Design</h2>
+      <p>The simplest possible architecture: 500 Redis instances, consistent hashing to distribute keys, no replication.</p>
+
+      <div class="full-width">
+        <h3>How It Works</h3>
+        <ol>
+          <li>Each of the 500 Redis instances is assigned a position on a hash ring (a circular space from 0 to 2<sup>32</sup> - 1).</li>
+          <li>When the client wants to read or write key <code>K</code>, it computes <code>hash(K)</code> and walks clockwise on the ring until it finds the first Redis node.</li>
+          <li>That node is the owner of key <code>K</code>. The client sends GET or SET directly to that node.</li>
+        </ol>
+      </div>
+
+      <div>
+        <h3>Naive Client Code</h3>
+        <pre class="line-numbers"><code class="language-python">import hashlib
+
+class NaiveDistributedCache:
+    def __init__(self, nodes):
+        """nodes: list of (host, port) tuples for 500 Redis instances"""
+        self.ring = {}
+        self.sorted_keys = []
+        for node in nodes:
+            hash_val = self._hash(f"{node[0]}:{node[1]}")
+            self.ring[hash_val] = node
+            self.sorted_keys.append(hash_val)
+        self.sorted_keys.sort()
+
+    def _hash(self, key):
+        return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**32)
+
+    def get_node(self, key):
+        """Find which Redis node owns this key"""
+        h = self._hash(key)
+        for ring_key in self.sorted_keys:
+            if h <= ring_key:
+                return self.ring[ring_key]
+        return self.ring[self.sorted_keys[0]]  # wrap around
+
+    def get(self, key):
+        node = self.get_node(key)
+        return redis_client(node).get(key)
+
+    def set(self, key, value, ttl=3600):
+        node = self.get_node(key)
+        return redis_client(node).set(key, value, ex=ttl)</code></pre>
+      </div>
+
+      <div>
+        <h3>What This Gets Right</h3>
+        <ul>
+          <li>Simple to understand and implement.</li>
+          <li>Keys are spread across 500 nodes &mdash; each node holds ~20GB.</li>
+          <li>Read and write throughput are well within per-node limits.</li>
+          <li>Latency for individual operations is sub-millisecond within the same data center.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- What Breaks                                                   -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="what-breaks">
+    <div class="container">
+      <h2>What Breaks</h2>
+      <p>This naive design has several critical failure modes. Let us walk through each one with concrete numbers.</p>
+
+      <div>
+        <h3>Problem 1: Node Failure Causes Data Loss and DB Spikes</h3>
+        <p>With no replication, when a node dies, all data on that node is <strong>gone</strong>. The cache does not have a copy anywhere else.</p>
+        <pre class="line-numbers"><code class="language-text">Keys per node:       10 billion / 500 = 20 million keys
+Data per node:       10TB / 500 = 20GB
+
+When node #237 crashes:
+  - 20 million keys become cache misses instantly
+  - 1M reads/sec × (1/500) = 2,000 reads/sec now hit the database
+  - These 2,000 reads/sec were previously ~1ms (cache hit)
+    Now they're ~50ms (database query)
+  - Database gets a sudden 2,000 QPS spike on cold queries</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 2: Node Failures Are Frequent at Scale</h3>
+        <p>Commodity server hardware has an annual failure rate of 2-5%. With 500 servers:</p>
+        <pre class="line-numbers"><code class="language-text">Expected failures per year = 500 × 3% = 15 failures/year
+That's roughly one failure every 24 days.
+
+Each failure:
+  - Causes 2,000 extra DB queries/sec
+  - Lasts until a replacement node is provisioned and warmed up
+  - Warm-up time: 20M keys × 50ms per DB read = way too long sequentially
+    Even at 2,000 reads/sec (organic traffic refilling the cache),
+    warm-up takes: 20M / 2,000 = 10,000 seconds ≈ 2.8 hours</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 3: Availability Math Does Not Work</h3>
+        <p>Our target is 99.99% availability (52 minutes downtime per year). But a single node failure means 1/500 = 0.2% of the cache is unavailable. If we define "available" as "all cache reads succeed," a single node failure already violates our SLA.</p>
+        <pre class="line-numbers"><code class="language-text">With 15 failures/year, each causing 2.8 hours of degradation:
+  Total degraded time = 15 × 2.8 hours = 42 hours/year
+  Availability = (8,760 - 42) / 8,760 = 99.52%
+
+  That's 99.52% — far below the 99.99% target.</code></pre>
+      </div>
+
+      <div>
+        <h3>Problem 4: Uneven Load Distribution</h3>
+        <p>With only 500 points on the hash ring (one per physical node), the distribution of keys is uneven. Some nodes get 30% more keys than average, others get 30% fewer. This means some nodes are at 26GB (overflowing 20GB budget) while others sit at 14GB (wasted capacity).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 1: Replication                                     -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-1">
+    <div class="container">
+      <h2>Iteration 1: Add Replication</h2>
+      <p>The single biggest improvement we can make is storing each key on <strong>multiple nodes</strong>. We replicate each key to 3 consecutive nodes on the hash ring: one <strong>primary</strong> and two <strong>replicas</strong>.</p>
+
+      <div class="full-width">
+        <h3>How Replication Works on the Ring</h3>
+        <p>When key <code>K</code> hashes to position <code>P</code> on the ring, we walk clockwise and find the first three distinct physical nodes. The first is the primary (handles writes), and the next two are replicas (can serve reads).</p>
+
+        <svg viewBox="0 0 700 340" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowGray2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker>
+          </defs>
+          <!-- Hash Ring -->
+          <circle cx="200" cy="170" r="120" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="6,3"/>
+          <text x="200" y="25" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Hash Ring (0 to 2^32)</text>
+          <!-- Node A (primary) at ~30 degrees -->
+          <circle cx="304" cy="110" r="14" fill="#2563eb" stroke="#1d4ed8" stroke-width="1.5"/>
+          <text x="304" y="115" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">A</text>
+          <text x="330" y="100" fill="#2563eb" font-size="11" font-weight="600">Primary</text>
+          <!-- Node B (replica1) at ~150 degrees -->
+          <circle cx="96" cy="110" r="14" fill="#0891b2" stroke="#0e7490" stroke-width="1.5"/>
+          <text x="96" y="115" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">B</text>
+          <text x="55" y="100" fill="#0891b2" font-size="11" font-weight="600">Replica 1</text>
+          <!-- Node C (replica2) at ~250 degrees -->
+          <circle cx="130" cy="265" r="14" fill="#0891b2" stroke="#0e7490" stroke-width="1.5"/>
+          <text x="130" y="270" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">C</text>
+          <text x="90" y="290" fill="#0891b2" font-size="11" font-weight="600">Replica 2</text>
+          <!-- Node D at ~330 degrees -->
+          <circle cx="296" cy="250" r="14" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="296" y="255" text-anchor="middle" fill="#334155" font-weight="700" font-size="11">D</text>
+          <!-- Key K marker at ~350 degrees -->
+          <circle cx="318" cy="195" r="6" fill="#ef4444" stroke="#dc2626" stroke-width="1.5"/>
+          <text x="340" y="200" fill="#ef4444" font-size="11" font-weight="600">Key K</text>
+          <!-- Clockwise arrow from K to A -->
+          <path d="M322,185 Q340,150 315,118" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+          <text x="355" y="155" fill="#ef4444" font-size="10">walk clockwise</text>
+
+          <!-- Right side: explanation -->
+          <rect x="420" y="40" width="260" height="260" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="550" y="65" text-anchor="middle" font-weight="700" fill="#334155" font-size="13">Replication Flow</text>
+          <!-- Step 1 -->
+          <text x="435" y="95" fill="#334155" font-size="12"><tspan font-weight="600">1.</tspan> hash(K) lands at position P</text>
+          <!-- Step 2 -->
+          <text x="435" y="120" fill="#334155" font-size="12"><tspan font-weight="600">2.</tspan> Walk clockwise to Node A</text>
+          <text x="450" y="137" fill="#64748b" font-size="11">(first physical node = primary)</text>
+          <!-- Step 3 -->
+          <text x="435" y="162" fill="#334155" font-size="12"><tspan font-weight="600">3.</tspan> Continue to Node B</text>
+          <text x="450" y="179" fill="#64748b" font-size="11">(second physical node = replica 1)</text>
+          <!-- Step 4 -->
+          <text x="435" y="204" fill="#334155" font-size="12"><tspan font-weight="600">4.</tspan> Continue to Node C</text>
+          <text x="450" y="221" fill="#64748b" font-size="11">(third physical node = replica 2)</text>
+          <!-- Result -->
+          <line x1="435" y1="240" x2="665" y2="240" stroke="#94a3b8" stroke-width="0.5"/>
+          <text x="435" y="262" fill="#2563eb" font-size="12" font-weight="600">Result: K stored on A, B, C</text>
+          <text x="435" y="282" fill="#64748b" font-size="11">Writes go to A; reads from any</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <pre class="line-numbers"><code class="language-python">class ReplicatedCache:
+    def get_nodes(self, key, replica_count=3):
+        """Return [primary, replica1, replica2] for this key"""
+        h = self._hash(key)
+        nodes = []
+        seen_physical = set()
+
+        for ring_key in self.sorted_keys:
+            if h <= ring_key:
+                node = self.ring[ring_key]
+                physical = node['physical_id']
+                if physical not in seen_physical:
+                    nodes.append(node)
+                    seen_physical.add(physical)
+                    if len(nodes) == replica_count:
+                        return nodes
+        # Wrap around the ring if needed
+        for ring_key in self.sorted_keys:
+            node = self.ring[ring_key]
+            physical = node['physical_id']
+            if physical not in seen_physical:
+                nodes.append(node)
+                seen_physical.add(physical)
+                if len(nodes) == replica_count:
+                    return nodes
+        return nodes
+
+    def read(self, key):
+        """Read from any replica (nearest/least-loaded)"""
+        nodes = self.get_nodes(key)
+        # Pick the replica with lowest current latency
+        return fastest_read(nodes, key)
+
+    def write(self, key, value):
+        """Write to primary, async replicate to replicas"""
+        primary, *replicas = self.get_nodes(key)
+        result = redis_client(primary).set(key, value)
+        for replica in replicas:
+            async_replicate(replica, key, value)  # fire-and-forget
+        return result</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>What Replication Fixes</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Problem</th><th>Before (No Replication)</th><th>After (3&times; Replication)</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Node failure data loss</td>
+                <td>20M keys lost, 2K reads/sec hit DB</td>
+                <td>Zero data loss &mdash; replicas serve reads immediately</td>
+              </tr>
+              <tr>
+                <td>Recovery time</td>
+                <td>2.8 hours to warm up replacement</td>
+                <td>Instant failover; background re-replication</td>
+              </tr>
+              <tr>
+                <td>Read throughput per key</td>
+                <td>Limited to 1 node</td>
+                <td>3 nodes can serve reads &mdash; 3&times; read capacity per key</td>
+              </tr>
+              <tr>
+                <td>Availability</td>
+                <td>99.52%</td>
+                <td>Key is unavailable only if all 3 replicas fail simultaneously</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Availability With 3&times; Replication</h3>
+        <pre class="line-numbers"><code class="language-text">Probability of a single node being down at any moment:
+  Assume 3% annual failure rate, 1-hour repair time (automated replacement)
+  P(node down) = 0.03 × (1/8760) ≈ 0.000003 = 0.0003%
+
+Probability all 3 replicas down simultaneously:
+  P(all 3 down) = (0.000003)³ = 2.7 × 10⁻¹⁷
+
+For 500 nodes / 3 = 167 key ranges:
+  P(any key range unavailable) = 167 × 2.7 × 10⁻¹⁷ ≈ 4.5 × 10⁻¹⁵
+
+This is astronomically better than 99.99%. ✓</code></pre>
+      </div>
+
+      <div>
+        <h3>Storage Math Still Works</h3>
+        <pre class="line-numbers"><code class="language-text">500 instances total. Each key replicated 3×.
+Total "logical" shards = 500 / 3 ≈ 167 shards
+Data per shard = 10TB / 167 ≈ 60GB per shard
+Each node stores one shard = 60GB
+With 64GB RAM per instance: 60GB fits (4GB headroom for OS). ✓</code></pre>
+      </div>
+
+      <div>
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>No replication, persistence instead (Redis AOF/RDB to disk).</strong> Survives a process restart but not a node loss (the disk dies with the node), and AOF fsync hurts write latency. Replication gives availability <em>and</em> read fan-out; persistence gives neither. Rejected. (We <em>add</em> RDB snapshots in Iter&nbsp;3 only as a warm-up aid, not as the durability story.)</li>
+          <li><strong>2&times; replication.</strong> Halves the replication storage tax (334 vs 501 nodes) but a key goes unavailable if both copies are down &mdash; during a rolling deploy you routinely have one replica down, so 2&times; means "one bad node from a blind spot." 3&times; tolerates one planned + one unplanned loss. Keep 3&times;.</li>
+          <li><strong>Synchronous replication (wait for 2-of-3 acks before SET returns).</strong> Eliminates the read-stale window but adds a cross-node RTT to every write (cite <a href="../canonicals/replication-decisions.html#single-sync">replication-decisions#single-sync</a>) &mdash; for a cache, where the DB is authoritative anyway, that's paying DB-grade latency for nothing. Async (cite <a href="../canonicals/replication-decisions.html#single-async">replication-decisions#single-async</a>). Revisited in Iter&nbsp;2.</li>
+          <li><strong>Erasure coding instead of full replicas.</strong> Cuts storage overhead (1.5&times; vs 3&times;) but a read on a lost node requires reconstructing from k fragments &mdash; CPU + multi-node fan-in on the hot path, unacceptable for a sub-5ms cache. Erasure coding is for cold blob storage, not a cache.</li>
+        </ul>
+      </div>
+
+      <div>
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Shard-primary loss</strong> (<a href="../canonicals/failure-modes.html#leader-loss">failure-modes#leader-loss</a>) &mdash; a replica is promoted; writes to that range pause for the ~5s detection window, reads keep flowing from the survivors. Detected by missed heartbeats; the promoted replica re-replicates a third copy in the background.</li>
+          <li><strong>Replica divergence</strong> (<a href="../canonicals/failure-modes.html#replica-divergence">failure-modes#replica-divergence</a>) &mdash; async replication means a replica can lag the primary by 1&ndash;5ms; a read to the lagging replica returns the pre-write value. Bounded by the replication lag; acceptable because the DB is the source of truth and cache-aside DELETE-on-write makes the worst case "one extra cache miss," not "wrong forever."</li>
+          <li><strong>Correlated node loss</strong> &mdash; if all 3 replicas of a shard land in the same rack/AZ and that fails, the shard goes dark. Mitigation: rack/AZ-aware replica placement (the next two distinct physical nodes on the ring must also be in distinct fault domains). Without it the per-shard availability math above is optimistic.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 2: Consistency & Virtual Nodes                      -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="iteration-2">
+    <div class="container">
+      <h2>Iteration 2: Consistency Model and Virtual Nodes</h2>
+
+      <div class="full-width">
+        <h3>Choosing a Consistency Model</h3>
+        <p>With 3 replicas per key, we must decide how reads work. There are two options:</p>
+
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Model</th><th>How It Works</th><th>Latency</th><th>Staleness</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Strong consistency</strong></td>
+                <td>All reads go to the primary</td>
+                <td>Higher (primary may be farther away; no load spreading)</td>
+                <td>None &mdash; always latest value</td>
+              </tr>
+              <tr>
+                <td><strong>Eventual consistency</strong></td>
+                <td>Reads go to any replica (nearest or least-loaded)</td>
+                <td>Lower (choose closest replica)</td>
+                <td>May read a value that is milliseconds behind the latest write</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><strong>Decision: Eventual consistency for reads.</strong> Here is why:</p>
+        <ul>
+          <li>This is a <em>cache</em>, not the source of truth. The database is authoritative. If the cache returns a slightly stale value, the consequence is minor (e.g., a user sees a product price that was updated 10ms ago).</li>
+          <li>With async replication, replicas lag behind the primary by 1-5ms in the same data center. This staleness is invisible to humans.</li>
+          <li>Eventual consistency lets us spread 1M reads/sec across all 500 nodes instead of concentrating them on 167 primaries. Each node handles 1M / 500 = 2,000 reads/sec instead of 1M / 167 = 6,000 reads/sec. Both are well within limits, but the lower per-node load gives us more headroom for spikes.</li>
+        </ul>
+        <p>Writes always go to the primary, which asynchronously replicates to the two replicas.</p>
+      </div>
+
+      <div>
+        <h3>Virtual Nodes for Even Distribution</h3>
+        <p>The naive design placed one point per physical node on the hash ring. With 500 points, the distribution of keys is lumpy &mdash; some nodes get 2&times; the keys of others. Virtual nodes solve this.</p>
+        <p>Instead of placing each physical node at one position on the ring, we place it at <strong>200 positions</strong>. Each position is a "virtual node" (vnode). The client hashes the key, walks clockwise, finds a virtual node, and maps it back to the physical node.</p>
+        <pre class="line-numbers"><code class="language-text">500 physical nodes × 200 virtual nodes each = 100,000 points on the ring
+
+Load variance (mathematical bound):
+  With N virtual nodes per physical node, the standard deviation of
+  load per physical node is approximately:
+
+    std_dev ≈ average_load / sqrt(N)
+    std_dev ≈ (10TB / 500) / sqrt(200)
+    std_dev ≈ 20GB / 14.14
+    std_dev ≈ 1.41GB
+
+  So most nodes hold 20GB ± 1.4GB (between 17.2GB and 22.8GB).
+  With 60GB usable RAM, even 22.8GB is well within limits.
+
+Memory cost of virtual nodes:
+  100,000 entries × (4 bytes hash + 8 bytes node pointer) = ~1.2MB
+  Trivial. Stored in memory on every app server.</code></pre>
+      </div>
+
+      <div>
+        <h3>Virtual Node Code</h3>
+        <pre class="line-numbers"><code class="language-python">class VirtualNodeRing:
+    def __init__(self, physical_nodes, vnodes_per_node=200):
+        self.ring = {}
+        self.sorted_keys = []
+        self.vnodes_per_node = vnodes_per_node
+
+        for node in physical_nodes:
+            for i in range(vnodes_per_node):
+                # Create a unique virtual node identifier
+                vnode_key = f"{node.host}:{node.port}#vnode{i}"
+                hash_val = self._hash(vnode_key)
+                self.ring[hash_val] = node  # maps back to physical node
+                self.sorted_keys.append(hash_val)
+
+        self.sorted_keys.sort()
+
+    def _hash(self, key):
+        digest = hashlib.md5(key.encode()).digest()
+        return int.from_bytes(digest[:4], 'big')
+
+    def get_node(self, key):
+        h = self._hash(key)
+        idx = bisect.bisect_left(self.sorted_keys, h)
+        if idx == len(self.sorted_keys):
+            idx = 0
+        return self.ring[self.sorted_keys[idx]]</code></pre>
+        <p>(For the full ring + virtual-nodes + jump/Maglev/multi-probe taxonomy, see <a href="../consistent-hashing.html">consistent-hashing.html</a> &mdash; this page only re-derives the variance bound we use.)</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; the topology decision</h3>
+        <p>Where does the consistent-hash ring live? Four options, with the trade-off that picks ours:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Topology</th><th>How</th><th>Wins when</th><th>Loses because</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Client-side hashing (chosen)</strong></td><td>Smart client holds the ring + a connection pool to all 500 nodes; one hop to the owning shard.</td><td>First-party callers; minimal latency; no extra tier to operate.</td><td>Every client needs the up-to-date ring (a control-plane push); N&times;500 connections fleet-wide; a buggy client can mis-route.</td></tr>
+              <tr><td>Proxy (twemproxy / mcrouter / Envoy)</td><td>Clients hit a stateless proxy tier; proxy holds the ring + pools.</td><td>Polyglot clients; you want one place to change routing / add features (mcrouter does per-key replication, shadowing).</td><td>One extra network hop (+0.2&ndash;0.5ms); a tier to scale and page on.</td></tr>
+              <tr><td>Redis Cluster mode</td><td>Server-side 16384-slot map; clients are MOVED/ASK-redirected.</td><td>You want the cluster to self-manage slot ownership and resharding.</td><td>Cross-slot multi-key ops are restricted; clients still need a slot cache; resharding is server-driven and coarser.</td></tr>
+              <tr><td>Sidecar per pod</td><td>A local proxy process colocated with each app pod.</td><td>Service-mesh shops; uniform mTLS / observability for free.</td><td>One more process per pod; the sidecar's own failure modes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>We pick <strong>client-side hashing</strong>: first-party callers, sub-5ms budget, no appetite for a proxy tier. The "ring push to every client" cost is real &mdash; it's the migration hazard in Iter&nbsp;4 and the Pushbacks (growing 167&rarr;334 shards).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Ring drift / split-brain ring</strong> (<a href="../canonicals/failure-modes.html#bad-deploy">failure-modes#bad-deploy</a>) &mdash; if clients hold different versions of the ring during a topology change, the same key routes to two shards and writes split. Mitigation: monotonic ring epoch; a SET also carries the epoch; the receiving node rejects (and the client refreshes) on epoch mismatch.</li>
+          <li><strong>Stale replica reads</strong> (<a href="../canonicals/failure-modes.html#replica-divergence">failure-modes#replica-divergence</a>) &mdash; eventual-consistency reads can return a value 1&ndash;5ms behind the latest write; bounded, acceptable for a cache (the DB is authoritative).</li>
+          <li><strong>Per-shard memory imbalance</strong> (<a href="../canonicals/bottlenecks.html#memory-capacity-bound">bottlenecks#memory-capacity-bound</a>) &mdash; even with 200 vnodes, the &plusmn;1.4GB tail means an unlucky shard can hit <code>maxmemory</code> first and start evicting hotter keys than its neighbours; surfaces as a hit-rate dip on one shard. Monitored per-shard in Iter&nbsp;3.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 3: Eviction and Monitoring                          -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="iteration-3">
+    <div class="container">
+      <h2>Iteration 3: Eviction, Failure Recovery, and Monitoring</h2>
+
+      <div>
+        <h3>LRU Eviction Strategy</h3>
+        <p>Since this is a cache (not the source of truth), we can evict entries when memory is tight. Redis implements an approximated LRU eviction policy. We configure each node to start evicting when memory usage reaches 90% of available RAM:</p>
+        <pre class="line-numbers"><code class="language-text">maxmemory 57gb          # 90% of 64GB (leave headroom)
+maxmemory-policy allkeys-lru  # Evict any key using approximate LRU
+
+When a node hits 57GB:
+  - Redis samples 10 random keys
+  - Evicts the one with the oldest last-access time
+  - Repeat until memory drops below threshold
+
+Consequence of eviction:
+  - The evicted key's next read becomes a cache miss
+  - The miss triggers a DB read (50ms) + cache refill
+  - This is fine: the key was rarely accessed (LRU guarantees this)
+  - If the key was popular, it would have been recently accessed
+    and would NOT have been evicted</code></pre>
+      </div>
+
+      <div>
+        <h3>Monitoring Eviction Rates</h3>
+        <p>Evictions are normal. But <em>excessive</em> evictions mean the cache is too small for the workload.</p>
+        <pre class="line-numbers"><code class="language-text">Healthy state:
+  Eviction rate per node: < 100/sec
+  Cache hit rate: > 95%
+  DB queries caused by misses: < 50K/sec (5% of 1M reads)
+
+Warning threshold:
+  Eviction rate per node: > 1,000/sec
+  Cache hit rate: < 90%
+  DB queries caused by misses: > 100K/sec
+
+Action: if eviction rate > 1% of reads sustained for 10 minutes,
+        trigger auto-scaling to add more cache nodes</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Node Failure Recovery</h3>
+        <p>When a node dies, the system must recover smoothly. Here is the timeline:</p>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Event</th><th>Impact</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>T+0s</td>
+                <td>Node #237 crashes</td>
+                <td>No immediate impact &mdash; replicas still serve reads</td>
+              </tr>
+              <tr>
+                <td>T+5s</td>
+                <td>Health check detects failure (3 missed heartbeats at 2s intervals)</td>
+                <td>Node marked as down in the ring</td>
+              </tr>
+              <tr>
+                <td>T+5s</td>
+                <td>Successor node takes ownership of dead node's key range</td>
+                <td>Writes for that range now go to the successor as new primary</td>
+              </tr>
+              <tr>
+                <td>T+10s</td>
+                <td>Ring update propagated to all app servers</td>
+                <td>All clients route around the dead node</td>
+              </tr>
+              <tr>
+                <td>T+60s</td>
+                <td>New replacement node provisioned (auto-scaling)</td>
+                <td>Empty node joins the ring</td>
+              </tr>
+              <tr>
+                <td>T+60s - T+120s</td>
+                <td>New node warm-up via organic traffic</td>
+                <td>Cache misses gradually refill the new node</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Warm-Up Math</h3>
+        <pre class="line-numbers"><code class="language-text">Keys owned by the dead node: ~20M keys
+Reads hitting the new (empty) node: 1M / 500 = 2,000 reads/sec
+
+But the new node also has 2 replicas that still have the data!
+Reads can still go to replicas during warm-up.
+
+Warm-up strategy:
+  Option A: Organic — wait for reads to naturally populate the new node
+    Time to fill: 20M keys / 2,000 keys/sec = 10,000 sec ≈ 2.8 hours
+    (Only keys that are actually read get cached — Pareto effect means
+     80% of traffic hits 20% of keys, so the hot keys fill in ~30 min)
+
+  Option B: Background copy from a replica
+    Copy rate: 50,000 keys/sec (throttled to avoid impacting the replica)
+    Time: 20M / 50K = 400 seconds ≈ 7 minutes
+    Network: 50K keys × 1KB = 50MB/sec — easily within data center bandwidth
+
+  → Use Option B with Option A as fallback</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4)</h3>
+        <ul>
+          <li><strong>Eviction policy &mdash; LRU vs LFU vs ARC vs W-TinyLFU vs FIFO/CLOCK</strong> (see <a href="../caching.html">caching.html</a> for the full taxonomy). We keep <code>allkeys-lru</code>: it's the LC kernel, it's what callers reason about, and Redis's sampled-LRU is cheap. <strong>W-TinyLFU</strong> (Caffeine) would give a measurably higher hit rate on this Zipf workload at the same memory &mdash; it admits new keys only if they're frequent enough to beat the eviction victim, so a one-off scan can't flush the cache; if a future hit-rate audit shows scan-flush, switch. <strong>ARC</strong> self-balances recency vs frequency but is patent-encumbered and not in Redis. <strong>FIFO/CLOCK</strong> is cheaper than LRU bookkeeping but evicts hot keys that haven't been touched <em>recently</em> &mdash; worse hit rate; only worth it on a CPU-starved box. <strong>volatile-*</strong> variants (evict only TTL'd keys) risk OOM if some keys have no TTL &mdash; we set a default TTL so <code>allkeys-lru</code> is safe.</li>
+          <li><strong>Consistency / write path &mdash; cache-aside vs write-through vs write-behind</strong> (cite <a href="../caching.html">caching.html</a>). We use <strong>cache-aside</strong>: the writer updates the DB then <code>DEL</code>s the key; the next reader misses, fetches fresh, fills. Why DELETE not SET-the-new-value: two concurrent writers doing read-DB-then-SET-cache can reorder on the network and leave the cache holding the older value forever; DELETE is idempotent and the next read self-heals. <strong>Write-through</strong> (write the cache synchronously on every DB write) removes the read-after-write miss but couples write latency to the cache and doubles the write fan-out. <strong>Write-behind</strong> (cache absorbs writes, flushes to DB async) is fastest but loses un-flushed writes on a crash &mdash; unacceptable when the cache has no durability. Stale-window: cache-aside has a tiny race (reader fetches old DB row, then writer's DELETE lands, then reader's SET writes the old value) &mdash; bounded by the DB-read latency, and a default TTL caps it; for keys that can't tolerate even that, use <strong>versioned keys</strong> (key suffixed with a monotonically-increasing version; readers always read the current version, old versions TTL out) &mdash; cite <a href="../canonicals/api-design-patterns.html#concurrency">api-design-patterns#concurrency</a>.</li>
+          <li><strong>Invalidation &mdash; TTL vs explicit-DEL vs versioned-keys.</strong> TTL alone (no DEL) bounds staleness to the TTL but serves a known-stale value until then; explicit DEL is exact but needs the writer to know the key; versioned keys make staleness impossible at the cost of a version registry. We use <strong>explicit DEL + a safety-net default TTL</strong>; per-key shorter TTLs for keys that change fast.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Cold-start thundering herd</strong> (<a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a>, <a href="../canonicals/bottlenecks.html#cold-start">bottlenecks#cold-start</a>) &mdash; a node restart (or a flushed cache after a deploy) means 20M&ndash;10B keys are cold; misses pour onto the DB at a rate it wasn't sized for. Mitigation: warm-up from a replica (Option&nbsp;B above) before the new node takes read traffic; rate-limit miss-driven DB reads; the deeper fix (single-flight, no two misses on the same key in flight) is Iter&nbsp;4.</li>
+          <li><strong>Eviction storm</strong> (<a href="../canonicals/bottlenecks.html#memory-capacity-bound">bottlenecks#memory-capacity-bound</a>) &mdash; if the working set grows past capacity, every node sits at <code>maxmemory</code> and evicts faster than reads refill; hit rate collapses, DB load explodes. Detected by per-node eviction rate &gt; 1% of reads; auto-scale adds shards. The signal is in the Operations block.</li>
+          <li><strong>Slow / dead backend on a miss</strong> (<a href="../canonicals/failure-modes.html#slow-dependency">failure-modes#slow-dependency</a>) &mdash; a cache miss now waits on a struggling DB; the app's threads block; retries pile on. Mitigation: short DB-read timeout on the miss path, circuit-breaker, serve-stale-on-error if the key still has an expired-but-present copy.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Iteration 4: Hot-Key Mitigation  (absorbs #22 imbalanced cache) -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="hot-key-iteration">
+    <div class="container">
+      <h2>Iteration 4: Hot-Key Mitigation &mdash; Detect, Replicate the Key, L1 in Front</h2>
+      <p class="full-width"><em>(This iteration absorbs the material that used to be a separate page, <a href="22-imbalanced-cache.html">22-imbalanced-cache.html</a> &mdash; the hot-key / imbalanced-shard problem and its mitigations. "Make a hot key not melt one shard" is a natural NALSD iteration on "build a distributed cache," so it lives here now.)</em></p>
+
+      <div class="full-width">
+        <h3>Bottleneck analysis of the Iteration-3 design</h3>
+        <p>Iterations 1&ndash;3 made keys <em>evenly distributed</em> &mdash; 200 vnodes per node, &plusmn;1.4GB load variance. But virtual nodes balance <em>key counts</em>, not <em>traffic per key</em>. The access pattern is Zipf (cite <a href="../canonicals/access-patterns.html#power-law">access-patterns#power-law</a>): the head is brutally concentrated. Concretely &mdash; 0.1% of keys (10M of them) take 40% of reads (400K reads/sec); the top 1,000 keys take 10% (100K reads/sec); and during a viral event one single key can pull <strong>50,000 reads/sec</strong>. That key hashes to exactly one shard. Cite <a href="../canonicals/bottlenecks.html#hot-key">bottlenecks#hot-key</a> for the steady-state shape and <a href="../canonicals/failure-modes.html#hot-key-meltdown">failure-modes#hot-key-meltdown</a> for the failure shape.</p>
+        <pre class="line-numbers"><code class="language-text">A shard handles ~100,000 GET/sec (from BOE: per-Redis throughput).
+Uniform background load on a shard: 1M reads/sec / 500 nodes = 2,000 reads/sec
+  → utilization 2,000 / 100,000 = 2%, p99 ≈ 0.5ms.
+
+Now the viral key (50,000 reads/sec) hashes to Node-42:
+  Node-42 load = 2,000 (background) + 50,000 (hot key) = 52,000 reads/sec
+  Utilization = 52,000 / 100,000 = 52% → p99 ≈ 3–5ms (queueing).
+And if two top keys collide on one node (birthday paradox over 500 nodes
+is not negligible with 1,000 hot keys):
+  Node load = 2,000 + 50,000 + 25,000 = 77,000 → 77% → p99 ≈ 10–20ms — SLA violated.
+
+Collateral damage: the ~20M innocent keys co-located on Node-42 all get the
+slow p99 too. And a slow shard makes app threads block → thread pools fill →
+timeouts → retries → 2× the load on the already-hot shard → death spiral
+(cite failure-modes#retry-storm). No amount of ring rebalancing fixes this —
+the hot key lives on one node.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>System after this iteration</h3>
+        <svg viewBox="0 0 820 560" style="width:100%;max-width:820px;display:block;margin:1.25rem auto;" font-family="system-ui,sans-serif" font-size="12">
+          <defs>
+            <marker id="arrHK" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+            <marker id="arrHKd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/></marker>
+          </defs>
+          <!-- App server -->
+          <rect x="30" y="20" width="760" height="190" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="410" y="42" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="14">App Server (&times;200) &mdash; NEW: L1 cache + hot-key-aware client + single-flight</text>
+          <rect x="60" y="56" width="700" height="48" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="410" y="76" text-anchor="middle" font-weight="600" fill="#334155" font-size="12">L1: in-process cache (100MB / server, 1s TTL on hot keys)</text>
+          <text x="410" y="94" text-anchor="middle" fill="#16a34a" font-size="11">&gt;99% of hot-key reads served here &mdash; no network call (~0.01ms)</text>
+          <rect x="60" y="112" width="700" height="86" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="410" y="132" text-anchor="middle" font-weight="600" fill="#334155" font-size="12">Cache client: hot-key set (refreshed 10s) + single-flight (one in-flight miss per key)</text>
+          <text x="410" y="150" text-anchor="middle" fill="#64748b" font-size="11">hot key &rarr; pick random replica suffix <tspan font-family="JetBrains Mono,monospace">k#r0..k#r9</tspan> &rarr; spread across 10 shards</text>
+          <text x="410" y="166" text-anchor="middle" fill="#64748b" font-size="11">cold key &rarr; standard consistent-hash lookup (with bounded-loads spillover if the owner is overloaded)</text>
+          <text x="410" y="184" text-anchor="middle" fill="#64748b" font-size="11">on L1+L2 miss: single-flight &mdash; first caller fetches DB, the rest wait on the same future</text>
+          <!-- arrow -->
+          <line x1="410" y1="210" x2="410" y2="248" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrHKd)"/>
+          <text x="540" y="232" text-anchor="middle" fill="#2563eb" font-size="11">L1 miss (~1% of hot-key reads) &rarr; L2</text>
+          <!-- L2 redis -->
+          <rect x="30" y="252" width="760" height="200" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+          <text x="410" y="274" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="14">L2: Distributed Redis (500 nodes, 167 shards &times; 3)</text>
+          <rect x="60" y="288" width="360" height="74" rx="6" fill="#dbeafe" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="240" y="308" text-anchor="middle" font-weight="600" fill="#334155" font-size="12">Redis shard (64GB) + NEW: count-min sketch (200KB)</text>
+          <text x="240" y="326" text-anchor="middle" fill="#64748b" font-size="11">counts local GETs; every 10s reports keys</text>
+          <text x="240" y="342" text-anchor="middle" fill="#64748b" font-size="11">over the hot threshold to the coordinator</text>
+          <rect x="450" y="288" width="310" height="74" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="605" y="308" text-anchor="middle" font-weight="600" fill="#334155" font-size="12">NEW: Hot-Key Coordinator</text>
+          <text x="605" y="326" text-anchor="middle" fill="#64748b" font-size="11">aggregates 500 reports &rarr; global hot-key list</text>
+          <text x="605" y="342" text-anchor="middle" fill="#64748b" font-size="11">(1K&ndash;10K keys) &rarr; broadcast to app servers</text>
+          <line x1="420" y1="325" x2="448" y2="325" stroke="#475569" stroke-width="1.5" marker-end="url(#arrHK)"/>
+          <path d="M 605 288 L 605 232 L 760 232 L 760 80 L 762 80" stroke="#2563eb" stroke-width="1.5" fill="none" stroke-dasharray="6,3" marker-end="url(#arrHKd)"/>
+          <text x="700" y="246" text-anchor="middle" fill="#2563eb" font-size="10">hot-key list every 10s</text>
+          <!-- shard row -->
+          <rect x="60" y="376" width="90" height="34" rx="5" fill="#dbeafe" stroke="#94a3b8" stroke-width="1"/><text x="105" y="397" text-anchor="middle" font-size="11" fill="#334155">shard 1</text>
+          <rect x="160" y="376" width="90" height="34" rx="5" fill="#dbeafe" stroke="#94a3b8" stroke-width="1"/><text x="205" y="397" text-anchor="middle" font-size="11" fill="#334155">shard 2</text>
+          <text x="290" y="397" text-anchor="middle" font-size="13" fill="#64748b">...</text>
+          <rect x="320" y="376" width="170" height="34" rx="5" fill="#dbeafe" stroke="#16a34a" stroke-width="2"/><text x="405" y="397" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="700">shard 42 (was hot &mdash; now ~20 r/s)</text>
+          <text x="520" y="397" text-anchor="middle" font-size="13" fill="#64748b">...</text>
+          <rect x="550" y="376" width="210" height="34" rx="5" fill="#dbeafe" stroke="#94a3b8" stroke-width="1"/><text x="655" y="397" text-anchor="middle" font-size="11" fill="#334155">hot-key replicas r0..r9 spread here</text>
+          <text x="410" y="432" text-anchor="middle" fill="#64748b" font-size="11">consistent-hash ring + 3&times; replication + allkeys-lru + (NEW) bounded-loads spillover</text>
+          <line x1="410" y1="452" x2="410" y2="488" stroke="#475569" stroke-width="1.5" marker-end="url(#arrHK)"/>
+          <text x="530" y="472" text-anchor="middle" fill="#64748b" font-size="11">L2 miss (~5% of total reads), single-flighted</text>
+          <rect x="180" y="492" width="460" height="48" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+          <text x="410" y="514" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">L3: Database (source of truth)</text>
+          <text x="410" y="531" text-anchor="middle" fill="#64748b" font-size="11">&le; 50K queries/sec from misses; never a stampede &mdash; single-flight collapses dup misses</text>
+        </svg>
+        <p>Three new things vs Iter&nbsp;3: (a) a <strong>count-min sketch</strong> on each shard + a coordinator that maintains the global hot-key list (detection); (b) <strong>hot-key replication</strong> &mdash; for keys on that list, the client appends a random <code>#r0..#r9</code> suffix so the same logical key lives on 10 shards; (c) an <strong>L1 in-process cache</strong> on every app server in front of the hot keys, plus <strong>single-flight</strong> on the miss path. Plus a small change to the ring: <strong>consistent hashing with bounded loads</strong> &mdash; if a key's owner is over a load cap, spill to the next node.</p>
+      </div>
+
+      <div>
+        <h3>Step 4a &mdash; Detect hot keys (count-min sketch)</h3>
+        <p>You can't replicate a key you don't know is hot, and you can't keep an exact counter for 10B keys. A <strong>count-min sketch</strong> (cite <a href="../canonicals/sketches.html">sketches.html</a>) estimates per-key access frequency in fixed memory, O(1) per increment and per query &mdash; it adds essentially zero latency to a GET, unlike a top-N min-heap which is O(log N) per read. Each Redis shard runs one (5 rows &times; 10,000 cols &times; 4B = <strong>200KB</strong>); every 10s it scans for keys whose estimate exceeds the hot threshold (~500 reads/sec &asymp; 5,000 over the 10s window) and ships those candidates to a coordinator, which unions them across all 500 shards into a global hot-key list (typically 1K&ndash;10K entries) and broadcasts it to the app servers.</p>
+        <pre class="line-numbers"><code class="language-text">Memory budget for detection:
+  Per shard:        200KB count-min sketch
+  Fleet of 500:     500 × 200KB = 100MB
+  Hot-key list:     10,000 entries × 100B = 1MB (broadcast to app servers)
+  → negligible against 10TB of cached data.
+
+Detection lag: ~10s (one report interval) + a few ms to broadcast.
+During that window one shard absorbs the spike — at the T+10s traffic level
+(say 10,000 reads/sec) the shard is at 10% utilization: elevated but safe.
+And the L1 cache (next step) already absorbs ~99% of the spike even before
+the key is "officially" hot, so the 10s gap is not the first line of defence —
+it's what enables the replication strategy and the monitoring.</code></pre>
+      </div>
+
+      <div>
+        <h3>Step 4b &mdash; Replicate the hot key (key suffixing)</h3>
+        <p>Once a key is on the hot list, the client appends a random replica suffix before hashing &mdash; <code>k#r0 .. k#r9</code> &mdash; so 10 physical copies of the value land on (up to) 10 different shards, and the key's read load is divided ~10&times;. Writes to a hot key fan out to all 10 copies (write amplification: ~1,000 hot keys &times; ~10 writes/sec &times; 10 copies = 100K extra writes/sec spread over 500 nodes &asymp; 200/node/sec &mdash; negligible). The staleness window is the same eventual-consistency tradeoff as the base design: a hot-key write hits the primary copy first, then the replicas, so for 1&ndash;5ms some <code>#rN</code> copies have the old value. A replica miss (the copy hasn't been written yet, e.g. just after a key goes hot) falls through to the un-suffixed key. <strong>Alternative: split the key.</strong> Replicating fans out <em>reads</em>; splitting a key (sharding its <em>value</em> &mdash; e.g. a counter into <code>k:part0..k:part9</code> summed at read time) is what you do when the key is <em>write</em>-hot (a counter incremented 50K times/sec), not read-hot. We're read-hot, so replicate.</p>
+        <pre class="line-numbers"><code class="language-text">Before:  "product:viral-sneaker" → 50,000 reads/sec on shard 42 → 52% util.
+After R=10: 50,000 / 10 = 5,000 reads/sec per replica shard.
+  shard 42 now: 2,000 (background) + 5,000 (its 1/10 share) = 7,000 reads/sec
+  → utilization 7% — well within limits, p99 back to ~0.5ms,
+    and the 20M innocent co-tenants are no longer collateral damage.</code></pre>
+      </div>
+
+      <div>
+        <h3>Step 4c &mdash; L1 in-process cache (the biggest lever)</h3>
+        <p>The best defence against a hot key is to never send the request over the network. Each app server keeps a small in-process cache (~100MB &asymp; 100K entries at 1KB) with a short TTL (1s for hot keys; a few seconds for warm ones). For the viral key at 50K reads/sec spread over 200 app servers, each server sees 250 reads/sec; with a 1s TTL, the first read each second misses L1 and hits L2, the other ~249 are L1 hits &mdash; a ~99.6% L1 hit rate. That collapses L2 traffic for the key to <strong>200 reads/sec total</strong> (one miss/sec/server &times; 200 servers), a 250&times; reduction; combine with R=10 and each replica shard sees ~20 reads/sec &mdash; essentially zero. Memory cost: 200 servers &times; 100MB = 20GB fleet-wide, 0.2% of the 10TB L2 &mdash; the highest-ROI line in the whole design. The cost is bounded staleness: a hot-key value can be up to 1s old. Fine for view counts, product info, news, profiles; for inventory-during-flash-sale or anything that can't tolerate 1s, use a 100ms TTL or bypass L1 for those keys.</p>
+        <pre class="line-numbers"><code class="language-python">class ThreeLayerCache:
+    def __init__(self):
+        self.l1 = L1Cache(max_entries=100_000, default_ttl=1.0)   # in-process
+        self.l2 = DistributedRedisCache(nodes=500)                # Iter 1–3
+        self.hot_keys = set()                                     # refreshed every 10s
+        self.inflight = {}                                        # key -> Future (single-flight)
+
+    def get(self, key):
+        v = self.l1.get(key)
+        if v is not None:
+            return v                                              # L1 hit (~0.01ms, no network)
+        if key in self.hot_keys:
+            v = self.l2.get(f"{key}#r{random.randrange(10)}") or self.l2.get(key)
+        else:
+            v = self.l2.get(key)                                  # ~1ms
+        if v is not None:
+            self.l1.put(key, v, ttl=1.0 if key in self.hot_keys else 5.0)
+            return v
+        # L1+L2 miss → single-flight: only the first caller hits the DB
+        return self._single_flight(key)
+
+    def _single_flight(self, key):                                # cite design-moves/single-flight.html
+        if key in self.inflight:
+            return self.inflight[key].result()                    # piggyback on the in-flight load
+        fut = self.inflight[key] = Future()
+        try:
+            v = database.query(key)                               # ~50ms — the ONE DB hit
+            if v is not None:
+                self.l2.set(key, v, ttl=3600); self.l1.put(key, v, ttl=1.0)
+            fut.set_result(v); return v
+        finally:
+            del self.inflight[key]</code></pre>
+      </div>
+
+      <div>
+        <h3>Step 4d &mdash; consistent hashing with bounded loads + single-flight (defense for the unlucky cases)</h3>
+        <p>Two residual risks. (1) A key goes hot <em>faster than 10s</em> (an instantaneous spike from a bot or a DDoS) &mdash; before detection kicks in, one shard takes the hit. <strong>Consistent hashing with bounded loads</strong> (cite <a href="../consistent-hashing.html">consistent-hashing.html</a>, and the "power of two choices" idea) caps any node at (1+&epsilon;)&times; the mean load; when the owner of a key is over the cap, the client walks the ring to the next under-cap node &mdash; the hot key's overflow reads spill to neighbours <em>without</em> waiting for the coordinator. It's a blanket safety net, cheap (a per-node load counter the client samples), and it composes with replication (spillover targets are themselves bounded). (2) A <em>cold</em> key gets a million simultaneous misses &mdash; a freshly-evicted or freshly-written key, or one whose TTL just expired, with a million callers all racing to the DB. <strong>Single-flight</strong> (cite <a href="../design-moves/single-flight.html">single-flight.html</a> &mdash; the canonical move for this; we don't re-derive it) collapses those into one DB read: the first caller fetches and fills, every other caller waiting on that key piggybacks on the same in-flight future. This is the stampede / thundering-herd defence (cite <a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a>, sister scenario <a href="27-thundering-herd.html">27-thundering-herd.html</a>); it caps DB miss-load at "distinct keys missing concurrently," not "callers missing concurrently."</p>
+        <pre class="line-numbers"><code class="language-text">Without single-flight: viral key's TTL expires → 50,000 callers in that second
+  all miss → 50,000 DB queries for ONE key. With 1,000 hot keys all expiring
+  in a burst → 50M DB queries/sec → DB falls over (failure-modes#stampede).
+With single-flight: 1 DB query per distinct key in flight.
+  1,000 hot keys → 1,000 DB queries total, regardless of caller count.
+  Then L2 is filled, L1 is filled, the herd is served from cache.</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>Hot-key before/after &mdash; the viral key</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Metric</th><th>Iter 3 (no hot-key mitigation)</th><th>Iter 4 (detect + replicate + L1 + single-flight)</th></tr></thead>
+            <tbody>
+              <tr><td>Reads/sec on the hottest shard</td><td>52,000 (52% util)</td><td>~20 (after L1 250&times; + R=10)</td></tr>
+              <tr><td>p99 on the hottest shard</td><td>15&ndash;30ms (SLA violated, and so are its 20M co-tenants)</td><td>&lt;1ms (normal)</td></tr>
+              <tr><td>Client-perceived p99 for a hot-key read</td><td>15&ndash;30ms</td><td>&lt;0.01ms (L1 hit)</td></tr>
+              <tr><td>DB load on a hot-key TTL-expiry burst</td><td>up to 50K queries/sec for one key (stampede)</td><td>1 query/key (single-flight)</td></tr>
+              <tr><td>Extra memory</td><td>0</td><td>20GB L1 + 100MB sketches &asymp; 20GB fleet-wide</td></tr>
+              <tr><td>Max staleness for a hot key</td><td>0 (direct from Redis)</td><td>1s (L1 TTL) &mdash; tunable per key</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Viral-event timeline</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Time</th><th>Event</th><th>System response</th></tr></thead>
+            <tbody>
+              <tr><td>T+0s</td><td>Celebrity tweets; key jumps 10 &rarr; 1,000 reads/sec.</td><td>L1 already absorbs ~99% (1s TTL); the residual to L2 is trivial.</td></tr>
+              <tr><td>T+10s</td><td>Traffic at 10,000 reads/sec; count-min sketches flag the key.</td><td>Coordinator adds it to the hot list, broadcasts to app servers. Shard at ~10% util &mdash; safe.</td></tr>
+              <tr><td>T+20s</td><td>App servers have the updated list; traffic at 30,000 reads/sec.</td><td>Key suffixing activates; reads spread over 10 shards; L1 absorbs &gt;99%.</td></tr>
+              <tr><td>T+30s</td><td>Peak: 50,000 reads/sec.</td><td>L1 serves ~49,800/sec; ~200/sec to L2, ~20/sec/replica-shard. No degradation.</td></tr>
+              <tr><td>T+3600s</td><td>Event subsides, traffic &lt; 500 reads/sec.</td><td>Key drops off the hot list; single-shard routing resumes; <code>#rN</code> copies TTL out.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Alternatives considered (C4) &mdash; the hot-key fix</h3>
+        <ul>
+          <li><strong>Replicate the key</strong> (chosen, with L1 in front) &mdash; spreads <em>read</em> load; cheap; write fan-out is small. The lever that does the heavy lifting is the L1 cache; replication handles the residual that escapes L1.</li>
+          <li><strong>Split the key</strong> &mdash; shard a key's <em>value</em> across N sub-keys (counter &rarr; <code>k:part0..partN</code>, summed at read). The right move when a key is <em>write</em>-hot; useless when it's read-hot (every read still touches all N parts). Out of scope for this read-heavy workload; flagged for the write-heavy variant.</li>
+          <li><strong>Local-LRU-in-front (L1) only, no replication</strong> &mdash; L1 alone cuts the viral key's L2 traffic 250&times; (to ~200 reads/sec), which is already under a shard's limit. Replication is belt-and-suspenders for the case where L1 TTL is forced very short, or where there are many simultaneous hot keys. We keep both because they're cheap; if you must pick one, pick L1.</li>
+          <li><strong>Consistent hashing with bounded loads (power of two choices)</strong> &mdash; a blanket cap on per-node load with ring-walk spillover. Doesn't need detection (it reacts in &lt;1ms, not 10s) but it only <em>spreads</em> the overload to neighbours &mdash; if the spike is huge it just makes 3 nodes hot instead of 1. It's the fast-reacting net under the detection-based replication, not a replacement for it.</li>
+          <li><strong>Single-flight / request coalescing</strong> &mdash; orthogonal: it kills the <em>miss</em>-side stampede on a cold key, where the others kill the <em>hit</em>-side overload on a hot key. Both are needed. Cite <a href="../design-moves/single-flight.html">single-flight.html</a>.</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>What breaks (C5; cite <a href="../canonicals/failure-modes.html">failure-modes.html</a>)</h3>
+        <ul>
+          <li><strong>Hot-key meltdown during the detection gap</strong> (<a href="../canonicals/failure-modes.html#hot-key-meltdown">failure-modes#hot-key-meltdown</a>) &mdash; if a key goes from cold to 100K reads/sec in &lt;1s (faster than the 10s detection cycle), L1 (1s TTL, blanket on all keys) still absorbs ~99% and bounded-loads spillover reacts immediately; the shard takes the residual for one report interval. The blast radius is one shard's other keys getting elevated p99 for ~10s; recovery is automatic when the key gets replicated.</li>
+          <li><strong>L1 staleness bites a consistency-sensitive key</strong> (<a href="../canonicals/failure-modes.html#replica-divergence">failure-modes#replica-divergence</a>) &mdash; a key that genuinely can't tolerate 1s of staleness (inventory during a flash sale) read through L1 returns an oversell-causing stale count. Mitigation: a per-key "no-L1" / short-L1-TTL flag set by the owning service; the cache client honours it.</li>
+          <li><strong>Write-hot key</strong> (<a href="../canonicals/bottlenecks.html#hot-partition">bottlenecks#hot-partition</a>) &mdash; a counter incremented 50K times/sec doesn't benefit from read-replication or L1; the writes still all hit one shard. Out of scope here (this is a read-heavy cache); the fix is key-splitting + eventual aggregation, flagged for the write-heavy sister.</li>
+          <li><strong>Coordinator down</strong> &mdash; if the hot-key coordinator dies, the hot list goes stale; new hot keys aren't detected until it recovers. L1 + bounded-loads keep the system safe in the meantime (L1 doesn't need the coordinator). The coordinator is a small, restartable service; run two and let app servers consume whichever is up.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Final Design                                                  -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="final-design">
+    <div class="container">
+      <h2>Final Design</h2>
+      <p>Putting all the iterations together, here is the complete architecture:</p>
+
+      <div class="full-width">
+        <h3>Architecture Overview</h3>
+        <svg viewBox="0 0 700 520" style="width:100%;max-width:700px;display:block;margin:1.5rem auto;" font-family="system-ui,sans-serif" font-size="13">
+          <defs>
+            <marker id="arrowPrimary" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2563eb"/></marker>
+            <marker id="arrowSlate" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#64748b"/></marker>
+            <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#16a34a"/></marker>
+            <marker id="arrowRed" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ef4444"/></marker>
+          </defs>
+
+          <!-- Application Servers Layer -->
+          <rect x="30" y="10" width="640" height="120" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+          <text x="350" y="35" text-anchor="middle" font-weight="700" fill="#2563eb" font-size="14">Application Servers (200)</text>
+
+          <!-- Cache Client Library inner box -->
+          <rect x="55" y="48" width="590" height="70" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+          <text x="350" y="68" text-anchor="middle" font-weight="600" fill="#1e40af" font-size="12">Cache Client Library</text>
+          <text x="80" y="86" fill="#334155" font-size="11">Consistent hash ring (100K vnodes)</text>
+          <text x="80" y="102" fill="#334155" font-size="11">Connection pool to 500 Redis instances</text>
+          <text x="370" y="86" fill="#334155" font-size="11">Automatic failover on node failure</text>
+          <text x="370" y="102" fill="#334155" font-size="11">Retry with exponential backoff</text>
+
+          <!-- Arrows from App to Redis -->
+          <line x1="230" y1="130" x2="230" y2="170" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+          <text x="145" y="155" fill="#16a34a" font-size="11" font-weight="600">reads (any replica)</text>
+          <line x1="470" y1="130" x2="470" y2="170" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+          <text x="490" y="155" fill="#ef4444" font-size="11" font-weight="600">writes (primary only)</text>
+
+          <!-- Redis Cluster Layer -->
+          <rect x="30" y="175" width="640" height="210" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="198" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Redis Cluster (500 instances)</text>
+          <text x="350" y="216" text-anchor="middle" fill="#64748b" font-size="11">167 shard groups x 3 replicas = 501 nodes</text>
+
+          <!-- Shard Group 1 -->
+          <rect x="55" y="230" width="190" height="100" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1"/>
+          <text x="150" y="248" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Shard Group 1</text>
+          <rect x="65" y="258" width="60" height="30" rx="4" fill="#2563eb" stroke="#1d4ed8" stroke-width="1"/>
+          <text x="95" y="277" text-anchor="middle" fill="#fff" font-size="10" font-weight="600">Primary</text>
+          <line x1="125" y1="273" x2="145" y2="273" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowSlate)"/>
+          <text x="135" y="265" fill="#64748b" font-size="8">async</text>
+          <rect x="148" y="258" width="40" height="30" rx="4" fill="#0891b2" stroke="#0e7490" stroke-width="1"/>
+          <text x="168" y="277" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">R1</text>
+          <line x1="188" y1="273" x2="195" y2="273" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowSlate)"/>
+          <rect x="198" y="258" width="40" height="30" rx="4" fill="#0891b2" stroke="#0e7490" stroke-width="1"/>
+          <text x="218" y="277" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">R2</text>
+          <text x="95" y="318" text-anchor="middle" fill="#64748b" font-size="10">writes</text>
+          <text x="195" y="318" text-anchor="middle" fill="#64748b" font-size="10">reads</text>
+
+          <!-- Shard Group 2 -->
+          <rect x="260" y="230" width="190" height="100" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1"/>
+          <text x="355" y="248" text-anchor="middle" fill="#64748b" font-size="10" font-weight="600">Shard Group 2</text>
+          <rect x="270" y="258" width="60" height="30" rx="4" fill="#2563eb" stroke="#1d4ed8" stroke-width="1"/>
+          <text x="300" y="277" text-anchor="middle" fill="#fff" font-size="10" font-weight="600">Primary</text>
+          <line x1="330" y1="273" x2="350" y2="273" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowSlate)"/>
+          <rect x="353" y="258" width="40" height="30" rx="4" fill="#0891b2" stroke="#0e7490" stroke-width="1"/>
+          <text x="373" y="277" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">R1</text>
+          <line x1="393" y1="273" x2="400" y2="273" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowSlate)"/>
+          <rect x="403" y="258" width="40" height="30" rx="4" fill="#0891b2" stroke="#0e7490" stroke-width="1"/>
+          <text x="423" y="277" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">R2</text>
+
+          <!-- Shard Group ... -->
+          <rect x="465" y="230" width="190" height="100" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3"/>
+          <text x="560" y="280" text-anchor="middle" fill="#94a3b8" font-size="13" font-weight="600">... Shard 167</text>
+
+          <!-- Annotations below shard groups -->
+          <text x="350" y="356" text-anchor="middle" fill="#64748b" font-size="11">Ring: 500&times;200 vnodes + bounded-loads spillover | allkeys-lru @90% | count-min sketch/shard | hot keys replicated &times;10 | L1 + single-flight on the app side</text>
+
+          <!-- Arrow from Redis to DB -->
+          <line x1="350" y1="385" x2="350" y2="415" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowSlate)"/>
+          <text x="350" y="405" text-anchor="middle" fill="#64748b" font-size="11">cache miss</text>
+
+          <!-- Database Layer -->
+          <rect x="130" y="420" width="440" height="80" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+          <text x="350" y="450" text-anchor="middle" font-weight="700" fill="#334155" font-size="14">Database (source of truth)</text>
+          <text x="350" y="472" text-anchor="middle" fill="#64748b" font-size="11">Cache miss rate target: &lt; 5% | DB load from misses: &lt; 50K queries/sec</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>Configuration Summary</h3>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Redis instances</td><td>500</td><td>Storage bottleneck: 10TB / 60GB per node, ×3 replication</td></tr>
+              <tr><td>RAM per instance</td><td>64GB</td><td>60GB usable, 4GB for OS and Redis overhead</td></tr>
+              <tr><td>Virtual nodes per instance</td><td>200</td><td>100K total vnodes gives &lt;8% load variance</td></tr>
+              <tr><td>Replication factor</td><td>3</td><td>Survives 2 simultaneous node failures per shard</td></tr>
+              <tr><td>Replication mode</td><td>Async</td><td>Cache tolerates ms-level staleness; sync is too slow</td></tr>
+              <tr><td>Read consistency</td><td>Eventual</td><td>Reads from any replica; staleness is 1-5ms</td></tr>
+              <tr><td>Eviction policy</td><td>allkeys-lru</td><td>Evict least-recently-used when memory hits 90%</td></tr>
+              <tr><td>TTL</td><td>1 hour default</td><td>Prevents stale data accumulation; tunable per key</td></tr>
+              <tr><td>Health check interval</td><td>2 seconds</td><td>Detect failures within 6 seconds (3 missed checks)</td></tr>
+              <tr><td>Node recovery</td><td>Background copy from replica</td><td>New node warm in ~7 minutes</td></tr>
+              <tr><td>Bounded-loads cap</td><td>(1+&epsilon;)&times; mean, &epsilon;&asymp;0.25</td><td>Iter&nbsp;4: ring-walk spillover when a node is over the cap &mdash; instant net under hot-key spikes</td></tr>
+              <tr><td>Hot-key detection</td><td>count-min sketch 5&times;10K/shard, 10s report</td><td>Iter&nbsp;4: O(1) per GET; coordinator unions reports into a 1K&ndash;10K-key list</td></tr>
+              <tr><td>Hot-key replication</td><td>&times;10 random-suffix copies</td><td>Iter&nbsp;4: spreads a viral key's read load over 10 shards</td></tr>
+              <tr><td>L1 in-process cache</td><td>100MB/app server, 1s TTL on hot keys</td><td>Iter&nbsp;4: ~99.6% L1 hit on a hot key &rarr; 250&times; fewer L2 reads</td></tr>
+              <tr><td>Single-flight</td><td>one in-flight DB load per key</td><td>Iter&nbsp;4: collapses a cold-key miss stampede to one DB query/key</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3>Request Flow: Read Path</h3>
+        <svg viewBox="0 0 340 400" style="width:100%;max-width:340px;display:block;margin:1rem auto;" font-family="system-ui,sans-serif" font-size="12">
+          <defs>
+            <marker id="arrowFlowB" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#2563eb"/></marker>
+            <marker id="arrowFlowG" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#64748b"/></marker>
+          </defs>
+          <!-- Step 1: App Server -->
+          <rect x="60" y="5" width="220" height="32" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+          <text x="170" y="25" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="11">1. App receives request for key</text>
+          <line x1="170" y1="37" x2="170" y2="52" stroke="#2563eb" stroke-width="1.2" marker-end="url(#arrowFlowB)"/>
+
+          <!-- Step 2: Hash -->
+          <rect x="60" y="55" width="220" height="32" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="170" y="75" text-anchor="middle" fill="#334155" font-size="11">2. hash("product:12345") = 0x7A3F</text>
+          <line x1="170" y1="87" x2="170" y2="102" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowFlowG)"/>
+
+          <!-- Step 3: Binary search -->
+          <rect x="60" y="105" width="220" height="32" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="170" y="125" text-anchor="middle" fill="#334155" font-size="11">3. Binary search vnode list</text>
+          <line x1="170" y1="137" x2="170" y2="152" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowFlowG)"/>
+
+          <!-- Step 4: Map to group -->
+          <rect x="40" y="155" width="260" height="32" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="170" y="175" text-anchor="middle" fill="#334155" font-size="11">4. Map to [Node-42, Node-187, Node-301]</text>
+          <line x1="170" y1="187" x2="170" y2="202" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowFlowG)"/>
+
+          <!-- Step 5: Pick replica -->
+          <rect x="40" y="205" width="260" height="32" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
+          <text x="170" y="225" text-anchor="middle" fill="#1e40af" font-size="11">5. Pick Node-187 (lowest latency)</text>
+          <line x1="170" y1="237" x2="170" y2="252" stroke="#2563eb" stroke-width="1.2" marker-end="url(#arrowFlowB)"/>
+
+          <!-- Step 6: GET -->
+          <rect x="60" y="255" width="220" height="32" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2"/>
+          <text x="170" y="275" text-anchor="middle" fill="#16a34a" font-weight="600" font-size="11">6. GET product:12345 -> value (0.3ms)</text>
+          <text x="170" y="305" text-anchor="middle" fill="#334155" font-weight="600" font-size="12">Total: ~1ms</text>
+
+          <!-- Cache miss path -->
+          <line x1="170" y1="315" x2="170" y2="330" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowFlowG)"/>
+          <text x="170" y="327" text-anchor="middle" fill="#ef4444" font-size="10">on miss</text>
+          <rect x="40" y="333" width="260" height="50" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+          <text x="170" y="352" text-anchor="middle" fill="#ef4444" font-size="11">7. Query DB (50ms), then SET to</text>
+          <text x="170" y="370" text-anchor="middle" fill="#ef4444" font-size="11">primary + async replicate (1-5ms)</text>
+        </svg>
+      </div>
+
+      <div>
+        <h3>Request Flow: Write Path</h3>
+        <svg viewBox="0 0 340 310" style="width:100%;max-width:340px;display:block;margin:1rem auto;" font-family="system-ui,sans-serif" font-size="12">
+          <defs>
+            <marker id="arrowFlowR" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#ef4444"/></marker>
+            <marker id="arrowFlowS" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#64748b"/></marker>
+          </defs>
+          <!-- Step 1: Write to DB -->
+          <rect x="40" y="5" width="260" height="32" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+          <text x="170" y="25" text-anchor="middle" fill="#2563eb" font-weight="600" font-size="11">1. Update product price in DB</text>
+          <line x1="170" y1="37" x2="170" y2="55" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowFlowS)"/>
+
+          <!-- Step 2: Invalidate cache -->
+          <rect x="40" y="58" width="260" height="32" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1.2"/>
+          <text x="170" y="78" text-anchor="middle" fill="#ef4444" font-weight="600" font-size="11">2. DELETE product:12345 on primary</text>
+          <line x1="170" y1="90" x2="170" y2="108" stroke="#ef4444" stroke-width="1.2" marker-end="url(#arrowFlowR)"/>
+
+          <!-- Step 3: Replicate delete -->
+          <rect x="40" y="111" width="260" height="32" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+          <text x="170" y="131" text-anchor="middle" fill="#334155" font-size="11">3. Primary sends DELETE to replicas</text>
+          <line x1="170" y1="143" x2="170" y2="161" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowFlowS)"/>
+
+          <!-- Step 4: Next read -->
+          <rect x="40" y="164" width="260" height="42" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2"/>
+          <text x="170" y="182" text-anchor="middle" fill="#16a34a" font-size="11">4. Next read = cache miss</text>
+          <text x="170" y="197" text-anchor="middle" fill="#16a34a" font-size="11">-> fetches fresh value from DB</text>
+
+          <!-- Why DELETE callout -->
+          <rect x="20" y="220" width="300" height="80" rx="6" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+          <text x="170" y="240" text-anchor="middle" font-weight="600" fill="#2563eb" font-size="11">Why DELETE instead of SET?</text>
+          <text x="35" y="258" fill="#334155" font-size="10">Cache-aside pattern avoids race conditions</text>
+          <text x="35" y="273" fill="#334155" font-size="10">where two concurrent writes leave cache</text>
+          <text x="35" y="288" fill="#334155" font-size="10">with stale data (network reordering).</text>
+        </svg>
+      </div>
+
+      <div class="full-width">
+        <h3>C8 &mdash; LC kernel (LRU dll+hashmap) &rarr; production cousin (property trade)</h3>
+        <p>Per-node complexity is unchanged from the LC kernel: <code>GET</code> / <code>SET</code> / <code>DEL</code> are O(1) (hashmap lookup + a constant-time recency touch &mdash; Redis approximates the dll with sampled-LRU, trading exactness for a fixed-size sample). What changed going from one box to 500:</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Property</th><th>Single-node LRU (LC #146)</th><th>Sharded distributed cache (this page)</th></tr></thead>
+            <tbody>
+              <tr><td>Capacity</td><td>one node's RAM (64GB)</td><td>N shards &times; RAM &mdash; 167 shards &times; 60GB &asymp; 10TB (Iter 1&ndash;2)</td></tr>
+              <tr><td>Recency scope</td><td>exact global LRU order over all keys</td><td>per-shard LRU; "global LRU" is <em>approximated</em>, not exact &mdash; an evicted key on shard A says nothing about recency on shard B (Iter 2)</td></tr>
+              <tr><td>Data structure</td><td>hashmap + doubly-linked list, both exact</td><td>per-shard sampled-LRU (CLOCK-ish; W-TinyLFU if hit-rate audit demands) + a consistent-hashing ring across shards + a count-min sketch per shard for hot-key detection (Iter 2, 4)</td></tr>
+              <tr><td>Failure mode</td><td>lost entirely on restart; nobody depends on it surviving</td><td>3&times; replicated so a node loss is invisible; but a cluster-wide flush is a cold-start thundering herd &mdash; warm-up-from-replica + rate-limited miss path + single-flight (Iter 1, 3, 4)</td></tr>
+              <tr><td>Hot key</td><td>n/a &mdash; one node sees every key, load is uniform by construction</td><td>a hot key melts <em>its</em> shard (and its 20M co-tenants) &mdash; detect (count-min) &rarr; replicate the key &times;10 &rarr; L1 in front; bounded-loads as the fast net (Iter 4)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>C9 &mdash; key shape, cache-aside pseudocode, the ring (cite <a href="../canonicals/api-design-patterns.html">api-design-patterns.html</a>)</h3>
+        <p>There is no REST surface &mdash; callers use the Redis wire protocol via the smart client. The "schema" is the key shape and the small control-plane records.</p>
+        <pre class="line-numbers"><code class="language-text"># --- Redis key shape (the only "schema" a flat KV cache has) ---
+  <namespace>:<entity>:<id>            # e.g. product:12345, user:88f3a, config:flags
+  TTL: per-key (default 3600s; shorter for fast-changing keys); allkeys-lru evicts under pressure
+  Value: opaque bytes (caller's serialization — protobuf / JSON / msgpack)
+  Hot-key replica copies (Iter 4): "<key>#r0" .. "<key>#r9" — same value, written by the writer to all 10
+  Versioned-key variant (for keys that can't tolerate cache-aside's race): "<key>#v<monotonic_version>"
+
+# --- Cache-aside read/write (caller's logic; the cache provides GET/SET/DEL) ---
+  read(k):  v = cache.GET(k); if v: return v
+            v = single_flight(k, lambda: db.SELECT(k))         # one DB hit per key in flight
+            cache.SET(k, v, ttl=3600); return v
+  write(k): db.UPDATE(k, v); cache.DEL(k)                      # DEL not SET — idempotent, self-heals on race
+            # for a hot key: also cache.DEL("k#r0".."k#r9")    # invalidate the replicas
+
+# --- The consistent-hashing ring (client-side, control-plane-pushed) ---
+  ring = sorted list of 100,000 (hash32, shard_id) pairs   # 500 shards × 200 vnodes
+  shard_for(k): i = bisect_left(ring, hash32(k)); return ring[i % len(ring)].shard_id
+  reads: pick the least-loaded of {primary, replica1, replica2}; writes: primary only
+  bounded-loads (Iter 4): if load[shard_for(k)] > (1+ε)·mean_load: walk the ring to the next under-cap shard
+  ring carries a monotonic epoch; SET/GET tagged with epoch; shard rejects on mismatch → client refreshes
+</code></pre>
+      </div>
+
+      <div class="full-width">
+        <h3>C10 &mdash; concrete technology, named &amp; justified</h3>
+        <p><strong>Pick: Redis 7.x in Cluster mode</strong> (self-managed on r6g.2xlarge-class boxes, 64GB), client-side smart-client routing (we treat Cluster's slot map as the source of ring truth but do the replica-pick + bounded-loads + hot-key suffixing in the client). Eviction <code>allkeys-lru</code>, <code>maxmemory</code> = 90% of RAM, persistence off on the cache tier (the DB is durable; we accept cold-start over AOF-fsync write-latency). Cite <a href="../canonicals/storage-engines.html#kv-engine">storage-engines#kv-engine</a> for the engine class, <a href="../canonicals/replication-decisions.html#single-async">replication-decisions#single-async</a> for async primary&ndash;replica, <a href="../canonicals/sharding-strategies.html#hash">sharding-strategies#hash</a> for consistent hashing.</p>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>Candidate</th><th>Why considered</th><th>Why not chosen here</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Redis 7 Cluster (chosen)</strong></td><td>Rich data types (we mostly use strings, but hashes/sorted-sets help for the versioned-key and counter variants); LRU/LFU eviction; Cluster mode handles slot ownership + failover; Redis 7 functions enable atomic single-flight on the server if we ever want it.</td><td>&mdash;</td></tr>
+              <tr><td>Memcached</td><td>Dead-simple, multithreaded, slab allocator &mdash; great pure look-aside cache; lower per-op overhead.</td><td>No replication / failover (a node loss = data loss for that shard &mdash; we want 99.99%); no LRU-with-TTL nuance, no count-min/sketch primitives; multi-key ops are clumsy. The availability requirement disqualifies it.</td></tr>
+              <tr><td>DragonflyKeyDB / Dragonfly</td><td>Redis-API-compatible, multithreaded &mdash; fewer, bigger nodes for the same throughput.</td><td>Younger ecosystem; we don't need the per-node throughput (storage, not ops, is the bottleneck). A fine drop-in if ops/node ever becomes the constraint.</td></tr>
+              <tr><td>Managed (ElastiCache Redis / MemoryDB)</td><td>No cluster to run; MemoryDB adds multi-AZ durability.</td><td>~30&ndash;50% unit-cost premium at 500 nodes; less control over the eviction/replica-pick/bounded-loads logic we run client-side; MemoryDB's durability is a feature we explicitly don't want (it slows writes for a guarantee the DB already provides). Worth it for a small team; not at this scale.</td></tr>
+              <tr><td>CDN / edge cache (CloudFront, Fastly)</td><td>Pushes hot, cacheable responses to the POP &mdash; absorbs traffic before it reaches the origin.</td><td>Different layer: caches HTTP responses keyed by URL, not arbitrary internal KV; great in front of read-only public content (see sister <a href="45-autocomplete-suggest.html">45-autocomplete-suggest.html</a>), not a substitute for the application's data cache.</td></tr>
+              <tr><td>mcrouter (sidecar/proxy)</td><td>Facebook's Memcached router &mdash; does per-key replication, shadowing, pool failover centrally.</td><td>That's the "proxy topology" we rejected in Iter&nbsp;2 (extra hop, a tier to run); we do the equivalent in the client. Reconsider if clients go polyglot.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Operability:</strong> self-managed &mdash; <code>SLOWLOG</code> + keyspace notifications + <code>INFO</code> stats scraped to the metrics pipeline; <code>redis-cli --bigkeys</code> / <code>--hotkeys</code> for ad-hoc; known hazards: <code>BGSAVE</code>/AOF-rewrite fork can OOM (we keep persistence off, so n/a), and a slow client can back up the single-threaded event loop (we cap client output buffers and use the smart client's pooling).</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Operations (C6)</h3>
+        <ul>
+          <li><strong>SLIs / dashboards:</strong> per-shard hit rate, eviction rate (alert &gt; 1% of reads sustained 10 min), p99 GET latency, ops/sec, memory used / <code>maxmemory</code>; fleet cache-hit rate (target &gt; 95%); DB queries/sec attributable to misses (target &lt; 50K); hot-key list size and the top-key reads/sec; L1 hit rate per app server; single-flight collapse ratio (callers served / DB queries). These map 1:1 to the C5 failure modes: hit-rate dip &rarr; eviction storm or imbalance; DB miss-spike &rarr; cold-start or stampede; one-shard p99 &rarr; hot key or rack-correlated loss.</li>
+          <li><strong>Rollout:</strong> cache-tier changes (Redis version, <code>maxmemory-policy</code>) are canaried on one shard group, then 10%, then fleet; the smart-client library is rolled like any client dependency (the ring epoch protects against split-brain during the rollout). New count-min-sketch / hot-key thresholds are config-pushed and watched for false-positive hot keys (over-replicating).</li>
+          <li><strong>Migration / scaling (8 &rarr; 16 shards, the classic):</strong> add the new shards to the ring with <em>zero</em> vnodes, then bleed vnodes from old shards to new ones in small steps, copying the affected key ranges from a replica before flipping ownership &mdash; so each step moves only ~1/N of one shard and the new shard is warm before it takes reads. Never re-hash the whole ring at once (that's a fleet-wide cold start). Bound the copy rate (~50K keys/sec/shard) so it doesn't impact live traffic. Ring epoch bumps once per step; clients refresh.</li>
+          <li><strong>Headroom:</strong> +20% RAM headroom per shard above the &plusmn;1.4GB load tail (so an unlucky shard isn't permanently evicting); read-throughput is ~50&times; over-provisioned by construction so burst headroom is free there; the hot-key path has its own elastic headroom (L1 + replication scale with the spike).</li>
+        </ul>
+      </div>
+
+      <div class="full-width">
+        <h3>Cross-cutting coverage (X1&ndash;X8; cite <a href="../canonicals/cross-cutting.html">cross-cutting.html</a>)</h3>
+        <div class="table-responsive">
+          <table>
+            <thead><tr><th>#</th><th>Concern</th><th>This design</th></tr></thead>
+            <tbody>
+              <tr><td>X1</td><td>Security</td><td>Cache is inside the trust boundary; mTLS between clients and Redis; no per-tenant auth (callers are first-party). Don't cache secrets / PII unencrypted &mdash; that's a caller policy. See <a href="../canonicals/cross-cutting.html#security">cross-cutting#security</a>.</td></tr>
+              <tr><td>X2</td><td>Privacy</td><td>Cached values are copies of DB rows; a DB-side erasure (right-to-be-forgotten) must also <code>DEL</code> the key (and its <code>#rN</code> replicas) &mdash; the writer's invalidation path covers it; TTL bounds the worst case. See <a href="../canonicals/cross-cutting.html#privacy">cross-cutting#privacy</a>.</td></tr>
+              <tr><td>X3</td><td>DR</td><td>The cache itself has nothing to recover &mdash; it's rebuildable from the DB. DR = "size the DB to absorb a region-wide cold cache at degraded latency" (the degradation contract). RPO/RTO are the DB's, not ours. See <a href="../canonicals/cross-cutting.html#dr">cross-cutting#dr</a>.</td></tr>
+              <tr><td>X4</td><td>Capacity</td><td>Auto-scale shards on sustained eviction rate &gt; 1% of reads; +20% RAM headroom; read capacity ~50&times; over-provisioned; warm-up &asymp; 7 min/shard from a replica. See <a href="../canonicals/cross-cutting.html#capacity">cross-cutting#capacity</a>.</td></tr>
+              <tr><td>X5</td><td>Subsetting</td><td>N/A as a fan-out problem (single cache tier), but the smart client opens connections to all 500 shards &mdash; at large client fleets we'd subset the connection pool (a client talks to a deterministic subset of shards via a second hash) to bound N&times;500 connections. See <a href="../canonicals/cross-cutting.html#subsetting">cross-cutting#subsetting</a>.</td></tr>
+              <tr><td>X6</td><td>Cells</td><td>The shard group is the cell &mdash; a shard-group loss (all 3 replicas) blacks out 1/167 &asymp; 0.6% of keys, which fall through to the DB; no cross-shard blast radius. See <a href="../canonicals/cross-cutting.html#cells">cross-cutting#cells</a>.</td></tr>
+              <tr><td>X7</td><td>Push</td><td>Invalidation is push-on-write (cache-aside DEL); the hot-key list is pushed to app servers every 10s. No client subscriptions / streaming. See <a href="../canonicals/cross-cutting.html#real-time-push">cross-cutting#real-time-push</a>.</td></tr>
+              <tr><td>X8</td><td>Edge</td><td>Out of scope here &mdash; a CDN/edge cache is a separate layer in front of cacheable HTTP responses (see C10 row and sister <a href="45-autocomplete-suggest.html">#45</a>). See <a href="../canonicals/cross-cutting.html#edge">cross-cutting#edge</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="full-width">
+        <h3>Degradation contract</h3>
+        <p><strong>The rule: the cache is an optimization, not a dependency.</strong> If the entire cache tier is unavailable, every read becomes a DB read &mdash; so the DB must be sized to survive that: it absorbs 1M reads/sec at degraded latency (p99 &asymp; 50ms instead of 1ms), shedding non-critical reads first if it can't. We accept reduced performance, not an outage. Concretely, by failure scope: <em>one shard-group lost</em> &rarr; 0.6% of keys fall through to the DB (~6K extra QPS) &mdash; invisible. <em>One AZ lost</em> &rarr; rack/AZ-aware placement means each shard still has a surviving replica; reads re-route, no fall-through. <em>Whole cache cold (deploy flush / region restart)</em> &rarr; warm-up-from-replica + rate-limited miss path + single-flight keep DB QPS bounded; hit rate climbs back to &gt;95% within minutes (the Zipf head fills in ~30 min from organic traffic, faster with background copy). <em>Hot-key coordinator down</em> &rarr; L1 + bounded-loads carry the load; degraded only in that <em>new</em> hot keys aren't auto-replicated until it recovers. The one place this contract changes: if the DB <em>cannot</em> survive a cold cache (e.g. it's already at capacity), the cache becomes load-bearing &mdash; then you add AOF persistence, warm-standby shards, and tighten the cache's own availability SLO toward 99.999%. State which world you're in; don't leave it implicit.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Cost (C7; cite <a href="../design-moves/cost-shapes.html#cache-heavy">cost-shapes#cache-heavy</a> + <a href="../design-moves/pricing-constants.html">pricing-constants.html</a>)</h3>
+        <p>Cache-heavy cost shape: it's dominated by <strong>RAM-hours</strong> &mdash; you're paying for memory, not CPU or I/O. 501 self-managed 64GB memory-optimized instances &mdash; an r6i.2xlarge-class node (half of r6i.4xlarge's $1.01/hr &asymp; <strong>~$0.50/hr</strong>, cite <a href="../design-moves/pricing-constants.html#compute">pricing-constants#compute</a>): 501 &times; $0.50 &times; 24 &times; 30 &asymp; <strong>~$180k/mo</strong> for the cache tier, plus ~20GB of L1 RAM that's already in the app servers (rounding error) and a tiny coordinator. 1 sig fig: ~$200k/mo. (Managed ElastiCache on <code>cache.r6g.4xlarge</code> @ $1.36/hr would be ~$500k/mo &mdash; the ~30&ndash;50% managed premium times the node count; we self-manage.) The cost-vs-availability knob: <em>3&times; replication is 2/3 of the bill</em> &mdash; dropping to 2&times; saves ~$60k/mo but turns "one bad node from a blind spot" into reality during deploys; that's the trade. (Bigger nodes lower instance count but raise blast radius per failure; we keep 64GB.) The hot-key machinery (Iter 4) costs essentially nothing &mdash; 100MB of sketches fleet-wide and L1 RAM that already exists &mdash; which is exactly why it's the highest-ROI line.</p>
+      </div>
+
+      <div class="full-width">
+        <h3>Real-system comparison</h3>
+        <p>This is roughly Facebook's <em>memcache</em> architecture (the NSDI&nbsp;2013 paper, "Scaling Memcache at Facebook"): a huge look-aside fleet, leases/single-flight to kill stampedes, regional pools, and mcrouter doing the client-side routing and per-key replication that we fold into the smart client. The hot-key + L1 layer mirrors Netflix's EVCache (in-process L1 + remote L2) and the general "L1/L2 cache" pattern. The consistent-hashing-with-bounded-loads idea is Google's "Consistent Hashing with Bounded Loads" (2017), used in Vimeo's Maglev-style load balancer and YouTube. The cache-aside-DELETE-not-SET race is the one Facebook's paper calls out as the reason for leases. URLs: Facebook memcache &mdash; usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf; Bounded-Loads &mdash; arxiv.org/abs/1608.01350.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Anticipated pushbacks                                          -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="pushbacks">
+    <div class="container">
+      <h2>Anticipated pushbacks</h2>
+
+      <div>
+        <h3>What if the working set is 10&times; bigger &mdash; 100TB? <span style="font-weight:normal;font-size:0.85em;">(scale flip)</span></h3>
+        <p>Storage was the only binding bottleneck, so 100TB just multiplies shard count: ~1,670 primary shards &times; 3 &asymp; 5,000 instances, ~$2M/mo. The smart client now opens 5,000 connections &mdash; this is where X5 subsetting becomes mandatory (each client talks to a deterministic subset, say 500, of the 5,000). Read throughput is still over-provisioned. Eviction monitoring matters more (more nodes &rarr; more eviction events). Nothing structural changes; the cost shape (RAM-hours) is the same, just larger. The thing to revisit: is 100TB really the <em>working set</em>, or are you trying to cache the whole DB? If the latter, you don't have a cache problem, you have an "the DB should be faster" problem.</p>
+      </div>
+
+      <div>
+        <h3>Why not just one big Redis? <span style="font-weight:normal;font-size:0.85em;">(alt-topology)</span></h3>
+        <p>The biggest single instance you can buy is ~1&ndash;2TB RAM (x2gd-class); 10TB doesn't fit, full stop &mdash; that's the LC-kernel "one node's RAM &ll; the working set" property. Even if it fit: one node is one failure domain (a crash blacks out 100% of the cache, a cold start thunders the DB), one throughput ceiling (~100K ops/sec for one Redis vs 50M across the fleet), and one hot-key victim (every hot key on one box). Sharding is forced by capacity and bought you availability, throughput, and blast-radius isolation as a bonus.</p>
+      </div>
+
+      <div>
+        <h3>What changes if the cache must be strongly consistent with the DB? <span style="font-weight:normal;font-size:0.85em;">(consistency flip)</span></h3>
+        <p>Then it's no longer a cache in the usual sense. Options, worst-to-best: (a) read-through with synchronous write-through and sync replication &mdash; every read sees the latest write, but you've paid DB-grade write latency and lost replica read fan-out (back to the strong-consistency row of Iter 2); (b) versioned keys &mdash; the writer bumps a monotonic version on the key, readers always read the current version, so a stale L1 entry is just a miss on the new version &mdash; this gets you read-your-writes without sync replication, at the cost of a version registry; (c) invalidation-via-CDC &mdash; tail the DB's binlog and DEL changed keys, so the staleness window is the CDC lag (sub-second) not the TTL. For most "I think I need strong consistency" cases, (b) or (c) is enough &mdash; true linearizable cache reads are rarely the actual requirement. Also: L1 must go (1s staleness is incompatible with strong consistency) or be CDC-invalidated too.</p>
+      </div>
+
+      <div>
+        <h3>A shard's primary dies right now &mdash; walk me through it. <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>T+0: primary stops responding. T+0&ndash;5s: clients fail GETs to it, retry against a replica (read traffic uninterrupted); writes to that range pause. T+5s: 3 missed heartbeats &rarr; the cluster promotes replica-1 to primary; ring epoch bumps; clients refresh and resume writes to the new primary. T+5&ndash;60s: a replacement node is provisioned, joins with 0 vnodes. T+60s&ndash;7min: it copies the shard's key range from a replica (throttled ~50K keys/sec) before taking read traffic; then it becomes replica-2 and the shard is back to 3&times;. Blast radius: zero data loss, ~5s of write-pause on ~0.6% of keys, no read impact. The thing that would make this worse: all 3 replicas in the same rack &mdash; hence rack-aware placement (Iter 1 What-Breaks).</p>
+      </div>
+
+      <div>
+        <h3>The hot-key meltdown &mdash; walk me through it. <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Before Iter 4: celebrity tweets, one key &rarr; 50K reads/sec, all to shard 42. Shard 42 hits 52% util, p99 climbs to 15&ndash;30ms; its 20M other keys get that p99 too (collateral damage). App threads waiting on shard 42 pile up, thread pools fill, requests time out, timeouts retry, retries double the load on shard 42 &rarr; death spiral; eventually shard 42's misses spike DB load too. With Iter 4: L1 (1s TTL, blanket) already absorbs ~99.6% before the key is even flagged, so shard 42 sees ~250 reads/sec for the key, not 50K &mdash; no meltdown. By T+20s the key is replicated &times;10 and L1-aware, and shard 42 sees ~20 reads/sec. Bounded-loads is the instant net if the spike outpaces the 10s detection. Detection: per-shard p99 alert + the hot-key list size; recovery: automatic (replication + L1 + the key dropping off the list when the event ends).</p>
+      </div>
+
+      <div>
+        <h3>Where does the bill come from? <span style="font-weight:normal;font-size:0.85em;">(cost)</span></h3>
+        <p>RAM-hours, ~$200k/mo for the 501-instance cache tier &mdash; cache-heavy cost shape, you're buying memory. The dominant line within that is the 3&times; replication factor: 2/3 of the spend exists for availability, not capacity. The cost-vs-availability knob is exactly that 3&times; &rarr; 2&times; (saves ~$60k/mo, costs you a deploy-time blind spot). Bigger nodes lower instance count but raise per-failure blast radius &mdash; not free. Managed (ElastiCache) would be ~$500k/mo &mdash; the managed premium times node count. The L1 / hot-key machinery is ~$0 (RAM that's already in app servers + 100MB of sketches) &mdash; the cheapest, highest-ROI part of the design.</p>
+      </div>
+
+      <div>
+        <h3>How do you grow from 8 to 16 shards without a stampede? <span style="font-weight:normal;font-size:0.85em;">(migration)</span></h3>
+        <p>Never re-hash the whole ring at once &mdash; that flushes everything and is a fleet-wide cold start. Instead: add the 8 new shards to the ring with 0 vnodes (they own nothing yet); then, in small steps, move vnodes from old shards to new ones &mdash; for each vnode moved, first background-copy that key range from a replica into the new shard (throttled), then flip ownership and bump the ring epoch. Each step migrates ~1/16 of one shard and the new shard is already warm when it starts taking reads, so DB miss-load barely moves. Clients refresh the ring on each epoch bump. Total migration is many small, warm, reversible steps &mdash; no cliff. (This is the same Operations#migration procedure as a node replacement, just repeated across many ranges.)</p>
+      </div>
+
+      <div>
+        <h3>Cache hit rate dropped &mdash; where do you look? <span style="font-weight:normal;font-size:0.85em;">(monitoring/debug)</span></h3>
+        <p>In order: (1) per-shard eviction rate &mdash; if one shard is evicting hard, it's an imbalance (an unlucky vnode allocation) or that shard is undersized; if <em>all</em> shards are evicting, the working set outgrew the cluster &rarr; auto-scale. (2) Recent deploys &mdash; a cache flush or a serialization-format change that invalidated keys. (3) TTL changes &mdash; someone shortened a default TTL. (4) Upstream &mdash; the app changed its key naming (now everything's a "miss" on the new keys) or its access pattern (a batch job scanning cold keys, polluting LRU &mdash; this is the scan-flush case W-TinyLFU would fix). (5) A node that's up but slow (black-hole-ish) &mdash; reads to it time out and look like misses. The SLI that disambiguates: eviction rate (capacity), key-cardinality drift (naming), and per-shard p99 (a sick node) &mdash; all three are on the C6 dashboard.</p>
+      </div>
+
+      <div>
+        <h3>A cold key gets a million simultaneous misses &mdash; the stampede. <span style="font-weight:normal;font-size:0.85em;">(failure)</span></h3>
+        <p>Without single-flight: a key's TTL expires (or it was just evicted/written), and in that instant a million callers all GET it, all miss, all query the DB &mdash; a million DB queries for one key, repeated for every popular key whose TTL lapses in that burst. The DB falls over (cite <a href="../canonicals/failure-modes.html#stampede">failure-modes#stampede</a>; sister <a href="27-thundering-herd.html">#27</a>). With single-flight (Iter 4): the first caller to miss a key registers an in-flight future and does the one DB read; every other caller for that key in that window awaits the same future; when it resolves, it fills L2 and L1 and everyone is served from cache. DB miss-load is bounded by "distinct keys missing concurrently" (thousands) not "callers missing" (millions). Belt-and-suspenders: stagger TTLs with jitter so popular keys don't all expire at the same instant, and serve-stale-on-error if the DB read fails (return the just-expired value rather than nothing). The canonical move and its variants are in <a href="../design-moves/single-flight.html">single-flight.html</a> &mdash; we cite it rather than re-deriving.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaways                                                 -->
+  <!-- ============================================================ -->
+  <section class="section section-alt dense-columns" id="takeaways">
+    <div class="container">
+      <h2>Key Takeaways</h2>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">1. Storage, not throughput, usually determines cache cluster size</h3>
+        <p>We needed 171 instances for storage but only 10 for read throughput. Most distributed cache designs are storage-bound. Always do the BOE math for all three dimensions (storage, reads, writes) and let the largest one drive your instance count.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">2. Replication gives you both availability and read throughput</h3>
+        <p>3&times; replication costs 3&times; the storage, but it eliminates single-node-failure data loss, enables instant failover, and triples your per-key read capacity. For a cache, this is almost always worth it.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">3. Eventual consistency is almost always right for caches</h3>
+        <p>A cache is not the source of truth &mdash; the database is. If a read returns a value that is 5ms behind the latest write, the impact is negligible. Strong consistency (reading only from the primary) wastes replica capacity and increases latency for no meaningful benefit in most cache use cases.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">4. Virtual nodes solve the uneven distribution problem</h3>
+        <p>200 virtual nodes per physical node gives load variance under 8%. The memory cost is trivial (1.2MB for 100K entries). Always use virtual nodes in production consistent hashing deployments.</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">5. LRU eviction with monitoring is your safety valve</h3>
+        <p>LRU eviction ensures the cache never runs out of memory. But eviction rate is a critical metric: if evictions are high, the cache is undersized and you are sending too many requests to the database. Monitor eviction rate and auto-scale when it exceeds thresholds. (W-TinyLFU is the upgrade if a hit-rate audit shows scan-flush.)</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">6. Virtual nodes balance key counts; they do nothing for traffic skew</h3>
+        <p>A hot key lives on one shard no matter how evenly the ring is balanced. Fix the hot key separately: detect it (count-min sketch, O(1) per GET), replicate it across shards (random suffix), and &mdash; the biggest lever &mdash; put a small in-process L1 cache in front of it (250&times; fewer L2 reads for ~20GB fleet-wide). Bounded-loads is the instant net; single-flight handles the inverse problem (a stampede on a cold key). See Iteration 4 (which absorbed the former separate scenario).</p>
+      </div>
+
+      <div class="callout" style="background: var(--color-bg-alt); border-left: 4px solid var(--color-primary); padding: 1.25rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
+        <h3 style="margin-bottom: 0.75rem;">7. State which world you're in: optimization or dependency</h3>
+        <p>"The cache is an optimization, not a dependency" means the DB is sized to survive a cold cache. If it can't be, the cache is load-bearing &mdash; add persistence, warm-standby, and a tighter availability SLO. The degradation contract is the most important paragraph on the page; don't leave it implicit.</p>
+      </div>
+
+      <div class="callout full-width" style="background: var(--color-assumption-bg); border-left: 4px solid var(--color-assumption-border); padding: 1.25rem; border-radius: var(--radius); margin-top: 2rem;">
+        <h3 style="margin-bottom: 0.75rem;">Assumptions and When They Break</h3>
+        <ul>
+          <li><strong>Working-set-resident:</strong> If 10TB is the whole DB rather than the hot set, hit rate falls and you're solving the wrong problem.</li>
+          <li><strong>Single data center:</strong> Cross-region caching adds replication lag (50&ndash;100ms) and needs geo-aware routing (a probe).</li>
+          <li><strong>1KB average value:</strong> If values are 100KB blobs, NIC bandwidth binds before RAM.</li>
+          <li><strong>Read-heavy (10:1):</strong> At 1:1, stale reads become frequent; at write-hot, key-splitting (not replication or L1) is the fix.</li>
+          <li><strong>The DB survives a cold cache:</strong> If not, the cache is load-bearing &mdash; see the degradation contract.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- Related Topics                                                -->
+  <!-- ============================================================ -->
+  <section class="section dense-columns" id="related">
+    <div class="container">
+      <h2>Related Topics</h2>
+      <div class="topic-grid full-width">
+        <a href="../caching.html" class="card topic-card">
+          <h3>Caching</h3>
+          <p>LRU, LFU, W-TinyLFU, cache-aside vs write-through vs write-behind, TTL/invalidation/versioned-keys, thundering herd.</p>
+        </a>
+        <a href="../consistent-hashing.html" class="card topic-card">
+          <h3>Consistent Hashing</h3>
+          <p>Hash rings, virtual nodes, bounded loads / power-of-two, Maglev, jump consistent hashing, multi-probe.</p>
+        </a>
+        <a href="../design-moves/single-flight.html" class="card topic-card">
+          <h3>Move: Single-flight</h3>
+          <p>Request coalescing &mdash; one in-flight load per key; the canonical defence against cache-miss stampedes.</p>
+        </a>
+        <a href="../canonicals/bottlenecks.html#hot-key" class="card topic-card">
+          <h3>Bottleneck: hot key</h3>
+          <p>One key, one shard, all the traffic &mdash; the steady-state shape of the Iteration-4 problem.</p>
+        </a>
+        <a href="../canonicals/failure-modes.html#hot-key-meltdown" class="card topic-card">
+          <h3>Failure mode: hot-key meltdown</h3>
+          <p>The death-spiral version &mdash; slow shard &rarr; thread starvation &rarr; retry storm.</p>
+        </a>
+        <a href="22-imbalanced-cache.html" class="card topic-card">
+          <h3>#22 Imbalanced Cache (merged)</h3>
+          <p>The hot-key material that used to be a separate page is now Iteration 4 of this page; #22 redirects here.</p>
+        </a>
+        <a href="45-autocomplete-suggest.html" class="card topic-card">
+          <h3>#45 Autocomplete / Suggest</h3>
+          <p>Edge-POP cache + single-flight reuse this design at the CDN layer.</p>
+        </a>
+        <a href="24-realtime-leaderboard.html" class="card topic-card">
+          <h3>#24 Real-time Leaderboard</h3>
+          <p>The Redis-Cluster cousin &mdash; sorted sets, sharding, hot-key reads on the top of the board.</p>
+        </a>
+        <a href="27-thundering-herd.html" class="card topic-card">
+          <h3>#27 Thundering Herd</h3>
+          <p>The stampede cousin &mdash; a cold key, a million simultaneous misses, single-flight + jitter + serve-stale.</p>
+        </a>
+        <a href="17-distributed-hash-table.html" class="card topic-card">
+          <h3>#17 / #18 DHT &amp; Hotspot Hashing</h3>
+          <p>The ring/partitioning machinery and the hot-partition defences this page builds on.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="../../js/sidebar.js"></script>
+
+</body>
+</html>
