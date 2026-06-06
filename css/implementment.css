@@ -1,0 +1,24 @@
+/* ==========================================================================
+   implementment.css — scoped overrides for pages under
+   llm/custom_scenario/implementment/ only.
+
+   Effect: the left sidebar stays PINNED in the viewport (does not scroll away
+   with the page content). It keeps the base style.css behavior of
+   position:fixed with its own internal scrollbar, since the on-page section
+   list is long.
+
+   Desktop only (min-width:1025px): the <=1024px off-canvas drawer behavior
+   defined in style.css (translateX + toggle button) is left untouched so the
+   mobile nav keeps working.
+   ========================================================================== */
+@media (min-width: 1025px) {
+  .sidebar {
+    position: fixed;        /* pinned: stays put while the page scrolls */
+    top: 0;
+    left: 0;
+    height: 100vh;          /* full viewport height */
+    min-height: 0;
+    overflow-y: auto;       /* its own scrollbar — the section list is long */
+    overscroll-behavior: contain;
+  }
+}

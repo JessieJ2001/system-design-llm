@@ -8,6 +8,8 @@
 /llm/custom_scenario/*
 !/llm/custom_scenario/implementment
 **/.DS_Store
+!/css
+!/js
 
 # Ignore all Markdown files
 *.md
