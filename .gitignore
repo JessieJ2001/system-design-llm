@@ -1,3 +1,14 @@
+# ignore everything
+/*
+# keep the path down to the one folder you want tracked
+!/.gitignore
+!/llm
+/llm/*
+!/llm/custom_scenario
+/llm/custom_scenario/*
+!/llm/custom_scenario/implementment
+**/.DS_Store
+
 # Ignore all Markdown files
 *.md
 
