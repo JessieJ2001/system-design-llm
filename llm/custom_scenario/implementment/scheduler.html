@@ -313,7 +313,7 @@ Iter 8&ndash;10  no wait-formula change (abuse gate / CP fork / ring-drop are or
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> no KV reuse (Iter 0 discarded KV). <strong>New state:</strong> the per-sequence <em>slab</em> cache &middot; HBM/DRAM/SSD free-lists &middot; tier-residency map &middot; the async evictor&rsquo;s parked-frame set + <code>cudaEvent</code> map. <strong>No blocks, no <code>slot_mapping</code>, no <code>ref_count</code> yet.</strong> Still B=1, still run-to-completion &mdash; but now expressed as an engine tick loop with an async watermark evictor underneath. Scenario reference: <a href="distributed_kv_cache.html#iter1a">&sect;5</a>.</p>
       </div>
 
-      <div class="svg-wrap">
+      <div class="svg-wrap-small">
       <svg viewBox="0 0 1180 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 1a single-task scheduler state. The scheduler thread on the CPU host holds the waiting deque, the single active sequence (B=1), the three HBM/DRAM/SSD free-lists, the slab-tier residency map and the evictor's parked-frame set. The GPU task is eight H100s at TP=8 whose 640 gigabytes of HBM holds 140 gigabytes of weights, a 450-gigabyte KV-slab region of 18 frames of 24.96 gigabytes each, and about 50 gigabytes of activations. KV slabs spill down a three-tier ladder: HBM to one terabyte of CPU DRAM to seven terabytes of local NVMe. The async evictor copies victim slabs down HBM to DRAM via device-to-host PCIe at 200 gigabytes per second aggregate, parks the frame and records a CUDA event; reap at top of tick commits the residency flip and returns the frame. Swap-in restores a demoted slab to HBM before the kernel launches. The tick ribbon at the bottom runs reap, retire/admit, ensure-resident, kernel, then device-to-host token readback.">
         <defs>
           <marker id="ahS1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
@@ -344,7 +344,7 @@ Iter 8&ndash;10  no wait-formula change (abuse gate / CP fork / ring-drop are or
         <text class="s1-m" x="54" y="132">active: Sequence | None   (B=1)</text>
         <text class="s1-m" x="54" y="146">slab_tier: dict[seq -&gt; HBM|DRAM|SSD]</text>
         <rect class="s1-store" x="42" y="160" width="324" height="52" rx="6"/>
-        <text class="s1-m" x="54" y="180">free_slabs_hbm (18)  ·  _dram  ·  _ssd</text>
+        <text class="s1-m" x="54" y="180">free_slabs_hbm: list[int]  (18 slots)</text>
         <text class="s1-s" x="54" y="198">low_watermark=1 · high_watermark=2 (of 18)</text>
         <rect class="s1-evt" x="42" y="224" width="324" height="98" rx="6"/>
         <text class="s1-h" x="54" y="242" fill="#b45309">async evictor — enqueue side only</text>
@@ -460,7 +460,15 @@ Iter 8&ndash;10  no wait-formula change (abuse gate / CP fork / ring-drop are or
       <div class="tpl-body">
 
       <h4 id="iter1a-evict"><code>eviction_thread()</code> &mdash; the enqueue half (async)</h4>
-      <p><strong>Runs on:</strong> a dedicated async coroutine, <em>not</em> the scheduler thread. <strong>Wakes:</strong> every <code>T_SWAP_MS</code> (a few ms). <strong>What it does, step by step:</strong> (1) read <code>len(free_slabs_hbm)</code>; if it is at or above <code>low_watermark</code>, return &mdash; nothing to do. (2) Otherwise pick victim slabs: the least-recently-used <em>idle</em> sequences (retained-but-not-active), oldest first, until enough frames are scheduled to lift free back to <code>high_watermark</code>. (3) For each victim, issue an async <code>cudaMemcpyAsync</code> (HBM&rarr;DRAM, no callback) of only its <em>live</em> bytes, lock the frame off the free-list into the <code>evicting</code> set, and record a <code>cudaEvent</code>. <strong>What it does NOT touch, and why:</strong> it never writes <code>slab_tier</code>, never returns a frame to <code>free_slabs_hbm</code>, never touches the active sequence. All of those are mutated only by <code>reap_evictions()</code> on the scheduler thread. The split is the whole point: the evictor <em>schedules</em> copies; the scheduler thread <em>commits</em> their results. Because every host-state write lives on one thread, <strong>there is no lock</strong> &mdash; the race a naive single-threaded evict-and-commit would create (freeing a frame whose copy hasn&rsquo;t landed, or committing while the tick reads the free-list) cannot occur.</p>
+      <p><strong>Runs on:</strong> a dedicated async coroutine, <em>not</em> the scheduler thread.<br>
+      <strong>Wakes:</strong> every <code>T_SWAP_MS</code> (&asymp;&nbsp;<code>tick_period</code> &asymp;&nbsp;5&nbsp;ms; derived in part&nbsp;G).</p>
+      <p><strong>What it does, step by step:</strong></p>
+      <ol>
+        <li>Read <code>len(free_slabs_hbm)</code>; if &ge;&nbsp;<code>low_watermark</code>, return &mdash; nothing to do.</li>
+        <li>Otherwise pick victim slabs: the least-recently-used <em>idle</em> sequences (retained-but-not-active), oldest first, until enough frames are scheduled to lift free back to <code>high_watermark</code>.</li>
+        <li>For each victim, issue an async <code>cudaMemcpyAsync</code> (HBM&rarr;DRAM, no callback) of only its <em>live</em> bytes, lock the frame off the free-list into the <code>evicting</code> set, and record a <code>cudaEvent</code>.</li>
+      </ol>
+      <p><strong>What it does NOT touch, and why:</strong> it never writes <code>slab_tier</code>, never returns a frame to <code>free_slabs_hbm</code>, never touches the active sequence. All of those are mutated only by <code>reap_evictions()</code> on the scheduler thread. The split is the whole point: the evictor <em>schedules</em> copies; the scheduler thread <em>commits</em> their results. Because every host-state write lives on one thread, <strong>there is no lock</strong> &mdash; the race a naive single-threaded evict-and-commit would create (freeing a frame whose copy hasn&rsquo;t landed, or committing while the tick reads the free-list) cannot occur.</p>
       <div class="code-box"><span class="kw">async def</span> <span class="fn">eviction_thread</span>():
     <span class="kw">while</span> <span class="kw">True</span>:
         <span class="kw">await</span> asyncio.sleep(T_SWAP_MS / 1000)
@@ -468,48 +476,70 @@ Iter 8&ndash;10  no wait-formula change (abuse gate / CP fork / ring-drop are or
             <span class="kw">continue</span>                                   <span class="cm"># pool healthy — stay armed, do nothing</span>
         need = high_watermark - <span class="kw">len</span>(free_slabs_hbm)
         <span class="kw">for</span> seq <span class="kw">in</span> _lru_idle_sequences()[:need]:        <span class="cm"># oldest retained-but-idle first</span>
-            frame = slab_frame[seq.id]
+            frame = slab_frame[seq.conv_id]
             evt   = cuda.Event()
             cuda.memcpy_async(dram_dst(seq), hbm_src(frame),  <span class="cm"># only LIVE bytes: seq.len &times; KV_per_tok</span>
                               nbytes=seq.len * KV_per_tok, stream=evict_stream)
             evt.record(evict_stream)
-            evicting[frame] = (seq.id, evt)                  <span class="cm"># park — touches ONLY the enqueue set</span></div>
+            evicting[frame] = (seq.conv_id, evt)              <span class="cm"># park — touches ONLY the enqueue set</span></div>
 
       <h4 id="iter1a-reap"><code>reap_evictions()</code> &mdash; the reap half (scheduler thread, top-of-tick)</h4>
-      <p><strong>Runs on:</strong> the scheduler thread, first thing every tick. <strong>What it does, step by step:</strong> (1) for each parked frame, poll its <code>cudaEvent</code>; if the copy hasn&rsquo;t completed, leave it parked. (2) On completion: flip <code>slab_tier[seq] = DRAM</code>, return the frame to <code>free_slabs_hbm</code>, drop it from <code>evicting</code>. <strong>What it does NOT touch:</strong> it never issues a copy (that is the evictor&rsquo;s job) and never picks victims. It is purely the commit step. Because it runs on the same thread as <code>_admit_next_if_idle()</code> and <code>_ensure_resident()</code>, the free-list is mutated by exactly one writer &mdash; no lock, no torn read. <strong>Difference from Iter 0:</strong> Iter 0 had no eviction at all (KV was freed synchronously at request end); this is the first appearance of asynchronous, watermark-driven reclamation.</p>
+      <p><strong>Runs on:</strong> the scheduler thread, first thing every tick.</p>
+      <p><strong>What it does, step by step:</strong></p>
+      <ol>
+        <li>For each parked frame, poll its <code>cudaEvent</code>; if the copy hasn&rsquo;t completed, leave it parked.</li>
+        <li>On completion: flip <code>slab_tier[seq] = DRAM</code>, return the frame to <code>free_slabs_hbm</code>, drop it from <code>evicting</code>.</li>
+      </ol>
+      <p><strong>What it does NOT touch:</strong> it never issues a copy (that is the evictor&rsquo;s job) and never picks victims. It is purely the commit step. Because it runs on the same thread as <code>_admit_next_if_idle()</code> and <code>_ensure_resident()</code>, the free-list is mutated by exactly one writer &mdash; no lock, no torn read.</p>
+      <p><strong>Difference from Iter&nbsp;0:</strong> Iter&nbsp;0 had no eviction at all (KV was freed synchronously at request end); this is the first appearance of asynchronous, watermark-driven reclamation.</p>
       <div class="code-box"><span class="kw">def</span> <span class="fn">reap_evictions</span>():                              <span class="cm"># &#9312; top of every tick</span>
     done = []
-    <span class="kw">for</span> frame, (seq_id, evt) <span class="kw">in</span> evicting.items():
+    <span class="kw">for</span> frame, (conv_id, evt) <span class="kw">in</span> evicting.items():
         <span class="kw">if</span> evt.query():                                <span class="cm"># non-blocking: has the D2H landed?</span>
-            slab_tier[seq_id] = DRAM                   <span class="cm"># commit residency flip — scheduler thread only</span>
+            slab_tier[conv_id] = DRAM                  <span class="cm"># commit residency flip — scheduler thread only</span>
             free_slabs_hbm.append(frame)               <span class="cm"># frame now reusable</span>
             done.append(frame)
     <span class="kw">for</span> frame <span class="kw">in</span> done:
         <span class="kw">del</span> evicting[frame]</div>
 
       <h4 id="iter1a-admit"><code>_admit_next_if_idle()</code> &mdash; B=1 admission</h4>
-      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9313;. <strong>Steps:</strong> (1) if a sequence is still active, return (B=1 &mdash; only one in flight). (2) Else pop the head of <code>waiting</code>; (3) take a frame from <code>free_slabs_hbm</code> (guaranteed non-empty because the evictor holds <code>low_watermark</code> &ge; 1 free); (4) one-shot H2D upload of the prompt token IDs; (5) set the seq active with <code>tier = HBM</code>. <strong>Does NOT</strong> build a block table or <code>slot_mapping</code> &mdash; none exist at Iter 1a; the kernel addresses the slab by base pointer + length.</p>
+      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9313;.</p>
+      <p><strong>Steps:</strong></p>
+      <ol>
+        <li>If a sequence is still active, return (B=1 &mdash; only one in flight).</li>
+        <li>Else pop the head of <code>waiting</code>.</li>
+        <li>Take a frame from <code>free_slabs_hbm</code> (guaranteed non-empty because the evictor holds <code>low_watermark</code> &ge;&nbsp;1 free).</li>
+        <li>One-shot H2D upload of the prompt token IDs.</li>
+        <li>Set the seq active with <code>tier = HBM</code>.</li>
+      </ol>
+      <p><strong>Does NOT</strong> build a block table or <code>slot_mapping</code> &mdash; none exist at Iter&nbsp;1a; the kernel addresses the slab by base pointer + length.</p>
       <div class="code-box"><span class="kw">def</span> <span class="fn">_admit_next_if_idle</span>():
     <span class="kw">if</span> active <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>: <span class="kw">return</span>                  <span class="cm"># B=1 — one sequence in flight</span>
     <span class="kw">if</span> <span class="kw">not</span> waiting:      <span class="kw">return</span>
     req   = waiting.popleft()
     frame = free_slabs_hbm.pop()                       <span class="cm"># non-empty by watermark invariant</span>
     h2d_upload(req.prompt_token_ids)                   <span class="cm"># one-shot; N_new &times; 4 B</span>
-    slab_frame[req.seq_id] = frame
-    slab_tier[req.seq_id]  = HBM
+    slab_frame[req.conv_id] = frame
+    slab_tier[req.conv_id]  = HBM
     set_active(req)</div>
 
       <h4 id="iter1a-resident"><code>_ensure_resident(active)</code> &mdash; swap-in on warm-turn reuse</h4>
-      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9314; (pre-launch). <strong>Steps:</strong> if the active seq&rsquo;s slab is already HBM, return. Otherwise take a free HBM frame and copy the slab in &mdash; over PCIe from DRAM (<code>&beta;_DRAM(N)</code>) or over GDS from NVMe (<code>&beta;_SSD(N)</code>) &mdash; <em>before</em> the kernel launches, so the kernel always reads HBM. This is the path that makes cross-turn reuse pay off: a returning turn whose KV was demoted is restored at swap-in cost instead of recomputed at <code>&beta;_cold</code>.</p>
+      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9314; (pre-launch).</p>
+      <p><strong>Steps:</strong></p>
+      <ol>
+        <li>If the active seq&rsquo;s slab is already HBM, return.</li>
+        <li>Otherwise take a free HBM frame and copy the slab in &mdash; over PCIe from DRAM (<code>&beta;_DRAM(N)</code>) or over GDS from NVMe (<code>&beta;_SSD(N)</code>) &mdash; <em>before</em> the kernel launches, so the kernel always reads HBM.</li>
+      </ol>
+      <p>This is the path that makes cross-turn reuse pay off: a returning turn whose KV was demoted is restored at swap-in cost instead of recomputed at <code>&beta;_cold</code>.</p>
       <div class="code-box"><span class="kw">def</span> <span class="fn">_ensure_resident</span>(seq):
-    <span class="kw">if</span> slab_tier[seq.id] == HBM: <span class="kw">return</span>
+    <span class="kw">if</span> slab_tier[seq.conv_id] == HBM: <span class="kw">return</span>
     frame = free_slabs_hbm.pop()
-    <span class="kw">if</span> slab_tier[seq.id] == DRAM:
+    <span class="kw">if</span> slab_tier[seq.conv_id] == DRAM:
         h2d_copy(hbm=frame, src=dram_slab(seq), nbytes=seq.len*KV_per_tok)   <span class="cm"># &beta;_DRAM(N), 200 GB/s agg</span>
     <span class="kw">else</span>:  <span class="cm"># SSD</span>
         gds_copy(hbm=frame, src=nvme_slab(seq), nbytes=seq.len*KV_per_tok)   <span class="cm"># &beta;_SSD(N), 7 GB/s</span>
-    slab_frame[seq.id] = frame
-    slab_tier[seq.id]  = HBM</div>
+    slab_frame[seq.conv_id] = frame
+    slab_tier[seq.conv_id]  = HBM</div>
       <p><code>_run_step()</code> (prefill or one decode step) and <code>_read_sampled_token()</code> are the standard forward-pass primitives from <a href="../../knowledge/K0_transformer-forward-pass-and-dimensions.html">K0</a>; no Iter-1a-specific behaviour beyond writing K,V in place into the active slab and returning one sampled token.</p>
       </div>
 
@@ -537,10 +567,9 @@ Iter 8&ndash;10  no wait-formula change (abuse gate / CP fork / ring-drop are or
             <li><code>waiting: deque[Request]</code> &mdash; admitted-but-not-started requests.</li>
             <li><code>active: Sequence | None</code> &mdash; the single in-flight seq (B=1).</li>
             <li><code>free_slabs_hbm: list[int]</code> &mdash; free HBM slab frames (<strong>18</strong> total; see part&nbsp;F).</li>
-            <li><code>free_slabs_dram / free_slabs_ssd: list[int]</code> &mdash; free frames on each cold tier.</li>
-            <li><code>slab_frame: dict[seq_id &rarr; frame]</code> &mdash; which physical frame holds each retained seq. <em>This IS a map.</em></li>
-            <li><code>slab_tier: dict[seq_id &rarr; HBM|DRAM|SSD]</code> &mdash; residency tag; written only by <code>reap</code> / <code>_ensure_resident</code>.</li>
-            <li><code>evicting: dict[frame &rarr; (seq_id, cudaEvent)]</code> &mdash; the evictor&rsquo;s parked-frame set (its <em>only</em> writable state).</li>
+            <li><code>slab_frame: dict[conv_id &rarr; frame]</code> &mdash; which physical frame (slot index 0–17) holds each retained seq. <em>This IS a map.</em> <code>frame</code> is a plain <code>int</code>; the physical HBM address is <code>kv_cache[l] + frame &times; slab_bytes_per_layer + …</code>. The 450&nbsp;GB KV slab region is <code>cudaMalloc</code>'d <em>once</em> at GPU-task startup — there is no per-sequence malloc; DRAM and SSD tiers each get one statically pre-assigned slot per frame via fixed-offset functions (<code>dram_slab(seq)</code>, <code>nvme_slab(seq)</code>), so there is no <code>free_slabs_dram</code> / <code>free_slabs_ssd</code> free-list.</li>
+            <li><code>slab_tier: dict[conv_id &rarr; HBM|DRAM|SSD]</code> &mdash; residency tag; written only by <code>reap</code> / <code>_ensure_resident</code>.</li>
+            <li><code>evicting: dict[frame &rarr; (conv_id, cudaEvent)]</code> &mdash; the evictor&rsquo;s parked-frame set (its <em>only</em> writable state).</li>
             <li><code>low_watermark, high_watermark</code> &mdash; derived in part&nbsp;G.</li>
             <li>the &sect;2.1 physics constant table (immutable).</li>
             <li><strong>Absent at Iter 1a:</strong> block tables, <code>slot_mapping</code>, <code>free_blocks_*</code>, <code>hash_index</code>, <code>ref_count</code>, any Router-push payload (arrives Iter 1b).</li>
@@ -588,9 +617,11 @@ HBM_slab_frames        = floor(G_KV / reserved_per_slab) = floor(450 / 24.96) = 
       <div class="formula-box"><span style="color:#0c4a6e;font-weight:700">drain side</span>
 drain_rate    = D2H bandwidth, HBM&rarr;DRAM = BW_pcie_agg = 8 &times; 25 GB/s = 200 GB/s   [D]
                 (KV sharded 1 head/GPU &rArr; 8 parallel D2H copies)
-victim_bytes  = avg LIVE bytes per slab = (T_in_mean + T_out_mean/2) &times; KV_per_tok
-              = 13 200 &times; 320 KB = 4.224 GB                                       [D]
-drain_latency = victim_bytes / drain_rate = 4.224 GB / 200 GB/s = 21 ms             [D]
+victim_bytes  = LIVE bytes per slab at eviction = (T_in_mean + T_out_mean) &times; KV_per_tok
+              = (13 000 + 400) &times; 320 KB = 13 400 &times; 320 KB = 4.288 GB             [D]
+              (evictor only targets idle retained slabs — sequence has finished its turn,
+               so all T_out_mean output tokens are already written; no /2 averaging needed)
+drain_latency = victim_bytes / drain_rate = 4.288 GB / 200 GB/s = 21.4 ms &asymp; 21 ms [D]
 
 <span style="color:#0c4a6e;font-weight:700">allocation side</span>
 req_time_mean = prefill_time(T_in_mean, TP=8) + T_out_mean &times; &beta;_per_decode_tok
@@ -599,11 +630,25 @@ alloc_rate    = per-task admit rate at B=1 = 1 / req_time_mean &asymp; 0.355 sla
                 (= eviction_rate once HBM is saturated: one evict per admit)
 
 <span style="color:#14532d;font-weight:700">the watermark pair (anti-thrash)</span>
-low_watermark   = ceil(drain_latency &times; alloc_rate) = ceil(0.021 &times; 0.355) = 1 slab [D]
-hysteresis_band = ceil(alloc_rate &times; tick_period) = ceil(0.355 &times; 5.22 ms) = 1 slab [D]
+low_watermark   = ceil(drain_latency &times; alloc_rate) = ceil(0.0214 &times; 0.355) = 1 slab [D]
+hysteresis_band = ceil(alloc_rate &times; T_SWAP_MS) = ceil(0.355 &times; 5.22 ms) = 1 slab  [D]
 high_watermark  = low_watermark + hysteresis_band = 2 slabs                          [D]</div>
       <p><strong>Why a pair, not one threshold.</strong> A single threshold re-arms the evictor every tick it sits just under the line &mdash; thrash. <code>low</code> is the floor that guarantees the next admit finds a free frame (the async drain refills the pool within <code>drain_latency</code>, faster than allocation drains it). <code>high</code> is where the evictor <em>stops</em>; the gap between them (<code>hysteresis_band</code>) is sized to one tick&rsquo;s allocation burst so a single admit can&rsquo;t immediately re-trip <code>low</code>.</p>
-      <p><strong>Why the band is asymmetric (thin here).</strong> The band&rsquo;s thickness is set by drain speed vs. refill reliability. At a single B=1 task allocation is slow (~0.355 slab/s) and the drain is fast and reliable (21&nbsp;ms/slab over a dedicated stream), so one slab of hysteresis is enough &mdash; <code>low=1, high=2</code> of 18. <strong>The formula, not the number, is the deliverable:</strong> the same derivation re-evaluates to <em>large</em> watermarks once a task holds many concurrently-decoding sequences (a much higher <code>alloc_rate</code>), which is exactly when the evictor becomes load-bearing rather than near-idle. At Iter 1a it is built and correct but barely engages.</p>
+      <p><strong>Why the band is asymmetric (thin here).</strong> The band&rsquo;s thickness is set by drain speed vs. refill reliability. At a single B=1 task allocation is slow (~0.355 slab/s) and the drain is fast and reliable (21.4&nbsp;ms/slab over a dedicated stream), so one slab of hysteresis is enough &mdash; <code>low=1, high=2</code> of 18. <strong>The formula, not the number, is the deliverable:</strong> the same derivation re-evaluates to <em>large</em> watermarks once a task holds many concurrently-decoding sequences (a much higher <code>alloc_rate</code>), which is exactly when the evictor becomes load-bearing rather than near-idle. At Iter 1a it is built and correct but barely engages.</p>
+      <p><strong>The wake period <code>T_SWAP_MS</code> (the evictor&rsquo;s poll cadence, <em>not</em> the copy time).</strong> <code>T_SWAP_MS</code> is how often the coroutine wakes to <em>check</em> <code>len(free_slabs_hbm)</code> against <code>low_watermark</code> &mdash; distinct from <code>drain_latency = 21.4&nbsp;ms</code>, which is how long one slab&rsquo;s D2H copy takes once issued. It is bounded on both sides, not guessed:</p>
+      <div class="formula-box"><span style="color:#0c4a6e;font-weight:700">floor &mdash; don&rsquo;t poll faster than the free-list can change</span>
+free-list changes at most once per engine tick (one admit/retire per tick at B=1),
+so T_SWAP_MS &ge; tick_period = 5.22 ms   (finer polling = wasted CPU wakeups)   [D]
+
+<span style="color:#0c4a6e;font-weight:700">ceiling &mdash; must refill before the one guaranteed-free frame is consumed</span>
+with low_watermark = 1, after a trip there is 1 free frame; it is consumed in
+1 / alloc_rate = 1 / 0.355 = 2.82 s. The evictor must wake, detect, AND drain
+within that window:  T_SWAP_MS + drain_latency &lt;&lt; 2.82 s   &rArr;   T_SWAP_MS &lt;&lt; 2.80 s   [D]
+
+<span style="color:#14532d;font-weight:700">choice</span>
+T_SWAP_MS = tick_period &asymp; 5 ms   &mdash; matches the cadence the free-list actually
+changes; leaves a ~530&times; margin on the ceiling (5 + 21.4 ms &lt;&lt; 2820 ms).      [D]</div>
+      <p>So &ldquo;a few ms&rdquo; is <code>tick_period</code>: the evictor observes a quantity that moves at the tick rate, so it samples at the tick rate. The ceiling is slack at B=1 (the pool drains slowly); it becomes the binding constraint at high <code>alloc_rate</code>, the same regime that widens the watermark pair above.</p>
       </div>
 
       <!-- (H) -->
@@ -623,7 +668,7 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> the locally-computed wait signal had no consumer (one task = nothing to route). <strong>New scheduler-side state:</strong> the outbound <code>TaskStatePush</code> payload + the 100&nbsp;ms / 5&nbsp;s emit timers. <strong>The tick loop, KV layout, state snapshot, CPU&harr;GPU contract, and eviction machinery are byte-for-byte the Iter 1a versions</strong> &mdash; this is a publish-only delta. Router side: <a href="router.html#iter1b">router.html &sect;5</a>. Scenario reference: <a href="distributed_kv_cache.html#iter1b">&sect;7</a>.</p>
       </div>
 
-      <div class="svg-wrap-small">
+      <div class="svg-wrap-small-small">
       <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 1b scheduler-side delta. The engine tick loop and GPU contract are unchanged from Iter 1a, shown as a greyed box. Two new outbound timers fire from the scheduler to the broker: TaskStatePush every 100 milliseconds carrying the locally-computed approx_wait_time_ms scalar plus kv_cap, and Heartbeat every 5 seconds. The broker fans these out to the Router fleet. Inbound, the Router sends Route per request, which the scheduler appends to the same waiting deque the Iter 1a admit step already drains.">
         <defs>
           <marker id="ahS1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
@@ -713,6 +758,26 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
     broker.publish(p)                          <span class="cm"># fire-and-forget onto the gossip stream</span></div>
       <p><code>_approx_wait()</code> is the &sect;2.3 Iter&nbsp;1 sum &mdash; for each request in <code>waiting</code> plus the active seq, add <code>&beta;</code> for the tier its KV currently sits in (<code>&beta;_HBM</code> if resident, <code>&beta;_DRAM(N)</code>/<code>&beta;_SSD(N)</code> if it must be swapped in, <code>&beta;_cold(N)</code> if it must be recomputed). At Iter 1b the queue is short and the sum is dominated by the one active decode; the value becomes load-bearing once a fleet spreads load across many tasks and the Router compares them.</p>
 
+      <p><strong>Deriving <code>T_push = 100 ms</code>.</strong> Three constraints bound it from both sides:</p>
+      <div class="formula-box"><span style="color:#0c4a6e;font-weight:700">floor — don't push faster than the signal changes</span>
+approx_wait_time_ms changes only on request start/finish: once per req_time_mean = 2.82 s.
+Pushing every tick (5.22 ms) sends ~540 identical snapshots per event — wasted broker writes.
+&there4; T_push &gt;&gt; tick_period = 5.22 ms
+
+<span style="color:#0c4a6e;font-weight:700">ceiling — stale info must not blow the TTFT SLA</span>
+If a task fills up, the Router keeps routing to it for up to T_push before learning.
+TTFT SLA &asymp; 1 s (scenario &sect;1) &rArr; T_push &lt;&lt; 1 s so staleness is a small fraction of the budget.
+
+<span style="color:#0c4a6e;font-weight:700">bandwidth check at fleet scale</span>
+broker_inbound = serving_task_num &times; (1 / T_push) &times; payload_bytes
+               = 291 500 &times; 10 Hz &times; 120 B &asymp; 350 MB/s                   [D]
+broker NIC = 25 Gbps = 3 125 MB/s  &rArr;  350 / 3 125 &asymp; 11% utilisation — well within budget.
+
+<span style="color:#14532d;font-weight:700">choice</span>
+T_push = 100 ms  — 19&times; above tick_period (floor), 10&times; below TTFT SLA (ceiling),
+         11% broker NIC at Iter 1b fleet scale. Not a crossover; any value in
+         [10 ms, 500 ms] satisfies all three constraints; 100 ms is the round-number pick.</div>
+
       <h3 id="iter1b-inbound">6.3 &nbsp;Inbound <code>Route</code> handler</h3>
       <p>The Router&rsquo;s only message to the scheduler at Iter 1b is <code>Route</code>; handling it is a one-liner that drops the request onto the same <code>waiting</code> deque <code>_admit_next_if_idle()</code> (&sect;5 part&nbsp;C) already pops from. The scheduler validates <code>ring_version</code> for staleness (a request stamped with an older ring than the task currently believes triggers a re-route via the Router) and otherwise enqueues.</p>
       <div class="code-box"><span class="kw">def</span> <span class="fn">on_route</span>(msg: Route):
@@ -733,7 +798,7 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> prefill (compute-bound) and decode (HBM-BW-bound) shared one task and one batch size. <strong>New state:</strong> <code>Request</code> / <code>Sequence</code> dataclasses &middot; per-pool <code>waiting</code>/<code>running</code> &middot; <code>pool</code> tag &middot; decode-side <code>live_conv_set</code>. <strong>New protocol:</strong> <code>KVHandoff</code>/<code>Ack</code>/<code>Nack</code> (scheduler&harr;scheduler). <strong>New role:</strong> the outbound KV stream (role&nbsp;4). Still <strong>B=1 on both pools</strong>; KV is still a contiguous slab. Scenario reference: <a href="distributed_kv_cache.html#iter2">&sect;8</a>; Router side <a href="router.html#iter2">&sect;6</a>.</p>
       </div>
 
-      <div class="svg-wrap">
+      <div class="svg-wrap-small">
       <svg viewBox="0 0 1180 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 2 prefill/decode split. The Router sends Route to a prefill task picked on prefill_ring. The prefill task runs the whole prompt prefill at B=1, then on completion hashes conv_id into its gossiped decode_ring copy, opens a gRPC server-stream over RDMA, and hands the prompt's K,V slab to the chosen decode task: 4.16 gigabytes cold takes 166 milliseconds, 64 megabytes warm takes 2.6 milliseconds. The decode task acknowledges with KVHandoffAck, installs the conv into its live_conv_set, and decodes at B=1.">
         <defs>
           <marker id="ahS2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
@@ -831,7 +896,7 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
       <p><strong><code>on_prefill_complete(s)</code></strong> runs on an async thread the moment a prefill finishes. <strong>Steps:</strong> (1) <code>dst = decode_ring.pick(hash(s.conv_id))</code> from the task&rsquo;s gossiped read-only ring copy; (2) open a gRPC server-stream to <code>dst</code> over RDMA; (3) stream the slab&rsquo;s K,V layer-by-layer; (4) on <code>KVHandoffAck</code>, the prefill task may release its slab (or retain it briefly for re-stream insurance). <strong>Does NOT</strong> block the prefill tick &mdash; the stream runs on its own connection. <strong><code>on_kv_handoff_if_any()</code></strong> (decode side) reserves a free decode frame, DMAs the arriving K,V in, sets <code>tier=HBM</code>, and adds <code>conv_id</code> to <code>live_conv_set</code> atomically with the reservation so <code>free_slots</code> can never go negative.</p>
       <div class="code-box"><span class="kw">def</span> <span class="fn">on_prefill_complete</span>(s: Sequence):
     dst = decode_ring.pick(hash64(s.conv_id))      <span class="cm"># local gossiped copy — no Router hop</span>
-    stream = grpc_open(dst, KVHandoff(s.seq_id, s.conv_id, s.blocks, ring_version))
+    stream = grpc_open(dst, KVHandoff(s.conv_id, s.blocks, ring_version))
     <span class="kw">for</span> layer <span class="kw">in</span> <span class="kw">range</span>(n_layers):
         stream.send(kv_layer(s, layer))            <span class="cm"># RDMA; ~52 MB/layer cold</span>
     ack = stream.recv()                            <span class="cm"># KVHandoffAck | KVHandoffNack</span>
@@ -891,7 +956,7 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> the contiguous slab&rsquo;s static-max reservation (24.96&nbsp;GB/slot &rarr; only 18 slots) blocks B&gt;1. <strong>New state:</strong> <code>free_blocks_{hbm,dram,ssd}</code> &middot; <code>block_table</code> &middot; <code>slot_mapping</code> &middot; <code>tier_locs</code> &middot; <code>gpu_block_table_dirty</code>. <strong>Still no <code>ref_count</code></strong> (blocks are single-owner; guards = free-list membership + owning-seq&nbsp;&isin;&nbsp;<code>running</code> + parked <code>evicting</code> set). Engine loop still B=1 &mdash; this iteration only frees the HBM headroom that batching will later consume. Scenario reference: <a href="distributed_kv_cache.html#iter3">&sect;9</a>; Router side <a href="router.html#iter3">&sect;7</a> (no-op).</p>
       </div>
 
-      <div class="svg-wrap">
+      <div class="svg-wrap-small">
       <svg viewBox="0 0 1180 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 3 PagedAttention layout. A logical sequence is a list of 16-token blocks. A per-sequence block_table maps logical block index to a physical block id; the physical 16-token blocks of 5.12 megabytes each are scattered across HBM, CPU DRAM and local NVMe rather than one contiguous slab. Each tick the scheduler builds a slot_mapping array and uploads it plus any dirty block-table rows host-to-device before the kernel; the kernel gathers KV through the block table. Static-max reservation of 78 thousand tokens per slot, B max static 18, is replaced by per-block allocation of actual length, B max paged about 106.">
         <defs>
           <marker id="ahS3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
@@ -972,7 +1037,15 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
 
       <div class="tpl">C &middot; Key function &mdash; <code>_pre_kernel_launch_uploads</code></div>
       <div class="tpl-body">
-      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9314;. <strong>Steps:</strong> (1) for the active seq, build <code>slot_mapping[i] = block_table[s][i // 16] &times; 16 + (i % 16)</code> for each token position written this tick; (2) H2D-upload <code>slot_mapping</code>; (3) H2D-upload only the block-table rows in <code>gpu_block_table_dirty</code> (allocations/swaps since last tick); (4) clear the dirty set. <strong>Does NOT</strong> re-upload the whole block table (only dirty rows &mdash; bandwidth-bounded) and never runs a <code>ref_count</code> check, because blocks are single-owner here: a block is allocatable iff it is on a free-list, in-use iff its owning seq is in <code>running</code>, and copy-in-flight iff it is in the parked <code>evicting</code> set. Those three booleans are the complete guard &mdash; a count would be meaningless until blocks are shared.</p>
+      <p><strong>Runs on:</strong> the scheduler thread, step&nbsp;&#9314;.</p>
+      <p><strong>Steps:</strong></p>
+      <ol>
+        <li>For the active seq, build <code>slot_mapping[i] = block_table[s][i // 16] &times; 16 + (i % 16)</code> for each token position written this tick.</li>
+        <li>H2D-upload <code>slot_mapping</code>.</li>
+        <li>H2D-upload only the block-table rows in <code>gpu_block_table_dirty</code> (allocations/swaps since last tick).</li>
+        <li>Clear the dirty set.</li>
+      </ol>
+      <p><strong>Does NOT</strong> re-upload the whole block table (only dirty rows &mdash; bandwidth-bounded) and never runs a <code>ref_count</code> check, because blocks are single-owner here: a block is allocatable iff it is on a free-list, in-use iff its owning seq is in <code>running</code>, and copy-in-flight iff it is in the parked <code>evicting</code> set. Those three booleans are the complete guard &mdash; a count would be meaningless until blocks are shared.</p>
       </div>
 
       <div class="tpl">D &middot; CPU&harr;GPU contract</div>
@@ -989,7 +1062,7 @@ high_watermark  = low_watermark + hysteresis_band = 2 slabs                     
       <div class="state-grid">
         <div class="cpu"><h5>CPU-resident</h5><ul>
           <li><code>free_blocks_hbm / _dram / _ssd: list[int]</code> &mdash; free 16-token frames per tier.</li>
-          <li><code>block_table: dict[seq_id &rarr; list[int]]</code> &mdash; logical block &rarr; physical block id. <em>This IS a map.</em></li>
+          <li><code>block_table: dict[conv_id &rarr; list[int]]</code> &mdash; logical block &rarr; physical block id. <em>This IS a map.</em></li>
           <li><code>tier_locs: dict[block_id &rarr; "HBM"|"DRAM"|"SSD"]</code> &mdash; single-valued (pre-sharing).</li>
           <li><code>gpu_block_table_dirty: set[int]</code> &mdash; rows changed since last upload.</li>
           <li><code>evicting</code>, watermarks, <code>waiting</code>/<code>running</code> &mdash; as before, block-granular.</li>
@@ -1023,12 +1096,27 @@ addr(l, s, kv_idx, h, t):
       <div class="tpl">G &middot; Async watermark eviction &mdash; victim unit is now a BLOCK</div>
       <div class="tpl-body">
       <p>The enqueue/reap split is identical; the victim unit shrinks from a 24.96&nbsp;GB slab to a 5.12&nbsp;MB block, which makes drain far cheaper and the watermarks finer-grained:</p>
-      <div class="formula-box">drain_latency_block = block_KV_bytes / BW_pcie_agg = 5.12 MB / 200 GB/s &asymp; 25.6 &micro;s   [D]
+      <div class="formula-box"><span style="color:#0c4a6e;font-weight:700">drain side</span>
+drain_latency_block = block_KV_bytes / BW_pcie_agg = 5.12 MB / 200 GB/s &asymp; 25.6 &micro;s   [D]
 alloc_rate_blocks   = admit_rate &times; blocks_per_seq &asymp; 0.355 &times; (13 200/16) &asymp; 293 blk/s [D]
-low_watermark       = sized to one tick's block-alloc BURST, not one block:
-                      a fresh admit claims ceil(N/16) blocks at once (hundreds)
-high_watermark      = low + one prefill's block demand (anti-thrash band)</div>
-      <p><strong>Why the band widens here:</strong> blocks are allocated in bursts (a fresh prompt claims <code>ceil(N/16)</code> blocks at admit, hundreds at once), so the hysteresis band is sized to one admit&rsquo;s block demand rather than one token &mdash; the same drain-rate&times;alloc-rate formula, now block-granular. The race-avoidance reasoning (single-thread commit in <code>reap</code>) is unchanged from Iter 1a.</p>
+
+<span style="color:#7c2d12;font-weight:700">why the Iter 1a formula breaks here</span>
+naive low = ceil(drain_latency_block &times; alloc_rate_blocks)
+          = ceil(0.0000256 s &times; 293 blk/s) = ceil(0.0075) = 1 block          [D]
+&rarr; wrong: a fresh admit grabs ceil(T_in_mean / page_size) = ceil(13 200/16) = 825 blocks
+  in one atomic burst; low=1 is violated by the very first admit.
+  binding constraint switches from drain-latency to burst-size.
+
+<span style="color:#14532d;font-weight:700">the watermark pair (anti-thrash)</span>
+burst_size     = ceil(T_in_mean / page_size) = ceil(13 200 / 16) = 825 blocks   [D]
+low_watermark  = burst_size = 825 blocks                                         [D]
+                 (pool must hold &ge; 825 free before evictor sleeps; one admit
+                  cannot undercut it)
+hysteresis_band = burst_size = 825 blocks                                        [D]
+                  (one additional admit&rsquo;s demand; prevents a single admit from
+                   immediately re-tripping low)
+high_watermark  = low_watermark + hysteresis_band = 825 + 825 = 1 650 blocks    [D]</div>
+      <p><strong>Why the band widens here:</strong> at Iter 1a blocks were slabs — allocated one-per-admit — so the hysteresis band was 1. Here an admit grabs 825 blocks atomically, so both thresholds are 825. The drain itself is now negligible (25.6&nbsp;&micro;s per block; a 100-block drain finishes in ~2.6&nbsp;ms, well inside the tick). The race-avoidance reasoning (single-thread commit in <code>reap</code>) is unchanged from Iter 1a.</p>
       </div>
 
       <div class="tpl">H &middot; Delta + next bottleneck</div>
@@ -1046,7 +1134,7 @@ high_watermark      = low + one prefill's block demand (anti-thrash band)</div>
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> a cold/rebalanced task recomputes a conv&rsquo;s prior KV (<code>&beta;_cold</code>) because local tiers die with the task. <strong>New state:</strong> <code>pool_writeback_queue</code> &middot; optional <code>pool_filter</code> (<code>None</code> on the main line) &middot; <code>TaskStatePush.pool_filter_version</code>. <strong>New protocol:</strong> <code>KVWriteback</code>/<code>Ack</code>, <code>KVPull</code>/<code>Resp</code>/<code>Miss</code> (scheduler&harr;<code>kv-store-job</code>, RDMA). <strong>No new kernel</strong> &mdash; both movements are off the per-tick critical path. Per <code>DESIGN_CHOICE_CHANGE.md</code> &sect;6/&sect;8/&sect;9. Scenario reference: <a href="distributed_kv_cache.html#iter3b">&sect;9b</a>; store internals: <a href="kv_store.html">kv_store.html</a>.</p>
       </div>
 
-      <div class="svg-wrap-small">
+      <div class="svg-wrap-small-small">
       <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 3b pooled KV store as a write-back victim cache. On end-of-sequence or local-tier eviction, if the predictor-free length gate passes (cumulative context above the 1.9 thousand recompute-versus-fetch crossover), the decode task async-writes the turn's K,V keyed by conv_id to the kv-store-job over RDMA, targeting its remote-DRAM L3 front; the store demotes to its NVMe L5 back internally. On a warm turn landing on a cold or rebalanced prefill task, the prefill task does a direct consistent-hash probe of conv_id into the pool ring to the owner, and on a hit RDMA-pulls the missing blocks; on a miss it recomputes with recovery-point-objective zero.">
         <defs><marker id="ahS3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker></defs>
         <style>
@@ -1180,7 +1268,12 @@ high_watermark      = low + one prefill's block demand (anti-thrash band)</div>
         <li><code>varlen_prefill</code> &mdash; <span class="tag tag-k" style="background:#fce7f3;color:#9d174d;border-color:#f9a8d4">kernel</span> FA v2 tiles each ragged segment through SRAM; never materializes the N&times;N score matrix.</li>
         <li><code>chunks_ahead()</code> &mdash; <span class="tag tag-g" style="background:#e0e7ff;color:#3730a3;border-color:#a5b4fc">CPU-only</span> the new wait driver: <code>&Sigma; ceil(remaining_unmatched_tokens(r) / C)</code>.</li>
       </ul>
-      <p><strong>Why <code>C = 4 K</code> (the chunk-size knob is the design question).</strong> Below ~4&nbsp;K, arithmetic intensity falls under the roofline ridge (<code>F_peak/HBM_BW &asymp; 295 FLOP/byte</code>) and the kernel starves the SMs &mdash; MFU collapses. Above ~8&nbsp;K, activation memory and head-of-line slip re-grow (a chunk is the worst-case wait a short request can sit behind). The band <code>[4 K, 8 K]</code> is the elbow; <code>C = 4 K</code> &rarr; <code>&beta;_chunk = prefill_time(4 K) &asymp; 190 ms</code>, the unit the scheduler interleaves and the bound on worst-case HoL slip.</p>
+      <p><strong>Why <code>C = 4 K</code> (the chunk-size knob is the design question).</strong></p>
+      <ul>
+        <li><strong>Floor &mdash; below ~4 K, MFU collapses.</strong> Arithmetic intensity &asymp; C FLOP/byte; the H100 roofline ridge is <code>F_peak/HBM_BW &asymp; 295 FLOP/byte</code>. Below that ridge the kernel is weight-BW-bound and re-pays the 17.5 GB/GPU weight read <code>N/C</code> times for no extra useful compute. Even above 295, achieved MFU keeps ramping and only plateaus near 40% around <code>C &asymp; 4 K</code> for a 70 B model on H100.</li>
+        <li><strong>Ceiling &mdash; above ~8 K, activation budget + HoL slip re-grow.</strong> Per-chunk transient HBM (Q/K/V/O softmax buffers) scales with C and starts crowding the KV cache above ~8 K; and a chunk is the worst-case wait a short request can sit behind, so larger C undoes the HoL bound chunking was designed to give.</li>
+        <li><strong>The chosen value: <code>C = 4 K</code></strong> &mdash; smallest fully compute-bound chunk, minimises HoL while staying at peak MFU. Yields <code>&beta;_chunk = prefill_time(4 K) &asymp; 190 ms</code>, the unit the scheduler interleaves and the hard bound on worst-case HoL slip.</li>
+      </ul>
       </div>
 
       <div class="tpl">D &middot; Contract &middot; E&ndash;G &middot; layout/state/eviction</div>
@@ -1200,7 +1293,7 @@ high_watermark      = low + one prefill's block demand (anti-thrash band)</div>
     <div class="container">
       <div class="iter-head">
         <h2 id="iter5">10. Iter 5 &mdash; Prefix caching (Role 2) &mdash; and <code>ref_count</code> is finally born</h2>
-        <p class="iter-meta"><strong>Bottleneck addressed:</strong> every warm turn re-prefills a prompt that is mostly identical to the last turn&rsquo;s. <strong>New state:</strong> <code>hash_index</code> (block_hash &rarr; physical_block) &middot; <strong><code>ref_count</code> (born here)</strong> &middot; <code>last_access</code> &middot; <code>tier_locs</code> upgraded to an atomic <code>HBM|DRAM|REMOTE</code> bitmap. <strong>Retention is reuse-recency LRU + <code>ref_count</code> + the pool &mdash; no hard pin</strong> (Change 5). Cites <a href="../../knowledge/K2_kv-cache.html">K2 D5/D52</a>. Scenario reference: <a href="distributed_kv_cache.html#iter5">&sect;11</a>; Router side <a href="router.html#iter5">&sect;8b</a> (single-flight only).</p>
+        <p class="iter-meta"><strong>Bottleneck addressed:</strong> every warm turn re-prefills a prompt that is mostly identical to the last turn&rsquo;s. <strong>New state:</strong> <code>hash_index</code> (block_hash &rarr; block_id) &middot; <strong><code>ref_count</code> (born here)</strong> &middot; <code>last_access</code> &middot; <code>tier_locs</code> upgraded to an atomic <code>HBM|DRAM|REMOTE</code> bitmap. <strong>Retention is reuse-recency LRU + <code>ref_count</code> + the pool &mdash; no hard pin</strong> (Change 5). Cites <a href="../../knowledge/K2_kv-cache.html">K2 D5/D52</a>. Scenario reference: <a href="distributed_kv_cache.html#iter5">&sect;11</a>; Router side <a href="router.html#iter5">&sect;8b</a> (single-flight only).</p>
       </div>
 
       <div class="ref-box"><strong>Why <code>ref_count</code> is born <em>now</em> and not at Iter 3.</strong> A <em>count</em> is meaningful only when a physical block can be referenced by more than one live sequence. Through Iter 4 every block had exactly one owner, so &ldquo;is it in use?&rdquo; was the boolean <em>owning-seq&nbsp;&isin;&nbsp;<code>running</code></em>. Prefix caching is the first time N concurrent sequences <em>share</em> one physical prefix block (the platform hidden prompt block is held by every request on the task). Now &ldquo;may I evict this block?&rdquo; genuinely needs <em>how many live sequences still point at it</em> &rarr; <code>ref_count == 0</code> becomes the hard correctness pin and the coldness-gate term. (Copy-on-write for parallel sampling, the other classic trigger, is off this design&rsquo;s main line.)</div>
@@ -1239,14 +1332,21 @@ high_watermark      = low + one prefill's block demand (anti-thrash band)</div>
 
       <div class="tpl">D&ndash;F &middot; contract / state / layout</div>
       <div class="tpl-body">
-      <p><strong>D (contract):</strong> no per-tick bus change; the only delta is fewer prompt tokens uploaded (unmatched tail). <strong>E (state):</strong> Iter 4 state + <code>hash_index: dict[block_hash &rarr; physical_block_id]</code>, <code>ref_count: dict[block_id &rarr; int]</code>, <code>last_access: dict[block_id &rarr; step]</code>; <code>tier_locs</code> is now an atomic <code>HBM|DRAM|REMOTE</code> bitmap (clean/dirty derived). <strong>F (layout):</strong> paged blocks, unchanged shape; the new thing is that one physical block can appear in many sequences&rsquo; <code>block_table</code> rows (sharing) &mdash; which is exactly what <code>ref_count</code> guards.</p>
+      <p><strong>D (contract):</strong> no per-tick bus change; the only delta is fewer prompt tokens uploaded (unmatched tail). <strong>E (state):</strong> Iter 4 state + <code>hash_index: dict[block_hash &rarr; block_id]</code>, <code>ref_count: dict[block_id &rarr; int]</code>, <code>last_access: dict[block_id &rarr; step]</code>; <code>tier_locs</code> is now an atomic <code>HBM|DRAM|REMOTE</code> bitmap (clean/dirty derived). <strong>F (layout):</strong> paged blocks, unchanged shape; the new thing is that one physical block can appear in many sequences&rsquo; <code>block_table</code> rows (sharing) &mdash; which is exactly what <code>ref_count</code> guards.</p>
       <div class="formula-box">unmatched_tokens(r) = r.prompt_tokens &minus; longest_local_match(r.chain_hash, hash_index)
 mean: 13.3 K &rarr; ~1.85 K   [D &mdash; scenario &sect;11.6]   &rArr; chunks_ahead falls &rarr; prefill wait + fleet both shrink ~7&times;</div>
       </div>
 
       <div class="tpl">G &middot; Eviction &mdash; reuse-recency LRU + the hard <code>ref_count</code> pin</div>
       <div class="tpl-body">
-      <p>The enqueue/reap split is unchanged; what changes is the <strong>victim-selection predicate</strong>. The coldness gate is now <code>(last_access old &and; ref_count == 0 &and; session_idle)</code>. <code>ref_count == 0</code> is the only <strong>hard</strong> pin (a block N live sequences share cannot be evicted &mdash; correctness); among <code>ref_count == 0</code> blocks the evictor picks by reuse-recency LRU (the <code>last_access</code> key is refreshed on cache <em>hit</em>/reuse at admission, not on every kernel read &mdash; vLLM free-queue re-append). A <strong>clean</strong> block (the <code>tier_locs</code> bitmap shows an identical copy already lives on a lower tier) is freed with <em>no copy-down</em> (Move B2 clean-drop); a <strong>dirty</strong> block falls to the length gate (write-down to the pool iff recompute &gt; transfer, else discard). <strong>No hard pin, no Router pin control-plane</strong> (Change 5): a hot prefix stays resident because it is <em>re-hit</em> (the platform prompt by a boot-time warmup-prefill + constant re-hits; a heavy user&rsquo;s system prompt by CH-stickiness landing them on the same task), not because it is pinned. An optional soft <code>retention_priority</code> bias is the only residual of the former pin and is off the main line.</p>
+      <p>The enqueue/reap split is unchanged; what changes is the <strong>victim-selection predicate</strong>.</p>
+      <ul>
+        <li><strong>Coldness gate: <code>(last_access old &and; ref_count == 0 &and; session_idle)</code>.</strong> All three conditions must hold before a block is even a candidate for eviction.</li>
+        <li><strong><code>ref_count == 0</code> is the only hard pin.</strong> A block shared by N live sequences cannot be evicted &mdash; correctness. Among eligible (<code>ref_count == 0</code>) blocks the evictor ranks by reuse-recency LRU; <code>last_access</code> is refreshed on cache hit/reuse at admission, not on every kernel read (vLLM free-queue re-append).</li>
+        <li><strong>Clean block &rarr; free with no copy-down.</strong> If the <code>tier_locs</code> bitmap shows an identical copy already on a lower tier, the block is dropped outright (Move B2 clean-drop). No write-back needed.</li>
+        <li><strong>Dirty block &rarr; length gate.</strong> Write-down to the pool iff recompute &gt; transfer (crossover ~1.9 K tok); otherwise discard.</li>
+        <li><strong>No hard pin, no Router pin control-plane (Change 5).</strong> A hot prefix stays resident because it is re-hit &mdash; the platform prompt via boot-time warmup-prefill + constant re-hits; a heavy user&rsquo;s system prompt via CH-stickiness landing them on the same task. An optional soft <code>retention_priority</code> bias is the only residual of the former pin and is off the main line.</li>
+      </ul>
       </div>
 
       <div class="tpl">H &middot; Delta + next bottleneck</div>
@@ -1283,7 +1383,7 @@ kv_store_job_task_num = max(storage-sized, QPS-sized)        [full chain: scenar
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> decode at B=1 idles the SMs (MBU&nbsp;&asymp;&nbsp;1%). <strong>The throughput prize</strong> the paged layout was built for. <strong>New state:</strong> the decode batch (up to <code>B_decode &asymp; 106</code>) &middot; the CUDA-graph captured-set. <strong>New kernels:</strong> Flash Decoding (<code>split_kv</code>) + captured-graph replay. The decode wait scalar&rsquo;s <code>B</code> placeholder finally graduates 1&nbsp;&rarr;&nbsp;<code>B_decode</code> &rarr; published decode wait drops ~106&times;. Scenario reference: <a href="distributed_kv_cache.html#iter6">&sect;12</a>; Router side <a href="router.html#iter6">&sect;8c</a> (no-op).</p>
       </div>
 
-      <div class="svg-wrap-small">
+      <div class="svg-wrap-small-small">
       <svg viewBox="0 0 1180 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 6 continuous batching on the decode pool. The decode tick now packs up to B_decode of about 106 active sequences into one batched varlen decode launch instead of one. Continuous batching admits and retires sequences tick-by-tick so the active batch stays full. The launch replays a captured CUDA graph chosen from a captured set of batch sizes 1, 4, 16, 64 and 128, picking the smallest graph at least the current active batch and padding unused slots with no-op tokens; warmup is 100 milliseconds per batch size and model revision, not per tick. The kernel is Flash Decoding, splitting along the KV sequence dimension when the query length is 1, reusing the Iter 4 Flash Attention v2 SRAM tiling. B max paged of 106 only fits because Iter 3 paging freed the HBM headroom.">
         <defs><marker id="ahS6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker></defs>
         <style>
@@ -1398,7 +1498,7 @@ kv_store_job_task_num = max(storage-sized, QPS-sized)        [full chain: scenar
         <p class="iter-meta"><strong>Bottleneck addressed:</strong> a p99.9 ~1&nbsp;M-token request needs ~320&nbsp;GB of KV &mdash; it cannot fit one task&rsquo;s <code>G_KV &asymp; 450&nbsp;GB</code> alongside a live batch. <strong>New state:</strong> <code>cp_rank</code> &middot; <code>cp_world_size</code> (set by <code>CPAssign</code> from the Router). <strong>New collective:</strong> a per-tick all-gather over RDMA; Flash Decoding within each rank&rsquo;s KV slice = <strong>Ring Attention</strong> (distributed Flash Attention). Triggered at admit by the Router&rsquo;s <code>est_kv &gt; CP_FORK_THRESHOLD = 256&nbsp;GB &asymp; 800&nbsp;K tok</code> (~0.1% of QPS). Cites <a href="../../knowledge/K17_attention-kernels-and-cuda-graphs.html">K17</a> + K11. Scenario reference: <a href="distributed_kv_cache.html#iter9">&sect;15</a>; Router side <a href="router.html#iter9">&sect;8f</a>.</p>
       </div>
 
-      <div class="svg-wrap-small">
+      <div class="svg-wrap-small-small">
       <svg viewBox="0 0 1180 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iter 9 context parallelism. The Router computes est_kv equal to prompt length times KV per token at admit. If est_kv exceeds the 256-gigabyte fork threshold, about 800 thousand tokens, it sends CPAssign rank, world-size 8, peers to a pre-grouped 8-task CP sub-pool. The long sequence's KV is sliced across the 8 ranks, 40 gigabytes per rank for a 1-million-token, 320-gigabyte sequence. Each decode tick the ranks run Ring Attention: each rank runs Flash Decoding on its local KV slice, then an all-gather over RDMA rotates KV slices around the ring so every rank attends over the full sequence. This is distributed Flash Attention. Only about 0.1 percent of QPS forks; the other 99.9 percent stays on the normal single-task path.">
         <defs><marker id="ahS9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker></defs>
         <style>
@@ -1461,7 +1561,7 @@ kv_store_job_task_num = max(storage-sized, QPS-sized)        [full chain: scenar
       <div class="tpl-body">
       <p>The engine tick loop and per-tick CPU&harr;GPU contract are <strong>byte-for-byte Iter 9</strong>; no new kernel, no new per-tick H2D/D2H. Two CPU-side additions: (i) a <strong>heartbeat emit timer</strong> (the <code>Heartbeat</code> every 5&nbsp;s already in role 2, now load-bearing for death detection); (ii) an <strong>idempotent recovery-retry handler</strong>.</p>
       <ul>
-        <li><strong>KV-handoff drop:</strong> on <code>KVHandoffNack</code> / stream EOF / Ack-timeout (~500&nbsp;ms), the prefill task re-streams from its still-resident paged blocks (cheap &mdash; no recompute). Idempotent: re-streaming the same <code>seq_id</code> is safe.</li>
+        <li><strong>KV-handoff drop:</strong> on <code>KVHandoffNack</code> / stream EOF / Ack-timeout (~500&nbsp;ms), the prefill task re-streams from its still-resident paged blocks (cheap &mdash; no recompute). Idempotent: re-streaming the same <code>conv_id</code> is safe.</li>
         <li><strong>Peer-task death:</strong> on a peer heartbeat miss the Router drops it from the rings and the rebalanced <code>Route</code> lands the conv on a neighbour, which <strong>pulls the conv&rsquo;s prior KV from the Iter 3b pool</strong> (<a href="#iter3b">&sect;8b</a> <code>pull_or_recompute</code>) &mdash; linear I/O, the common case for an admitted long/active conv &mdash; else re-prefills. <strong>RPO=0</strong> either way (the worst case is latency, never lost output).</li>
       </ul>
       <div class="formula-box">recovery cost on rebalance (warm conv in pool):
@@ -1474,7 +1574,7 @@ RTO has three independently-owned parts:
 
       <div class="tpl">E&ndash;H &middot; state / next</div>
       <div class="tpl-body">
-      <p><strong>E (state):</strong> Iter 9 state + the heartbeat timer + a small in-flight-retry table (<code>seq_id &rarr; (target, attempt)</code>, idempotency-keyed). <strong>F&ndash;G (layout/eviction):</strong> unchanged. <strong>H:</strong> with RPO=0 recovery on every failure path, the page&rsquo;s build is complete &mdash; from a single B=1 task that recomputed every turn (Iter 0) to a fault-tolerant, prefix-caching, continuously-batched, P/D-disaggregated fleet with a cross-task victim cache and a CP fork for the long-context tail.</p>
+      <p><strong>E (state):</strong> Iter 9 state + the heartbeat timer + a small in-flight-retry table (<code>conv_id &rarr; (target, attempt)</code>, idempotency-keyed). <strong>F&ndash;G (layout/eviction):</strong> unchanged. <strong>H:</strong> with RPO=0 recovery on every failure path, the page&rsquo;s build is complete &mdash; from a single B=1 task that recomputed every turn (Iter 0) to a fault-tolerant, prefix-caching, continuously-batched, P/D-disaggregated fleet with a cross-task victim cache and a CP fork for the long-context tail.</p>
       </div>
     </div>
   </section>
@@ -1538,9 +1638,9 @@ RTO has three independently-owned parts:
 
       <h3 id="protocol-s2s">17.2 &nbsp;Scheduler &harr; Scheduler (Iter 2+ direct hand-off)</h3>
       <table class="sheet"><thead><tr><th>Message</th><th>Direction</th><th>Trigger</th></tr></thead><tbody>
-        <tr><td><code>KVHandoff(seq_id, conv_id, blocks[], ring_version)</code></td><td>prefill &rarr; decode</td><td>prefill completion (CH on <code>decode_ring</code>)</td></tr>
-        <tr><td><code>KVHandoffAck(seq_id, decode_task_id)</code></td><td>decode &rarr; prefill</td><td>install complete &rarr; close stream</td></tr>
-        <tr><td><code>KVHandoffNack(seq_id, reason)</code></td><td>decode &rarr; prefill</td><td>drop/timeout &rarr; prefill re-streams (&sect;19)</td></tr>
+        <tr><td><code>KVHandoff(conv_id, blocks[], ring_version)</code></td><td>prefill &rarr; decode</td><td>prefill completion (CH on <code>decode_ring</code>)</td></tr>
+        <tr><td><code>KVHandoffAck(conv_id, decode_task_id)</code></td><td>decode &rarr; prefill</td><td>install complete &rarr; close stream</td></tr>
+        <tr><td><code>KVHandoffNack(conv_id, reason)</code></td><td>decode &rarr; prefill</td><td>drop/timeout &rarr; prefill re-streams (&sect;19)</td></tr>
       </tbody></table>
       <p>Transport: gRPC server-stream over NDR400 IB. Payload ~4&nbsp;GB cold / ~580&nbsp;MB post-Iter-5 (prefix-match shrinks the unmatched tail).</p>
 
@@ -1570,7 +1670,7 @@ RTO has three independently-owned parts:
       <h2 id="topology">18. Physical deployment topology (Borg-style)</h2>
       <p>One <code>serving-*-job</code> task = one bare-metal host (per scenario &sect;1.5). Task counts are symbolic and materialise at scenario S6; the SVG shows the comms that matter and the per-task hardware.</p>
 
-      <div class="svg-wrap">
+      <div class="svg-wrap-small">
       <svg viewBox="0 0 1180 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Borg-style deployment topology. The L4 load balancer feeds the router-job, a fleet of CPU-only tasks. The broker-job, about 3 HA tasks on commodity hosts with 25-gigabit NICs running Redis Streams or NATS, fans gossip between routers and serving tasks. The serving-prefill-job and serving-decode-job are fleets of TP-8 hosts, each 8 H100 SXM5 GPUs on NVLink 4, dual EPYC CPUs, 1 terabyte DRAM, 7-terabyte NVMe, and 8 NDR400 InfiniBand NICs. Prefill tasks stream KV to decode tasks over gRPC on InfiniBand. Both serving fleets write-back and pull cross-turn KV over RDMA to the kv-store-job, a fleet of NVMe-dense CPU-only tasks holding the conv_id-keyed store. All intra-task GPU collectives run on NVLink; all cross-task KV runs on the NDR400 InfiniBand fabric.">
         <defs><marker id="ahT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
           <marker id="arT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker></defs>
