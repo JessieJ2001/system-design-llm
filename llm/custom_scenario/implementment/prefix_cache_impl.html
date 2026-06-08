@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Radix tree vs block-hash &mdash; is &ldquo;structure-aware eviction&rdquo; a real benefit?</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    .code-box { background:#f8fafc; color:#0f172a; border:1px solid #cbd5e1; border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.8rem; line-height:1.5;
+      white-space:pre; overflow-x:auto; }
+    .code-box .kw { color:#1d4ed8; font-weight:700; }
+    .code-box .cm { color:#64748b; font-style:italic; }
+    .code-box .lt { color:#b45309; }
+    .code-box .fn { color:#15803d; font-weight:700; }
+    .code-box .st { color:#0e7490; }
+    .out-box { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:.7rem 1rem; margin:.6rem 0;
+      font-family:'JetBrains Mono',monospace; font-size:.8rem; line-height:1.5; white-space:pre-wrap; }
+    .out-box .ok { color:#4ade80; font-weight:700; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    @media (max-width: 1100px){ .two-col { grid-template-columns:1fr; } }
+    html { scroll-behavior: auto; }
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+    .pick { color:#15803d; font-weight:700; }
+    .reject { color:#b91c1c; font-weight:700; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.88rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">&larr; Scenario page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Sibling pages</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">Scenario page</a></li>
+          <li><a class="sidebar-section-link" href="kv_store.html">kv_store.html</a></li>
+          <li><a class="sidebar-section-link" href="scheduler.html">scheduler.html</a></li>
+          <li><a class="sidebar-section-link" href="router.html">router.html</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#scope">What this page shows</a></li>
+          <li><a class="sidebar-section-link" href="#model">1. The shared model (held fixed)</a></li>
+          <li><a class="sidebar-section-link" href="#impls">2. The two implementations</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#radix">&nbsp;&nbsp;2a. Radix per-page tree</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#blockhash">&nbsp;&nbsp;2b. Block-hash + the triple</a></li>
+          <li><a class="sidebar-section-link" href="#driver">3. Driver &amp; the equivalence</a></li>
+          <li><a class="sidebar-section-link" href="#why">4. Why they match (the lemma)</a></li>
+          <li><a class="sidebar-section-link" href="#limit">5. What radix STILL wins (#1)</a></li>
+          <li><a class="sidebar-section-link" href="#crosslinks">6. Cross-links</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Radix tree vs block-hash: is &ldquo;structure-aware eviction&rdquo; a real benefit?</h1>
+      <p class="hero-subtitle"><strong>No.</strong> Held at the <em>same</em> page granularity, a flat block-hash table reproduces a RadixAttention-style tree&rsquo;s &ldquo;evict the coldest <em>leaf</em>, never an internal node with a live child&rdquo; order <strong>exactly</strong> &mdash; using two extra scalar fields per entry (<code>last_access</code>, <code>min_position</code>) on top of the <code>ref_count</code> it already carries. So structure-aware eviction is a cheap block-hash <em>upgrade</em>, not a tree capability. The <em>only</em> genuine capability gap is <a href="#limit">benefit #1</a> (the token-granular match boundary, which is really a <code>page_size</code> knob).</p>
+      <p class="hero-meta">
+        Companion to <a href="distributed_kv_cache_image_tool.html">distributed_kv_cache_image_tool.html</a> Iter&nbsp;B1 (the four radix-vs-block-hash benefits) &middot;
+        Cites <a href="../../knowledge/K2_kv-cache.html">K2</a> (prefix caching / APC / CoW) &middot; runnable Python &middot; ~12 min
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="scope">What this page shows (and isn&rsquo;t)</h2>
+      <p><strong>TL;DR.</strong> Iter&nbsp;B1 lists four claimed benefits of a radix tree over a block-hash KV index. Benefit&nbsp;#2 was &ldquo;structure-aware eviction&rdquo;: the tree makes <em>&ldquo;evict the coldest leaf, never an internal node with live children&rdquo;</em> a first-class operation because the parent/child structure <em>is</em> the sharing graph. This page proves that claim is <strong>not a discriminating benefit</strong> &mdash; both representations can do it, and a flat table matches the tree byte-for-byte on eviction order once it carries two scalars it can compute for free.</p>
+      <ul>
+        <li><strong>Is:</strong> two small, <em>runnable</em> Python caches &mdash; (a) a per-page radix tree with leaf-LRU eviction, (b) a flat block-hash table with the <code>(ref_count==0</code> gate&nbsp;&rarr;&nbsp;<code>last_access</code>&nbsp;&rarr;&nbsp;<code>min_position)</code> policy &mdash; driven by one fork-tree workload, with an assertion that their eviction sequences are identical; plus the <a href="#why">lemma</a> that explains <em>why</em> they must match and exactly which field does the work.</li>
+        <li><strong>Is not:</strong> the token-granularity question (benefit&nbsp;#1) &mdash; that is a real gap and is held <em>fixed</em> here (both run at the same page size) so we isolate eviction. It is summarised in <a href="#limit">&sect;5</a>. The distributed-pool keying debate lives on the <a href="distributed_kv_cache_image_tool.html">scenario page</a>.</li>
+      </ul>
+      <div class="note-box"><strong>The point in one line.</strong> The radix tree gets eviction order from its <em>shape</em>; the block-hash table gets the same order from <em>data on each entry</em>. Same result, different bookkeeping &mdash; a convenience, not a capability.</div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="model">1. The shared model &mdash; page granularity held fixed</h2>
+      <p>To compare <em>only</em> eviction, both caches store KV at the <strong>same</strong> page granularity (<code>BLOCK = 4</code> tokens/page) and key each page by the <strong>path-dependent prefix hash</strong> (<code>hash(tokens[:(i+1)&middot;BLOCK])</code>) &mdash; the APC content-hash chain (<a href="../../knowledge/K2_kv-cache.html">K2</a> D5). Identical prefixes collide on the same key, so prefix <em>sharing</em> is identical in both; the only thing that can differ is which dead page each evicts first.</p>
+      <div class="code-box"><span class="kw">import</span> hashlib
+
+BLOCK = <span class="lt">4</span>  <span class="cm"># tokens / page. FIXED across both impls =&gt; only eviction differs.</span>
+
+<span class="kw">def</span> <span class="fn">page_keys</span>(tokens):
+    <span class="st">"""key[i] = hash(tokens[:(i+1)*BLOCK]) -- identical prefixes collide =&gt; sharing (K2 D5)."""</span>
+    <span class="kw">assert</span> len(tokens) % BLOCK == <span class="lt">0</span>, <span class="st">"demo uses full pages only (benefit #1 is separate)"</span>
+    keys = []
+    <span class="kw">for</span> i <span class="kw">in</span> range(<span class="lt">0</span>, len(tokens), BLOCK):
+        h = hashlib.blake2b(repr(tokens[: i + BLOCK]).encode(), digest_size=<span class="lt">6</span>).hexdigest()
+        keys.append(h)
+    <span class="kw">return</span> keys</div>
+      <p>Each page key has a fixed <strong>depth</strong> (its page index), because a given prefix has a fixed length. Depth&nbsp;&times;&nbsp;<code>BLOCK</code> is the page&rsquo;s <code>min_position</code> &mdash; the start offset of its first token. That offset is known at allocation, so it is <strong>free</strong>.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="impls">2. The two implementations</h2>
+      <p>Both expose the same interface: <code>open(keys, t)</code> (admit a head + its path, mark it live), <code>close(keys, t)</code> (the head dies), <code>evict_one()</code> (reclaim one page under pressure). Reading them side by side, the <em>only</em> difference is the body of <code>evict_one</code> and how each stores the structure.</p>
+
+      <div class="two-col">
+        <div>
+          <h4 id="radix">2a. Radix &mdash; structure from the tree shape</h4>
+          <p style="font-size:.86rem; margin:.2rem 0 .4rem">One node per physical page. A node&rsquo;s <code>ref</code> = live heads passing through it (incremented along the whole path on <code>open</code>). A <strong>leaf</strong> = a node with no <em>resident</em> child. Eviction picks the coldest leaf.</p>
+          <div class="code-box"><span class="kw">class</span> <span class="fn">Radix</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        self.nodes = {}   <span class="cm"># key-&gt;{parent,children,ref,last,depth}</span>
+        self.evicted = []
+        self.hits = <span class="lt">0</span>
+
+    <span class="kw">def</span> <span class="fn">_walk</span>(self, head, t, delta):
+        k = head                      <span class="cm"># ref += delta UP the path</span>
+        <span class="kw">while</span> k <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            n = self.nodes[k]
+            n[<span class="st">"ref"</span>] += delta
+            <span class="kw">if</span> delta &gt; <span class="lt">0</span>:
+                n[<span class="st">"last"</span>] = max(n[<span class="st">"last"</span>], t)
+            k = n[<span class="st">"parent"</span>]
+
+    <span class="kw">def</span> <span class="fn">open</span>(self, keys, t):
+        parent = <span class="kw">None</span>
+        <span class="kw">for</span> depth, k <span class="kw">in</span> enumerate(keys):
+            <span class="kw">if</span> k <span class="kw">in</span> self.nodes:
+                self.hits += <span class="lt">1</span>          <span class="cm"># shared page</span>
+            <span class="kw">else</span>:
+                self.nodes[k] = dict(parent=parent,
+                    children=set(), ref=<span class="lt">0</span>, last=t, depth=depth)
+                <span class="kw">if</span> parent <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+                    self.nodes[parent][<span class="st">"children"</span>].add(k)
+            parent = k
+        self._walk(keys[-<span class="lt">1</span>], t, +<span class="lt">1</span>)    <span class="cm"># head is live</span>
+
+    <span class="kw">def</span> <span class="fn">close</span>(self, keys, t):
+        self._walk(keys[-<span class="lt">1</span>], t, -<span class="lt">1</span>)
+
+    <span class="kw">def</span> <span class="fn">evict_one</span>(self):
+        <span class="cm"># resident LEAF + ref==0, then coldest (LRU),</span>
+        <span class="cm"># deepest-first as the recency tie-break.</span>
+        cands = [k <span class="kw">for</span> k, n <span class="kw">in</span> self.nodes.items()
+                 <span class="kw">if</span> n[<span class="st">"ref"</span>] == <span class="lt">0</span>
+                 <span class="kw">and</span> all(c <span class="kw">not</span> <span class="kw">in</span> self.nodes
+                         <span class="kw">for</span> c <span class="kw">in</span> n[<span class="st">"children"</span>])]
+        <span class="kw">if</span> <span class="kw">not</span> cands: <span class="kw">return</span> <span class="kw">None</span>
+        v = min(cands, key=<span class="kw">lambda</span> k: (
+            self.nodes[k][<span class="st">"last"</span>],
+            -self.nodes[k][<span class="st">"depth"</span>], k))
+        n = self.nodes.pop(v)
+        <span class="kw">if</span> n[<span class="st">"parent"</span>] <span class="kw">in</span> self.nodes:
+            self.nodes[n[<span class="st">"parent"</span>]][<span class="st">"children"</span>].discard(v)
+        self.evicted.append(v)
+        <span class="kw">return</span> v</div>
+        </div>
+
+        <div>
+          <h4 id="blockhash">2b. Block-hash &mdash; structure from two scalars</h4>
+          <p style="font-size:.86rem; margin:.2rem 0 .4rem">One flat entry per physical page; no parent/child links. It carries <code>ref</code> (flat, incremented along the path), <code>last</code> (recency), and <code>min_pos</code> (depth&times;BLOCK). Eviction is the <strong>triple</strong>: <code>ref==0</code> gate &rarr; LRU &rarr; deepest-first.</p>
+          <div class="code-box"><span class="kw">class</span> <span class="fn">BlockHash</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        self.entries = {}  <span class="cm"># key-&gt;{ref,last,min_pos}</span>
+        self.evicted = []
+        self.hits = <span class="lt">0</span>
+
+    <span class="kw">def</span> <span class="fn">open</span>(self, keys, t):
+        <span class="kw">for</span> depth, k <span class="kw">in</span> enumerate(keys):
+            <span class="kw">if</span> k <span class="kw">in</span> self.entries:
+                self.hits += <span class="lt">1</span>          <span class="cm"># shared page</span>
+            <span class="kw">else</span>:
+                self.entries[k] = dict(ref=<span class="lt">0</span>,
+                    last=t, min_pos=depth * BLOCK)
+        <span class="kw">for</span> k <span class="kw">in</span> keys:           <span class="cm"># flat ref-count,</span>
+            self.entries[k][<span class="st">"ref"</span>] += <span class="lt">1</span>  <span class="cm"># monotone UP the chain</span>
+            self.entries[k][<span class="st">"last"</span>] = max(
+                self.entries[k][<span class="st">"last"</span>], t)
+
+    <span class="kw">def</span> <span class="fn">close</span>(self, keys, t):
+        <span class="kw">for</span> k <span class="kw">in</span> keys:
+            self.entries[k][<span class="st">"ref"</span>] -= <span class="lt">1</span>
+
+    <span class="kw">def</span> <span class="fn">evict_one</span>(self):
+        <span class="cm"># (1) ref==0 gate</span>
+        <span class="cm"># (2) last asc  = LRU primary</span>
+        <span class="cm"># (3) largest min_pos = deepest first</span>
+        cands = [k <span class="kw">for</span> k, e <span class="kw">in</span> self.entries.items()
+                 <span class="kw">if</span> e[<span class="st">"ref"</span>] == <span class="lt">0</span>]
+        <span class="kw">if</span> <span class="kw">not</span> cands: <span class="kw">return</span> <span class="kw">None</span>
+        v = min(cands, key=<span class="kw">lambda</span> k: (
+            self.entries[k][<span class="st">"last"</span>],
+            -self.entries[k][<span class="st">"min_pos"</span>], k))
+        self.entries.pop(v)
+        self.evicted.append(v)
+        <span class="kw">return</span> v</div>
+        </div>
+      </div>
+
+      <div class="note-box"><strong>The one structural difference.</strong> Radix&rsquo;s candidate set is computed by <em>walking the shape</em> (&ldquo;no resident child&rdquo;). Block-hash&rsquo;s candidate set is a one-line filter (<code>ref==0</code>), and the leaf-first ordering that the shape gave radix for free is recovered by the <code>-min_pos</code> tie-break. Everything else &mdash; <code>open</code>, <code>close</code>, the <code>ref</code> bookkeeping, sharing &mdash; is line-for-line the same.</div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="driver">3. The driver &amp; the equivalence assertion</h2>
+      <p>One fork-tree workload: a 2-page shared system prefix; <code>b1</code> and <code>b2</code> share a tail page (<code>b2</code> extends <code>b1</code>); <code>b3</code> and <code>b4</code> diverge at depth&nbsp;2. We open all four, then kill <code>b3</code> (oldest dead), then kill <code>b1</code> and <code>b2</code> together (so they share <code>last_access</code> &mdash; the tie case that needs <code>min_pos</code>). <code>b4</code> is left <strong>live</strong> to prove the <code>ref</code>-gate protects it. Then we drain evictions and compare.</p>
+      <div class="code-box"><span class="cm"># --- workload: a fork tree (shared sublists =&gt; shared prefix hashes) ---</span>
+sys = [<span class="lt">0</span>,<span class="lt">1</span>,<span class="lt">2</span>,<span class="lt">3</span>, <span class="lt">4</span>,<span class="lt">5</span>,<span class="lt">6</span>,<span class="lt">7</span>]            <span class="cm"># 2 shared system pages (depth 0,1)</span>
+b1  = sys + [<span class="lt">10</span>,<span class="lt">11</span>,<span class="lt">12</span>,<span class="lt">13</span>]              <span class="cm"># trunk + tail page (depth 2)</span>
+b2  = b1  + [<span class="lt">20</span>,<span class="lt">21</span>,<span class="lt">22</span>,<span class="lt">23</span>]              <span class="cm"># shares b1's tail, + page (depth 3)</span>
+b3  = sys + [<span class="lt">30</span>,<span class="lt">31</span>,<span class="lt">32</span>,<span class="lt">33</span>]              <span class="cm"># diverges at depth 2 (own page)</span>
+b4  = sys + [<span class="lt">40</span>,<span class="lt">41</span>,<span class="lt">42</span>,<span class="lt">43</span>, <span class="lt">44</span>,<span class="lt">45</span>,<span class="lt">46</span>,<span class="lt">47</span>]  <span class="cm"># diverges at depth 2, 2 pages deep</span>
+keys = {n: page_keys(s) <span class="kw">for</span> n, s <span class="kw">in</span> {<span class="st">"b1"</span>:b1,<span class="st">"b2"</span>:b2,<span class="st">"b3"</span>:b3,<span class="st">"b4"</span>:b4}.items()}
+
+events = [(<span class="lt">1</span>,<span class="st">"open"</span>,<span class="st">"b1"</span>),(<span class="lt">2</span>,<span class="st">"open"</span>,<span class="st">"b2"</span>),(<span class="lt">3</span>,<span class="st">"open"</span>,<span class="st">"b3"</span>),(<span class="lt">4</span>,<span class="st">"open"</span>,<span class="st">"b4"</span>),
+          (<span class="lt">5</span>,<span class="st">"close"</span>,<span class="st">"b3"</span>),                <span class="cm"># b3 dies first (oldest dead)</span>
+          (<span class="lt">6</span>,<span class="st">"close"</span>,<span class="st">"b1"</span>),(<span class="lt">7</span>,<span class="st">"close"</span>,<span class="st">"b2"</span>)]  <span class="cm"># b1,b2 die together -&gt; share last_access; b4 stays LIVE</span>
+
+R, H = Radix(), BlockHash()
+<span class="kw">for</span> t, act, br <span class="kw">in</span> events:
+    (R.open <span class="kw">if</span> act == <span class="st">"open"</span> <span class="kw">else</span> R.close)(keys[br], t)
+    (H.open <span class="kw">if</span> act == <span class="st">"open"</span> <span class="kw">else</span> H.close)(keys[br], t)
+
+<span class="kw">while</span> R.evict_one() <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>: <span class="kw">pass</span>      <span class="cm"># drain both under full pressure</span>
+<span class="kw">while</span> H.evict_one() <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>: <span class="kw">pass</span>
+
+<span class="kw">assert</span> R.evicted == H.evicted              <span class="cm"># SAME eviction order</span>
+<span class="kw">assert</span> R.hits == H.hits                    <span class="cm"># SAME prefix sharing</span>
+live = set(keys[<span class="st">"b4"</span>])
+<span class="kw">assert</span> <span class="kw">not</span> (set(R.evicted) &amp; live)            <span class="cm"># ref-gate protected live b4</span>
+<span class="kw">assert</span> <span class="kw">not</span> (set(H.evicted) &amp; live)</div>
+      <p>Running it (the exact script lives at <code>tmp/prefix_cache_demo.py</code>):</p>
+      <div class="out-box">radix     hits: 7  evicted: ['f413ca42a253', 'a74261dfdc32', 'c19f75804dd1']
+blockhash hits: 7  evicted: ['f413ca42a253', 'a74261dfdc32', 'c19f75804dd1']
+eviction order identical: <span class="ok">True</span>
+same prefix-sharing (hit count): <span class="ok">True</span>
+
+<span class="ok">ALL ASSERTIONS PASS</span> -&gt; block-hash + (ref==0, last_access, min_pos) == radix leaf-LRU</div>
+      <p>Three dead tail pages are reclaimed in the same order by both; the two shared system pages and <code>b4</code>&rsquo;s two tail pages survive in both because <code>b4</code> is live (<code>ref&nbsp;&gt;&nbsp;0</code> all the way to the root). The <code>b1</code>/<code>b2</code> tie (both died at the same instant, equal <code>last_access</code>) is broken deepest-first &mdash; <code>b2</code>&rsquo;s depth-3 page before <code>b1</code>&rsquo;s depth-2 page &mdash; which is exactly what the radix leaf constraint forces.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="why">4. Why they must match &mdash; the recency-monotonicity lemma</h2>
+      <p>This is not a coincidence of the workload. There is a one-line invariant that makes the flat policy provably equal to radix leaf-LRU:</p>
+
+      <h4>The problem, step by step</h4>
+      <ol>
+        <li>Radix evicts only <strong>leaves</strong> (no resident child), so it structurally peels the <em>deepest</em> resident dead page of any chain first, then works inward.</li>
+        <li>Block-hash has no notion of leaf &mdash; its <code>ref==0</code> gate admits an entire dead chain at once (a shallow dead page <em>and</em> its dead children are all candidates simultaneously).</li>
+        <li>So the worry is: could the flat policy evict a <em>shallow</em> dead page before its own deeper dead child, violating radix&rsquo;s leaf-first order and (in a real cache) throwing away a long shared prefix that a future request would re-hit?</li>
+      </ol>
+
+      <h4>The solution, step by step</h4>
+      <ol>
+        <li><strong>Recency is monotone up the chain.</strong> A page is touched on a <em>superset</em> of the paths/times its descendants are (every head below it also passes through it). So for any ancestor <code>a</code> and descendant <code>d</code>: <code>a.last_access &ge; d.last_access</code>. The deeper page is always at-most-as-recent.</li>
+        <li><strong>Strict case needs no help.</strong> When the inequality is strict, plain LRU (the <code>last_access</code> primary key) already picks the deeper page first &mdash; leaf-first falls out for free, no <code>min_pos</code> required.</li>
+        <li><strong>The tie case is the <em>only</em> place <code>min_pos</code> earns its keep.</strong> Releasing a head decrements <code>ref</code> along its whole unique suffix at one instant, so a parent and child can die with <em>equal</em> <code>last_access</code> (exactly the <code>b1</code>/<code>b2</code> tie). Plain LRU is then ambiguous; the <code>-min_pos</code> tie-break forces deepest-first &mdash; reproducing radix&rsquo;s leaf order precisely.</li>
+        <li><strong>Correctness needs no field at all.</strong> The &ldquo;never evict an internal node with a live child&rdquo; invariant is enforced by the <code>ref==0</code> gate alone, because <code>ref</code> is monotone up: <code>ref(page)==0 &rArr;</code> every descendant is 0 <code>&rArr;</code> no live child. There is nothing for the tree to close here.</li>
+      </ol>
+
+      <div class="ref-box"><strong>So the faithful flat policy is the triple</strong> <code>(ref_count==0</code> gate &rarr; <code>last_access</code> primary &rarr; <code>min_position</code> tie-break<code>)</code>. <code>last_access</code> recovers <em>recency</em> (what radix&rsquo;s LRU encodes); <code>min_position</code> recovers <em>structure</em> (what radix&rsquo;s shape encodes) but only matters on exact-recency ties. Both fields are free (recency is a timestamp; <code>min_position</code> is the allocation offset). The radix tree is therefore a <em>convenience</em> for this operation, not a capability &mdash; matching Iter&nbsp;B1&rsquo;s conclusion that <strong>only benefit&nbsp;#1 is a genuine gap.</strong></div>
+
+      <div class="warn-box"><strong>The trap to avoid: depth alone is not recency.</strong> If you drop <code>last_access</code> and order purely by <code>min_position</code> (deepest-first), you break on a hot, idle-tailed long conversation whose deep pages outrank a genuinely cold short one&rsquo;s &mdash; you would evict the hot tail. <code>min_position</code> is the <em>tie-break</em>, not the primary key. The triple, in that order, is what reproduces radix.</div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="container">
+      <h2 id="limit">5. What the radix tree <em>still</em> wins &mdash; benefit #1, and it is a <code>page_size</code> knob</h2>
+      <p>Eviction is a wash; the genuine gap is the <strong>token-granular match boundary</strong>, which this page deliberately held fixed by running both at <code>BLOCK = 4</code>. The honest framing:</p>
+      <table class="sheet">
+        <thead><tr><th>Axis</th><th>Block-hash (flat)</th><th>Radix tree</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td><strong>#1 Token-granular sharing</strong></td><td>shares whole pages; a non-aligned fork CoW-copies the trailing page + re-prefills up to <code>BLOCK&minus;1</code> tokens</td><td>can share to the exact divergence token <em>iff</em> <code>page_size&rarr;1</code></td><td class="c"><span class="pick">radix wins</span> &mdash; but only with a small/unit page; cost is page-table size + kernel-gather efficiency</td></tr>
+          <tr><td><strong>#2 Structure-aware eviction</strong></td><td><code>(ref==0, last_access, min_pos)</code> &mdash; proven equal above</td><td>leaf-LRU from the tree shape</td><td class="c"><span class="reject">wash</span> &mdash; this page</td></tr>
+          <tr><td><strong>#3 One-walk longest-prefix match</strong></td><td><code>P/BLOCK</code> O(1) probes</td><td>one pointer walk</td><td class="c"><span class="reject">near-wash</span> on time</td></tr>
+          <tr><td><strong>#4 Native many-way branching</strong></td><td>flat entries + <code>ref</code></td><td>insert a child edge at the divergence node</td><td class="c">ergonomic only</td></tr>
+        </tbody>
+      </table>
+      <p>And even #1 reverses at the <em>distributed</em> layer: a content/block hash is a flat, global, shardable key (the whole <a href="kv_store.html">kv-store-job</a> design); a radix tree is a centralized in-memory structure. So the scenario keeps <strong>block-hash for the shardable pool</strong> and adopts a <strong>radix tree only as the local per-task structure</strong> where arbitrary-fork-point sharing dominates &mdash; see <a href="distributed_kv_cache_image_tool.html">Iter&nbsp;B1</a>&rsquo;s &ldquo;honest tradeoff&rdquo;.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2 id="crosslinks">6. Cross-links</h2>
+      <ul>
+        <li><strong>Out:</strong> <a href="distributed_kv_cache_image_tool.html">distributed_kv_cache_image_tool.html</a> Iter&nbsp;B1 (the four radix-vs-block-hash benefits this page tests; benefit&nbsp;#2 is reclassified to an upgrade and #1 to a <code>page_size</code> knob); <a href="kv_store.html">kv_store.html</a> (the block-hash-keyed distributed pool that #1 reverses at); <a href="../../knowledge/K2_kv-cache.html">K2</a> (prefix caching / APC content-hash chain / CoW / RadixAttention).</li>
+        <li><strong>In:</strong> Iter&nbsp;B1 benefit&nbsp;#2 links here for the runnable proof.</li>
+        <li><strong>Algorithm + structure names inlined:</strong> per-page radix tree with leaf-LRU; flat block-hash table with the <code>(ref_count==0</code> gate &rarr; <code>last_access</code> &rarr; <code>min_position)</code> eviction triple; the recency-monotonicity lemma (<code>ancestor.last_access &ge; descendant.last_access</code>).</li>
+      </ul>
+    </div>
+  </section>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

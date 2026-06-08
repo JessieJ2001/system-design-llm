@@ -1,0 +1,2108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed KV Cache for a Multimodal Claude-Code-Style Assistant &mdash; Staff+ NALSD Walkthrough (Image / PDF / Video)</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <link rel="stylesheet" href="../../../css/implementment.css">
+  <style>
+    .container { max-width: 94vw; }
+    .nav-inner { max-width: 94vw; }
+    table.sheet { width:100%; border-collapse:collapse; font-size:.9rem; margin:.6rem 0 1rem; }
+    table.sheet th, table.sheet td { border:1px solid var(--color-border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+    table.sheet th { background:#f1f5f9; }
+    table.sheet td.n { font-family:'JetBrains Mono',monospace; text-align:right; white-space:nowrap; }
+    table.sheet td.c { font-family:'JetBrains Mono',monospace; }
+    .formula-box { background:#f8fafc; border-left:4px solid var(--color-primary);
+      border-radius:8px; padding:.7rem 1rem; margin:.6rem 0; font-family:'JetBrains Mono',monospace; font-size:.86rem; line-height:1.5;
+      white-space:pre-wrap; }
+    .ref-box { background:#ecfdf5; border-left:4px solid #059669; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .warn-box { background:#fffbeb; border-left:4px solid #d97706; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .note-box { background:#eff6ff; border-left:4px solid #2563eb; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    .gate-box { background:#fef2f2; border-left:4px solid #dc2626; border-radius:8px;
+      padding:.7rem 1rem; margin:.8rem 0; }
+    /* Number-source tags (rendered as inline chips, greppable). */
+    .tag { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+      font-weight:700; padding:.05rem .35rem; border-radius:4px; margin-left:.25rem;
+      vertical-align:baseline; }
+    .tag-g  { color:#15803d; background:#dcfce7; border:1px solid #86efac; }
+    .tag-d  { color:#1d4ed8; background:#dbeafe; border:1px solid #93c5fd; }
+    .tag-fa { color:#b45309; background:#fef3c7; border:1px solid #fcd34d; }
+    .tag-k  { color:#6b21a8; background:#f3e8ff; border:1px solid #d8b4fe; }
+    /* Marker chips for "new" / "changed-from-parent" content. */
+    .mk { display:inline-block; font-size:.72rem; font-weight:700; padding:.05rem .4rem;
+      border-radius:4px; margin-right:.3rem; vertical-align:baseline; }
+    .mk-new { color:#9a3412; background:#ffedd5; border:1px solid #fdba74; }
+    .mk-chg { color:#1e40af; background:#dbeafe; border:1px solid #93c5fd; }
+    /* B-row spine */
+    table.bspine td:first-child { font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; }
+    /* Iteration header */
+    .iter-head { background:linear-gradient(90deg,#eff6ff,#f8fafc); border-left:6px solid #2563eb;
+      border-radius:8px; padding:.6rem 1rem; margin:1.5rem 0 .6rem; }
+    .iter-head h2 { margin:0; }
+    .iter-head .iter-meta { font-size:.85rem; color:#475569; margin-top:.25rem; }
+    /* Two-column layout (side-by-side comparisons) */
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .two-col > div { background:#fff; border:1px solid var(--color-border); border-radius:8px; padding:.7rem 1rem; }
+    .two-col h4 { margin-top:0; }
+    /* Design-choice block */
+    .dc { background:#fff; border:1px solid var(--color-border); border-radius:8px;
+      padding:.7rem 1rem; margin:.6rem 0; }
+    .dc h4 { margin:0 0 .25rem; color:#1e3a8a; }
+    .dc .dc-prob { font-weight:700; color:#7c2d12; }
+    .dc .dc-sols { font-weight:700; color:#0c4a6e; }
+    .dc .dc-why { font-weight:700; color:#14532d; }
+    .dc .dc-why.lead { margin-bottom:.15rem; }
+    .dc ul { margin:.2rem 0 .35rem 1rem; padding:0; }
+    .dc ul.why-list { margin:.1rem 0 .35rem 1rem; }
+    .dc ul.why-list > li { font-weight:400; color:#14532d; margin:.15rem 0; }
+    .dc ul.why-list > li > strong { color:#14532d; }
+    .dc .pick { background:#dcfce7; padding:.05rem .3rem; border-radius:3px; }
+    .dc .reject { color:#991b1b; }
+    /* SLO impact table */
+    table.slo th { background:#dbeafe; }
+    table.slo .arrow-down { color:#15803d; font-weight:700; }
+    table.slo .arrow-up { color:#b91c1c; font-weight:700; }
+    table.slo .arrow-flat { color:#6b7280; font-weight:700; }
+    /* Step lists */
+    ol.steps { margin:.3rem 0 .6rem 1.2rem; padding:0; }
+    ol.steps > li { margin:.3rem 0; }
+    /* Anchor jumps are DIRECT (instant), not animated-scroll. */
+    html { scroll-behavior: auto; }
+    /* Section anchors get a subtle scroll-margin so sidebar jumps don't hide behind nav. */
+    section[id], h2[id], h3[id] { scroll-margin-top: 5rem; }
+      /* --- Pinned left nav + scroll-spy (overrides implementment.css's scroll-away sidebar) --- */
+    @media (min-width: 1025px) {
+      .sidebar {
+        position: fixed;       /* re-pin: implementment.css set this to absolute */
+        top: 0; left: 0;
+        height: 100vh;         /* full viewport so it stays put while page scrolls */
+        min-height: 0;
+        overflow-y: auto;      /* its own scrollbar - the link list is long */
+        overscroll-behavior: contain;
+      }
+    }
+    /* Make the current-section link clearly stand out as you scroll */
+    .sidebar-section-link.active {
+      color: var(--color-primary);
+      font-weight: 700;
+      border-left-color: var(--color-primary);
+      background: #eff6ff;
+    }
+</style>
+</head>
+<body class="has-sidebar">
+
+  <!-- ===================================================== -->
+  <!-- Navigation                                              -->
+  <!-- ===================================================== -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="distributed_kv_cache.html">Text sibling page</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- ===================================================== -->
+  <!-- Hero                                                   -->
+  <!-- ===================================================== -->
+  <section class="topic-hero">
+    <div class="container">
+      <h1>Distributed KV Cache for a <em>Multimodal</em> Claude-Code-Style Assistant</h1>
+      <p class="hero-subtitle">A staff+ NALSD walkthrough &mdash; same fleet, same SLOs, same hardware as the
+        <a href="distributed_kv_cache.html">text sibling page</a>, with <strong>one functional change: requests may now carry image / PDF / video attachments.</strong>
+        An image, a PDF page, and a video frame are all the <strong>same thing</strong> to the serving system: raw bytes that a
+        <strong>vision encoder</strong> turns into embedding &ldquo;tokens,&rdquo; which are <strong>spliced into the text token stream and then produce
+        K,V through the very same LLM layers as text</strong> (<a href="../../knowledge/K2_kv-cache.html#d32">K2&nbsp;D32</a>). So the
+        <strong>entire distributed-KV-cache design of the parent page still holds</strong> &mdash; tiering, PagedAttention, the cross-task pool,
+        prefix caching, context parallelism &mdash; it just now has to absorb (1) a <strong>new upstream compute stage with the opposite roofline</strong>
+        (the encoder), (2) <strong>far more KV per request</strong> (one image &asymp; 1&ndash;3&nbsp;k tokens; one minute of video &asymp; 15&nbsp;k+;
+        a 100-page PDF &asymp; 150&nbsp;k), and (3) a <strong>new, richer reuse axis</strong> &mdash; the encoder&rsquo;s output is
+        <strong>deterministic and content-addressable</strong>, which unlocks cross-user dedup the text design explicitly <em>rejected</em>.</p>
+      <p class="hero-meta">
+        Cites <a href="../../knowledge/K12_multimodal-and-image-offload.html">K12 multimodal</a> /
+        <a href="../../knowledge/K2_kv-cache.html">K2 KV cache</a> (D32 / D31 / D5 / D52) /
+        <a href="../../knowledge/K5_disaggregated-serving.html">K5 disaggregation</a> /
+        <a href="../../knowledge/K11_context-parallelism.html">K11 context parallelism</a> &middot;
+        delta of <a href="distributed_kv_cache.html">distributed_kv_cache.html</a> &middot;
+        ~20 min (delta only)
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Scope: how to read this delta page                      -->
+  <!-- ===================================================== -->
+  <section class="section">
+    <div class="container">
+      <h2 id="scope">What this page is &mdash; and how to read it</h2>
+      <p><strong>TL;DR.</strong> This is the <strong>multimodal sibling</strong> of the
+        <a href="distributed_kv_cache.html">text scenario page</a>. It is a <strong>delta</strong>: same scenario, same SLOs,
+        same 8&times;H100 hardware, same fleet, same iterations Iter&nbsp;0&nbsp;&rarr;&nbsp;10 &mdash; <em>one</em> functional change
+        (attachments). Everything not marked below is <strong>inherited verbatim</strong> from the parent page. A reader who knows the
+        text page reads only the marked spans.</p>
+      <ul>
+        <li><span class="mk mk-new">NEW</span> a section / iteration / entity that does not exist on the text page.</li>
+        <li><span class="mk mk-chg">&Delta;</span> an inherited section that <em>changes</em> under attachments (the parent text is otherwise intact).</li>
+        <li><strong>VLM</strong> = <em>Vision-Language Model</em>: an LLM whose input can include images, not just text. This is the model family the whole page is about.</li>
+      </ul>
+      <p><strong>Where the new content lands.</strong> This page adds one knowledge section &mdash;
+        <a href="#m">&sect;M &ldquo;How an image / PDF / video becomes tokens&rdquo;</a> (the from-zero explainer) &mdash; placed right
+        after the scenario (<a href="#s0">S0</a>) because every later delta references it, plus four multimodal iterations
+        (<a href="#m-iter">Iter&nbsp;M0&ndash;M3</a>) slotted into the existing Iter&nbsp;0&rarr;10 ribbon, then the S6/S7 and cross-link deltas.</p>
+      <div class="warn-box"><strong>Number-source discipline (inherited &mdash; one-line pointer).</strong>
+        Same chips as the parent:
+        <span class="tag tag-g">G</span> given &middot;
+        <span class="tag tag-fa">G-FA</span> flagged assumption (would confirm in interview) &middot;
+        <span class="tag tag-k">G&nbsp;&mdash;&nbsp;K{N}&nbsp;D{m}</span> owned by a knowledge page (cite, don&rsquo;t restate) &middot;
+        <span class="tag tag-d">D</span> derived &mdash; <em>formula + substituted values printed inline</em>.
+        In &sect;M the dimensions are illustrative anchors (<span class="tag tag-fa">G-FA</span>, settled in the interview); the patch arithmetic is
+        derived inline; <code>KV_per_tok</code> is cited, not re-derived.
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S0 delta - Scenario & Requirements                      -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s0">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S0 &nbsp;Scenario &amp; Requirements (delta)</h2>
+      <p><strong>TL;DR.</strong> One functional change &mdash; requests may carry attachments &mdash; reshapes three things: the
+        <strong>non-goals</strong> (&sect;S0.1), the <strong>NFR budget</strong> (TTFT now includes encode; a single attachment can fill the 1&nbsp;M
+        context &mdash; &sect;S0.2), and the <strong>workload distribution</strong> (&sect;S0.3, the single source of truth for every new number on this
+        page). Everything else in the parent S0 is inherited verbatim.</p>
+
+      <h3 id="s0-functional">S0.1 &nbsp;Functional shape &amp; non-goals (delta)</h3>
+      <h4>Added to the functional shape</h4>
+      <ul>
+        <li>Each user message <code>content[]</code> may include <strong>attachment parts</strong>: <code>image</code> (JPEG / PNG / WebP),
+          <code>file</code> (PDF), <code>video</code> (MP4 / MOV / WebM, <strong>uploaded files</strong>).</li>
+        <li>Attachments are uploaded <strong>out-of-band</strong> (presigned URL / multipart) and referenced by handle; they are <strong>not</strong>
+          inlined as base64 in the hot request path (S2 delta).</li>
+      </ul>
+      <h4>Removed from non-goals (this is the whole point)</h4>
+      <ul>
+        <li><del>Image / PDF / video attachments &mdash; LLM-only.</del> &rarr; <strong>now in scope.</strong></li>
+      </ul>
+      <h4>Added to non-goals (new)</h4>
+      <ul>
+        <li><strong>Live / real-time video streams</strong> (continuous ingest) &mdash; uploaded files only (&sect;M.4).</li>
+        <li><strong>Audio / speech</strong> &mdash; image, PDF, video only (audio is a separate encoder family; flagged for a future delta).</li>
+        <li><strong>Image / video <em>generation</em> (output)</strong> &mdash; output stays text / SSE (<em>Server-Sent Events</em>); the model <em>reads</em> media, does not <em>emit</em> it.</li>
+        <li><strong>OCR-as-a-service / structured document extraction</strong> &mdash; internally we feed render-to-image + a text-layer grounding stream (&sect;M.3); returning <em>structured</em> extracted data (tables&rarr;JSON) as a product is the client&rsquo;s job.</li>
+        <li>Cross-region media CDN (<em>Content Delivery Network</em>) &mdash; single metro (inherited).</li>
+      </ul>
+
+      <h3 id="s0-nfr">S0.2 &nbsp;Non-functional requirements (delta)</h3>
+      <table class="sheet">
+        <thead><tr><th>Dimension</th><th>Parent</th><th>Delta under attachments</th><th>Tag</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99</td><td class="n">&le; 400 ms</td><td><strong>Target unchanged</strong>, but TTFT now <strong>includes encode</strong> for a cold attachment: <code>TTFT = upload_wait? + encode_time + prefill_time + &hellip;</code>. Encode must fit the budget &rarr; an <strong>encode SLO</strong> is introduced (Iter&nbsp;M1).</td><td class="n"><span class="tag tag-g">G</span></td></tr>
+          <tr><td>Max context</td><td class="n">1 M tokens</td><td><strong>Unchanged</strong>, but now <strong>a single attachment can consume it</strong> (a ~1-hour video / ~600-page PDF &asymp; 256 GB+ KV) &rarr; the context-parallelism fork (Iter&nbsp;9 delta) can fire at <em>turn 1</em> &mdash; rare (beyond the &sect;S0.3 p99), but off a single upload.</td><td class="n"><span class="tag tag-g">G</span></td></tr>
+          <tr><td><strong>Max attachments / request</strong> <span class="mk mk-new">NEW</span></td><td class="n">&mdash;</td><td>cap (&le; 20 images / &le; 1 video / total &le; <code>T_attach_cap</code> vision tokens) &mdash; bounds worst-case prefill + KV.</td><td class="n"><span class="tag tag-fa">G-FA</span></td></tr>
+          <tr><td><strong>Max attachment size</strong> <span class="mk mk-new">NEW</span></td><td class="n">&mdash;</td><td>per-format byte caps (image &le; 20 MB; PDF &le; <code>pdf_page_cap</code> pages; video &le; <code>video_len_cap</code> min).</td><td class="n"><span class="tag tag-fa">G-FA</span></td></tr>
+          <tr><td><strong>Supported formats</strong> <span class="mk mk-new">NEW</span></td><td class="n">&mdash;</td><td>image JPEG / PNG / WebP; PDF; video MP4 / MOV / WebM.</td><td class="n"><span class="tag tag-g">G</span></td></tr>
+          <tr><td>TPOT p99</td><td class="n">&le; 30 ms</td><td><strong>Unchanged</strong> &mdash; decode is modality-agnostic once K,V exist.</td><td class="n"><span class="tag tag-g">G</span></td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s0-workload">S0.3 &nbsp;Workload composition (delta) &mdash; single source of truth</h3>
+      <div class="note-box"><strong>Discipline.</strong> Every new vision-token / attachment number is declared <strong>once, here</strong>, and cited
+        downstream. Inputs are <span class="tag tag-fa">G-FA</span> (would confirm in interview); derived rows print their formula + substitution
+        inline (<span class="tag tag-d">D</span>). The two parent constants reused below: <code>&lambda;<sub>peak</sub> = 100&nbsp;K&nbsp;req/s</code> and
+        <code>T_in_mean(text) = 13.3&nbsp;k</code> tokens.</div>
+
+      <h4>Arrival mix &mdash; who carries attachments</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>What / used-for / writer</th></tr></thead>
+        <tbody>
+          <tr><td class="c">f_mm</td><td class="n">0.15</td><td><span class="tag tag-fa">G-FA</span></td><td>fraction of requests carrying &ge;1 attachment; <strong>written by</strong> product telemetry; <strong>used for</strong> sizing the encode pool + blob path.</td></tr>
+          <tr><td class="c">attach_per_mm_req</td><td class="n">2</td><td><span class="tag tag-fa">G-FA</span></td><td>mean attachments on a multimodal request.</td></tr>
+          <tr><td class="c">(p_image, p_pdf, p_video)</td><td class="n">(0.6, 0.3, 0.1)</td><td><span class="tag tag-fa">G-FA</span></td><td>modality mix among attachments.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Tokens per attachment &mdash; the capacity drivers (<code>KV_per_tok = 320 KB</code>, K2 D31, unchanged)</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>Derivation / source</th></tr></thead>
+        <tbody>
+          <tr><td class="c">vtok_per_image</td><td class="n">~1.3 k</td><td><span class="tag tag-k">G&nbsp;&mdash;&nbsp;K12</span></td><td>&sect;M.2 worked example (1&ndash;3 k band).</td></tr>
+          <tr><td class="c">vtok_per_pdf_page</td><td class="n">~1.5 k</td><td><span class="tag tag-fa">G-FA</span></td><td>&sect;M.3 render @ 150 DPI.</td></tr>
+          <tr><td class="c">pdf_pages mean / p99</td><td class="n">8 / 100</td><td><span class="tag tag-fa">G-FA</span></td><td>doc-length distribution.</td></tr>
+          <tr><td class="c">vtok_per_frame</td><td class="n">~256</td><td><span class="tag tag-fa">G-FA</span></td><td>&sect;M.4 post temporal-merge (Qwen2-VL).</td></tr>
+          <tr><td class="c">fps_sample</td><td class="n">1</td><td><span class="tag tag-fa">G-FA</span></td><td>frame-sampling rate.</td></tr>
+          <tr><td class="c">video_sec mean / p99</td><td class="n">30 / 600</td><td><span class="tag tag-fa">G-FA</span></td><td>clip-length distribution.</td></tr>
+          <tr><td class="c">T_vis_pdf</td><td class="n">12 k / 150 k</td><td><span class="tag tag-d">D</span></td><td><code>pdf_pages &times; vtok_per_pdf_page = 8&times;1.5k = 12k</code> (mean); <code>100&times;1.5k = 150k</code> (p99).</td></tr>
+          <tr><td class="c">T_vis_video</td><td class="n">7.7 k / 154 k</td><td><span class="tag tag-d">D</span></td><td><code>video_sec &times; fps_sample &times; vtok_per_frame = 30&times;1&times;256 = 7.68k</code> (mean); <code>600&times;1&times;256 = 154k</code> (p99).</td></tr>
+          <tr><td class="c">T_vis_mean</td><td class="n">~10.3 k</td><td><span class="tag tag-d">D</span></td><td>mean vision tokens / <em>multimodal request</em>:<br><code>attach_per_mm_req &times; &Sigma; p&middot;vtok = 2 &times; (0.6&middot;1.3k + 0.3&middot;12k + 0.1&middot;7.68k) = 2 &times; 5.15k = 10.3k</code>.</td></tr>
+          <tr><td class="c">T_in_mm_mean</td><td class="n">~23.6 k</td><td><span class="tag tag-d">D</span></td><td><code>T_in_mean(text) + T_vis_mean = 13.3k + 10.3k = 23.6k</code> &mdash; a multimodal request&rsquo;s input.</td></tr>
+          <tr><td class="c"><strong>T_in_blended</strong></td><td class="n"><strong>~14.8 k</strong></td><td><span class="tag tag-d">D</span></td><td><strong>the new fleet-mean input length</strong> &mdash; replaces 13.3 k in every prefill-sizing formula:<br><code>(1&minus;f_mm)&middot;13.3k + f_mm&middot;T_in_mm_mean = 0.85&middot;13.3k + 0.15&middot;23.6k = 14.8k</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Reuse profile &mdash; the new caching axis (drives the embedding-cache iteration)</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td class="c">vis_intra_conv_reref</td><td class="n">0.7</td><td><span class="tag tag-fa">G-FA</span></td><td>P(an attachment is referenced again in a later turn of the <strong>same</strong> conv). <strong>Within an admitted conv the parent conv-keyed pool already covers it</strong> (no re-encode / re-prefill); Iter&nbsp;M2 adds reuse only <em>across convs / after the conv&rsquo;s K,V is evicted</em>.</td></tr>
+          <tr><td class="c">vis_cross_user_dup</td><td class="n">0.2</td><td><span class="tag tag-fa">G-FA</span></td><td>P(an attachment&rsquo;s <strong>bytes</strong> are byte-identical to another user/conv upload) &mdash; viral images, shared PDFs, logos / boilerplate. <strong>Only the public/shareable slice dedups cross-user by default</strong> (private uploads stay per-user-keyed &mdash; Iter&nbsp;M2 DC3).</td></tr>
+          <tr><td class="c">vis_public_share</td><td class="n">~0.5</td><td><span class="tag tag-fa">G-FA</span></td><td>fraction of byte-identical cross-user dups that are <strong>public/shareable</strong> (templates, logos, public docs, opt-in shared) &rarr; dedup-eligible without a per-user key; the rest stay isolated.</td></tr>
+          <tr><td class="c">enc_cache_hit_rate</td><td class="n">~0.4</td><td><span class="tag tag-fa">G-FA</span></td><td>incremental embedding-cache hit rate <strong>over the parent pool</strong> = per-user cross-conv / post-eviction reuse <code>+ vis_public_share&middot;vis_cross_user_dup</code> &mdash; <strong>not</strong> the raw 0.7 (conv-keyed pool covers that). The swing factor for encode-pool cost (Iter&nbsp;M2); settled at S6.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Blob ingress + encoder hardware (drive the blob and encode iterations)</h4>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>Value</th><th>Tag</th><th>What / derivation</th></tr></thead>
+        <tbody>
+          <tr><td class="c">image / pdf / video bytes_mean</td><td class="n">1 / 5 / 50 MB</td><td><span class="tag tag-fa">G-FA</span></td><td>upload + blob-store sizing; <strong>video dominates ingress.</strong></td></tr>
+          <tr><td class="c">&lambda;<sub>attach</sub></td><td class="n">30 k / s</td><td><span class="tag tag-d">D</span></td><td><code>&lambda;<sub>peak</sub>&middot;f_mm&middot;attach_per_mm_req = 100k &times; 0.15 &times; 2 = 30k</code> attachments/s at peak.</td></tr>
+          <tr><td class="c">blob_ingress_BW</td><td class="n">~213 GB/s</td><td><span class="tag tag-d">D</span></td><td><code>&lambda;<sub>attach</sub> &times; bytes_mean = 30k &times; (0.6&middot;1 + 0.3&middot;5 + 0.1&middot;50) MB = 30k &times; 7.1 MB</code> &mdash; object-store / CDN sizing; <strong>5 of 7.1 MB is video.</strong></td></tr>
+          <tr><td class="c">P_vit</td><td class="n">~0.6 B</td><td><span class="tag tag-fa">G-FA</span></td><td>ViT encoder size (SigLIP-so400m-class).</td></tr>
+          <tr><td class="c">enc_throughput_per_task</td><td class="n">~14 img/s</td><td><span class="tag tag-d">D</span></td><td>sized at Iter&nbsp;M1 on an L40S (BOE &sect;S3).</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="s0-flagged">S0.4 &nbsp;Flagged assumptions (delta)</h3>
+      <ul>
+        <li>VLM architecture = <strong>splice fusion + MLP projector + native dynamic resolution</strong> (&sect;M.5); cross-attention fusion is the named alternative.</li>
+        <li>ViT = SigLIP-class ~0.6 B; patch 14; spatial-merge 2&times;2.</li>
+        <li><code>vtok_per_image &asymp; 1.3 k</code>, <code>vtok_per_pdf_page &asymp; 1.5 k</code>, <code>vtok_per_frame &asymp; 256</code>, <code>fps_sample = 1</code>.</li>
+        <li><code>f_mm = 0.15</code>; modality mix (0.6, 0.3, 0.1); <code>vis_cross_user_dup = 0.2</code> of which <code>vis_public_share &asymp; 0.5</code> dedups cross-user by default (rest stays per-user-keyed).</li>
+        <li>PDF path = render-to-image <strong>+ parallel text-layer extraction</strong> (image-only on scans; text-extraction is the single-stream oversize fallback).</li>
+        <li>Encode hardware: the encode pool may run a <strong>smaller / cheaper GPU</strong> than the 8&times;H100 serving task (no 70 B weights to hold) &mdash; the concrete SKU (<em>Stock-Keeping Unit</em>, i.e. GPU model) is settled at Iter&nbsp;M1 against <code>enc_throughput_per_task</code>.</li>
+      </ul>
+
+      <h3 id="s0-spine">S0.5 &nbsp;Bottleneck spine (delta) &mdash; new rows BM1&ndash;BM6</h3>
+      <p>Inherited B1&ndash;B12 are <strong>unchanged</strong> (they now also apply to vision K,V via K2 D32). Add:</p>
+      <table class="sheet bspine">
+        <thead><tr><th>ID</th><th>Bottleneck</th><th>Solved by</th></tr></thead>
+        <tbody>
+          <tr><td>BM1</td><td>Vision encoding is a <strong>new compute stage</strong> with the <strong>opposite roofline</strong> to the LLM; colocating a ViT in every serving task leaves it idle ~85% of the time, lets its compute-bound burst jitter decode, and can&rsquo;t batch it across requests (HBM cost negligible).</td><td>Iter&nbsp;M1 (E/P/D disagg &mdash; dedicated encode pool, K12 D41)</td></tr>
+          <tr><td>BM2</td><td><strong>Re-encoding identical attachments</strong> wastes ViT FLOPs (viral image, re-uploaded PDF, image re-referenced next turn).</td><td>Iter&nbsp;M2 (content-addressed vision-embedding cache, K12)</td></tr>
+          <tr><td>BM3</td><td><strong>Variable image / PDF / video sizes</strong> make the ViT batch half-padding &rarr; encoder MFU collapses.</td><td>Iter&nbsp;M3 (ragged variable-resolution batching, K12 D27)</td></tr>
+          <tr><td>BM4</td><td><strong>Attachment bytes ingress / storage</strong> &mdash; MB&ndash;GB blobs (esp. video) need upload, durable store, decode / frame-sample; absent from the text path.</td><td>Iter&nbsp;M0 (blob-store + preprocessing pipeline)</td></tr>
+          <tr><td>BM5</td><td><strong>Vision tokens explode prefill length + KV footprint</strong> (1 k&ndash;1 M tokens/req) &rarr; stresses chunked prefill, PagedAttention, tiering, the pool at every attachment, and triggers context parallelism from a <em>single</em> near-1 M-context attachment.</td><td>Deltas to Iter 1a / 3 / 3b / 4 / 9</td></tr>
+          <tr><td>BM6</td><td><strong>Attachment-based abuse</strong> &mdash; a tiny upload (50 MB video) is cheap for the client but costs the fleet 150 k prefill tokens + encode FLOPs; a per-<em>request</em> rate-limit doesn&rsquo;t see it.</td><td>Iter 8 delta (token / byte-weighted quota)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- §M - How an image/PDF/video becomes tokens              -->
+  <!-- ===================================================== -->
+
+  <!-- ===================================================== -->
+  <!-- §M - How an image/PDF/video becomes tokens              -->
+  <!-- ===================================================== -->
+  <section class="section" id="m">
+    <div class="container">
+      <h2><span class="mk mk-new">NEW</span> &sect;M &nbsp;How an image / PDF / video becomes tokens (from zero)</h2>
+
+      <div class="note-box"><strong>Why this section exists.</strong> The reader is assumed to know LLM <em>text</em> serving cold
+        (the parent page) but <strong>nothing</strong> about vision. So this section defines from zero, walks one concrete image
+        token-by-token, and gives the tensor transform a diagram (not a wall of prose). It is <strong>knowledge, not a design iteration</strong>
+        &mdash; no &ldquo;what breaks&rdquo; / SLO table. It cites <a href="../../knowledge/K12_multimodal-and-image-offload.html">K12</a> and
+        <a href="../../knowledge/K2_kv-cache.html#d32">K2&nbsp;D32</a> for depth but stands alone, so you never have to leave.
+      </div>
+
+      <!-- ---------- M.1 the load-bearing fact ---------- -->
+      <h3 id="m1">M.1 &nbsp;The one load-bearing fact (state it first)</h3>
+      <div class="ref-box">
+        <p style="margin-top:0"><strong>The LLM never sees pixels.</strong> A <em>separate</em> model &mdash; the
+          <strong>vision encoder</strong> (a <strong>ViT</strong>, <em>Vision Transformer</em>) &mdash; converts raw pixels into a sequence of
+          embedding vectors in the LLM&rsquo;s hidden dimension <code>d_model</code>. Those vectors are <strong>inserted into the input
+          sequence</strong> at the spot the <code>&lt;image&gt;</code> / <code>&lt;video&gt;</code> placeholder occupied.</p>
+        <p><strong>After insertion they are indistinguishable from text-token embeddings.</strong> They flow through the same
+          <code>n_layers</code> decoder blocks, the same attention, and produce the same K,V entries in the KV cache &mdash;
+          <a href="../../knowledge/K2_kv-cache.html#d32">K2&nbsp;D32</a>. <em>This is the reason the parent page&rsquo;s entire KV machinery
+          transfers wholesale.</em></p>
+        <p style="margin-bottom:0"><strong>Consequence, stated up front (so the rest of &sect;M pays off):</strong></p>
+        <ul style="margin-bottom:0">
+          <li>&ldquo;Cache the KV of an image&rdquo; is just &ldquo;cache KV&rdquo; &mdash; <strong>already solved by the parent</strong> (tiering, paging, pool, prefix cache all apply to vision K,V for free).</li>
+          <li>The genuinely <strong>new caching</strong> question is one level <em>up</em>: <strong>can we skip re-running the encoder?</strong> (Iter&nbsp;M2.)</li>
+          <li>The genuinely new <strong>capacity</strong> question is: <strong>there are a lot more tokens now</strong> (the volume deltas to Iter&nbsp;1a / 3 / 9).</li>
+        </ul>
+      </div>
+
+      <!-- ---------- M.2 the encoder walked end to end ---------- -->
+      <h3 id="m2">M.2 &nbsp;The vision encoder, walked end-to-end (worked example + diagram)</h3>
+      <p><strong>Anchor architecture for this page.</strong> A <strong>decoder-only &ldquo;splice&rdquo; fusion</strong> VLM &mdash; the family where
+        vision tokens become regular self-attention KV &mdash; built from <strong>a SigLIP/CLIP-class ViT encoder + an MLP &ldquo;projector&rdquo; + the
+        parent&rsquo;s Llama-3-70B-class decoder backbone</strong>, in the style of <strong>LLaVA-OneVision / Qwen2-VL / InternVL</strong>
+        (native dynamic-resolution variants).</p>
+      <ul>
+        <li><strong>SigLIP</strong> = <em>Sigmoid Loss for Language-Image Pre-training</em>; <strong>CLIP</strong> = <em>Contrastive Language-Image
+          Pre-training</em> &mdash; two ways to pre-train a ViT so its output embeddings are semantically aligned with text. Either yields the same
+          serving shape; concrete dims are flagged <span class="tag tag-fa">G-FA</span> and settled at compose.</li>
+        <li>The alternative <em>cross-attention fusion</em> family (where vision is <em>not</em> in the autoregressive KV sequence) is the design
+          choice in <a href="#m5">&sect;M.5</a>.</li>
+      </ul>
+
+      <h4>Notation for &sect;M (every symbol defined before first use)</h4>
+      <p>These are <strong>architecture constants</strong> &mdash; set once at model-design / training time and only ever change on an
+        <code>encoder_version</code> bump (the model provider is the &ldquo;writer&rdquo;); they are <em>not</em> per-request state.</p>
+      <table class="sheet">
+        <thead><tr><th>Symbol</th><th>What it is</th><th>Value (illustrative)</th><th>Used for</th></tr></thead>
+        <tbody>
+          <tr><td class="c">p</td><td>patch side length &mdash; pixels per square patch the ViT tokenizes</td><td class="n">14 <span class="tag tag-fa">G-FA</span></td><td>sets patch count = how many vision tokens an image costs</td></tr>
+          <tr><td class="c">n_patch</td><td>number of patches for one image = <code>(H/p)&middot;(W/p)</code></td><td class="n">~5&nbsp;329 <span class="tag tag-d">D</span></td><td>ViT sequence length (the encoder&rsquo;s cost driver)</td></tr>
+          <tr><td class="c">d_vision</td><td>ViT hidden dimension (the encoder&rsquo;s &ldquo;d_model&rdquo;)</td><td class="n">1&nbsp;152 <span class="tag tag-fa">G-FA</span></td><td>width of patch features before the projector</td></tr>
+          <tr><td class="c">L_vit</td><td>number of transformer layers in the ViT</td><td class="n">~27 <span class="tag tag-fa">G-FA</span></td><td>encoder depth (fixed; no autoregression)</td></tr>
+          <tr><td class="c">d_model</td><td>the <em>LLM&rsquo;s</em> hidden dimension (the projector&rsquo;s target)</td><td class="n">8&nbsp;192 <span class="tag tag-g">G</span></td><td>vision vectors must land here to splice into the text stream</td></tr>
+          <tr><td class="c">vtok_per_image</td><td>vision tokens produced per image (post spatial-merge)</td><td class="n">~1&nbsp;332 <span class="tag tag-d">D</span></td><td>how much prefill + KV one image adds</td></tr>
+          <tr><td class="c">KV_per_tok</td><td>KV-cache bytes per token &mdash; <strong>identical to text</strong></td><td class="n">320&nbsp;KB <span class="tag tag-k">G&nbsp;&mdash;&nbsp;K2&nbsp;D31</span></td><td>KV footprint of the vision span (same 80 layers, same GQA)</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Walk one 1024&times;1024 RGB image through the pipeline</h4>
+      <p><strong>RGB</strong> = <em>Red / Green / Blue</em> &mdash; the three colour channels of a raw decoded image. Numbers below are illustrative
+        (<span class="tag tag-fa">G-FA</span> for the model dims; the patch arithmetic is <span class="tag tag-d">D</span>, derived inline).</p>
+      <ol class="steps">
+        <li><strong>Preprocess</strong> &mdash; decode (JPEG / PNG / WebP &rarr; raw RGB) and resize/pad to a grid the encoder accepts.
+          <em>(Video adds frame-sampling; PDF adds page-rendering &mdash; <a href="#m3">&sect;M.3</a> / <a href="#m4">&sect;M.4</a>.)</em></li>
+        <li><strong>Patchify</strong> &mdash; cut into fixed <code>p&times;p</code> patches (<code>p = 14</code>):
+          <code>1024 / 14 &asymp; 73</code> per side &rarr; <code>73 &times; 73 = 5&nbsp;329</code> patches <span class="tag tag-d">D</span>.
+          Each patch is <code>14 &middot; 14 &middot; 3 = 588</code> raw values, <strong>linearly projected</strong> (a <code>conv2d</code>,
+          <em>2-D convolution</em>, with stride <code>p</code>) to a <code>d_vision</code>-dim vector
+          (<code>d_vision = 1&nbsp;152</code>). <em>This is the &ldquo;tokenizer&rdquo; for pixels.</em></li>
+        <li><strong>+ 2-D positional embedding</strong> &mdash; so the encoder knows <em>where</em> each patch sat (interpolated for native
+          resolution). Tensor so far: <code>[5&nbsp;329 &times; 1&nbsp;152]</code>.</li>
+        <li><strong>ViT encoder</strong> &mdash; <code>L_vit</code> (~27) transformer layers of <strong>bidirectional</strong> self-attention over the
+          ~5&nbsp;329 patch tokens &rarr; one <code>d_vision</code> feature vector per patch. <strong>No causal mask, no KV cache</strong> &mdash; it is a
+          single forward pass. <em>(This is the roofline asymmetry of <a href="#m6">&sect;M.6</a>: the ViT is compute-bound, the decoder is bandwidth-bound.)</em></li>
+        <li><strong>Spatial merge / pooling</strong> &mdash; adjacent patches are merged (<code>2&times;2</code> &rarr; &divide;4) to cut token count:
+          <code>5&nbsp;329 / 4 &asymp; 1&nbsp;332 vision tokens</code> <span class="tag tag-d">D</span> (lands inside K12&rsquo;s &ldquo;1&ndash;3&nbsp;k tokens per image&rdquo;).</li>
+        <li><strong>Projector / connector</strong> &mdash; an <strong>MLP</strong> (<em>Multi-Layer Perceptron</em>; LLaVA uses a 2-layer GELU MLP) maps
+          <code>d_vision (1&nbsp;152) &rarr; d_model (8&nbsp;192)</code>. <em>(Alternative connector = a cross-attention
+          <strong>resampler</strong> / Perceiver / Q-Former that compresses to a <strong>fixed</strong> token count &mdash; the DC in <a href="#m5">&sect;M.5</a>.)</em></li>
+        <li><strong>Splice</strong> &mdash; the ~1&nbsp;332 vectors <em>replace</em> the <code>&lt;image&gt;</code> placeholder in the input embedding
+          sequence: <code>[hidden_sys &hellip; &lang;1&nbsp;332 image vecs&rang; &hellip; user_msg]</code>.</li>
+        <li><strong>LLM prefill</strong> &mdash; from here it is <strong>exactly the parent page</strong>: prefill over (text + vision) tokens &rarr;
+          K,V &rarr; decode. Each vision token costs <code>KV_per_tok = 320&nbsp;KB</code>, identical to a text token.</li>
+      </ol>
+
+      <p><strong>Diagram D-M1 &mdash; the vision pipeline</strong> (the user&rsquo;s explicit ask). Left&rarr;right then snaking down; a tensor
+        shape rides on every arrow; the two regions are colour-coded (amber = the new vision encoder, blue = the inherited parent page). The four
+        spans worth pausing on are flagged in red: the <em>bidirectional / no-KV</em> ViT, the <em>token-count collapse</em> at spatial-merge, the
+        <em>d_vision&rarr;d_model</em> projection (where the two models meet), and the <em>splice</em> boundary (where &ldquo;vision&rdquo; stops and
+        &ldquo;parent page&rdquo; begins).</p>
+
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vision pipeline: image bytes through patchify, ViT, spatial merge, projector, splice into the LLM prefill that produces KV">
+        <defs>
+          <marker id="dm1h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .bx   { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .bv   { fill:#fef3c7; stroke:#d97706; stroke-width:1.4; rx:8; }
+          .bp   { fill:#dbeafe; stroke:#2563eb; stroke-width:1.4; rx:8; }
+          .bd   { fill:#f1f5f9; stroke:#94a3b8; stroke-width:1.2; rx:8; }
+          .benc { fill:#fff7ed; stroke:#ea580c; stroke-width:2; rx:10; }
+          .t    { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s    { font-size:11px; fill:#475569; }
+          .ts   { font-size:11px; font-family:'JetBrains Mono',monospace; fill:#7c2d12; }
+          .em   { font-size:11px; font-weight:700; fill:#b91c1c; }
+          .num  { font-size:13px; font-weight:700; fill:#1d4ed8; }
+          .reg  { font-size:12px; font-weight:700; fill:#475569; }
+          line.f,  path.f  { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#dm1h); }
+          line.fa, path.fa { stroke:#94a3b8; stroke-width:1.5; stroke-dasharray:6 4; fill:none; marker-end:url(#dm1h); }
+        </style>
+
+        <!-- region captions -->
+        <text class="reg" x="30"  y="26">STAGE 1 &middot; VISION ENCODER &mdash; the new upstream stage (bidirectional, compute-bound, no KV cache)</text>
+        <text class="reg" x="290" y="455">STAGE 2 &middot; LLM PREFILL &mdash; inherited from the parent page (K2 D32)</text>
+
+        <!-- top row: A bytes -> B pixels -> C patchify -> E ViT -->
+        <rect class="bx" x="30"  y="64" width="150" height="60"/>
+        <text class="t" x="105" y="92"  text-anchor="middle">raw image bytes</text>
+        <text class="s" x="105" y="110" text-anchor="middle">~1 MB JPEG / PNG / WebP</text>
+
+        <rect class="bd" x="290" y="64" width="140" height="60"/>
+        <text class="t"  x="360" y="90"  text-anchor="middle">decoded pixels</text>
+        <text class="ts" x="360" y="108" text-anchor="middle">[1024&times;1024&times;3]</text>
+
+        <rect class="bv" x="540" y="50" width="180" height="88"/>
+        <text class="t"  x="630" y="74"  text-anchor="middle">PATCHIFY + EMBED</text>
+        <text class="s"  x="630" y="92"  text-anchor="middle">conv2d stride p=14</text>
+        <text class="s"  x="630" y="108" text-anchor="middle">73&times;73 = 5329 patches</text>
+        <text class="ts" x="630" y="126" text-anchor="middle">&rarr; [5329 &times; 1152]</text>
+
+        <rect class="benc" x="940" y="40" width="210" height="170"/>
+        <text class="t"  x="1045" y="66"  text-anchor="middle">ViT ENCODER</text>
+        <text class="s"  x="1045" y="84"  text-anchor="middle">L_vit &asymp; 27 transformer layers</text>
+        <text class="em" x="1045" y="106" text-anchor="middle">BIDIRECTIONAL self-attn</text>
+        <text class="em" x="1045" y="122" text-anchor="middle">NO causal mask &middot; NO KV cache</text>
+        <text class="s"  x="1045" y="142" text-anchor="middle">single forward pass</text>
+        <text class="s"  x="1045" y="160" text-anchor="middle">SigLIP/CLIP-class ViT, ~0.6 B</text>
+        <text class="s"  x="1045" y="178" text-anchor="middle">roofline: compute-bound</text>
+
+        <!-- top arrows -->
+        <line class="f" x1="180" y1="94" x2="290" y2="94"/>
+        <text class="num" x="235" y="84"  text-anchor="middle">&#9312;</text>
+        <text class="ts"  x="235" y="108" text-anchor="middle">decode/resize</text>
+
+        <line class="f" x1="430" y1="94" x2="540" y2="94"/>
+        <text class="num" x="485" y="84"  text-anchor="middle">&#9313;</text>
+        <text class="ts"  x="485" y="108" text-anchor="middle">[5329 &times; 588]</text>
+
+        <line class="f" x1="720" y1="94" x2="940" y2="94"/>
+        <text class="num" x="830" y="84"  text-anchor="middle">&#9314;</text>
+        <text class="ts"  x="830" y="108" text-anchor="middle">[5329 &times; 1152] +2-D pos</text>
+
+        <!-- E -> F vertical -->
+        <line class="f" x1="1045" y1="210" x2="1045" y2="300"/>
+        <text class="num" x="1030" y="248" text-anchor="end">&#9315;</text>
+        <text class="ts"  x="1060" y="252" text-anchor="start">[5329 &times; 1152]</text>
+
+        <!-- middle row (right->left): F merge -> G projector -> H splice ; T text feeds H -->
+        <rect class="bv" x="940" y="300" width="210" height="84"/>
+        <text class="em" x="1045" y="294" text-anchor="middle">&darr; token-count collapse &divide;4</text>
+        <text class="t"  x="1045" y="326" text-anchor="middle">SPATIAL MERGE 2&times;2</text>
+        <text class="s"  x="1045" y="344" text-anchor="middle">5329 / 4 &asymp; 1332 tokens</text>
+        <text class="ts" x="1045" y="362" text-anchor="middle">[1332 &times; 1152]</text>
+
+        <rect class="bv" x="660" y="300" width="190" height="84"/>
+        <text class="em" x="755" y="294" text-anchor="middle">d_vision &rarr; d_model (two models meet)</text>
+        <text class="t"  x="755" y="324" text-anchor="middle">PROJECTOR (MLP)</text>
+        <text class="s"  x="755" y="342" text-anchor="middle">1152 &rarr; 8192 (GELU &times;2)</text>
+        <text class="ts" x="755" y="360" text-anchor="middle">[1332 &times; 8192]</text>
+
+        <rect class="bv" x="290" y="300" width="300" height="84"/>
+        <text class="t"  x="440" y="324" text-anchor="middle">SPLICE at &lt;image&gt;</text>
+        <text class="s"  x="440" y="342" text-anchor="middle">[sys &hellip; &lang;1332 vision tok&rang; &hellip; msg]</text>
+        <text class="em" x="440" y="360" text-anchor="middle">vision ends &middot; parent page begins</text>
+
+        <rect class="bp" x="20" y="306" width="150" height="64"/>
+        <text class="t"  x="95" y="332" text-anchor="middle">text token embeds</text>
+        <text class="ts" x="95" y="350" text-anchor="middle">[T_text &times; 8192]</text>
+
+        <!-- middle arrows -->
+        <line class="f" x1="940" y1="342" x2="850" y2="342"/>
+        <text class="num" x="895" y="330" text-anchor="middle">&#9316;</text>
+        <text class="ts"  x="895" y="356" text-anchor="middle">[1332 &times; 1152]</text>
+
+        <line class="f" x1="660" y1="342" x2="590" y2="342"/>
+        <text class="num" x="625" y="330" text-anchor="middle">&#9317;</text>
+        <text class="ts"  x="625" y="356" text-anchor="middle">[1332 &times; 8192]</text>
+
+        <line class="f" x1="170" y1="342" x2="290" y2="342"/>
+        <text class="s"  x="230" y="330" text-anchor="middle">text embeds</text>
+        <text class="ts" x="230" y="356" text-anchor="middle">[T_text &times; 8192]</text>
+
+        <!-- H -> I vertical -->
+        <line class="f" x1="440" y1="384" x2="440" y2="470"/>
+        <text class="num" x="425" y="424" text-anchor="end">&#9318;</text>
+        <text class="ts"  x="455" y="428" text-anchor="start">[T_text + 1332 &times; 8192]</text>
+
+        <!-- bottom row: I prefill -> KV -->
+        <rect class="bp" x="290" y="470" width="380" height="110"/>
+        <text class="t"  x="480" y="500" text-anchor="middle">LLM PREFILL</text>
+        <text class="s"  x="480" y="520" text-anchor="middle">(parent page &mdash; unchanged)</text>
+        <text class="s"  x="480" y="540" text-anchor="middle">n_layers &middot; GQA (Grouped-Query Attention)</text>
+        <text class="ts" x="480" y="562" text-anchor="middle">vision tok &rarr; K,V &middot; K2 D32</text>
+
+        <rect class="bp" x="740" y="485" width="190" height="80"/>
+        <text class="t"  x="835" y="513" text-anchor="middle">KV CACHE</text>
+        <text class="s"  x="835" y="533" text-anchor="middle">same blocks as text</text>
+        <text class="ts" x="835" y="553" text-anchor="middle">320 KB / token</text>
+
+        <line class="f" x1="670" y1="525" x2="740" y2="525"/>
+        <text class="num" x="705" y="512" text-anchor="middle">&#9319;</text>
+        <text class="ts"  x="705" y="540" text-anchor="middle">320 KB/tok</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Decode / resize</strong> &mdash; bytes &rarr; raw RGB pixels <code>[1024&times;1024&times;3]</code> (CPU or NVDEC for video).</li>
+        <li><span class="b">&#9313;</span> <strong>Patchify + embed</strong> &mdash; <code>conv2d</code> stride 14 cuts 5329 patches, each <code>[588]</code> projected to <code>[1152]</code>.</li>
+        <li><span class="b">&#9314;</span> <strong>+ 2-D position</strong> &mdash; patch grid coords added; <code>[5329&times;1152]</code> enters the ViT.</li>
+        <li><span class="b">&#9315;</span> <strong>ViT forward</strong> &mdash; bidirectional self-attention, <strong>no KV cache</strong>; one feature vector per patch, <code>[5329&times;1152]</code>.</li>
+        <li><span class="b">&#9316;</span> <strong>Spatial merge 2&times;2</strong> &mdash; token count collapses &divide;4 to <code>[1332&times;1152]</code> (the capacity win).</li>
+        <li><span class="b">&#9317;</span> <strong>Projector (MLP)</strong> &mdash; maps <code>d_vision 1152 &rarr; d_model 8192</code>; the two models meet here.</li>
+        <li><span class="b">&#9318;</span> <strong>Splice</strong> &mdash; vision vectors replace the <code>&lt;image&gt;</code> placeholder; combined with text embeds <code>[T_text+1332 &times; 8192]</code>.</li>
+        <li><span class="b">&#9319;</span> <strong>Prefill &rarr; K,V</strong> &mdash; spliced stream runs the parent decoder; every vision token costs <code>320 KB</code> of KV (<a href="../../knowledge/K2_kv-cache.html#d32">K2 D32</a>).</li>
+      </ul>
+      <p><em>(The unnumbered arrow from the blue box is the text-token embedding stream entering the splice &mdash; not a vision step. The vision
+        pipeline proper is the amber path &#9312;&ndash;&#9317;; &#9318;&ndash;&#9319; are the inherited parent-page splice + prefill.)</em></p>
+
+      <!-- ---------- M.3 PDF ---------- -->
+      <h3 id="m3">M.3 &nbsp;How a PDF is parsed (two complementary streams &mdash; render-to-image <em>and</em> extract-text)</h3>
+      <p><strong>Problem.</strong> A PDF is <em>not</em> pixels and <em>not</em> plain text &mdash; it is a layout container (text runs, vector
+        graphics, embedded fonts, tables, scanned images). There are two ways to turn a page into model input, and production
+        <strong>feeds both in parallel</strong> &mdash; each is blind to exactly what the other captures.</p>
+      <div class="two-col">
+        <div>
+          <h4>Stream A &mdash; extract-text / OCR <span class="pick" style="background:#dcfce7">(complementary)</span></h4>
+          <ul>
+            <li><strong>OCR</strong> = <em>Optical Character Recognition</em>. A parser (<code>pdfminer</code>, <code>pdfplumber</code>) reads the PDF&rsquo;s embedded text layer (or an OCR engine reads a scan) &rarr; fed as ordinary <strong>text tokens</strong>.</li>
+            <li><strong>What it is for &mdash; the exact characters, verbatim.</strong> A born-digital PDF carries the real Unicode underneath: ground-truth text the vision encoder can only approximate.</li>
+            <li><strong>Cheap</strong> &mdash; text tokens are far fewer than the ~1.5&nbsp;k vision tokens/page, so exact grounding costs almost nothing.</li>
+            <li><strong>But blind to layout</strong> &mdash; flattens tables to token soup, drops figures/charts, returns nothing on a scanned page.</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Stream B &mdash; render-to-image <span class="pick" style="background:#dcfce7">(primary)</span></h4>
+          <ul>
+            <li><strong>Rasterize each page to an image</strong> (~150 <strong>DPI</strong>, <em>dots per inch</em>) and run it through <a href="#m2">&sect;M.2</a> as an image.</li>
+            <li><strong>What it is for &mdash; layout, tables, figures, charts, handwriting, spatial arrangement</strong> &mdash; and it is the <em>only</em> stream that works on a <strong>scanned</strong> PDF (no text layer at all).</li>
+            <li><strong>One PDF page = one image &asymp; ~1.5&nbsp;k vision tokens</strong> <span class="tag tag-fa">G-FA</span>.</li>
+            <li>A 20-page PDF &asymp; <strong>~30&nbsp;k tokens</strong>; a 100-page PDF (the &sect;S0.3 p99) &asymp; <strong>~150&nbsp;k</strong> &mdash; that is only <strong>~48 GB KV</strong>, still well inside one task&rsquo;s HBM-for-KV budget. Only a <strong>~533+ page PDF</strong> (&ge; 800&nbsp;k tokens / 256 GB) reaches the context-parallelism fork (Iter&nbsp;9 delta).</li>
+          </ul>
+        </div>
+      </div>
+      <ul>
+        <li><strong>Why both, in parallel &mdash; complementary failure modes.</strong> The <em>vision</em> stream is strong on structure but
+          <strong>weak on exact character fidelity</strong> (a downsampled 150-DPI image of small dense text makes the encoder misread digits, decimal
+          points, code, IDs); the <em>text</em> stream is exact but <strong>blind to layout</strong>. Feeding both lets the model use the picture for
+          <em>structure</em> and the text for <em>exact content</em>. <strong>Concrete example &mdash; a financial-table screenshot:</strong> the image
+          shows it <em>is</em> a table and which column is which; the extracted text supplies <code>$1,234,567.89</code> exactly, so the model quotes the
+          figure without the encoder turning a <code>3</code> into an <code>8</code>.</li>
+        <li><strong>When you genuinely get only one stream (the true fallbacks).</strong> A <strong>scanned</strong> PDF has no text layer &rarr;
+          image-only; an <strong>oversize</strong> doc past the page/token cap forces a single stream (render-to-image is kept, text-extraction is the
+          degraded fallback). For an in-budget born-digital PDF the default is <strong>both</strong>.</li>
+        <li><strong>KV consequence.</strong> A PDF is just &ldquo;N images back-to-back&rdquo; &rarr; it inherits everything in <a href="#m2">&sect;M.2</a>
+          and multiplies the token / KV count by page count. <em>This is why PDFs are the dominant capacity driver.</em></li>
+      </ul>
+
+      <!-- ---------- M.4 video ---------- -->
+      <h3 id="m4">M.4 &nbsp;How a video is parsed (frame-sample &rarr; images + a temporal axis)</h3>
+      <p><strong>Problem.</strong> A 1-minute 30&nbsp;<strong>fps</strong> (<em>frames per second</em>) clip is <strong>1&nbsp;800 frames</strong>;
+        encoding every frame as a full image is infeasible (<code>1&nbsp;800 &times; 1&nbsp;332 &asymp; 2.4&nbsp;M tokens</code> <span class="tag tag-d">D</span>
+        &mdash; past the 1&nbsp;M context cap by itself).</p>
+      <ol class="steps">
+        <li><strong>Frame-sample</strong> at a low rate (<code>fps_sample &asymp; 1</code>) &rarr; 60 frames for a 1-minute clip.</li>
+        <li><strong>Encode each frame</strong> as an image (<a href="#m2">&sect;M.2</a>) &mdash; hardware video decode (<strong>NVDEC</strong>, <em>NVIDIA Video Decoder</em>) feeds the frames.</li>
+        <li><strong>Temporal + spatial merge</strong> &mdash; merge adjacent frames/patches to cut tokens hard (Qwen2-VL merges to <strong>~256
+          tokens/frame</strong> after a <code>2&times;2&times;2</code> merge) &rarr; 1-minute clip &asymp; <strong>~15.4&nbsp;k tokens</strong>
+          <span class="tag tag-d">D</span> (<code>60 &times; 256</code>); 10-minute (the &sect;S0.3 p99) &asymp; <strong>~154&nbsp;k</strong> (&asymp; 49 GB KV &mdash; still fits one task). Only a <strong>~52+ minute</strong> clip crosses
+          <strong>~1&nbsp;M tokens / 256 GB</strong> &rarr; context parallelism (Iter&nbsp;9 delta) from a <em>single attachment</em>.</li>
+        <li><strong>Temporal position</strong> &mdash; a <strong>3-D / multimodal RoPE</strong> (<strong>M-RoPE</strong>; <strong>RoPE</strong> =
+          <em>Rotary Position Embedding</em>) gives the LLM a <em>temporal axis</em>, so &ldquo;what happened <em>after</em> X&rdquo; works.</li>
+      </ol>
+      <ul>
+        <li><strong>KV consequence.</strong> Video is the <strong>token-explosion king</strong> and the reason the parent&rsquo;s long-context machinery
+          (tiering and the pool at every clip; context parallelism only for the hour-long extreme) gets exercised at <em>turn 1</em>, not just on long chat histories.</li>
+        <li><strong>Page scope flag.</strong> <strong>Uploaded video files only.</strong> Live / real-time video streams (continuous ingest, streaming
+          encode) are a different system &rarr; new non-goal (S0 delta).</li>
+      </ul>
+
+      <!-- ---------- M.5 fusion DC ---------- -->
+      <h3 id="m5">M.5 &nbsp;Design choice &mdash; fusion architecture (the one with a KV-cache consequence)</h3>
+      <div class="dc">
+        <h4>DC &mdash; How do the vision features reach the LLM&rsquo;s attention?</h4>
+        <p class="dc-prob">Problem: the ViT produced <code>[1332 &times; 8192]</code> vectors. There are two architecturally distinct ways to feed them
+          into the decoder, and they put the vision K,V in <em>different</em> places.</p>
+        <p class="dc-sols">Possible solutions enumerated:</p>
+        <ul>
+          <li><span class="pick">(a) Decoder-only &ldquo;splice&rdquo; fusion &mdash; CHOSEN (main line)</span> &mdash; concatenate vision tokens into the
+            input sequence (LLaVA, Qwen2-VL, InternVL, GPT-4V-class; <strong>Llama-4&rsquo;s early fusion</strong> is the same family for KV purposes &mdash; vision tokens live in the sequence). <strong>KV consequence: vision tokens become regular self-attention KV
+            (<a href="../../knowledge/K2_kv-cache.html#d32">K2&nbsp;D32</a>) &rarr; the entire parent design applies unchanged.</strong> Picked because
+            it makes the &ldquo;distributed <em>KV cache</em>&rdquo; framing exact and matches the dominant open-weights family.</li>
+          <li>(b) <strong>Cross-attention fusion</strong> (Flamingo, Llama-3.2-Vision) &mdash; vision features are consumed by
+            <strong>dedicated gated cross-attention layers</strong>; they are <strong>not</strong> in the autoregressive KV sequence.
+            <strong>KV consequence:</strong> a <em>separate</em> &ldquo;vision KV&rdquo; read by cross-attention at every layer &mdash; <em>still
+            cacheable</em>, even <strong>more separable</strong> (decode never re-reads it through self-attn), but it splits the cache into two key
+            spaces and changes the prefix-chain math. Named as the alternative with a spelled-out KV consequence; <span class="reject">not shipped</span>
+            (it would fork every downstream iteration).</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list">
+          <li>The page&rsquo;s thesis is &ldquo;vision K,V <strong>is</strong> the parent&rsquo;s KV&rdquo; &mdash; only splice fusion makes that literally true, so every parent iteration transfers with a one-line delta instead of a fork.</li>
+        </ul>
+      </div>
+      <div class="dc">
+        <h4>Connector sub-choice (an orthogonal axis &mdash; independent of the fusion choice)</h4>
+        <p class="dc-prob">Problem: the projector step (<a href="#m2">&sect;M.2</a> step 6) can either preserve native token count or compress to a fixed budget.</p>
+        <ul>
+          <li><span class="pick">MLP projector &mdash; CHOSEN</span> &mdash; variable token count &prop; image area; <strong>native dynamic resolution</strong> (detail scales with the image).</li>
+          <li><strong>Cross-attention resampler / Perceiver / Q-Former</strong> &mdash; compresses to a <strong>fixed</strong> <code>N_query</code> tokens;
+            <strong>bounds KV per image</strong> but <span class="reject">caps detail</span>.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list">
+          <li>The product needs full-fidelity tables and screenshots (the same reason PDF renders to image), so detail beats a fixed KV bound here; main line = <strong>splice + MLP + native dynamic resolution</strong>. The fixed-<code>N_query</code> option returns as a lever in the ragged-batching iteration.</li>
+        </ul>
+      </div>
+
+      <!-- ---------- M.6 three consequences ---------- -->
+      <h3 id="m6">M.6 &nbsp;The three serving consequences that drive the entire delta</h3>
+      <p>State these once; every iteration delta downstream traces to exactly one of them. <strong>FLOP</strong> = <em>Floating-Point Operation</em>;
+        <strong>HBM</strong> = <em>High-Bandwidth Memory</em> (the GPU&rsquo;s on-package RAM); <strong>MFU</strong> = <em>Model FLOPs Utilization</em>
+        (how much of the GPU&rsquo;s peak FLOP/s the work actually uses); <strong>E/P/D</strong> = <em>Encode / Prefill / Decode</em>.</p>
+      <ol class="steps">
+        <li><strong>A new compute stage with the <em>opposite</em> roofline.</strong> The ViT is <strong>compute-bound, fixed-depth, no-KV, a single
+          bidirectional forward</strong>; the LLM decode is <strong>memory-bandwidth-bound, autoregressive</strong> (K12). Colocating a ViT in every LLM
+          task (the common baseline) carries encode capacity on every task though only ~15% of requests use it, and lets a compute-bound ViT burst
+          steal cycles from latency-sensitive decode &mdash; the HBM cost is <em>not</em> the issue (1.2 GB ViT vs ~140 GB LLM weights, i.e. 0.6 B vs 70 B
+          params &times; 2 B). &rarr; <strong>Iter&nbsp;M1</strong> (E/P/D disaggregation,
+          a dedicated encode pool, <a href="../../knowledge/K12_multimodal-and-image-offload.html#d41">K12&nbsp;D41</a>) +
+          <strong>Iter&nbsp;M3</strong> (ragged encoder batching) &mdash; the <strong>scale-out escalation</strong> off the colocated baseline, not table stakes
+          (a smaller deployment keeps the ViT colocated; full argument in the Iter&nbsp;M1 note-box).</li>
+        <li><strong>Far more KV per request.</strong> Same <code>KV_per_tok = 320&nbsp;KB</code>
+          (<a href="../../knowledge/K2_kv-cache.html#d31">K2&nbsp;D31</a>), but the vision-token count per request is <strong>1&nbsp;k&ndash;1&nbsp;M</strong>.
+          &rarr; stresses the parent&rsquo;s tiering, PagedAttention, the cross-task pool at every attachment, and &mdash; only at the near-1&nbsp;M-context
+          extreme &mdash; triggers context parallelism from a <em>single</em> attachment; it also shifts the whole workload distribution (S0 delta).</li>
+        <li><strong>The encoder output is deterministic &amp; content-addressable.</strong> Same bytes + same preprocessing + same
+          <code>encoder_version</code> &rarr; <strong>bit-identical embeddings</strong>. &rarr; a <strong>new cache layer above prefill</strong>
+          (<strong>Iter&nbsp;M2</strong> vision-embedding cache) and a <strong>content-addressed</strong> reuse axis the text pool had nothing for:
+          <strong>per-user cross-conversation</strong> reuse always, plus <strong>opt-in cross-user dedup of the public/shareable slice</strong>
+          (private uploads stay isolated &mdash; Iter&nbsp;M2 DC3). The headline reversal of the text page&rsquo;s &ldquo;nothing to dedup&rdquo; verdict.</li>
+      </ol>
+
+      <div class="note-box"><strong>Bridge to the iterations.</strong> &sect;M.6&rsquo;s three consequences are the spine of everything below:
+        consequence&nbsp;1 (opposite roofline) &rarr; the <a href="#iter-m1">encode pool</a> + <a href="#iter-m3">ragged batching</a>;
+        consequence&nbsp;2 (far more KV) &rarr; the <a href="#part-a">Part-A volume deltas</a> to tiering / paging / pool / context parallelism;
+        consequence&nbsp;3 (deterministic, content-addressable output) &rarr; the <a href="#iter-m2">content-addressed embedding cache</a> &mdash; the
+        headline reversal of the text page&rsquo;s &ldquo;nothing to dedup.&rdquo; The <a href="#s1">S1&ndash;S3 deltas</a> name the new jobs, entities, and
+        API surface those iterations need; the <a href="#m-iter">iteration ribbon</a> then slots them in.
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S1 delta - Entities + Borg topology                     -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s1">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S1 &nbsp;Entities &amp; Borg topology (delta)</h2>
+      <p><strong>TL;DR.</strong> Attachments add <strong>four entities</strong>, <strong>two jobs</strong>
+        (<code>vision-encoder-job</code>, <code>blob-store-job</code>), and a <strong>second key space</strong> on the existing pool &mdash; no third
+        storage system. Borg vocabulary throughout: <strong>job</strong> = logical service, <strong>task</strong> = one replica.</p>
+
+      <h3 id="s1-entities">S1.1 &nbsp;New core entities <span class="mk mk-new">NEW</span></h3>
+      <table class="sheet">
+        <thead><tr><th>Entity</th><th>Minimal shape</th><th>Note (detailed at the iteration that introduces it)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Attachment</strong></td><td class="c">attach_id, conv_id, modality&isin;{image,pdf,video}, blob_ref, content_hash, preproc_params, n_vis_tok, status</td><td><code>content_hash</code> = hash(raw bytes &Vert; preproc_params &Vert; encoder_version) &rarr; the embedding-cache key (Iter&nbsp;M2). Introduced Iter&nbsp;M0.</td></tr>
+          <tr><td><strong>BlobRef</strong></td><td class="c">blob_ref, bytes_len, storage_class, sha256</td><td>handle into the blob store. Introduced Iter&nbsp;M0.</td></tr>
+          <tr><td><strong>VisionEmbedding</strong></td><td class="c">content_hash &rarr; {embedding_blocks[], n_vis_tok, d_model, encoder_version, tier_locs}</td><td>the <strong>encoder output</strong>, content-addressed &mdash; this is <strong>K12&rsquo;s embedding cache</strong>, NOT the parent&rsquo;s conv-keyed KV pool. Introduced Iter&nbsp;M2.</td></tr>
+          <tr><td><strong>EncodeJob</strong></td><td class="c">attach_id, content_hash, modality, prio, arrival_ts, target_prefill_task</td><td>one encode unit (an image / a PDF page / a video-frame-batch). Introduced Iter&nbsp;M1.</td></tr>
+        </tbody>
+      </table>
+      <h4>Edits to inherited entities</h4>
+      <ul>
+        <li><strong>Request</strong> &mdash; <code>content[]</code> gains attachment parts; <code>prompt_tokens[]</code> is now <strong>post-splice</strong> (text + vision placeholders resolved to embeddings).</li>
+        <li><strong>KV Block</strong> &mdash; gains <code>origin&isin;{text,vision}</code> (a cheap tag; lets eviction / metrics distinguish the huge vision blocks). Vision blocks are otherwise <strong>identical</strong> K,V (K2 D32).</li>
+        <li><strong>Pool Conv Index</strong> (parent S1) &mdash; the content-addressed <code>block_hash</code> variant the parent left <em>optional</em> becomes <strong>load-bearing here</strong> (Iter&nbsp;M2): vision K,V gains per-user cross-conversation reuse + opt-in cross-user dedup of public/shared assets.</li>
+      </ul>
+
+      <h3 id="s1-jobs">S1.2 &nbsp;New jobs &mdash; Borg topology delta <span class="mk mk-new">NEW</span></h3>
+      <table class="sheet">
+        <thead><tr><th>Job</th><th>Tasks (sizing)</th><th>What it runs</th><th>At</th></tr></thead>
+        <tbody>
+          <tr><td><code>vision-encoder-job</code> (encode pool)</td><td><code>enc_task_num = &lceil;&lambda;<sub>attach</sub> / enc_throughput_per_task &times; headroom&rceil;</code>; runs a <strong>smaller / cheaper GPU SKU</strong> than serving tasks &mdash; the ViT is compute-bound and holds no 70 B weights (Iter&nbsp;M1).</td><td>ViT + projector forward; ragged batcher (Iter&nbsp;M3)</td><td>Iter&nbsp;M1</td></tr>
+          <tr><td><code>blob-store-job</code></td><td>managed object store (S3 / GCS) + a <strong>hot-blob cache / CDN</strong> sized to <code>blob_ingress_BW</code>; preprocessing workers (CPU + NVDEC).</td><td>durable attachment bytes; decode / resize / frame-sample / page-render</td><td>Iter&nbsp;M0</td></tr>
+          <tr><td>vision-embedding cache</td><td><strong>co-tenant of the existing <code>kv-store-job</code></strong> (parent Iter&nbsp;3b) &mdash; same Mooncake-style RDMA-front / NVMe-back backend, a <strong>second key space</strong> keyed by <code>content_hash</code>; <strong>no new job.</strong></td><td>content-addressed encoder output</td><td>Iter&nbsp;M2</td></tr>
+        </tbody>
+      </table>
+      <p><strong>State-management spectrum for the encode pool</strong> (the four options to enumerate when scaling a stateful-ish job):
+        (A) read-replicas, (B) sharded, (C) quorum, (D) CRDT (<em>Conflict-free Replicated Data Type</em>). The encode pool is
+        <strong>stateless per request</strong> &mdash; an encode is a pure function of bytes &mdash; so it is <strong>option-free</strong> (any task can serve
+        any attachment; scale it horizontally on arrival rate). The <em>stateful</em> part is the <strong>embedding cache</strong> it feeds, which inherits
+        the parent pool&rsquo;s choice: <strong>(B) sharded</strong>, consistent-hashed (CH, <em>Consistent Hashing</em>) on <code>content_hash</code>.</p>
+
+      <h3 id="s1-routing">S1.3 &nbsp;Routing-model delta</h3>
+      <p>Parent path: <code>clients &rarr; L4 &rarr; Router &rarr; prefill &rarr; decode</code>. New path (full E/P/D fleet drawn at
+        <a href="#iter-m1">Iter&nbsp;M1, D-M2</a>):</p>
+      <ol class="steps">
+        <li>The Router does a per-attachment <code>content_hash</code> <strong>lookup against the embedding cache before dispatching an encode</strong> (skip on hit).</li>
+        <li>On miss, it routes the attachment to an encode task by <strong>CH-on-<code>content_hash</code></strong> over the encode ring &mdash; so identical attachments <strong>coalesce</strong> (single-flight on encode, mirroring the parent&rsquo;s cold-prefill single-flight).</li>
+        <li>The encode task streams <strong>embeddings</strong> to the prefill task chosen by the parent&rsquo;s CH-on-<code>conv_id</code>; prefill produces K,V; decode runs unchanged.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S2 delta - API / Interface contracts                    -->
+  <!-- ===================================================== -->
+  <section class="section" id="s2">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S2 &nbsp;API / Interface contracts (delta)</h2>
+      <table class="sheet">
+        <thead><tr><th>Method + Path</th><th>Request</th><th>Response</th><th>SLO</th></tr></thead>
+        <tbody>
+          <tr><td><strong>POST /v1/attachments</strong> <span class="mk mk-new">NEW</span></td><td class="c">multipart, or {presign:true, modality, bytes_len, sha256}</td><td class="c">{attach_id, upload_url?, content_hash?}</td><td class="n">p99 &le; 200 ms (control-plane; bytes flow to blob store directly)</td></tr>
+          <tr><td>POST /v1/conversations/{id}/messages <span class="mk mk-chg">&Delta;</span></td><td class="c">content[] now includes {type:image|file|video, attach_id} parts</td><td class="c">SSE (unchanged)</td><td class="n">TTFT p99 &le; 400 ms <strong>incl. encode</strong></td></tr>
+          <tr><td><strong>GET /v1/attachments/{attach_id}</strong> <span class="mk mk-new">NEW</span></td><td class="c">&mdash;</td><td class="c">{status, n_vis_tok, modality}</td><td class="n">p99 &le; 50 ms</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li><strong>Upload is out-of-band.</strong> Bytes go client&rarr;blob store via presigned URL; the message references <code>attach_id</code>. Keeps MB&ndash;GB blobs off the LLM hot path.</li>
+        <li><strong>Idempotency / dedup.</strong> <code>content_hash</code> makes re-upload of identical bytes a no-op (returns the existing handle) &mdash; the first cheap win, before any cache.</li>
+        <li><strong>Error model (added).</strong> <code>413</code> attachment too large; <code>415</code> unsupported format; <code>422</code> page / length cap exceeded; <code>429</code> carries a <strong>token-weighted</strong> budget (Iter 8 delta).</li>
+        <li><strong>Limits surfaced</strong> from S0.2: max attachments, max size, supported formats.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S3 delta - Back-of-envelope (new ratios only)           -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s3">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S3 &nbsp;Back-of-envelope &mdash; new ratios only</h2>
+      <p>Cite K12 for the encoder cost profile; cite K2 D31/D32 for KV. New rows only (every <span class="tag tag-d">D</span> prints its substitution):</p>
+      <table class="sheet">
+        <thead><tr><th>Quantity</th><th>Formula &amp; substitution</th><th>Tag</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td>Vision tokens / image</td><td class="c">&sect;M.2</td><td><span class="tag tag-k">G&nbsp;&mdash;&nbsp;K12</span></td><td>~1.3 k</td></tr>
+          <tr><td><strong>KV per vision token</strong></td><td class="c">= KV_per_tok = 320 KB</td><td><span class="tag tag-k">G&nbsp;&mdash;&nbsp;K2&nbsp;D31</span></td><td><strong>identical to text</strong> &mdash; the continuity hook</td></tr>
+          <tr><td>KV per 1-min video</td><td class="c">(60&times;256 tok) &times; 320 KB = 15.4k &times; 320 KB &asymp; 4.9 GB</td><td><span class="tag tag-d">D</span></td><td>one attachment &asymp; one mid-size text conv</td></tr>
+          <tr><td>KV per 10-min video / 100-pg PDF (the p99)</td><td class="c">~154k &times; 320 KB &asymp; 49 GB; 100&times;1.5k&times;320 KB &asymp; 48 GB</td><td><span class="tag tag-d">D</span></td><td>~12&times; a mean text conv, but still <strong>fits one task&rsquo;s ~120&ndash;450 GB HBM-for-KV budget</strong> &mdash; a prime spill/eviction candidate (Iter 1a), <strong>not</strong> a CP trigger</td></tr>
+          <tr><td><strong>CP-fork crossover</strong></td><td class="c">256 GB &divide; 320 KB = <strong>800 k tokens</strong> = ~533-pg PDF or ~52-min video</td><td><span class="tag tag-d">D</span></td><td>only a <strong>beyond-p99, near-1&nbsp;M-context</strong> attachment crosses <code>CP_FORK_THRESHOLD_BYTES = 256 GB</code> (Iter 9 delta) &mdash; threshold inherited unchanged</td></tr>
+          <tr><td>Encoder FLOPs / image</td><td class="c">&asymp; 2&middot;P_vit&middot;n_patch = 2&times;0.6e9&times;5329 &asymp; 6.4 TFLOP (+ ViT attn ~3.5)</td><td><span class="tag tag-d">D&nbsp;&mdash;&nbsp;K12</span></td><td>single-digit TFLOP/image; <strong>compute-bound, no KV</strong></td></tr>
+          <tr><td>Encode vs prefill FLOP ratio</td><td class="c">enc_FLOPs / prefill_FLOPs(1.3k tok @70B) = 6.4 / (2&times;70e9&times;1300=182) &asymp; 3.5%</td><td><span class="tag tag-d">D</span></td><td><strong>the issue is fleet waste from colocation, not raw FLOPs</strong> (K12)</td></tr>
+          <tr><td>Encoder roofline</td><td class="c">compute-bound, fixed-depth, single forward</td><td><span class="tag tag-k">G&nbsp;&mdash;&nbsp;K12</span></td><td><strong>opposite</strong> of decode&rsquo;s BW-bound autoregression &rarr; disagg</td></tr>
+          <tr><td>New fleet-mean input</td><td class="c">T_in_blended = 14.8 k (S0.3)</td><td><span class="tag tag-d">D</span></td><td>replaces 13.3 k in <code>prefill_task_num</code> sizing</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- M-ITER intro: ribbon + Part A inherited-iteration deltas -->
+  <!-- ===================================================== -->
+  <section class="section" id="m-iter">
+    <div class="container">
+      <h2>Iteration deltas &mdash; where the new work slots in</h2>
+      <p><strong>How to read.</strong> <strong>Part A</strong> = short deltas to inherited iterations (the parent iteration is unchanged except as
+        noted). <strong>Part B</strong> = the four new multimodal iterations (full treatment), each placed at its dependency point in the existing
+        Iter&nbsp;0&rarr;10 ribbon. They are presented in <strong>ribbon order</strong> (M0, M1, M3, M2) so each builds only on what came before.</p>
+
+      <h3 id="m-iter-ribbon">The ribbon &mdash; new iterations in amber, changed inherited ones outlined</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Iteration ribbon: new multimodal iterations M0, M1, M3, M2 slotted into the parent Iter 0 to 10 sequence">
+        <defs>
+          <marker id="rbh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+          </marker>
+        </defs>
+        <style>
+          .pi { fill:#f1f5f9; stroke:#94a3b8; stroke-width:1.2; rx:6; }
+          .ni { fill:#fef3c7; stroke:#d97706; stroke-width:1.6; rx:6; }
+          .ci { fill:#eef2ff; stroke:#4f46e5; stroke-width:1.6; rx:6; }
+          .il { font-size:11px; font-weight:700; fill:#0f172a; }
+          .is { font-size:9px; fill:#475569; }
+          line.r { stroke:#64748b; stroke-width:1.4; fill:none; marker-end:url(#rbh); }
+          path.r { stroke:#64748b; stroke-width:1.4; fill:none; marker-end:url(#rbh); stroke-dasharray:4 3; }
+        </style>
+        <!-- row 1 -->
+        <g>
+          <rect class="pi" x="20"  y="40" width="92" height="40"/><text class="il" x="66"  y="58" text-anchor="middle">Iter 0</text><text class="is" x="66"  y="72" text-anchor="middle">naive</text>
+          <rect class="pi" x="132" y="40" width="92" height="40"/><text class="il" x="178" y="58" text-anchor="middle">Iter 1a</text><text class="is" x="178" y="72" text-anchor="middle">cache+tier</text>
+          <rect class="pi" x="244" y="40" width="92" height="40"/><text class="il" x="290" y="58" text-anchor="middle">Iter 1b</text><text class="is" x="290" y="72" text-anchor="middle">Router</text>
+          <rect class="ni" x="356" y="36" width="92" height="48"/><text class="il" x="402" y="56" text-anchor="middle">M0</text><text class="is" x="402" y="70" text-anchor="middle">blob ingress</text>
+          <rect class="pi" x="468" y="40" width="92" height="40"/><text class="il" x="514" y="58" text-anchor="middle">Iter 2</text><text class="is" x="514" y="72" text-anchor="middle">P/D split</text>
+          <rect class="ni" x="580" y="36" width="92" height="48"/><text class="il" x="626" y="56" text-anchor="middle">M1</text><text class="is" x="626" y="70" text-anchor="middle">E/P/D</text>
+          <rect class="pi" x="692" y="40" width="92" height="40"/><text class="il" x="738" y="58" text-anchor="middle">Iter 3</text><text class="is" x="738" y="72" text-anchor="middle">PagedAttn</text>
+          <rect class="pi" x="804" y="40" width="92" height="40"/><text class="il" x="850" y="58" text-anchor="middle">Iter 3b</text><text class="is" x="850" y="72" text-anchor="middle">pool</text>
+        </g>
+        <!-- row 1 arrows -->
+        <line class="r" x1="112" y1="60" x2="132" y2="60"/>
+        <line class="r" x1="224" y1="60" x2="244" y2="60"/>
+        <line class="r" x1="336" y1="60" x2="356" y2="60"/>
+        <line class="r" x1="448" y1="60" x2="468" y2="60"/>
+        <line class="r" x1="560" y1="60" x2="580" y2="60"/>
+        <line class="r" x1="672" y1="60" x2="692" y2="60"/>
+        <line class="r" x1="784" y1="60" x2="804" y2="60"/>
+        <!-- wrap: row1 end -> down through the inter-row gap -> row2 start -->
+        <path class="r" d="M896,60 C952,60 952,114 480,114 C150,114 95,114 35,144"/>
+        <!-- row 2 -->
+        <g>
+          <rect class="pi" x="20"   y="150" width="86" height="40"/><text class="il" x="63"   y="168" text-anchor="middle">Iter 4</text><text class="is" x="63"   y="182" text-anchor="middle">prefill</text>
+          <rect class="ni" x="118"  y="146" width="86" height="48"/><text class="il" x="161"  y="166" text-anchor="middle">M3</text><text class="is" x="161"  y="180" text-anchor="middle">ragged enc</text>
+          <rect class="pi" x="216"  y="150" width="86" height="40"/><text class="il" x="259"  y="168" text-anchor="middle">Iter 5</text><text class="is" x="259"  y="182" text-anchor="middle">prefix$</text>
+          <rect class="ni" x="314"  y="146" width="86" height="48"/><text class="il" x="357"  y="166" text-anchor="middle">M2</text><text class="is" x="357"  y="180" text-anchor="middle">embed$</text>
+          <rect class="pi" x="412"  y="150" width="86" height="40"/><text class="il" x="455"  y="168" text-anchor="middle">Iter 5b</text><text class="is" x="455"  y="182" text-anchor="middle">spec.dec</text>
+          <rect class="pi" x="510"  y="150" width="86" height="40"/><text class="il" x="553"  y="168" text-anchor="middle">Iter 6</text><text class="is" x="553"  y="182" text-anchor="middle">cont.batch</text>
+          <rect class="pi" x="608"  y="150" width="86" height="40"/><text class="il" x="651"  y="168" text-anchor="middle">Iter 7</text><text class="is" x="651"  y="182" text-anchor="middle">autoscale</text>
+          <rect class="ci" x="706"  y="146" width="86" height="48"/><text class="il" x="749"  y="166" text-anchor="middle">Iter 8 &Delta;</text><text class="is" x="749"  y="180" text-anchor="middle">+byte quota</text>
+          <rect class="ci" x="804"  y="146" width="86" height="48"/><text class="il" x="847"  y="166" text-anchor="middle">Iter 9 &Delta;</text><text class="is" x="847"  y="180" text-anchor="middle">CP @turn1</text>
+          <rect class="pi" x="902"  y="150" width="86" height="40"/><text class="il" x="945"  y="168" text-anchor="middle">Iter 10</text><text class="is" x="945"  y="182" text-anchor="middle">fault-tol</text>
+        </g>
+        <!-- row 2 arrows -->
+        <line class="r" x1="106" y1="170" x2="118" y2="170"/>
+        <line class="r" x1="204" y1="170" x2="216" y2="170"/>
+        <line class="r" x1="302" y1="170" x2="314" y2="170"/>
+        <line class="r" x1="400" y1="170" x2="412" y2="170"/>
+        <line class="r" x1="498" y1="170" x2="510" y2="170"/>
+        <line class="r" x1="596" y1="170" x2="608" y2="170"/>
+        <line class="r" x1="694" y1="170" x2="706" y2="170"/>
+        <line class="r" x1="792" y1="170" x2="804" y2="170"/>
+        <line class="r" x1="890" y1="170" x2="902" y2="170"/>
+        <text class="is" x="20" y="28" text-anchor="start">Each new iteration is introduced at the point its enabling prior exists &mdash; never earlier.</text>
+        <text class="is" x="20" y="220" text-anchor="start" font-weight="700">Legend:</text>
+        <rect class="pi" x="70" y="210" width="16" height="12"/><text class="is" x="90" y="220" text-anchor="start">inherited (unchanged)</text>
+        <rect class="ni" x="230" y="210" width="16" height="12"/><text class="is" x="250" y="220" text-anchor="start">new multimodal iteration</text>
+        <rect class="ci" x="410" y="210" width="16" height="12"/><text class="is" x="430" y="220" text-anchor="start">inherited but changed (&Delta;)</text>
+      </svg>
+      </div>
+      <ul>
+        <li><strong>M0</strong> after Iter 1b &mdash; needs the Router / L4 ingress; you cannot encode without bytes.</li>
+        <li><strong>M1</strong> right after Iter 2 &mdash; the P/D (prefill/decode) split is the precedent; M1 extends 2 stages &rarr; 3 (E/P/D).</li>
+        <li><strong>M3</strong> after Iter 4 &mdash; reuses Iter 4&rsquo;s FlashAttention-varlen / ragged-batch reasoning, applied to the ViT.</li>
+        <li><strong>M2</strong> after Iter 5 &mdash; reuses Iter 5&rsquo;s content-hash chain + the Iter 3b pool as its storage home.</li>
+      </ul>
+
+      <h3 id="part-a">Part A &mdash; deltas to inherited iterations</h3>
+      <table class="sheet">
+        <thead><tr><th>Iter</th><th>Delta (everything else inherited verbatim)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Iter 0</strong> (naive)</td><td>One added &ldquo;what breaks&rdquo; row: a single image / PDF makes the naive B=1 no-cache task pay full encode + huge prefill &rarr; the cost shock is <em>worse</em> with attachments. No design change.</td></tr>
+          <tr><td><strong>Iter 1a</strong> (cache + tiering)</td><td>Vision K,V are <strong>regular blocks</strong> (K2 D32) &rarr; same HBM/DRAM tiering. New pressure (BM5): a video&rsquo;s 49 GB KV is <strong>~12&times; a mean text conv</strong> &mdash; it fits one task&rsquo;s HBM-for-KV budget but, under concurrency, is the <strong>first thing to spill</strong>; the <code>origin=vision</code> tag lets the coldness gate treat a finished attachment&rsquo;s huge tail as a prime eviction candidate. Watermark <em>form</em> unchanged; the <strong>band widens</strong> &mdash; see below.</td></tr>
+          <tr><td><strong>Iter 3</strong> (PagedAttention)</td><td>The over-allocation argument <strong>sharpens</strong>: a video request&rsquo;s true length is unknowable until frames are sampled &rarr; static-max reservation is catastrophic; paging is <strong>non-optional</strong> for multimodal. Block pool unchanged; <code>B_decode</code> math now blends <code>T_in_blended</code>.</td></tr>
+          <tr><td><strong>Iter 3b</strong> (cross-task pool)</td><td>Vision K,V is a <strong>new admission class</strong>: huge, content-addressable. <strong>Conv-level:</strong> every multimodal conv clears the ~1.9 k length gate (its text alone is 13.3 k), so vision adds <strong>~&frac14; of pool KV bytes</strong> (<code>f_mm&middot;1.77 / (0.85 + f_mm&middot;1.77) &asymp; 24%</code>, at <code>T_in_mm/T_in_text = 23.6k/13.3k</code>) &mdash; a major new class, <em>not</em> the majority; re-derive <code>W_pool</code> at S6. <strong>Per-attachment caveat</strong> (the <a href="#iter-m2">Iter&nbsp;M2</a> layer-ii content-addressed vision-K,V): a <em>single image</em> is only ~1.3 k vision tokens &mdash; <strong>below</strong> the ~1.9 k recompute-vs-transfer crossover &mdash; so that layer pays off for PDFs / video / multi-image, not lone images. The content-addressed key space (parent&rsquo;s optional uniformity upgrade) becomes load-bearing here.</td></tr>
+          <tr><td><strong>Iter 4</strong> (chunked / varlen prefill)</td><td>Vision tokens make long prefills <strong>common, not tail</strong> &rarr; the head-of-line (HoL) argument is now driven by attachments. Chunked prefill chunks across the spliced text+vision sequence transparently. Subtlety: vision spans are contiguous and known-length &rarr; the chunker can align chunk boundaries to attachment boundaries (cleaner CUDA-graph shapes).</td></tr>
+          <tr><td><strong>Iter 5</strong> (prefix caching)</td><td>The block-hash chain folds in vision content: a block over vision tokens hashes <code>H_i = hash(parent_hash &Vert; content_hash(attachment) &Vert; span)</code> &mdash; position-aware (K2 D5) and content-addressed. Two wins: (i) same attachment next turn = intra-conv hit; (ii) same attachment across users = cross-user prefix hit &mdash; <strong>but only if the chain is not per-user-seeded</strong> &rarr; ties into the <a href="#iter-m2">Iter&nbsp;M2</a> privacy DC. <code>hidden_sys</code> retention inherited unchanged.</td></tr>
+          <tr><td><strong>Iter 8</strong> (abuse)</td><td><strong>BM6:</strong> add a <strong>token / byte-weighted</strong> dimension to the token bucket &mdash; charge a request its <code>(vision_tokens + encode_FLOPs)</code> cost, not just <code>1 req</code>. Same token-bucket algorithm, richer cost function &mdash; see below.</td></tr>
+          <tr><td><strong>Iter 9</strong> (context parallelism)</td><td>The CP fork can now fire from a <strong>single near-1&nbsp;M-context attachment</strong> at <em>turn 1</em> (not only on long chat history) &mdash; see below.</td></tr>
+          <tr><td><strong>Iter 10</strong> (fault tolerance)</td><td>Encoder output is <strong>reproducible from blob bytes</strong> (RPO=0, like text from tokens) &rarr; encode-task death = re-encode from the durable blob. The blob store is the new durability root for the media path; recompute-as-fallback extends to <strong>re-encode-as-fallback</strong>.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Iter 1a delta, expanded &mdash; why the watermark band <em>widens</em> for vision</h4>
+      <ul>
+        <li><strong>The pair, and why a pair (anti-thrash, unchanged in form).</strong> Tiering keeps a <strong>low watermark</strong> (evict/write-down <em>until</em> free-HBM rises above it) and a <strong>high watermark</strong> (do <em>not</em> re-trigger eviction until used-HBM crosses it). Two thresholds, not one, so the system drains in a batch and then rests &mdash; a single threshold would evict-one / admit-one on every block and thrash.</li>
+        <li><strong>The asymmetry (what changes).</strong> The gap <code>hi &minus; lo</code> is set by <em>(bytes freed per eviction step) &times; (burstiness)</em>. Text blocks are small and steady; a finished <strong>vision</strong> attachment frees a <strong>huge, bursty tail</strong> (a video&rsquo;s 49 GB drains in one step). To absorb that without immediately re-triggering, the <strong>band must be wider</strong> for the vision tier &mdash; a symmetric pair, asymmetrically <em>thick</em>, sized by drain-burst size, exactly as the parent justified the HBM&harr;DRAM band thickness by drain speed.</li>
+      </ul>
+
+      <h4>Iter 8 delta, expanded &mdash; token/byte-weighted quota</h4>
+      <ol class="steps">
+        <li><strong>The problem, step by step.</strong> (1) The parent token bucket debits <code>1</code> per request. (2) A multimodal request is not one unit of work: a 50 MB video debits the same <code>1</code> as a one-line chat. (3) So a client can upload a few tiny-looking videos and consume 150 k prefill tokens + encode FLOPs the limiter never sees (BM6).</li>
+        <li><strong>The solution, step by step.</strong> (1) Keep the token-bucket algorithm. (2) Replace the cost function: debit <code>cost = base + vision_tokens&middot;w_kv + encode_FLOPs&middot;w_enc</code>, so the bucket drains in proportion to true fleet cost. (3) Add a cap <code>max_attachment_tokens_per_user_per_window</code>. A 50 MB video now debits its real cost; the limiter sees it.</li>
+      </ol>
+
+      <h4>Iter 9 delta, expanded &mdash; context parallelism (CP) fires at turn 1</h4>
+      <ul>
+        <li><strong>What changes.</strong> The parent triggers CP only on long <em>chat history</em>. Now a <strong>single near-1&nbsp;M-context attachment</strong> &mdash; a <strong>~600-page PDF</strong> (~900 k tokens, 288 GB) or a <strong>~1-hour video</strong> (~1 M tokens, 320 GB) &mdash; can cross the fork at <strong>turn 1</strong>, off a brand-new conversation.</li>
+        <li><strong>What does <em>not</em>.</strong> The threshold <code>CP_FORK_THRESHOLD_BYTES = 256 GB</code> (&asymp; 800 k tokens) is <strong>unchanged</strong> (an HBM-bytes threshold); Ring Attention is unchanged. Only the <strong>trigger source</strong> changes &rarr; the Router computes <code>est_kv</code> from <code>T_text + &Sigma; n_vis_tok(attach)</code> before placement.</li>
+        <li><strong>Frequency is still rare.</strong> The &sect;S0.3 p99 attachments (100-page PDF / 10-min video &asymp; 48&ndash;49 GB) are <strong>5&times; below</strong> the 256 GB fork &mdash; they fit one task. Only <strong>beyond-p99, near-context-cap</strong> attachments fork, matching the parent&rsquo;s &ldquo;~0.1% of QPS&rdquo; CP framing. The change is the <em>source</em> (a single upload, not 100 chat turns), not the rate.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter M0 - Blob ingress + preprocessing                  -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="iter-m0">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter M0 &mdash; Blob ingress + preprocessing pipeline</h2>
+        <div class="iter-meta">Bottleneck <strong>BM4</strong> &middot; placed after Iter 1b &middot; introduces <code>blob-store-job</code> &middot; diagram D-M5</div>
+      </div>
+
+      <h3>M0.1 &nbsp;Architecture (diagram first)</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1400 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Blob ingress: client presigned upload to object store, hot-blob cache, preprocess workers with NVDEC, then to the encode pool, which streams embeddings to the serving (prefill/decode) task">
+        <defs>
+          <marker id="m5h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .bx { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .bs { fill:#ecfeff; stroke:#0891b2; stroke-width:1.4; rx:8; }
+          .bv { fill:#fef3c7; stroke:#d97706; stroke-width:1.4; rx:8; }
+          .bn { fill:#f1f5f9; stroke:#94a3b8; stroke-width:1.2; rx:8; opacity:.85; }
+          .t  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s  { font-size:11px; fill:#475569; }
+          .num{ font-size:13px; font-weight:700; fill:#1d4ed8; }
+          line.f,  path.f  { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#m5h); }
+          line.fa, path.fa { stroke:#94a3b8; stroke-width:1.5; stroke-dasharray:6 4; fill:none; marker-end:url(#m5h); }
+        </style>
+
+        <rect class="bx" x="30" y="160" width="150" height="80"/>
+        <text class="t" x="105" y="190" text-anchor="middle">Client</text>
+        <text class="s" x="105" y="208" text-anchor="middle">uploads bytes,</text>
+        <text class="s" x="105" y="222" text-anchor="middle">refs attach_id</text>
+
+        <rect class="bx" x="260" y="50" width="180" height="70"/>
+        <text class="t" x="350" y="78" text-anchor="middle">Attachment service</text>
+        <text class="s" x="350" y="95" text-anchor="middle">control plane</text>
+        <text class="s" x="350" y="109" text-anchor="middle">issues presigned URL</text>
+
+        <rect class="bs" x="260" y="180" width="180" height="90"/>
+        <text class="t" x="350" y="208" text-anchor="middle">Object store</text>
+        <text class="s" x="350" y="226" text-anchor="middle">S3 / GCS &middot; durable</text>
+        <text class="s" x="350" y="240" text-anchor="middle">RPO=0 root</text>
+        <text class="s" x="350" y="256" text-anchor="middle">multi-AZ</text>
+
+        <rect class="bs" x="510" y="180" width="170" height="90"/>
+        <text class="t" x="595" y="208" text-anchor="middle">Hot-blob cache / CDN</text>
+        <text class="s" x="595" y="226" text-anchor="middle">re-read path</text>
+        <text class="s" x="595" y="240" text-anchor="middle">sized to</text>
+        <text class="s" x="595" y="256" text-anchor="middle">blob_ingress_BW</text>
+
+        <rect class="bv" x="750" y="160" width="190" height="120"/>
+        <text class="t" x="845" y="190" text-anchor="middle">Preprocess workers</text>
+        <text class="s" x="845" y="208" text-anchor="middle">CPU + NVDEC</text>
+        <text class="s" x="845" y="224" text-anchor="middle">decode &middot; resize</text>
+        <text class="s" x="845" y="240" text-anchor="middle">frame-sample (video)</text>
+        <text class="s" x="845" y="256" text-anchor="middle">page-render (PDF)</text>
+
+        <rect class="bn" x="1000" y="180" width="160" height="90"/>
+        <text class="t" x="1080" y="206" text-anchor="middle">Encode pool</text>
+        <text class="s" x="1080" y="224" text-anchor="middle">ViT + projector</text>
+        <text class="s" x="1080" y="240" text-anchor="middle">(Iter M1)</text>
+
+        <rect class="bn" x="1215" y="180" width="160" height="90"/>
+        <text class="t" x="1295" y="206" text-anchor="middle">Serving task</text>
+        <text class="s" x="1295" y="224" text-anchor="middle">prefill &rarr; decode</text>
+        <text class="s" x="1295" y="240" text-anchor="middle">image tok &rarr; KV (K2&middot;D32)</text>
+        <text class="s" x="1295" y="256" text-anchor="middle">(parent page)</text>
+
+        <!-- arrows -->
+        <line class="f" x1="180" y1="175" x2="260" y2="92"/>
+        <text class="num" x="206" y="124" text-anchor="middle">&#9312;</text>
+        <line class="fa" x1="260" y1="110" x2="180" y2="200"/>
+        <text class="num" x="232" y="168" text-anchor="middle">&#9313;</text>
+
+        <line class="fa" x1="180" y1="220" x2="260" y2="222"/>
+        <text class="num" x="220" y="212" text-anchor="middle">&#9314;</text>
+
+        <line class="f" x1="440" y1="222" x2="510" y2="222"/>
+        <text class="num" x="475" y="212" text-anchor="middle">&#9315;</text>
+
+        <line class="f" x1="680" y1="222" x2="750" y2="222"/>
+        <text class="num" x="715" y="212" text-anchor="middle">&#9316;</text>
+
+        <path class="fa" d="M350,270 C350,330 845,330 845,282"/>
+        <text class="num" x="595" y="348" text-anchor="middle">&#9317;</text>
+
+        <line class="f" x1="940" y1="222" x2="1000" y2="222"/>
+        <text class="num" x="970" y="212" text-anchor="middle">&#9318;</text>
+
+        <line class="f" x1="1160" y1="222" x2="1215" y2="222"/>
+        <text class="num" x="1188" y="212" text-anchor="middle">&#9319;</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>POST /v1/attachments</strong> &mdash; control-plane call; small JSON, no bytes.</li>
+        <li><span class="b">&#9313;</span> <strong>Presigned URL</strong> &mdash; service returns a direct-to-store upload URL.</li>
+        <li><span class="b">&#9314;</span> <strong>PUT bytes (out-of-band)</strong> &mdash; MB&ndash;GB blob goes client&rarr;store, never through the Router.</li>
+        <li><span class="b">&#9315;</span> <strong>Populate cache</strong> &mdash; object store fronts a hot-blob cache / CDN for re-reads.</li>
+        <li><span class="b">&#9316;</span> <strong>Pull bytes (hot)</strong> &mdash; preprocess workers read from the cache.</li>
+        <li><span class="b">&#9317;</span> <strong>Cold-miss read</strong> &mdash; on a cache miss, workers read straight from the durable store.</li>
+        <li><span class="b">&#9318;</span> <strong>Decoded frames / pages</strong> &mdash; preprocessed tensors handed to the encode pool.</li>
+        <li><span class="b">&#9319;</span> <strong>Embeddings &rarr; serving task</strong> &mdash; the encode pool streams vision embeddings to the <code>serving-prefill-job</code> task, where they splice into the token stream and become regular KV (K2&middot;D32). The encode pool + handoff are introduced at Iter&nbsp;M1; the serving task is the parent page&rsquo;s fleet.</li>
+      </ul>
+      <h4>Per-component why-exists / stores / updated-when</h4>
+      <ul>
+        <li><strong>Attachment service</strong> &mdash; <em>why:</em> mint <code>attach_id</code> + presigned URL; <em>stores:</em> the <code>Attachment</code> row; <em>updated:</em> on upload-init and on <code>status</code> transitions.</li>
+        <li><strong>Object store (S3 / GCS)</strong> &mdash; <em>why:</em> durable bytes = the RPO=0 (<em>Recovery Point Objective</em>) root of the media path; <em>stores:</em> raw blobs; <em>updated:</em> once on upload, then immutable.</li>
+        <li><strong>Hot-blob cache / CDN</strong> &mdash; <em>why:</em> serve re-reads (a re-referenced PDF page next turn) without hitting cold storage; <em>stores:</em> recent / popular blobs; <em>updated:</em> on first read + eviction.</li>
+        <li><strong>Preprocess workers (CPU + NVDEC)</strong> &mdash; <em>why:</em> keep CPU decode off the ViT GPU; <em>stores:</em> nothing durable; <em>updated:</em> per attachment.</li>
+      </ul>
+
+      <h3>M0.2 &nbsp;Why introduce this now (after Iter 1b)</h3>
+      <ul>
+        <li><strong>Enabling prior:</strong> the L4 + Router ingress (Iter 1b) exists; attachments need somewhere to land before any encode.</li>
+        <li><strong>Constraint that flipped:</strong> text fits in the request body (KBs); a 50 MB video does <em>not</em> &mdash; it would blow the request path and the Router heap. Bytes must move <strong>out-of-band</strong>.</li>
+        <li><strong>Why not inline base64 in the message?</strong> 33% size inflation + holds the HTTP/2 stream open for the whole upload + re-sends on retry. Out-of-band presigned upload is the standard answer.</li>
+        <li><strong>Roofline note:</strong> video <strong>decode</strong> is its own compute (NVDEC on GPU, or CPU <code>ffmpeg</code>); frame-sample + page-render are CPU/GPU work that must not sit on an H100 serving task.</li>
+      </ul>
+
+      <h3>M0.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Upload path</h4>
+        <p class="dc-prob">Problem: a 50 MB video cannot ride the JSON request body.</p>
+        <ul>
+          <li><span class="reject">(a) inline base64</span> &mdash; 33% inflation; holds the stream open; re-sent on retry.</li>
+          <li><span class="pick">(b) presigned direct-to-object-store + reference handle &mdash; CHOSEN.</span></li>
+          <li><span class="reject">(c) proxy-through-Router</span> &mdash; turns the Router into a byte pump.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Only (b) keeps MB&ndash;GB bytes off the latency-critical control plane while staying retry-safe.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Blob store</h4>
+        <p class="dc-prob">Problem: where do durable attachment bytes live?</p>
+        <ul>
+          <li><span class="pick">S3 / GCS &mdash; CHOSEN</span> (durable, cheap, RPO=0 root) + a hot-blob cache / CDN sized to <code>blob_ingress_BW</code>.</li>
+          <li>self-hosted MinIO &mdash; works but adds ops cost / on-call.</li>
+          <li><span class="reject">Redis / blob-in-KV-store</span> &mdash; RAM cost for cold MBs is absurd.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Cold MB&ndash;GB blobs want cheap durable object storage, not RAM; managed S3/GCS gives RPO=0 + multi-AZ for free.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Preprocessing placement</h4>
+        <p class="dc-prob">Problem: decode / resize / frame-sample / page-render is CPU-heavy work &mdash; where does it run?</p>
+        <ul>
+          <li><span class="reject">(a) on the encode task</span> &mdash; CPU decode steals ViT GPU cycles.</li>
+          <li><span class="pick">(b) dedicated preprocess workers (CPU + NVDEC) &mdash; CHOSEN.</span></li>
+          <li><span class="reject">(c) on the client</span> &mdash; untrusted; format inconsistency.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Decode must not contend for the ViT&rsquo;s compute-bound GPU, and must run on trusted, uniform infrastructure.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC4 &mdash; Video decode</h4>
+        <p class="dc-prob">Problem: decoding 50 MB clips at <code>&lambda;<sub>attach</sub>&middot;p_video</code> is heavy.</p>
+        <ul>
+          <li><span class="pick">NVDEC hardware decode &mdash; CHOSEN</span> (dedicated silicon, off the CUDA cores).</li>
+          <li><span class="reject">CPU <code>ffmpeg</code></span> &mdash; slower, CPU-bound, won&rsquo;t hold throughput.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Picked by the <code>video_bytes_mean &times; &lambda;<sub>attach</sub>&middot;p_video</code> throughput &mdash; hardware decode is the only path that keeps up.</li></ul>
+      </div>
+
+      <h3>M0.4 &nbsp;Schema introduced here</h3>
+      <div class="formula-box">@dataclass Attachment:
+    attach_id: str          # primary key
+    conv_id: str            # owning conversation
+    modality: str           # 'image' | 'pdf' | 'video'
+    blob_ref: str           # &rarr; BlobRef
+    content_hash: bytes     # sha256(bytes &Vert; preproc_params &Vert; encoder_version)
+    preproc_params: dict    # resize grid, fps_sample, dpi
+    n_vis_tok: int          # filled after encode
+    status: str             # 'uploading'|'stored'|'encoding'|'ready'|'failed'
+
+@dataclass BlobRef:
+    blob_ref: str; bytes_len: int; storage_class: str; sha256: bytes</div>
+
+      <h3>M0.5 &nbsp;Number chain</h3>
+      <div class="formula-box">blob_ingress_BW       = &lambda;_attach &times; bytes_mean = 30k/s &times; 7.1 MB &asymp; 213 GB/s   [D, S0.3]  &rarr; object-store + CDN sizing
+preproc_worker_num    = &lceil; &lambda;_attach / preproc_throughput_per_worker &rceil;            [D]  &rarr; settled at S6 (video dominates: NVDEC-bound)</div>
+
+      <h3>M0.6 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>Blob store unavailable</strong> &rarr; request fails fast (no recompute possible &mdash; bytes are the source) &rarr; mitigate with multi-AZ + retry.</li>
+        <li><strong>Malicious / corrupt media</strong> &rarr; decode bomb / decompression bomb &rarr; mitigate with size caps + sandboxed decode + timeouts.</li>
+        <li><strong>Hot-blob cache miss storm</strong> on a viral attachment &rarr; mitigate with CDN + single-flight on <code>content_hash</code>.</li>
+      </ul>
+
+      <h3>M0.7 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99</td><td>gains an <code>upload_wait</code> term for cold uploads &mdash; <span class="arrow-flat">&rarr;</span> off the model&rsquo;s critical path if the client pre-uploads.</td></tr>
+          <tr><td>TPOT / context / others</td><td><span class="arrow-flat">&rarr;</span> unchanged.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter M1 - E/P/D disaggregation                          -->
+  <!-- ===================================================== -->
+  <section class="section" id="iter-m1">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter M1 &mdash; Encode/Prefill/Decode (E/P/D) disaggregation: the vision-encoder pool</h2>
+        <div class="iter-meta">Bottleneck <strong>BM1</strong> &middot; cite <a href="../../knowledge/K12_multimodal-and-image-offload.html#d41">K12 D41</a> &middot; placed right after Iter 2&rsquo;s P/D split &middot; diagram D-M2</div>
+      </div>
+
+      <h3>M1.1 &nbsp;Architecture (diagram first) &mdash; three rooflines, three pools</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="E/P/D fleet: clients to L4 to Router, Router routes attachments to the encode pool which streams embeddings to the prefill pool, which hands KV to the decode pool">
+        <defs>
+          <marker id="m2h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+        </defs>
+        <style>
+          .bx { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .be { fill:#fff7ed; stroke:#ea580c; stroke-width:2; rx:9; }
+          .bp { fill:#ecfdf5; stroke:#059669; stroke-width:2; rx:9; }
+          .bd { fill:#eff6ff; stroke:#2563eb; stroke-width:2; rx:9; }
+          .bn { fill:#f1f5f9; stroke:#94a3b8; stroke-width:1.2; rx:8; opacity:.85; }
+          .t  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s  { font-size:11px; fill:#475569; }
+          .em { font-size:11px; font-weight:700; fill:#b91c1c; }
+          .num{ font-size:13px; font-weight:700; fill:#1d4ed8; }
+          line.f,  path.f  { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#m2h); }
+          line.fa, path.fa { stroke:#94a3b8; stroke-width:1.5; stroke-dasharray:6 4; fill:none; marker-end:url(#m2h); }
+        </style>
+
+        <rect class="bx" x="20"  y="190" width="110" height="56"/>
+        <text class="t" x="75"  y="214" text-anchor="middle">Clients</text>
+        <text class="s" x="75"  y="230" text-anchor="middle">SSE</text>
+
+        <rect class="bx" x="160" y="190" width="100" height="56"/>
+        <text class="t" x="210" y="214" text-anchor="middle">L4 LB</text>
+        <text class="s" x="210" y="230" text-anchor="middle">round-robin</text>
+
+        <rect class="bx" x="290" y="184" width="130" height="70"/>
+        <text class="t" x="355" y="208" text-anchor="middle">Router</text>
+        <text class="s" x="355" y="224" text-anchor="middle">content_hash lookup</text>
+        <text class="s" x="355" y="238" text-anchor="middle">CH dispatch</text>
+
+        <rect class="bn" x="470" y="50" width="180" height="76"/>
+        <text class="t" x="560" y="76" text-anchor="middle">Blob + preprocess</text>
+        <text class="s" x="560" y="93" text-anchor="middle">(Iter M0)</text>
+        <text class="s" x="560" y="109" text-anchor="middle">decoded frames/pages</text>
+
+        <rect class="be" x="470" y="178" width="180" height="120"/>
+        <text class="t"  x="560" y="204" text-anchor="middle">ENCODE pool</text>
+        <text class="s"  x="560" y="221" text-anchor="middle">vision-encoder-job</text>
+        <text class="em" x="560" y="240" text-anchor="middle">compute-bound</text>
+        <text class="em" x="560" y="256" text-anchor="middle">NO KV &middot; cheap SKU</text>
+        <text class="s"  x="560" y="274" text-anchor="middle">L40S &middot; autoscaled</text>
+        <text class="s"  x="560" y="290" text-anchor="middle">~14 img/s/task</text>
+
+        <rect class="bp" x="720" y="178" width="180" height="120"/>
+        <text class="t"  x="810" y="204" text-anchor="middle">PREFILL pool</text>
+        <text class="em" x="810" y="223" text-anchor="middle">compute-bound</text>
+        <text class="s"  x="810" y="241" text-anchor="middle">8&times;H100 &middot; TP</text>
+        <text class="s"  x="810" y="259" text-anchor="middle">text + vision tok</text>
+        <text class="s"  x="810" y="277" text-anchor="middle">&rarr; K,V (320 KB/tok)</text>
+
+        <rect class="bd" x="970" y="178" width="180" height="120"/>
+        <text class="t"  x="1060" y="204" text-anchor="middle">DECODE pool</text>
+        <text class="em" x="1060" y="223" text-anchor="middle">BW-bound</text>
+        <text class="s"  x="1060" y="241" text-anchor="middle">8&times;H100</text>
+        <text class="s"  x="1060" y="259" text-anchor="middle">autoregressive</text>
+        <text class="s"  x="1060" y="277" text-anchor="middle">modality-agnostic</text>
+
+        <!-- arrows -->
+        <line class="f" x1="130" y1="218" x2="160" y2="218"/>
+        <text class="num" x="145" y="208" text-anchor="middle">&#9312;</text>
+        <line class="f" x1="260" y1="218" x2="290" y2="218"/>
+        <text class="num" x="275" y="208" text-anchor="middle">&#9313;</text>
+
+        <line class="f" x1="420" y1="200" x2="470" y2="110"/>
+        <text class="num" x="435" y="150" text-anchor="middle">&#9314;</text>
+        <line class="fa" x1="560" y1="126" x2="560" y2="178"/>
+        <text class="num" x="575" y="156" text-anchor="middle">&#9315;</text>
+
+        <line class="f" x1="420" y1="228" x2="470" y2="238"/>
+        <text class="num" x="445" y="248" text-anchor="middle">&#9316;</text>
+
+        <line class="f" x1="650" y1="238" x2="720" y2="238"/>
+        <text class="num" x="685" y="226" text-anchor="middle">&#9317;</text>
+
+        <path class="f" d="M355,254 C355,360 810,360 810,298"/>
+        <text class="num" x="585" y="378" text-anchor="middle">&#9318;</text>
+
+        <line class="f" x1="900" y1="238" x2="970" y2="238"/>
+        <text class="num" x="935" y="226" text-anchor="middle">&#9319;</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>HTTP / SSE</strong> &mdash; client request enters the L4 load balancer.</li>
+        <li><span class="b">&#9313;</span> <strong>Route</strong> &mdash; L4 hands to a Router task.</li>
+        <li><span class="b">&#9314;</span> <strong>Attachment &rarr; blob/preprocess</strong> &mdash; Router triggers the Iter M0 path for the bytes.</li>
+        <li><span class="b">&#9315;</span> <strong>Decoded frames</strong> &mdash; preprocess feeds the encode pool.</li>
+        <li><span class="b">&#9316;</span> <strong>Encode dispatch</strong> &mdash; Router routes by CH-on-<code>content_hash</code> &rarr; identical attachments coalesce (single-flight).</li>
+        <li><span class="b">&#9317;</span> <strong>Embeddings (gRPC over RDMA)</strong> &mdash; <code>[n_vis_tok &times; d_model]</code> &asymp; 21 MB/image streamed to prefill.</li>
+        <li><span class="b">&#9318;</span> <strong>Text path</strong> &mdash; Router sends text tokens to the prefill task chosen by CH-on-<code>conv_id</code> (parent path).</li>
+        <li><span class="b">&#9319;</span> <strong>K,V handoff (RDMA)</strong> &mdash; prefill streams produced K,V to the decode pool (parent Iter 2 transport).</li>
+      </ul>
+      <p><strong>The whole point in one line:</strong> three stages, <strong>three different rooflines</strong> &mdash; encode is compute-bound with
+        <em>no KV</em>, prefill is compute-bound, decode is bandwidth-bound &mdash; so each gets its own independently-scaled pool, exactly as Iter 2 split
+        prefill from decode.</p>
+
+      <h3>M1.2 &nbsp;Why introduce this now (right after Iter 2&rsquo;s P/D split)</h3>
+      <ul>
+        <li><strong>Enabling prior:</strong> Iter 2 already split rooflines (prefill compute-bound vs decode BW-bound) into separate pools. M1 is the <em>same move, one stage earlier</em>: the encoder is a <strong>third roofline</strong> (compute-bound, fixed-depth, <strong>no KV</strong>, single bidirectional forward &mdash; &sect;M.6.1).</li>
+        <li><strong>Constraint that flipped:</strong> colocation (the common baseline) provisions encode capacity on <em>every</em> serving task &mdash; sized to total QPS &mdash; but only <code>f_mm = 0.15</code> of requests carry an attachment, so ~85% of that capacity sits idle. And when a colocated ViT <em>does</em> fire, its compute-bound burst steals SM (<em>Streaming Multiprocessor</em>) cycles from the latency-sensitive prefill/decode sharing the GPU. <strong>The HBM cost is <em>not</em> the issue</strong>: 1.2 GB of BF16 ViT weights (0.6 B &times; 2 B) is a rounding error next to the LLM&rsquo;s ~140 GB (70 B &times; 2 B).</li>
+        <li><strong>Why disaggregate?</strong> Three reasons &mdash; all the Iter 2 argument one stage earlier: <strong>(1) independent scaling</strong> &mdash; encode capacity tracks <code>&lambda;_attach</code>, not total QPS (~6.7&times; less over-provisioning at <code>f_mm = 0.15</code>); <strong>(2) no compute interference</strong> &mdash; the ViT&rsquo;s compute-bound burst no longer jitters decode; <strong>(3) batching</strong> &mdash; a dedicated pool batches ViT forwards across requests (Iter M3 ragged), which a per-task colocated ViT cannot. Plus a <strong>cheaper SKU</strong> (no 70 B weights to hold).</li>
+        <li><strong>The handoff (K12 D41):</strong> the encode pool emits <strong>embeddings</strong> (<code>[n_vis_tok &times; d_model]</code>) over the <em>same</em> gRPC-over-RDMA (<em>Remote Direct Memory Access</em>) transport as the Iter 2 K,V handoff &mdash; a smaller payload: <code>1.3k &times; 8192 &times; 2 B &asymp; 21 MB/image</code> vs the <code>1.3k &times; 320 KB &asymp; 416 MB</code> of K,V that prefill <em>produces</em> from them.</li>
+      </ul>
+
+      <div class="note-box"><strong>Baseline vs. this page&rsquo;s target.</strong> The <em>common production baseline is colocation</em>: vLLM and
+        SGLang run the ViT inside the same serving engine, on the same GPU as the LLM, and a 0.6 B ViT is cheap to carry. Disaggregation is the
+        <em>scale-out</em> move &mdash; it earns its extra hop only once attachment volume (<code>&lambda;_attach</code>) is high enough that independent
+        scaling + dedicated ragged batching + a cheaper SKU dominate. This page builds the scaled target; a smaller deployment would stop at colocation.</div>
+
+      <h3>M1.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Encode placement</h4>
+        <p class="dc-prob">Problem: where does the ViT run?</p>
+        <ul>
+          <li><span class="reject">(a) colocated ViT in every serving task</span> (the common baseline) &mdash; encode capacity idle ~85%, compute-bound bursts jitter decode, no cross-request ViT batching.</li>
+          <li><span class="pick">(b) dedicated <code>vision-encoder-job</code> pool, autoscaled &mdash; CHOSEN</span> (K12 D41).</li>
+          <li><span class="reject">(c) external 3rd-party vision API</span> &mdash; added latency + data-egress + no cache control.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Only a dedicated pool lets encode capacity track attachment arrival independently of LLM capacity, batch ViT forwards across requests for MFU, and keep the (deterministic) output under our cache control.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Encode-task hardware</h4>
+        <p class="dc-prob">Problem: which GPU SKU for a compute-bound 0.6 B ViT?</p>
+        <ul>
+          <li><span class="reject">(a) same 8&times;H100 as serving</span> &mdash; overkill; no 70 B weights to hold.</li>
+          <li><span class="pick">(b) smaller / cheaper GPU (L40S / A10 / 1&ndash;2&times;H100) &mdash; CHOSEN</span>, sized by <code>enc_throughput_per_task</code>.</li>
+          <li><span class="reject">(c) CPU</span> &mdash; ViT is GPU work.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>The ViT (1.2 GB BF16 weights) fits a 48 GB L40S with room for big ragged batches; the compute-bound roofline means a cheaper FLOP/$ SKU wins over H100.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Embedding handoff transport</h4>
+        <p class="dc-prob">Problem: move <code>~21 MB/image</code> embeddings from encode to prefill.</p>
+        <ul>
+          <li><span class="pick">(a) gRPC-stream over RDMA (reuse Iter 2) &mdash; CHOSEN</span> &mdash; trivial at 21 MB.</li>
+          <li>(b) write to blob store + prefill pulls &mdash; adds a hop for a small payload, <em>but</em> this becomes the cache-write path in the next iteration.</li>
+          <li><span class="reject">(c) one-sided RDMA verbs</span> &mdash; payload too small to justify; defer.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>21 MB is negligible on the existing RDMA fabric; reusing the Iter 2 transport adds zero new infrastructure.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC4 &mdash; Encode&harr;prefill binding</h4>
+        <p class="dc-prob">Problem: which encode task, and which prefill task?</p>
+        <ul class="why-list">
+          <li>Router routes the attachment to an encode task by <strong>CH-on-<code>content_hash</code></strong> (coalesces identical attachments &rarr; single-flight); the encode task streams embeddings to the prefill task chosen by <strong>CH-on-<code>conv_id</code></strong> (the parent path). Two different hash keys, one for dedup, one for conv locality.</li>
+        </ul>
+      </div>
+
+      <h3>M1.4 &nbsp;Wait-time formula delta</h3>
+      <div class="formula-box">approx_wait_encode(t_e) = &Sigma; over t_e&rsquo;s queue of &gamma;_encode(attach)
+&gamma;_encode(attach) &asymp; enc_FLOPs(attach) / F_sustained_encode        [D &mdash; K12]
+TTFT = max(encode_path, text_prefill_path) + remaining_prefill + decode_first_tok
+       (encode of an attachment overlaps text prefill where possible)</div>
+
+      <div class="note-box"><strong>The 400 ms budget for multimodal is the binding case &mdash; a number owed at compose, not a free
+        &ldquo;unchanged.&rdquo;</strong> A multimodal request prefills <code>T_in_mm_mean &asymp; 23.6 k</code> tokens (&sect;S0.3) &mdash; <strong>~1.8&times;</strong>
+        the 13.3 k text mean &mdash; so the vision span <em>dominates</em> TTFT, and encode is added on top. It fits the &le; 400 ms budget only because
+        three things stack: <strong>(1)</strong> encode overlaps text prefill (the <code>max(&middot;)</code> above), so it is hidden, not summed, when the
+        client pre-uploads; <strong>(2)</strong> chunked prefill (Iter 4 delta) keeps the long vision prefill from head-of-line-blocking; <strong>(3)</strong>
+        on a repeat attachment the Iter M2 layer-ii vision-K,V hit removes the vision-prefill term entirely. <strong>The cold, large, first-time attachment
+        is the worst case</strong> &mdash; for it, TTFT degrades and is governed by the <code>encode SLO</code> + a per-request prefill budget set at compose
+        (e.g. relax TTFT for attachments above a token cap, rather than silently breach it).</div>
+
+      <h3>M1.5 &nbsp;Number chain</h3>
+      <div class="formula-box">enc_throughput_per_task = MFU &middot; F_peak(L40S) / enc_FLOPs(img)
+                        = 0.5 &times; 181 TFLOP/s / 6.4 TFLOP &asymp; 14 img/s            [D]
+enc_task_num (pre-cache) = &lceil; &lambda;_attach / enc_throughput &times; headroom &rceil;
+                         = &lceil; 30,000 / 14 &times; 1.3 &rceil; &asymp; 2,760 L40S tasks       [D]
+$/mo_encode             = enc_task_num &times; $_per_L40S_task_per_mo  (cheaper SKU &rarr; small line item)
+relative cost           = enc_FLOPs / vision-prefill_FLOPs &asymp; 3.5%  &mdash; the encode pool is a few % of the LLM FLOP budget</div>
+      <p>This <code>enc_task_num</code> is <strong>provisional</strong>: Iter&nbsp;M3 (ragged batching) raises <code>enc_throughput_per_task</code> and
+        Iter&nbsp;M2 (embedding cache) cuts <code>&lambda;<sub>attach</sub></code> by the <em>incremental</em> <code>enc_cache_hit_rate</code> &asymp; 0.4,
+        shrinking it to <code>&lceil;30,000&middot;0.6 / 14 &times; 1.3&rceil; &asymp; 1,660</code> tasks &mdash; both settled at S6. The encode pool is a
+        <strong>small $ line</strong> regardless (ViT FLOPs &asymp; 3.5% of per-attachment compute); the larger M2 saving is on the <em>prefill</em> pool (layer ii).</p>
+
+      <h3>M1.6 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>Encode pool saturated</strong> &rarr; TTFT breach on multimodal requests &rarr; autoscale on <code>approx_wait_encode</code> p99 (same signal discipline as the parent).</li>
+        <li><strong>Embedding / version skew</strong> (encoder redeployed mid-flight) &rarr; <code>encoder_version</code> in <code>content_hash</code> invalidates stale cache.</li>
+        <li><strong>Handoff fabric contention</strong> shares the Iter 2/3b NIC (<em>Network Interface Card</em>) budget &rarr; account the encode handoff in the NIC budget re-derivation.</li>
+      </ul>
+
+      <h3>M1.7 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99 (multimodal)</td><td><span class="arrow-down">&darr;</span> no ViT idle-steal; encode scales independently.</td></tr>
+          <tr><td>TPOT p99</td><td><span class="arrow-flat">&rarr;</span> unchanged.</td></tr>
+          <tr><td>$/mo</td><td><span class="arrow-up">&uarr;</span> small (new pool) &mdash; but &Lt; the prefill savings from the embedding cache.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter M3 - Ragged variable-resolution encoder batching   -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="iter-m3">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter M3 &mdash; Ragged variable-resolution encoder batching</h2>
+        <div class="iter-meta">Bottleneck <strong>BM3</strong> &middot; cite <a href="../../knowledge/K12_multimodal-and-image-offload.html#d27">K12 D27</a> &middot; placed after Iter 4 + Iter M1 &middot; diagram D-M4</div>
+      </div>
+
+      <h3>M3.1 &nbsp;The problem, in one diagram (D-M4)</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ragged batching: pad-to-max wastes half the batch on padding, ragged varlen concat with cu_seqlens has no intra-batch padding">
+        <style>
+          .c  { fill:#fcd34d; stroke:#d97706; stroke-width:1.2; }
+          .c2 { fill:#fdba74; stroke:#c2410c; stroke-width:1.2; }
+          .c3 { fill:#fca5a5; stroke:#b91c1c; stroke-width:1.2; }
+          .pad{ fill:#e2e8f0; stroke:#94a3b8; stroke-width:1; }
+          .t  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s  { font-size:11px; fill:#475569; }
+          .em { font-size:12px; font-weight:700; fill:#b91c1c; }
+          .ok { font-size:12px; font-weight:700; fill:#15803d; }
+          .tick { stroke:#0f172a; stroke-width:1.2; }
+        </style>
+
+        <!-- divider -->
+        <line x1="600" y1="40" x2="600" y2="330" stroke="#cbd5e1" stroke-width="1.2" stroke-dasharray="5 4"/>
+
+        <!-- Panel A: pad-to-max -->
+        <text class="t"  x="40" y="60">(a) Pad-to-max</text>
+        <text class="em" x="40" y="78">every image padded to the largest &rarr; MFU collapses</text>
+
+        <text class="s" x="40" y="113">img A (64 patches)</text>
+        <rect class="c"   x="180" y="98"  width="40"  height="28"/>
+        <rect class="pad" x="220" y="98"  width="350" height="28"/>
+
+        <text class="s" x="40" y="163">img B (1 332)</text>
+        <rect class="c"   x="180" y="148" width="150" height="28"/>
+        <rect class="pad" x="330" y="148" width="240" height="28"/>
+
+        <text class="s" x="40" y="213">img C (5 329)</text>
+        <rect class="c"   x="180" y="198" width="390" height="28"/>
+
+        <text class="em" x="180" y="258">&asymp; half the batch is padding &rarr; wasted FLOPs</text>
+
+        <!-- Panel B: ragged -->
+        <text class="t"  x="640" y="60">(b) Ragged varlen concat</text>
+        <text class="ok" x="640" y="78">FlashAttention cu_seqlens &rarr; no intra-batch pad</text>
+
+        <rect class="c"   x="640" y="150" width="40"  height="32"/>
+        <rect class="c2"  x="680" y="150" width="150" height="32"/>
+        <rect class="c3"  x="830" y="150" width="300" height="32"/>
+        <rect class="pad" x="1130" y="150" width="18" height="32"/>
+        <!-- cu_seqlens ticks -->
+        <line class="tick" x1="640"  y1="146" x2="640"  y2="192"/>
+        <line class="tick" x1="680"  y1="146" x2="680"  y2="192"/>
+        <line class="tick" x1="830"  y1="146" x2="830"  y2="192"/>
+        <line class="tick" x1="1130" y1="146" x2="1130" y2="192"/>
+        <text class="s" x="640"  y="208" text-anchor="middle">0</text>
+        <text class="s" x="680"  y="208" text-anchor="middle">64</text>
+        <text class="s" x="830"  y="208" text-anchor="middle">1396</text>
+        <text class="s" x="1130" y="208" text-anchor="middle">6725</text>
+        <text class="s"  x="640" y="232">cu_seqlens = [0, 64, 1396, 6725]  (cumulative sequence lengths)</text>
+        <text class="ok" x="640" y="258">padding only to the tile boundary &rarr; MFU &asymp; 1/(1&minus;pad_fraction) recovered</text>
+
+        <!-- legend -->
+        <rect class="c"   x="40"  y="305" width="16" height="12"/><text class="s" x="62"  y="315">real patch tokens</text>
+        <rect class="pad" x="220" y="305" width="16" height="12"/><text class="s" x="242" y="315">padding (wasted)</text>
+      </svg>
+      </div>
+
+      <h3>M3.2 &nbsp;Why introduce this now (after Iter 4 + Iter M1)</h3>
+      <ul>
+        <li><strong>Enabling priors:</strong> Iter M1 gave a dedicated encode pool to optimize; Iter 4 established the <strong>ragged / varlen batching pattern</strong> (FlashAttention <code>cu_seqlens</code>, end-of-buffer-only padding) &mdash; M3 is that pattern applied to the ViT.</li>
+        <li><strong>Constraint that flipped:</strong> images / PDF-pages / frames arrive at <strong>wildly different resolutions</strong> &rarr; different patch counts (a thumbnail = 64 patches; a 4K screenshot = 20 k). A naive fixed-shape ViT batch pads every image to the largest &rarr; <strong>encoder MFU collapses</strong> (half the batch is padding).</li>
+        <li><strong>Why not bucket by size?</strong> Bucketing reduces but does not eliminate padding and adds queueing latency (wait to fill a bucket). Ragged batching eliminates intra-batch padding &mdash; same trick as Iter 4.</li>
+        <li><strong>Why not a fixed-token resampler (cap every image to <code>N_query</code>)?</strong> That is the &sect;M.5 connector DC; it bounds tokens but caps detail. Native dynamic resolution + ragged batching keeps detail <strong>and</strong> MFU.</li>
+      </ul>
+
+      <h3>M3.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; Encoder batch layout</h4>
+        <p class="dc-prob">Problem: variable patch counts in one batch.</p>
+        <ul>
+          <li><span class="reject">(a) fixed-shape pad-to-max</span> &mdash; MFU collapse.</li>
+          <li>(b) size-bucketed &mdash; residual pad + queueing latency.</li>
+          <li><span class="pick">(c) ragged / varlen concat (FlashAttention <code>cu_seqlens</code>) &mdash; CHOSEN</span> (K12 D27).</li>
+          <li>(d) fixed <code>N_query</code> resampler &mdash; caps detail (the &sect;M.5 connector axis, orthogonal).</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Only ragged concat removes intra-batch padding without bucket-fill latency or detail loss &mdash; it recovers MFU directly.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Batch admission knob <code>B_enc</code></h4>
+        <p class="dc-prob">Problem: how many images per ragged batch? This knob has a cliff on both sides.</p>
+        <ul>
+          <li><strong>Floor cliff:</strong> <code>B_enc</code> too small &rarr; ViT weight-read dominates, compute-starved (the same per-tick weight read whether 1 or many images).</li>
+          <li><strong>Ceiling cliff:</strong> <code>B_enc</code> too large &rarr; activation footprint + latency blow up.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Same shape as Iter 4&rsquo;s chunk knob; the range is settled at compose against the image-size distribution (S0.3): pick the smallest <code>B_enc</code> past the floor that fits the activation budget.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; PDF / video intra-attachment batching</h4>
+        <ul class="why-list">
+          <li>A PDF&rsquo;s pages and a video&rsquo;s frames are <strong>independent images</strong> &rarr; batch them together raggedly (one PDF = one ragged batch of N pages), improving MFU on multi-page / multi-frame attachments &mdash; no waiting on other users.</li>
+        </ul>
+      </div>
+
+      <h3>M3.4 &nbsp;Number chain</h3>
+      <div class="formula-box">enc_throughput_per_task &rarr; rises by the MFU-recovery factor 1 / (1 &minus; pad_fraction)
+   pad-to-max pad_fraction &asymp; 0.5  &rarr;  recovery &asymp; 2&times;  (ragged removes it)
+   &rArr; enc_task_num shrinks proportionally  [D, settled at S6]</div>
+
+      <h3>M3.5 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong>Adversarial all-same-huge-size batch</strong> &rarr; activation OOM (<em>Out Of Memory</em>) &rarr; cap total patches/batch.</li>
+        <li><strong>Ragged kernel tuning at extreme aspect ratios</strong> &rarr; pad-to-tile within varlen (the Iter 4 mitigation).</li>
+        <li><strong>Head-of-line:</strong> one giant image (20 k patches) in a ragged batch &rarr; chunk the ViT forward (mirror Iter 4 chunked prefill) for the encoder.</li>
+      </ul>
+
+      <h3>M3.6 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>Encode-pool $/mo</td><td><span class="arrow-down">&darr;</span> MFU recovery &rarr; fewer encode tasks.</td></tr>
+          <tr><td>TTFT p99 (multimodal)</td><td><span class="arrow-down">&darr;</span> less encode queueing.</td></tr>
+          <tr><td>LLM-side SLOs</td><td><span class="arrow-flat">&rarr;</span> unchanged.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Iter M2 - Content-addressed vision-embedding cache      -->
+  <!-- ===================================================== -->
+  <section class="section" id="iter-m2">
+    <div class="container">
+      <div class="iter-head">
+        <h2><span class="mk mk-new">NEW</span> Iter M2 &mdash; Content-addressed vision-embedding cache (the genuinely new cache layer)</h2>
+        <div class="iter-meta">Bottleneck <strong>BM2</strong> &middot; cite <a href="../../knowledge/K12_multimodal-and-image-offload.html">K12 (embedding cache)</a> + <a href="../../knowledge/K2_kv-cache.html#d52">K2 D52 (privacy probe)</a> &middot; placed after Iter 5 &middot; diagram D-M3</div>
+      </div>
+
+      <div class="warn-box"><strong>The headline reversal &mdash; and exactly what it buys.</strong> Parent &sect;8b DC3 <strong>rejected</strong>
+        content-addressed pool keys for text (&ldquo;the one big shared blob <code>hidden_sys</code> is pinned per task, never pooled &rarr; nothing to
+        dedup&rdquo;). For vision a dedup-able content class actually <em>exists</em>, so content-addressing buys <strong>two distinct things</strong>,
+        and it is important not to conflate them:
+        <ol style="margin:.5em 0 0 0">
+          <li><strong>Per-user, cross-conversation reuse</strong> (the <em>guaranteed</em> win) &mdash; the same user&rsquo;s same attachment hits across
+            different convs and <em>after</em> the conv&rsquo;s K,V is evicted from the pool. This is a strict <strong>superset</strong> of the parent&rsquo;s
+            conv-scoped hit, and it needs no public flag &mdash; it is keyed <code>hash(tenant_id &Vert; content_hash)</code>.</li>
+          <li><strong>Cross-user dedup</strong> (the <em>opt-in</em> win) &mdash; byte-identical uploads shared across users, but <strong>only the
+            public/shareable slice</strong> by default, because DC3 keys <em>private</em> uploads per-user. A viral meme or shared PDF a user uploads
+            privately does <strong>not</strong> dedup cross-user unless flagged shared.</li>
+        </ol>
+        So the optional key space becomes <strong>load-bearing here</strong> &mdash; strongly for (1), opt-in for (2). Per-modality decision; it does
+        <strong>not</strong> retroactively change <code>distributed_kv_cache.html</code> / implies <strong>no</strong> <code>DESIGN_CHOICE_CHANGE.md</code>
+        entry for the text page.</div>
+
+      <div class="note-box"><strong>Baseline vs. frontier here too.</strong> Layer (i) &mdash; caching the encoder <em>output</em> per attachment &mdash; is
+        already <em>mainstream</em>: vLLM ships a multimodal encoder-output cache, and per-conversation prefix caching that hashes vision tokens is standard
+        in vLLM / SGLang. What is <em>frontier</em> (large-operator, not the common baseline) is the <strong>cross-user, content-addressed dedup behind the
+        privacy gate</strong> (layer ii + DC3): keying vision K,V by <code>content_hash</code> <em>across tenants</em> and defending the K2 D52 timing probe.
+        A smaller deployment ships layer (i) + conv-scoped reuse and stops there.</div>
+
+      <h3>M2.1 &nbsp;Architecture (diagram first) &mdash; two cache layers, content-addressed</h3>
+      <div class="svg-wrap">
+      <svg viewBox="0 0 1180 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Embedding cache: Router looks up content_hash; hit streams cached embeddings to prefill skipping encode; miss encodes and writes back; prefill writes content-addressed vision KV to the pool; two-class keying for privacy">
+        <defs>
+          <marker id="m3h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/>
+          </marker>
+          <marker id="m3g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#15803d"/>
+          </marker>
+        </defs>
+        <style>
+          .bx { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .ca { fill:#f5f3ff; stroke:#7c3aed; stroke-width:2; rx:9; }
+          .be { fill:#fff7ed; stroke:#ea580c; stroke-width:1.6; rx:8; }
+          .bp { fill:#ecfdf5; stroke:#059669; stroke-width:1.6; rx:8; }
+          .bd { fill:#eff6ff; stroke:#2563eb; stroke-width:1.6; rx:8; }
+          .key{ fill:#fffbeb; stroke:#d97706; stroke-width:1.4; rx:8; }
+          .t  { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s  { font-size:11px; fill:#475569; }
+          .em { font-size:11px; font-weight:700; fill:#7c3aed; }
+          .num{ font-size:13px; font-weight:700; fill:#1d4ed8; }
+          .numg{ font-size:13px; font-weight:700; fill:#15803d; }
+          line.f,  path.f  { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#m3h); }
+          line.g,  path.g  { stroke:#15803d; stroke-width:1.8; fill:none; marker-end:url(#m3g); }
+        </style>
+
+        <rect class="bx" x="20" y="200" width="150" height="80"/>
+        <text class="t" x="95" y="232" text-anchor="middle">Router</text>
+        <text class="s" x="95" y="250" text-anchor="middle">per-attach</text>
+        <text class="s" x="95" y="264" text-anchor="middle">content_hash</text>
+
+        <rect class="ca" x="270" y="40" width="250" height="130"/>
+        <text class="t"  x="395" y="66"  text-anchor="middle">Embedding cache (layer i)</text>
+        <text class="s"  x="395" y="84"  text-anchor="middle">encoder output &middot; ~21 MB/img</text>
+        <text class="s"  x="395" y="100" text-anchor="middle">key: content_hash</text>
+        <text class="s"  x="395" y="116" text-anchor="middle">on kv-store-job (2nd key space)</text>
+        <text class="em" x="395" y="138" text-anchor="middle">saves ViT FLOPs</text>
+        <text class="s"  x="395" y="156" text-anchor="middle">eviction: LFU-leaning</text>
+
+        <rect class="be" x="270" y="330" width="210" height="100"/>
+        <text class="t" x="375" y="360" text-anchor="middle">Encode pool</text>
+        <text class="s" x="375" y="378" text-anchor="middle">(Iter M1)</text>
+        <text class="s" x="375" y="396" text-anchor="middle">runs only on MISS</text>
+
+        <rect class="bp" x="610" y="200" width="180" height="120"/>
+        <text class="t" x="700" y="230" text-anchor="middle">Prefill pool</text>
+        <text class="s" x="700" y="250" text-anchor="middle">text + vision tok</text>
+        <text class="s" x="700" y="268" text-anchor="middle">&rarr; K,V (320 KB/tok)</text>
+
+        <rect class="ca" x="860" y="40" width="290" height="140"/>
+        <text class="t"  x="1005" y="66"  text-anchor="middle">Vision-K,V cache (layer ii)</text>
+        <text class="s"  x="1005" y="84"  text-anchor="middle">post-prefill &middot; ~416 MB/img</text>
+        <text class="s"  x="1005" y="100" text-anchor="middle">key: (content_hash, chain-pos)</text>
+        <text class="s"  x="1005" y="116" text-anchor="middle">in the Iter 3b pool</text>
+        <text class="em" x="1005" y="138" text-anchor="middle">saves prefill FLOPs</text>
+        <text class="s"  x="1005" y="158" text-anchor="middle">chain: hash(parent &Vert; content_hash &Vert; span)</text>
+
+        <rect class="bd" x="900" y="330" width="180" height="100"/>
+        <text class="t" x="990" y="372" text-anchor="middle">Decode pool</text>
+        <text class="s" x="990" y="390" text-anchor="middle">modality-agnostic</text>
+
+        <!-- two-class keying inset -->
+        <rect class="key" x="510" y="350" width="350" height="110"/>
+        <text class="t"  x="685" y="372" text-anchor="middle">Two-class keying (privacy DC3)</text>
+        <text class="s"  x="525" y="392" text-anchor="start">&bull; shared/public: key = content_hash (dedup fleet-wide)</text>
+        <text class="s"  x="525" y="410" text-anchor="start">&bull; private (DEFAULT): key = hash(tenant_id &Vert; content_hash)</text>
+        <text class="s"  x="525" y="428" text-anchor="start">&bull; private &rArr; chain hash includes tenant_id</text>
+        <text class="s"  x="525" y="446" text-anchor="start">&nbsp;&nbsp;&rarr; no cross-user hit (closes the K2 D52 probe)</text>
+
+        <!-- arrows -->
+        <line class="f" x1="170" y1="222" x2="270" y2="130"/>
+        <text class="num" x="205" y="166" text-anchor="middle">&#9312;</text>
+
+        <path class="g" d="M520,150 C560,150 580,200 610,224"/>
+        <text class="numg" x="560" y="172" text-anchor="middle">&#9313;</text>
+
+        <line class="f" x1="150" y1="280" x2="270" y2="362"/>
+        <text class="num" x="195" y="334" text-anchor="middle">&#9314;</text>
+
+        <line class="f" x1="380" y1="330" x2="392" y2="170"/>
+        <text class="num" x="410" y="250" text-anchor="middle">&#9315;</text>
+
+        <line class="f" x1="480" y1="345" x2="610" y2="305"/>
+        <text class="num" x="548" y="326" text-anchor="middle">&#9316;</text>
+
+        <line class="f" x1="790" y1="226" x2="860" y2="130"/>
+        <text class="num" x="815" y="166" text-anchor="middle">&#9317;</text>
+
+        <path class="g" d="M860,150 C820,150 800,200 790,232"/>
+        <text class="numg" x="812" y="196" text-anchor="middle">&#9318;</text>
+
+        <line class="f" x1="790" y1="300" x2="900" y2="362"/>
+        <text class="num" x="840" y="346" text-anchor="middle">&#9319;</text>
+      </svg>
+      </div>
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Lookup</strong> &mdash; Router probes the embedding cache by <code>content_hash</code> before any encode.</li>
+        <li><span class="b" style="color:#15803d">&#9313;</span> <strong>HIT &rarr; embeddings</strong> (green = fast path) &mdash; cached embeddings stream straight to prefill; <strong>encode skipped.</strong></li>
+        <li><span class="b">&#9314;</span> <strong>MISS &rarr; dispatch</strong> &mdash; on a miss the Router dispatches an encode (Iter M1, single-flight on <code>content_hash</code>).</li>
+        <li><span class="b">&#9315;</span> <strong>Write embeddings</strong> &mdash; the encode result is written back to the cache for the next requester.</li>
+        <li><span class="b">&#9316;</span> <strong>Embeddings &rarr; prefill</strong> &mdash; freshly-encoded embeddings also go to prefill.</li>
+        <li><span class="b">&#9317;</span> <strong>Write vision-K,V</strong> &mdash; prefill writes the content-addressed vision K,V into the Iter 3b pool (layer ii).</li>
+        <li><span class="b" style="color:#15803d">&#9318;</span> <strong>HIT &rarr; skip vision prefill</strong> (green) &mdash; a pooled vision-K,V hit lets prefill skip the vision span entirely.</li>
+        <li><span class="b">&#9319;</span> <strong>K,V &rarr; decode</strong> &mdash; unchanged parent handoff.</li>
+      </ul>
+
+      <h3>M2.2 &nbsp;Why introduce this now (after Iter 5)</h3>
+      <ul>
+        <li><strong>Enabling priors:</strong> Iter M1 made the encoder output a <strong>clean standalone artifact</strong> (embeddings, pre-prefill) &mdash; a well-defined thing to cache. Iter 5 built the <strong>content-hash chain</strong>; Iter 3b built the <strong>pooled store</strong>. M2 reuses both &mdash; the cache <strong>co-tenants the existing <code>kv-store-job</code></strong> as a second key space (no new job).</li>
+        <li><strong>Constraint that flipped (&sect;M.6.3):</strong> the encoder is <strong>deterministic</strong> &mdash; same bytes + same <code>preproc_params</code> + same <code>encoder_version</code> &rarr; <strong>bit-identical embeddings.</strong> So re-encoding the same bytes is <strong>pure waste</strong> (BM2).</li>
+        <li><strong>What is genuinely net-new over the parent (do not over-count):</strong> within an <em>admitted</em> conv, the parent conv-keyed pool already serves a re-referenced attachment (no re-encode, no re-prefill) &mdash; so <code>vis_intra_conv_reref = 0.7</code> is <strong>mostly already covered</strong>. M2 adds value only where the conv-keyed pool cannot reach: <strong>(a)</strong> the same user&rsquo;s attachment <em>across convs / after the conv&rsquo;s K,V is evicted</em> (per-user key), and <strong>(b)</strong> the <strong>public/shareable slice</strong> of <code>vis_cross_user_dup = 0.2</code> (cross-user key). These two, not the raw 0.7, set the incremental hit rate.</li>
+        <li><strong>What to cache &mdash; two layers, both keyed by <code>content_hash</code>:</strong>
+          <ul>
+            <li><strong>(i) Embedding cache (encoder output, pre-prefill)</strong> &mdash; saves the <strong>ViT FLOPs</strong>; small payload (~21 MB/img). This is K12&rsquo;s embedding cache. Applies to <em>every</em> attachment that re-hits (a 21 MB fetch always beats re-encoding), but ViT FLOPs are only <strong>~3.5%</strong> of the per-attachment compute (&sect;S3), so this is the <em>smaller</em> saving.</li>
+            <li><strong>(ii) Content-addressed vision-K,V (post-prefill, in the Iter 3b pool)</strong> &mdash; saves the <strong>LLM prefill FLOPs</strong> on the vision span (the larger cost); payload ~416 MB/img; keyed by <code>(content_hash, chain-pos)</code> via the Iter 5 chain delta. <strong>Gated by the ~1.9 k recompute-vs-transfer crossover:</strong> a lone image (~1.3 k vision tokens) sits <em>below</em> it &mdash; re-prefill beats a pool fetch &mdash; so layer (ii) pays off for <strong>PDFs / video / multi-image</strong>, not single images.</li>
+          </ul>
+          Both ship; (i) is the cheap universal encode-FLOP trim, (ii) the larger prefill-FLOP win <em>where the attachment clears the crossover</em>.</li>
+      </ul>
+
+      <h3>M2.3 &nbsp;Design choices</h3>
+      <div class="dc">
+        <h4>DC1 &mdash; What to cache</h4>
+        <p class="dc-prob">Problem: an encode and a vision-prefill are both repeatable work &mdash; cache which?</p>
+        <ul>
+          <li><span class="reject">(a) nothing (re-encode every time)</span> &mdash; wastes ViT FLOPs.</li>
+          <li>(b) embedding cache only &mdash; saves ViT, but still re-prefills the vision span.</li>
+          <li><span class="pick">(c) embedding + content-addressed vision-K,V &mdash; CHOSEN</span> &mdash; saves ViT <em>and</em> vision-prefill.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list">
+          <li>The vision span is the dominant prefill cost for a multimodal request (the embedding cache alone trims only the ~3.5% encode FLOPs), so layer (ii) is what makes M2 a material $ saving.</li>
+          <li><strong>But layer (ii) is conditional:</strong> below the ~1.9 k recompute-vs-transfer crossover (inherited from the parent length gate), re-prefilling a lone image&rsquo;s ~1.3 k tokens beats pulling its ~416 MB of K,V over the fabric &mdash; so layer (ii) is admitted only for attachments above the crossover (PDFs / video / multi-image). Layer (i) embedding cache still applies to lone images.</li>
+        </ul>
+      </div>
+      <div class="dc">
+        <h4>DC2 &mdash; Key</h4>
+        <p class="dc-prob">Problem: what identifies &ldquo;the same attachment&rdquo;?</p>
+        <ul>
+          <li><span class="reject">(a) <code>attach_id</code></span> &mdash; per-upload; never dedups.</li>
+          <li><span class="pick">(b) <code>content_hash = hash(bytes &Vert; preproc_params &Vert; encoder_version)</code> &mdash; CHOSEN</span> &mdash; dedups byte-identical uploads fleet-wide; version-safe.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Only a content hash collapses re-uploads of identical bytes across users and invalidates cleanly on an encoder upgrade.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC3 &mdash; Privacy (the K2 D52 timing probe, sharper than text)</h4>
+        <p class="dc-prob">Problem: cross-user dedup means a user can <strong>upload an image and detect a cache hit via latency &rarr; learn someone else uploaded it.</strong> Worse than the text front-of-chain probe &mdash; images are often private photos / documents.</p>
+        <ul>
+          <li><span class="reject">(a) dedup everything (max savings)</span> &mdash; leaks &ldquo;this exact file exists in the fleet&rdquo; for <em>private</em> uploads.</li>
+          <li><span class="reject">(b) no dedup; per-user-keyed everywhere</span> &mdash; kills the cross-user win entirely; only intra-user re-reference hits.</li>
+          <li><span class="pick">(c) two-class dedup &mdash; CHOSEN</span> &mdash; dedup <strong>derived / public-ish</strong> content freely (fleet-template assets, <code>hidden_sys</code> companions), but <strong>per-user-key private uploads by default</strong> (<code>seed = tenant_id</code>); promote to shared dedup only on an explicit public/shared flag.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list">
+          <li>Media exposure is higher-value than text, so the default flips to <strong>isolation</strong> &mdash; the opposite of the text page&rsquo;s accepted front-of-chain probe (<a href="../../knowledge/K2_kv-cache.html#d52">K2 D52</a>); the cross-user win is opt-in, not default.</li>
+          <li><strong>Consistency with the Iter 5 chain delta:</strong> when private-keyed, the vision span&rsquo;s chain hash includes <code>tenant_id</code> &rarr; no cross-user prefix hit either. One switch (<code>seed = tenant_id</code>) governs both cache layers.</li>
+        </ul>
+      </div>
+      <div class="dc">
+        <h4>DC4 &mdash; Storage home</h4>
+        <p class="dc-prob">Problem: where do embeddings + vision-K,V live?</p>
+        <ul>
+          <li><span class="pick">co-tenant the Iter 3b <code>kv-store-job</code> (second key space) &mdash; CHOSEN</span> &mdash; same Mooncake-style backend + replication.</li>
+          <li><span class="reject">a new dedicated embedding store</span> &mdash; duplicate infra for a blob class the pool already serves.</li>
+        </ul>
+        <p class="dc-why lead">Winning constraint:</p>
+        <ul class="why-list"><li>Embeddings are just another content-addressed blob class; reusing the pool&rsquo;s sharding + replication costs nothing new.</li></ul>
+      </div>
+      <div class="dc">
+        <h4>DC5 &mdash; Eviction (and both watermarks)</h4>
+        <ul class="why-list">
+          <li><strong>Policy:</strong> content-addressed entries use an <strong>LFU-leaning</strong> (<em>Least Frequently Used</em>) policy &mdash; a viral asset is hot fleet-wide, and recency-only (<strong>LRU</strong>, <em>Least Recently Used</em>) would drop a periodically-popular logo between bursts. Contrast the parent pool&rsquo;s capacity-LRU for conv K,V.</li>
+          <li><strong>Both watermarks, and the asymmetry:</strong> the hi/lo pair exists to batch-drain then rest (anti-thrash, as everywhere). The <strong>dedup set</strong> is small + hot &rarr; a <strong>narrow band</strong> (few bytes move per step). The <strong>per-user private set</strong> is large + cold &rarr; a <strong>wider band</strong> (more bytes per drain). Same symmetric pair, band thickness sized by drain-burst size &mdash; consistent with the Iter 1a derivation.</li>
+        </ul>
+      </div>
+
+      <h3>M2.4 &nbsp;Schema introduced here</h3>
+      <div class="formula-box">@dataclass VisionEmbedding:           # content-addressed encoder output (layer i)
+    content_hash: bytes               # primary key = hash(bytes &Vert; preproc_params &Vert; encoder_version)
+    embedding_blocks: list[BlockRef]  # the [n_vis_tok &times; d_model] payload, tiered
+    n_vis_tok: int
+    d_model: int
+    encoder_version: str              # bump &rArr; key changes &rArr; old entries naturally invalidate
+    tier_locs: dict                   # HBM / DRAM / NVMe locations (parent tiering)
+    seed: str | None                  # = tenant_id for private uploads; None for shared/public</div>
+
+      <h3>M2.5 &nbsp;Number chain</h3>
+      <div class="formula-box">enc_cache_hit_rate &asymp; P(per-user cross-conv / post-eviction reuse) + vis_public_share&middot;vis_cross_user_dup &asymp; 0.4
+                     [G-FA &mdash; INCREMENTAL over the conv-keyed pool, NOT the raw 0.7 (that is already parent-covered)]
+ViT FLOPs saved      = enc_cache_hit_rate &times; &lambda;_attach &times; enc_FLOPs(attach)   (enc_FLOPs &asymp; 3.5% of per-attach compute &rarr; small $ line)
+                     &rArr; enc_task_num: 2,760 &rarr; ~1,660 tasks (M1 number chain)
+vision-prefill saved = (layer-ii hit rate; attachments &gt; ~1.9 k only) &times; vision-prefill_FLOPs  &rArr; prefill_task_num shrinks  &larr; the LARGER $ win
+W_pool               += embedding set (~21 MB/img) + vision-K,V set (~416 MB/img, PDFs/video/multi-image only)  [re-derive at S6]</div>
+
+      <h3>M2.6 &nbsp;What breaks</h3>
+      <ul>
+        <li><strong><code>encoder_version</code> bump</strong> invalidates the whole embedding cache &rarr; cold-encode storm &rarr; versioned warm-up / staged rollout (the parent&rsquo;s shadow&rarr;canary&rarr;ramp).</li>
+        <li><strong>Hash collision on <code>content_hash</code></strong> &rarr; wrong image served &rarr; use <strong>SHA-256</strong> (<em>Secure Hash Algorithm</em>, collision-free at scale), not a fast non-crypto hash.</li>
+        <li><strong>Privacy regression</strong> if a private upload is mis-flagged public &rarr; default-isolate + audit.</li>
+        <li><strong>Dedup hot-key</strong> (viral asset) pull storm &rarr; front-replicate in the pool (parent Iter 3b mechanism).</li>
+      </ul>
+
+      <h3>M2.7 &nbsp;SLO impact</h3>
+      <table class="sheet slo">
+        <thead><tr><th>SLO</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT p99 (reuse-eligible attachments)</td><td><span class="arrow-down">&darr;&darr;</span> for the per-user-reuse + public/shared slice: skip encode (layer i) and, when the attachment clears the ~1.9 k crossover, vision-prefill (layer ii). Private one-off uploads: <span class="arrow-flat">&rarr;</span>.</td></tr>
+          <tr><td>$/mo</td><td><span class="arrow-down">&darr;</span> on the reuse-eligible slice. The <strong>encode</strong> saving is small (ViT &asymp; 3.5% of per-attach compute); the <strong>prefill</strong> saving (layer ii, PDFs/video/multi-image) is the larger component. Less universal than Iter 5 for text, since the cross-user slice is privacy-gated.</td></tr>
+          <tr><td>Other SLOs</td><td><span class="arrow-flat">&rarr;</span> unchanged.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- S6 / S7 deltas + diagrams + cross-links                 -->
+  <!-- ===================================================== -->
+  <section class="section section-alt" id="s6">
+    <div class="container">
+      <h2><span class="mk mk-chg">&Delta;</span> S6 / S7 &nbsp;Final design &amp; takeaways (delta)</h2>
+
+      <h3 id="s6-arch">S6.1 &nbsp;Final fleet architecture &mdash; the parent fleet <em>plus</em> the multimodal stack (D-M6)</h3>
+      <p>This is the parent page&rsquo;s final-design diagram (D13) with every multimodal addition folded in &mdash; <strong>not</strong> a delta sketch but the whole settled fleet in one picture. The new pieces are drawn in <span style="color:#ea580c;font-weight:700;">amber</span>: the <strong>blob-store + preprocess</strong> ingress (Iter&nbsp;M0), the dedicated <strong>encode pool</strong> with its ragged batcher (Iter&nbsp;M1&nbsp;+&nbsp;M3), and the embedding cache as a <strong>second key space</strong> co-tenanted on the existing <code>kv-store-job</code> (Iter&nbsp;M2). The parent five-job fleet (Router, broker, prefill, decode, kv-store, <code>cp_ring</code>) is unchanged in structure &mdash; only its inputs widen (a vision token is just a token).</p>
+
+      <div class="svg-wrap-small">
+      <svg viewBox="0 0 1340 680" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Final multimodal fleet architecture. Clients reach an L4 load balancer and a 3-task HA router-job. The Router holds two consistent-hashing rings on conv_id with BLCH spill, a per-user token-bucket admit gate (Iter 8), a CP-fork check whose est_kv now sums text plus all attachment vision tokens (Iter 9), a NEW content_hash lookup that on a hit returns cached embeddings and on a miss dispatches an encode by consistent hashing on content_hash (Iter M0 and M2), and the wait-time autoscale consumer (Iter 1a through 7). A NEW amber blob-store-job plus preprocess pipeline takes presigned uploads to an object store, a hot-blob CDN cache, and NVDEC preprocess workers that emit decoded frames or pages to a NEW amber encode pool: the vision-encoder-job runs ViT plus an MLP projector on a cheap compute-bound L40S SKU holding no KV, with an Iter M3 ragged varlen batcher, emitting about 21 MB of embeddings per image to the prefill pool. The serving-prefill-job is now sized against the blended mean input of 14.8k tokens and splices vision embeddings with the text tail, folding in Flash Attention v2 chunked-varlen prefill (Iter 4), content-hashed prefix caching whose chain now includes vision blocks (Iter 5), local HBM and DRAM tiers (Iter 1a), and write-back of conversation KV (Iter 3b); every vision token costs 320 KB of KV. The modality-agnostic serving-decode-job folds in continuous batching with Flash Decoding (Iter 6), speculative decoding at about 2x (Iter 7), and recompute-as-fallback fault tolerance (Iter 10). The shared kv-store-job is Mooncake-style with an RDMA DRAM front over an NVMe back and now holds TWO key spaces: key space 1 is the parent conv_id-to-KV write-back victim cache, and key space 2 is a NEW amber content_hash-to-VisionEmbedding content-addressed cache with private-versus-shared two-class keying. A near-1M-context attachment forks onto an on-demand 8-rank cp_ring running Ring Attention, now reachable from a single upload at turn 1.">
+        <defs>
+          <marker id="mf-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+          <marker id="mf-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/></marker>
+          <marker id="mf-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#047857"/></marker>
+          <marker id="mf-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker>
+          <marker id="mf-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+          <marker id="mf-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+        </defs>
+        <style>
+          .b   { fill:#fff; stroke:#334155; stroke-width:1.4; rx:8; }
+          .blb { fill:#fef3c7; stroke:#d97706; stroke-width:1.6; rx:8; }
+          .brt { fill:#eff6ff; stroke:#1e40af; stroke-width:2; rx:8; }
+          .bbr { fill:#fce7f3; stroke:#be185d; stroke-width:2; rx:8; }
+          .bsp { fill:#ecfdf5; stroke:#047857; stroke-width:2; rx:8; }
+          .bsd { fill:#ede9fe; stroke:#6d28d9; stroke-width:2; rx:8; }
+          .bks { fill:#fff7ed; stroke:#c2410c; stroke-width:2; rx:8; }
+          .bcp { fill:#f0fdfa; stroke:#0d9488; stroke-width:1.6; stroke-dasharray:6 4; rx:8; }
+          .bmm { fill:#fff7ed; stroke:#ea580c; stroke-width:2; rx:8; }
+          .bi  { fill:#fff; stroke:#1e40af; stroke-width:1.1; rx:6; }
+          .bia { fill:#fff7ed; stroke:#ea580c; stroke-width:1.3; rx:6; }
+          .bm  { fill:#f1f5f9; stroke:#475569; stroke-width:1.1; rx:6; }
+          .bp  { fill:#fff; stroke:#047857; stroke-width:1.1; rx:6; }
+          .bd  { fill:#fff; stroke:#6d28d9; stroke-width:1.1; rx:6; }
+          .bre { fill:#fff; stroke:#ea580c; stroke-width:1.1; rx:6; }
+          .bk1 { fill:#fff; stroke:#c2410c; stroke-width:1.2; rx:6; }
+          .bk2 { fill:#ffedd5; stroke:#ea580c; stroke-width:1.6; rx:6; }
+          .t   { font-size:13px; font-weight:700; fill:#0f172a; }
+          .s   { font-size:11px; fill:#475569; }
+          .em  { font-size:11px; font-weight:700; fill:#b91c1c; }
+          .num { font-size:11px; font-weight:700; fill:#fff; }
+          line.sy, path.sy { stroke:#1e293b; stroke-width:1.6; fill:none; marker-end:url(#mf-d); }
+          line.mm, path.mm { stroke:#ea580c; stroke-width:2; fill:none; marker-end:url(#mf-a); }
+          line.mmd,path.mmd{ stroke:#ea580c; stroke-width:1.8; stroke-dasharray:5 3; fill:none; marker-end:url(#mf-a); marker-start:url(#mf-a); }
+          line.kv, path.kv { stroke:#059669; stroke-width:2.4; fill:none; marker-end:url(#mf-g); }
+          line.pl, path.pl { stroke:#7c3aed; stroke-width:2.4; fill:none; marker-end:url(#mf-p); marker-start:url(#mf-p); }
+          line.as, path.as { stroke:#64748b; stroke-width:1.5; stroke-dasharray:6 4; fill:none; marker-end:url(#mf-s); }
+          line.fk, path.fk { stroke:#0d9488; stroke-width:1.8; stroke-dasharray:2 3; fill:none; marker-end:url(#mf-t); }
+        </style>
+
+        <!-- Clients -->
+        <rect class="b" x="12" y="150" width="96" height="52"/>
+        <text class="t" x="60" y="172" text-anchor="middle">Clients</text>
+        <text class="s" x="60" y="190" text-anchor="middle">HTTP &middot; SSE &middot; upload</text>
+
+        <!-- L4 LB -->
+        <rect class="blb" x="120" y="146" width="104" height="60"/>
+        <text class="t" x="172" y="170" text-anchor="middle">L4 LB</text>
+        <text class="s" x="172" y="186" text-anchor="middle">stable VIP &middot; TLS</text>
+
+        <!-- router-job -->
+        <rect class="brt" x="236" y="36" width="192" height="308"/>
+        <text class="t" x="332" y="53" text-anchor="middle">router-job (3 tasks, HA)</text>
+        <rect class="bi" x="246" y="60" width="172" height="48"/>
+        <text class="s" x="332" y="78" text-anchor="middle"><tspan font-weight="700">Iter 1b/2</tspan> &mdash; two CH rings</text>
+        <text class="s" x="332" y="94" text-anchor="middle"><tspan font-family="monospace">prefill_ring</tspan>&middot;<tspan font-family="monospace">decode_ring</tspan> (conv_id)</text>
+        <rect class="bi" x="246" y="112" width="172" height="40"/>
+        <text class="s" x="332" y="129" text-anchor="middle"><tspan font-weight="700">Iter 8</tspan> &mdash; per-user admit gate</text>
+        <text class="s" x="332" y="144" text-anchor="middle">token bucket &middot; <tspan font-weight="700">429</tspan> on breach</text>
+        <rect class="bi" x="246" y="156" width="172" height="40"/>
+        <text class="s" x="332" y="173" text-anchor="middle"><tspan font-weight="700">Iter 9</tspan> &mdash; CP-fork check</text>
+        <text class="s" x="332" y="188" text-anchor="middle"><tspan font-family="monospace">est_kv</tspan> = T_text + &Sigma; n_vis_tok</text>
+        <rect class="bia" x="246" y="200" width="172" height="48"/>
+        <text class="s" x="332" y="218" text-anchor="middle"><tspan font-weight="700" fill="#c2410c">Iter M0/M2</tspan> &mdash; <tspan font-family="monospace">content_hash</tspan> lookup</text>
+        <text class="s" x="332" y="234" text-anchor="middle">hit&rarr;cached emb &middot; miss&rarr;CH dispatch</text>
+        <rect class="bi" x="246" y="252" width="172" height="52"/>
+        <text class="s" x="332" y="270" text-anchor="middle"><tspan font-weight="700">Iter 1a&rarr;7</tspan> &mdash; wait-time</text>
+        <text class="s" x="332" y="286" text-anchor="middle"><tspan font-family="monospace">approx_wait</tspan>/pool &middot; autoscale</text>
+
+        <!-- broker-job -->
+        <rect class="bbr" x="236" y="360" width="192" height="96"/>
+        <text class="t" x="332" y="380" text-anchor="middle">broker-job (3 tasks, HA)</text>
+        <text class="s" x="332" y="398" text-anchor="middle"><tspan font-weight="700">Iter 1b</tspan> &mdash; gossip ring epochs</text>
+        <text class="s" x="332" y="414" text-anchor="middle">+ per-task <tspan font-family="monospace">approx_wait</tspan></text>
+        <text class="s" x="332" y="430" text-anchor="middle">(read-replica fan-out)</text>
+
+        <!-- cp_ring -->
+        <rect class="bcp" x="236" y="476" width="192" height="150"/>
+        <text class="t" x="332" y="496" text-anchor="middle"><tspan font-family="monospace">cp_ring</tspan> (Iter 9)</text>
+        <text class="s" x="332" y="514" text-anchor="middle">on-demand 8-rank fork</text>
+        <text class="s" x="332" y="530" text-anchor="middle">Ring Attention</text>
+        <text class="s" x="332" y="548" text-anchor="middle">ctx &gt; 256 GB</text>
+        <text class="s" x="332" y="564" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">now turn-1 from one</tspan></text>
+        <text class="s" x="332" y="580" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">attachment</tspan> (&ge; 800 K tok)</text>
+
+        <!-- blob + preprocess (NEW) -->
+        <rect class="bmm" x="446" y="36" width="200" height="116"/>
+        <text class="t" x="546" y="54" text-anchor="middle">blob-store-job + preprocess</text>
+        <text class="s" x="546" y="70" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">(Iter M0) NEW</tspan></text>
+        <text class="s" x="546" y="88" text-anchor="middle">presigned upload &rarr; object store</text>
+        <text class="s" x="546" y="106" text-anchor="middle">hot-blob cache (CDN)</text>
+        <text class="s" x="546" y="124" text-anchor="middle">preprocess &middot; NVDEC</text>
+        <text class="s" x="546" y="142" text-anchor="middle">&rarr; decoded frames / pages</text>
+
+        <!-- encode pool (NEW) -->
+        <rect class="bmm" x="446" y="178" width="200" height="250"/>
+        <text class="t" x="546" y="198" text-anchor="middle">ENCODE pool</text>
+        <text class="s" x="546" y="214" text-anchor="middle"><tspan font-family="monospace">vision-encoder-job</tspan> <tspan fill="#c2410c" font-weight="700">(M1) NEW</tspan></text>
+        <text class="em" x="546" y="231" text-anchor="middle">compute-bound &middot; NO KV</text>
+        <text class="s" x="546" y="247" text-anchor="middle">L40S cheap SKU &middot; ~14 img/s/task</text>
+        <text class="s" x="546" y="263" text-anchor="middle">ViT 1.2 GB + MLP projector</text>
+        <rect class="bre" x="456" y="276" width="180" height="104"/>
+        <text class="s" x="546" y="294" text-anchor="middle"><tspan font-weight="700" fill="#c2410c">Iter M3</tspan> &mdash; ragged batcher</text>
+        <text class="s" x="546" y="310" text-anchor="middle">varlen <tspan font-family="monospace">cu_seqlens</tspan> packing</text>
+        <text class="s" x="546" y="326" text-anchor="middle">no intra-batch padding</text>
+        <text class="s" x="546" y="344" text-anchor="middle">&rarr; MFU recovered (~2&times;)</text>
+        <text class="s" x="546" y="362" text-anchor="middle">emits [n_vis_tok &times; d_model]</text>
+        <text class="s" x="546" y="404" text-anchor="middle">&asymp; 21 MB/img &rarr; prefill</text>
+
+        <!-- serving-prefill-job -->
+        <rect class="bsp" x="664" y="36" width="326" height="392"/>
+        <text class="t" x="827" y="55" text-anchor="middle">serving-prefill-job</text>
+        <text class="s" x="827" y="70" text-anchor="middle">sized vs <tspan font-family="monospace">T_in_blended</tspan> = 14.8 K (was 13.3 K)</text>
+        <text class="s" x="827" y="85" text-anchor="middle">TP=8 H100 &middot; MFU 40% &middot; B=1</text>
+        <rect class="bp" x="676" y="98" width="302" height="56"/>
+        <text class="t" x="827" y="116" text-anchor="middle">prefill task &mdash; sticky <tspan font-family="monospace">conv_id</tspan></text>
+        <text class="s" x="827" y="132" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">splices vision embeddings</tspan> + text tail</text>
+        <text class="s" x="827" y="148" text-anchor="middle">&rarr; computes K,V for the unmatched tail</text>
+        <rect class="bm" x="676" y="166" width="302" height="250"/>
+        <text class="t" x="827" y="184" text-anchor="middle">folds in (final form)</text>
+        <text class="s" x="827" y="203" text-anchor="middle"><tspan font-weight="700">Iter 4</tspan> &mdash; Flash Attn v2 chunked-varlen prefill</text>
+        <text class="s" x="827" y="221" text-anchor="middle"><tspan font-weight="700">Iter 5</tspan> &mdash; prefix cache (content-hashed)</text>
+        <text class="s" x="827" y="235" text-anchor="middle">vision blocks chained: H=hash(parent&Vert;<tspan font-family="monospace">content_hash</tspan>&Vert;span)</text>
+        <text class="s" x="827" y="254" text-anchor="middle"><tspan font-weight="700">Iter 1a</tspan> &mdash; local tiers: HBM + DRAM</text>
+        <text class="s" x="827" y="272" text-anchor="middle"><tspan font-weight="700">Iter 3b</tspan> &mdash; write-back / pull conv KV &darr;</text>
+        <text class="s" x="827" y="293" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">every vision tok &rarr; 320 KB KV</tspan> (K2 D32)</text>
+        <text class="s" x="827" y="311" text-anchor="middle">unmatched tail &asymp; 1.85 K tok/req</text>
+
+        <!-- serving-decode-job -->
+        <rect class="bsd" x="1008" y="36" width="320" height="392"/>
+        <text class="t" x="1168" y="55" text-anchor="middle">serving-decode-job</text>
+        <text class="s" x="1168" y="70" text-anchor="middle"><tspan fill="#c2410c" font-weight="700">modality-agnostic</tspan> (vision = text once tokens)</text>
+        <text class="s" x="1168" y="85" text-anchor="middle">TP=8 H100 &middot; HBM-BW &middot; B<tspan baseline-shift="sub" font-size="9px">decode</tspan> &asymp; 106</text>
+        <rect class="bd" x="1020" y="98" width="296" height="56"/>
+        <text class="t" x="1168" y="116" text-anchor="middle">decode task &mdash; sticky <tspan font-family="monospace">conv_id</tspan></text>
+        <text class="s" x="1168" y="132" text-anchor="middle">holds full conv KV incl. its own output</text>
+        <text class="s" x="1168" y="148" text-anchor="middle">rolling continuous-batch decode tick</text>
+        <rect class="bm" x="1020" y="166" width="296" height="250"/>
+        <text class="t" x="1168" y="184" text-anchor="middle">folds in (final form)</text>
+        <text class="s" x="1168" y="203" text-anchor="middle"><tspan font-weight="700">Iter 6</tspan> &mdash; continuous batch + Flash Decoding</text>
+        <text class="s" x="1168" y="221" text-anchor="middle"><tspan font-weight="700">Iter 7</tspan> &mdash; speculative decode ~2&times; (cost-only)</text>
+        <text class="s" x="1168" y="239" text-anchor="middle"><tspan font-weight="700">Iter 10</tspan> &mdash; recompute-as-fallback FT</text>
+        <text class="s" x="1168" y="257" text-anchor="middle"><tspan font-weight="700">Iter 1a</tspan> &mdash; local tiers: HBM + DRAM</text>
+        <text class="s" x="1168" y="275" text-anchor="middle"><tspan font-weight="700">Iter 3b</tspan> &mdash; write-back asst delta / pull &darr;</text>
+
+        <!-- kv-store-job (two key spaces) -->
+        <rect class="bks" x="446" y="476" width="882" height="170"/>
+        <text class="t" x="887" y="496" text-anchor="middle">kv-store-job &mdash; Mooncake-style RDMA-front / NVMe-back (Iter 3b) &middot; I/O-sized, no GPU</text>
+        <rect class="bk2" x="460" y="512" width="190" height="124"/>
+        <text class="t" x="555" y="530" text-anchor="middle" font-size="12px"><tspan fill="#c2410c">Key space 2 (M2) NEW</tspan></text>
+        <text class="s" x="555" y="547" text-anchor="middle"><tspan font-family="monospace">content_hash</tspan> &rarr;</text>
+        <text class="s" x="555" y="561" text-anchor="middle"><tspan font-family="monospace">VisionEmbedding</tspan></text>
+        <text class="s" x="555" y="578" text-anchor="middle">content-addressed</text>
+        <text class="s" x="555" y="592" text-anchor="middle">encoder output</text>
+        <text class="s" x="555" y="609" text-anchor="middle">private vs shared 2-class key</text>
+        <text class="s" x="555" y="625" text-anchor="middle">re-encode from blob = RPO 0</text>
+        <rect class="bk1" x="664" y="512" width="652" height="124"/>
+        <text class="t" x="990" y="530" text-anchor="middle" font-size="12px">Key space 1 &mdash; <tspan font-family="monospace">conv_id</tspan> &rarr; K,V (parent Iter 3b/5b)</text>
+        <text class="s" x="990" y="550" text-anchor="middle"><tspan font-weight="700">write-back victim cache</tspan> &middot; length-gate &gt; ~1.9 K tok &middot; <tspan font-family="monospace">conv_id</tspan>-keyed</text>
+        <text class="s" x="990" y="568" text-anchor="middle">holds cross-turn conv K,V (assistant deltas stranded by P/D split) + long-tail <tspan font-family="monospace">user_sys</tspan></text>
+        <text class="s" x="990" y="586" text-anchor="middle">L3 remote DRAM front (RDMA ~25 GB/s) &nbsp;&rarr;&nbsp; L5 NVMe back</text>
+        <text class="s" x="990" y="608" text-anchor="middle">recompute from client tokens = RPO 0 floor on a pool miss</text>
+
+        <!-- ===== arrows ===== -->
+        <!-- 1 Clients -> LB -->
+        <line class="sy" x1="108" y1="176" x2="120" y2="176"/>
+        <circle cx="114" cy="160" r="9" fill="#1d4ed8"/><text class="num" x="114" y="164" text-anchor="middle">1</text>
+        <!-- 2 LB -> Router -->
+        <line class="sy" x1="224" y1="176" x2="236" y2="176"/>
+        <circle cx="230" cy="160" r="9" fill="#1d4ed8"/><text class="num" x="230" y="164" text-anchor="middle">2</text>
+        <!-- 3 Router -> Blob -->
+        <line class="mm" x1="428" y1="90" x2="446" y2="90"/>
+        <circle cx="437" cy="74" r="9" fill="#ea580c"/><text class="num" x="437" y="78" text-anchor="middle">3</text>
+        <!-- 4 Blob -> Encode -->
+        <line class="mm" x1="546" y1="152" x2="546" y2="178"/>
+        <circle cx="566" cy="165" r="9" fill="#ea580c"/><text class="num" x="566" y="169" text-anchor="middle">4</text>
+        <!-- 5 Router -> Encode -->
+        <line class="mm" x1="428" y1="300" x2="446" y2="300"/>
+        <circle cx="437" cy="286" r="9" fill="#ea580c"/><text class="num" x="437" y="290" text-anchor="middle">5</text>
+        <!-- 6 Encode <-> embedding cache (ks2) -->
+        <line class="mmd" x1="548" y1="428" x2="548" y2="512"/>
+        <circle cx="528" cy="470" r="9" fill="#ea580c"/><text class="num" x="528" y="474" text-anchor="middle">6</text>
+        <!-- 7 Encode -> Prefill (embeddings) -->
+        <line class="mm" x1="646" y1="300" x2="664" y2="300"/>
+        <circle cx="655" cy="286" r="9" fill="#ea580c"/><text class="num" x="655" y="290" text-anchor="middle">7</text>
+        <!-- 8 Router -> Prefill (text path) -->
+        <path class="sy" d="M 428 165 L 664 165"/>
+        <circle cx="606" cy="165" r="9" fill="#1d4ed8"/><text class="num" x="606" y="169" text-anchor="middle">8</text>
+        <!-- 9 Prefill -> Decode (KV handoff) -->
+        <line class="kv" x1="990" y1="120" x2="1008" y2="120"/>
+        <circle cx="999" cy="106" r="9" fill="#047857"/><text class="num" x="999" y="110" text-anchor="middle">9</text>
+        <!-- 10 Decode -> Clients (SSE) -->
+        <path class="sy" d="M 1168 36 L 1168 16 L 60 16 L 60 150"/>
+        <circle cx="614" cy="16" r="9" fill="#1d4ed8"/><text class="num" x="614" y="20" text-anchor="middle">10</text>
+        <!-- 11 Prefill <-> ks1 -->
+        <line class="pl" x1="760" y1="428" x2="760" y2="512"/>
+        <circle cx="740" cy="470" r="9" fill="#7c3aed"/><text class="num" x="740" y="474" text-anchor="middle">11</text>
+        <!-- 12 Decode <-> ks1 -->
+        <line class="pl" x1="1168" y1="428" x2="1168" y2="512"/>
+        <circle cx="1148" cy="470" r="9" fill="#7c3aed"/><text class="num" x="1148" y="474" text-anchor="middle">12</text>
+        <!-- 13 pools -> broker (gossip) -->
+        <path class="as" d="M 700 428 L 700 442 L 428 442"/>
+        <path class="as" d="M 1050 428 L 1050 454 L 428 454"/>
+        <circle cx="500" cy="442" r="9" fill="#64748b"/><text class="num" x="500" y="446" text-anchor="middle">13</text>
+        <!-- 14 broker -> router -->
+        <path class="as" d="M 332 360 L 332 344"/>
+        <circle cx="356" cy="352" r="9" fill="#64748b"/><text class="num" x="356" y="356" text-anchor="middle">14</text>
+        <!-- 15 router -> cp_ring (fork) -->
+        <path class="fk" d="M 236 182 L 222 182 L 222 548 L 236 548"/>
+        <circle cx="222" cy="362" r="9" fill="#0d9488"/><text class="num" x="222" y="366" text-anchor="middle">15</text>
+      </svg>
+      </div>
+
+      <ul class="legend-list">
+        <li><span class="b">&#9312;</span> <strong>Clients &rarr; L4 LB</strong> &mdash; HTTP opens an SSE stream; the managed L4 LB terminates TLS and holds the stable VIP (parent).</li>
+        <li><span class="b">&#9313;</span> <strong>L4 LB &rarr; router-job</strong> &mdash; round-robin across the 3 HA Router tasks (parent).</li>
+        <li><span style="color:#ea580c;">&#9472;&#9472;</span> <span class="b">&#9314;</span> <strong>Router &rarr; blob/preprocess</strong> &mdash; the attachment path (Iter M0): Router issues a presigned URL, bytes land in the object store, NVDEC preprocess workers decode frames/pages.</li>
+        <li><span style="color:#ea580c;">&#9472;&#9472;</span> <span class="b">&#9315;</span> <strong>Preprocess &rarr; encode pool</strong> &mdash; decoded frames/pages feed the <code>vision-encoder-job</code> (Iter M1).</li>
+        <li><span style="color:#ea580c;">&#9472;&#9472;</span> <span class="b">&#9316;</span> <strong>Router &rarr; encode (on cache MISS)</strong> &mdash; dispatch by CH-on-<code>content_hash</code> over the encode ring, so identical attachments coalesce (single-flight, Iter M2).</li>
+        <li><span style="color:#ea580c;">&#9476;&#9476;</span> <span class="b">&#9317;</span> <strong>Encode &harr; embedding cache (key space 2)</strong> &mdash; encode writes back the content-addressed embeddings; on a later HIT the Router (&#9315; lookup) returns these cached embeddings and <em>skips encode entirely</em> (Iter M2).</li>
+        <li><span style="color:#ea580c;">&#9472;&#9472;</span> <span class="b">&#9318;</span> <strong>Encode &rarr; prefill</strong> &mdash; <code>[n_vis_tok &times; d_model]</code> &asymp; 21 MB/image streamed over the Iter 2 gRPC-over-RDMA transport (much smaller than the 416 MB of K,V prefill then <em>produces</em>).</li>
+        <li><span class="b">&#9319;</span> <strong>Router &rarr; prefill (text path)</strong> &mdash; text tokens routed by CH-on-<code>conv_id</code> after the Iter 8 admit gate clears (parent hot path); prefill splices the vision embeddings in at their placeholder positions.</li>
+        <li><span style="color:#059669;">&#9472;&#9472;</span> <span class="b">&#9320;</span> <strong>Prefill &rarr; decode (K,V handoff)</strong> &mdash; prefill ships the turn&rsquo;s K,V (text + vision, 320 KB/tok) to the conv&rsquo;s sticky decode task (parent Iter 2).</li>
+        <li><span class="b">&#9321;</span> <strong>Decode &rarr; Clients (SSE)</strong> &mdash; output tokens stream back through the L4 LB; the encode/prefill/decode handoffs are invisible to the client.</li>
+        <li><span style="color:#7c3aed;">&#9472;&#9472;</span> <span class="b">&#9322;&#9323;</span> <strong>Serving pools &harr; kv-store key space 1</strong> &mdash; write-back on local eviction (async, length-gated &gt; ~1.9 K tok) down; pull on local miss (sync) up; recompute is the RPO = 0 floor (parent Iter 3b).</li>
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9324;</span> <strong>Both pools &rarr; broker (async gossip)</strong> &mdash; each task publishes <code>approx_wait</code> + ring epoch every <code>T_gossip = 100 ms</code> (parent Iter 1b).</li>
+        <li><span style="color:#64748b;">&#9476;&#9476;</span> <span class="b">&#9325;</span> <strong>Broker &rarr; Router (async fan-out)</strong> &mdash; ring epochs + per-task wait sketches fanned out to every Router (read-replica pattern, parent).</li>
+        <li><span style="color:#0d9488;">&#8943;&#8943;</span> <span class="b">&#9326;</span> <strong>Router &rarr; <code>cp_ring</code> (on-demand fork)</strong> &mdash; a request whose <code>est_kv</code> (now <code>T_text + &Sigma; n_vis_tok</code>) exceeds 256 GB forks onto the 8-rank CP ring; the Iter 9 delta makes this reachable from a <em>single</em> &ge; 800 K-token upload at turn 1.</li>
+      </ul>
+
+      <p><strong>Read the diagram.</strong> The parent fleet (blue/green/purple/pink boxes) is structurally untouched &mdash; a vision token becomes regular KV (K2&nbsp;D32), so prefill, decode, and the conv-keyed pool serve it with no new machinery. Three amber additions carry the entire delta: <strong>&#9314;&ndash;&#9315; (Iter M0)</strong> turns uploaded bytes into decoded frames; <strong>the encode pool (Iter M1+M3)</strong> runs the ViT on a cheap compute-bound SKU with no KV and a ragged batcher, exactly mirroring how Iter 2 split prefill from decode for a <em>different roofline</em>; and <strong>key space 2 (Iter M2)</strong> co-tenants a content-addressed embedding cache on the existing <code>kv-store-job</code> &mdash; the one genuinely new reuse axis, gated private-vs-shared because cross-user dedup re-opens the K2&nbsp;D52 timing probe. The only parent boxes whose <em>parameters</em> move are prefill (sized against <code>T_in_blended = 14.8 K</code>) and the CP-fork trigger (<code>est_kv</code> now sums attachment tokens, so one upload can fork at turn 1).</p>
+
+      <h3 id="s6-final">S6.2 &nbsp;Final-design additions (cost &amp; degradation)</h3>
+      <ul>
+        <li><strong>The final SVG above folds in:</strong> blob-store + preprocess (M0), the encode pool (M1), the embedding cache as a <em>second key space</em> on <code>kv-store-job</code> (M2), the ragged encoder batcher (M3), and the <strong>E/P/D</strong> three-stage pipeline.</li>
+        <li><strong>Optimization-stack table gains the multimodal rows:</strong> encode-pool cost, embedding-cache savings (ViT + vision-prefill), ragged-batch MFU recovery.</li>
+        <li><strong>Degradation contract adds:</strong> encode pool down &rarr; fall back to colocated emergency encode (slow) or reject multimodal with <code>503</code>; blob store down &rarr; reject upload; embedding cache down &rarr; re-encode (RPO=0 from blob).</li>
+        <li><strong>Fleet comparison</strong> now reports <code>prefill_task_num</code> against <code>T_in_blended = 14.8 k</code> (not 13.3 k) and adds <code>enc_task_num &times; $_per_L40S_task_per_mo</code>.</li>
+      </ul>
+
+      <h3 id="s7-takeaways">S7 &nbsp;New takeaways (added to the parent&rsquo;s list)</h3>
+      <ol class="steps">
+        <li>An image, a PDF page, and a video frame are the <strong>same object</strong> to the system: bytes &rarr; ViT &rarr; embedding tokens &rarr; <strong>regular KV</strong> (K2 D32). The text page&rsquo;s KV cache already serves them &mdash; the delta is <em>volume</em>, a <em>new upstream stage</em>, and a <em>new reuse axis</em>.</li>
+        <li>The encoder has the <strong>opposite roofline</strong> to decode &mdash; so it gets its <strong>own pool</strong> (E/P/D), the same way prefill and decode split at Iter 2.</li>
+        <li>Content-addressing was <strong>rejected</strong> for the text pool (nothing to dedup) and is <strong>load-bearing</strong> for vision &mdash; a real shareable content class now exists. It guarantees <strong>per-user cross-conversation</strong> reuse (a superset of the conv-keyed hit) and adds <strong>opt-in cross-user dedup of public/shared assets</strong> (private uploads stay isolated). The right cache key is a function of the <em>modality&rsquo;s reuse pattern</em>, not a global constant.</li>
+        <li>Caching the <strong>encoder output</strong> (embeddings) saves ViT FLOPs (~3.5% of per-attach compute &mdash; the small win); caching the <strong>vision K,V</strong> saves prefill FLOPs (the larger win, but only above the ~1.9 k recompute-vs-transfer crossover, so PDFs/video/multi-image) &mdash; two layers, two payload sizes, both keyed by <code>content_hash</code>.</li>
+        <li>Cross-user dedup re-opens the <strong>K2 D52 timing probe</strong>, and for <strong>private media</strong> the exposure is higher than for text &mdash; so media defaults to <strong>per-user keying</strong>, dedup only on an explicit shared flag.</li>
+        <li>A single <strong>near-1&nbsp;M-context</strong> attachment (a ~600-page PDF / ~1-hour video, &ge; 256 GB KV) can trigger <strong>context parallelism at turn 1</strong> &mdash; the long-context machinery the text page built for rare 1 M chat histories is now reachable from one upload. (Typical p99 attachments &mdash; 100-page PDF / 10-min video, ~48&ndash;49 GB &mdash; stay well under the fork.)</li>
+      </ol>
+
+      <h3 id="diagrams">Diagram index</h3>
+      <table class="sheet">
+        <thead><tr><th>ID</th><th>Title</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>D-M1</td><td>Vision pipeline &mdash; bytes &rarr; patchify &rarr; ViT &rarr; spatial-merge &rarr; projector &rarr; splice &rarr; LLM prefill</td><td><a href="#m2">&sect;M.2</a></td></tr>
+          <tr><td>D-M2</td><td>E/P/D fleet &mdash; encode pool + embedding handoff (extends Iter 2 P/D)</td><td><a href="#iter-m1">Iter M1</a></td></tr>
+          <tr><td>D-M3</td><td>Vision-embedding cache + content-hash chain; private vs shared keying</td><td><a href="#iter-m2">Iter M2</a></td></tr>
+          <tr><td>D-M4</td><td>Ragged encoder batch &mdash; varlen <code>cu_seqlens</code> vs pad-to-max</td><td><a href="#iter-m3">Iter M3</a></td></tr>
+          <tr><td>D-M5</td><td>Blob ingress &mdash; presigned upload &rarr; object store &rarr; hot-blob cache &rarr; preprocess (NVDEC) &rarr; encode pool</td><td><a href="#iter-m0">Iter M0</a></td></tr>
+          <tr><td>D-M6</td><td>Final multimodal fleet &mdash; the parent D13 fleet + blob/preprocess + encode pool + embedding cache (2nd key space) in one picture</td><td><a href="#s6-arch">S6.1</a></td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="links">Cross-links</h3>
+      <ul>
+        <li><strong>Knowledge:</strong> <a href="../../knowledge/K12_multimodal-and-image-offload.html">K12 multimodal</a> &middot; <a href="../../knowledge/K2_kv-cache.html">K2 KV cache</a> (<a href="../../knowledge/K2_kv-cache.html#d32">D32</a>/<a href="../../knowledge/K2_kv-cache.html#d31">D31</a>/<a href="../../knowledge/K2_kv-cache.html#d5">D5</a>/<a href="../../knowledge/K2_kv-cache.html#d52">D52</a>) &middot; <a href="../../knowledge/K5_disaggregated-serving.html">K5 disaggregation</a> &middot; <a href="../../knowledge/K11_context-parallelism.html">K11 context parallelism</a> &middot; <a href="../../knowledge/K17_attention-kernels-and-cuda-graphs.html">K17 attention kernels</a>.</li>
+        <li><strong>Sibling:</strong> the text scenario this delta layers on &mdash; <a href="distributed_kv_cache.html">distributed_kv_cache.html</a>.</li>
+        <li><strong>Implementation detail:</strong> <a href="router.html">router.html</a> &middot; <a href="scheduler.html">scheduler.html</a> &middot; <a href="kv_store.html">kv_store.html</a>.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================================================== -->
+  <!-- Sidebar (sticky on-page nav)                           -->
+  <!-- ===================================================== -->
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <a href="../../index.html" class="sidebar-home">&larr; LLM Serving</a>
+      <div class="sidebar-divider"></div>
+
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">On this page</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="#scope">Scope &mdash; how to read</a></li>
+
+          <li><a class="sidebar-section-link" href="#s0">1. Scenario &amp; reqs (S0 delta)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-functional">&nbsp;&nbsp;Functional &amp; non-goals</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-nfr">&nbsp;&nbsp;NFR delta</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-workload">&nbsp;&nbsp;Workload SoT</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-flagged">&nbsp;&nbsp;Flagged assumptions</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s0-spine">&nbsp;&nbsp;Spine BM1&ndash;BM6</a></li>
+
+          <li><a class="sidebar-section-link" href="#m">&sect;M. How media becomes tokens</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m1">&nbsp;&nbsp;M.1 Load-bearing fact</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m2">&nbsp;&nbsp;M.2 Vision encoder walk</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m3">&nbsp;&nbsp;M.3 PDF parsing</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m4">&nbsp;&nbsp;M.4 Video parsing</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m5">&nbsp;&nbsp;M.5 Fusion architecture (DC)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m6">&nbsp;&nbsp;M.6 Serving consequences</a></li>
+
+          <li><a class="sidebar-section-link" href="#s1">2. Entities + Borg topology (S1)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-entities">&nbsp;&nbsp;New entities</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-jobs">&nbsp;&nbsp;New jobs (encode pool)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s1-routing">&nbsp;&nbsp;Routing-model delta</a></li>
+
+          <li><a class="sidebar-section-link" href="#s2">3. API contracts (S2 delta)</a></li>
+          <li><a class="sidebar-section-link" href="#s3">4. BOE (S3 delta)</a></li>
+
+          <li><a class="sidebar-section-link" href="#m-iter">5. Iteration deltas</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#m-iter-ribbon">&nbsp;&nbsp;The ribbon</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#part-a">&nbsp;&nbsp;Part A &mdash; inherited deltas</a></li>
+          <li><a class="sidebar-section-link" href="#iter-m0">Iter M0 &mdash; Blob ingress + preprocess</a></li>
+          <li><a class="sidebar-section-link" href="#iter-m1">Iter M1 &mdash; E/P/D disaggregation</a></li>
+          <li><a class="sidebar-section-link" href="#iter-m3">Iter M3 &mdash; Ragged encoder batch</a></li>
+          <li><a class="sidebar-section-link" href="#iter-m2">Iter M2 &mdash; Vision-embedding cache</a></li>
+
+          <li><a class="sidebar-section-link" href="#s6">S6 &mdash; Final design</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s6-arch">&nbsp;&nbsp;Final fleet architecture (D-M6)</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#s7-takeaways">&nbsp;&nbsp;S7 takeaways</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#diagrams">&nbsp;&nbsp;Diagram index</a></li>
+          <li><a class="sidebar-section-link sidebar-section-sub" href="#links">&nbsp;&nbsp;Cross-links</a></li>
+        </ul>
+      </div>
+
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-group">
+        <p class="sidebar-group-title">Cross-links</p>
+        <ul class="sidebar-section-list">
+          <li><a class="sidebar-section-link" href="../../knowledge/K12_multimodal-and-image-offload.html">K12 &mdash; multimodal</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K2_kv-cache.html">K2 &mdash; KV cache (D32/D31)</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K5_disaggregated-serving.html">K5 &mdash; disaggregation</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K11_context-parallelism.html">K11 &mdash; context parallelism</a></li>
+          <li><a class="sidebar-section-link" href="../../knowledge/K17_attention-kernels-and-cuda-graphs.html">K17 &mdash; attention kernels</a></li>
+          <li><a class="sidebar-section-link" href="distributed_kv_cache.html">distributed_kv_cache.html (text sibling)</a></li>
+        </ul>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===================================================== -->
+  <!-- Footer                                                  -->
+  <!-- ===================================================== -->
+  <footer style="text-align:center; padding:2rem; color:#64748b; font-size:0.95rem;">
+    <p>&copy; 2026 System Design Reference. Built for learning.</p>
+  </footer>
+
+  <script src="../../../js/sidebar.js"></script>
+
+  <script>
+  /* Scroll-spy: highlight the sidebar link for whichever section is currently
+     at the top of the viewport, and keep it updated as the page scrolls. */
+  (function () {
+    var links = Array.prototype.slice.call(
+      document.querySelectorAll('.sidebar-section-link[href^="#"]'));
+    if (!links.length) return;
+
+    var linkFor = {};
+    var targets = [];
+    links.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) { linkFor[id] = a; targets.push(el); }
+    });
+    if (!targets.length) return;
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      var a = linkFor[id];
+      if (a) {
+        a.classList.add('active');
+        if (typeof a.scrollIntoView === 'function') {
+          a.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+
+    var TOP_OFFSET = 90;
+    function onScroll() {
+      var best = targets[0], bestTop = -Infinity;
+      for (var i = 0; i < targets.length; i++) {
+        var top = targets[i].getBoundingClientRect().top - TOP_OFFSET;
+        if (top <= 0 && top > bestTop) { bestTop = top; best = targets[i]; }
+      }
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+        best = targets[targets.length - 1];
+      }
+      setActive(best.id);
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    onScroll();
+  })();
+  </script>
+
+</body>
+</html>

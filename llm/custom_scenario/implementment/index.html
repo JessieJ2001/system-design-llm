@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementation &amp; Reference Pages — Distributed KV Cache</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../../css/style.css">
+  <link rel="stylesheet" href="../../../css/diagrams.css">
+  <style>
+    /* Page-local: numbered step pills on the scenario series + small tag chips. */
+    .kcode { display:inline-block; font-family:'JetBrains Mono',monospace;
+      font-weight:700; font-size:0.8rem; color:#2563eb; background:#eff6ff;
+      border:1px solid #bfdbfe; border-radius:6px; padding:0.1rem 0.5rem;
+      margin-bottom:0.6rem; }
+    .tagrow { display:flex; flex-wrap:wrap; gap:0.4rem; margin-top:0.6rem; }
+    .tag { display:inline-block; font-size:0.72rem; font-weight:700;
+      letter-spacing:0.02em; text-transform:uppercase; padding:0.15rem 0.5rem;
+      border-radius:999px; }
+    .tag-scenario  { color:#15803d; background:#dcfce7; }
+    .tag-impl      { color:#1d4ed8; background:#dbeafe; }
+    .tag-ref       { color:#b45309; background:#fef3c7; }
+    .tag-deep      { color:#6b21a8; background:#f3e8ff; }
+    .legend { font-size:0.9rem; color:#64748b; margin-top:0.5rem; }
+    .seq { font-size:0.9rem; color:#64748b; margin:0.3rem 0 0.9rem; }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="../../../index.html" class="nav-brand">System Design</a>
+      <ul class="nav-links">
+        <li><a href="../../../index.html">Home</a></li>
+        <li><a href="../../index.html">LLM Serving</a></li>
+        <li><a href="index.html">Implementation</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="topic-hero">
+    <div class="container-wide">
+      <h1>Distributed KV Cache &mdash; Implementation &amp; Reference Pages</h1>
+      <p class="hero-subtitle">The implementation-depth companion set to the Distributed KV Cache scenario: a four-page scenario series built as deltas (text &rarr; +media &rarr; +tools &rarr; +branching), the per-component implementation pages (router, scheduler, KV store, eviction), and the reference / deep-dive sheets every number cites back to. This page is the one entry point into the folder.</p>
+      <p class="legend">
+        <span class="tag tag-scenario">Scenario</span> end-to-end NALSD walkthrough &nbsp;&middot;&nbsp;
+        <span class="tag tag-impl">Component</span> one job's data structures &amp; protocol &nbsp;&middot;&nbsp;
+        <span class="tag tag-ref">Reference</span> citable number/formula sheet &nbsp;&middot;&nbsp;
+        <span class="tag tag-deep">Deep-dive</span> one focused tradeoff
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ SCENARIO SERIES ============ -->
+  <section class="section">
+    <div class="container-wide">
+      <h2>Scenario series &mdash; the delta chain</h2>
+      <p>Read in order. Each page is a <strong>delta</strong> against the one before it: the text design is built in full, then media, tool execution, and conversation branching each layer on without restating the base. Every number is newly derived, previously derived, or given.</p>
+      <p class="seq">1 &nbsp;&rarr;&nbsp; 2 &nbsp;&rarr;&nbsp; 3 &nbsp;&rarr;&nbsp; 4 (each adds one capability)</p>
+
+      <div class="topic-grid">
+
+        <article class="card topic-card">
+          <a href="distributed_kv_cache.html">
+            <span class="kcode">1 &middot; base</span>
+            <h3>Distributed KV Cache</h3>
+            <p>The Staff+ NALSD walkthrough for a Claude-Code-style assistant: pooled KV store, prefix reuse, tiering &amp; eviction, fleet sizing and the cost model. The text-only foundation the rest extend.</p>
+            <div class="tagrow"><span class="tag tag-scenario">Scenario</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="distributed_kv_cache_image.html">
+            <span class="kcode">2 &middot; +media</span>
+            <h3>+ Image / PDF / Video</h3>
+            <p>Delta against (1): how media becomes tokens, the vision-encode pool (E/P/D disaggregation), ragged encoder batching, and a content-addressed vision-embedding cache.</p>
+            <div class="tagrow"><span class="tag tag-scenario">Scenario</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="distributed_kv_cache_image_tool.html">
+            <span class="kcode">3 &middot; +tools</span>
+            <h3>+ Tool Execution</h3>
+            <p>Delta against (2): client-side tool calls, the keep-warm-vs-park decision, cross-user tool-definition prefixes, and turning a quadratic tool loop linear.</p>
+            <div class="tagrow"><span class="tag tag-scenario">Scenario</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="distributed_kv_cache_image_tool_branch.html">
+            <span class="kcode">4 &middot; +branch</span>
+            <h3>+ Conversation Forks</h3>
+            <p>Delta against (3): forking a conversation shares its content-hashed prefix for free &mdash; the real delta is the tree: ref-count lifetime, copy-on-write, co-location and fan-out abuse.</p>
+            <div class="tagrow"><span class="tag tag-scenario">Scenario</span></div>
+          </a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ COMPONENT IMPLEMENTATION PAGES ============ -->
+  <section class="section section-alt">
+    <div class="container-wide">
+      <h2>Component implementation pages</h2>
+      <p>One job per page: its data structures, update cadences, and the byte-level protocol it speaks with its neighbors. These are the implementation-level details deliberately deferred out of the scenario pages.</p>
+
+      <div class="topic-grid">
+
+        <article class="card topic-card">
+          <a href="router.html">
+            <span class="kcode">router</span>
+            <h3>Cache-Aware Router</h3>
+            <p>Data structures, wait-time-driven routing, the token bucket, the CP-fork path, and the wire protocol with the scheduler.</p>
+            <div class="tagrow"><span class="tag tag-impl">Component</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="scheduler.html">
+            <span class="kcode">scheduler</span>
+            <h3>Per-Task Scheduler</h3>
+            <p>Per-iteration state evolution, the GPU memory contract, block-table layout, watermark drain&times;alloc, and the router protocol &mdash; the A&ndash;H tick template.</p>
+            <div class="tagrow"><span class="tag tag-impl">Component</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="kv_store.html">
+            <span class="kcode">kv_store</span>
+            <h3>Pooled KV Store</h3>
+            <p>PoolConvIndex, the direct consistent-hash lookup path, the cuckoo membership summary, and the store&rarr;broker&rarr;router gossip chain.</p>
+            <div class="tagrow"><span class="tag tag-impl">Component</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="cache_eviction_policy.html">
+            <span class="kcode">eviction</span>
+            <h3>Eviction &amp; Tier-Demotion Policy</h3>
+            <p>The HBM &rarr; CPU RAM &rarr; SSD demotion ladder, the hi/lo watermark pairs (and why each is a pair), and the drain-speed asymmetry between tiers.</p>
+            <div class="tagrow"><span class="tag tag-impl">Component</span></div>
+          </a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ REFERENCE COMPANIONS ============ -->
+  <section class="section">
+    <div class="container-wide">
+      <h2>Reference companions</h2>
+      <p>Number and formula sheets the scenario pages cite. Nothing here is re-derived elsewhere; everything elsewhere points back here.</p>
+
+      <div class="topic-grid">
+
+        <article class="card topic-card">
+          <a href="formula.html">
+            <span class="kcode">formula</span>
+            <h3>Formula Reference</h3>
+            <p>The constants plus F1&ndash;F15 foundational and C1&ndash;C12 crossover formulas, with a per-iteration ledger &mdash; all back-linked to where they are used.</p>
+            <div class="tagrow"><span class="tag tag-ref">Reference</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="crossover.html">
+            <span class="kcode">crossover</span>
+            <h3>Crossover Reference</h3>
+            <p>Every break-even number on the Distributed KV Cache page in one place: the design choice each one decides, and the cliff on either side.</p>
+            <div class="tagrow"><span class="tag tag-ref">Reference</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="sidecars.html">
+            <span class="kcode">sidecars</span>
+            <h3>Sidecars (S1&ndash;S3)</h3>
+            <p>Optional interview-depth add-ons for the Distributed KV Cache walkthrough &mdash; pull in when a section needs more depth.</p>
+            <div class="tagrow"><span class="tag tag-ref">Reference</span></div>
+          </a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FOCUSED DEEP-DIVES ============ -->
+  <section class="section section-alt">
+    <div class="container-wide">
+      <h2>Focused deep-dives</h2>
+      <p>Each isolates one tradeoff that would otherwise bloat a scenario page &mdash; cited from the relevant section when the depth is wanted.</p>
+
+      <div class="topic-grid">
+
+        <article class="card topic-card">
+          <a href="add.html">
+            <span class="kcode">gemm</span>
+            <h3>Multi-Stage GEMM Pipelining (Hopper)</h3>
+            <p>Shared-memory budget, pipeline stages, and the reuse tradeoff &mdash; the supplement backing the GEMM design-choice change.</p>
+            <div class="tagrow"><span class="tag tag-deep">Deep-dive</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="prefix_cache_impl.html">
+            <span class="kcode">radix</span>
+            <h3>Radix Tree vs Block-Hash</h3>
+            <p>Is &ldquo;structure-aware eviction&rdquo; a real benefit? The four-benefit side-by-side that decides the prefix-cache index structure.</p>
+            <div class="tagrow"><span class="tag tag-deep">Deep-dive</span></div>
+          </a>
+        </article>
+
+        <article class="card topic-card">
+          <a href="redis_vs_memcached.html">
+            <span class="kcode">redis</span>
+            <h3>Redis vs Memcached</h3>
+            <p>Single-threaded vs multi-threaded event loops, and why each chooses what it does &mdash; the backing-store engine comparison.</p>
+            <div class="tagrow"><span class="tag tag-deep">Deep-dive</span></div>
+          </a>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container-wide">
+      <p>Implementation &amp; reference set for the Distributed KV Cache scenario &middot; <a href="../../index.html">&larr; back to LLM Serving</a></p>
+    </div>
+  </footer>
+
+</body>
+</html>
